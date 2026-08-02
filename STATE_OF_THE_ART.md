@@ -729,6 +729,10 @@ matches, that fact must be machine-readable.
 
 ## 9. Implementation sequence
 
+The issue-sized discovery and acquisition plan, including connector contracts,
+access fallbacks, security gates, milestones, and acceptance tests, is maintained
+in [docs/NEXT_PHASE.md](docs/NEXT_PHASE.md).
+
 ### Phase 0 — one-week spike
 
 - Pick one bounded, contested, fast-changing topic.
