@@ -1,0 +1,28 @@
+{
+  "response": {
+    "status": "OK",
+    "head": {
+      "query": "\"knowledge graph\" ontology",
+      "start": 1,
+      "return": 3,
+      "results": 3
+    },
+    "results": [
+      {
+        "url": "https://example.org/research/ontology#overview",
+        "title": "Ontology &amp; knowledge graphs",
+        "desc": "A structured research source."
+      },
+      {
+        "url": "https://standards.example/specification?version=2",
+        "title": "Specification",
+        "desc": "Primary standards material."
+      },
+      {
+        "url": "http://127.0.0.1/private",
+        "title": "Invalid private target",
+        "desc": "Must not become an acquisition candidate."
+      }
+    ]
+  }
+}

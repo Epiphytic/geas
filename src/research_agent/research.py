@@ -11,8 +11,10 @@ from research_agent.discovery import (
     AcquisitionAttempt,
     AcquisitionRequest,
     AcquisitionState,
+    ConnectorCapability,
     CoverageRun,
     DiscoveryCandidate,
+    DiscoveryConnector,
     DiscoveryHit,
     DiscoveryRequest,
     DiscoveryRun,
@@ -36,28 +38,25 @@ class OfflineResearchResult(StrictModel):
     record_hashes: dict[str, tuple[str, ...]] = Field(default_factory=dict)
 
 
-class OfflineResearchRunner:
-    """Executes a validated plan without a model, network, credentials, or graph writes."""
+class DiscoveryExecution(StrictModel):
+    discovery_run: DiscoveryRun
+    hits: tuple[DiscoveryHit, ...]
 
-    version = "offline-research-runner/1"
 
-    def __init__(
-        self,
-        *,
-        store: ImmutableStore,
-        connector: ResearchConnector,
-        clock: Callable[[], datetime] = utc_now,
-        freshness: timedelta = timedelta(days=7),
-    ) -> None:
-        self.store = store
-        self.connector = connector
+class DiscoveryExecutor:
+    """Executes a validated discovery plan without acquisition or model access."""
+
+    version = "discovery-executor/1"
+
+    def __init__(self, *, clock: Callable[[], datetime] = utc_now) -> None:
         self.clock = clock
-        self.freshness = freshness
 
-    def run(self, plan: QueryPlan, *, topic_branch: str = "topic:local") -> OfflineResearchResult:
-        manifest = self.connector.manifest
+    def run(self, plan: QueryPlan, connector: DiscoveryConnector) -> DiscoveryExecution:
+        manifest = connector.manifest
         if manifest.id not in plan.connector_ids:
             raise ValueError(f"plan does not authorize connector {manifest.id}")
+        if ConnectorCapability.DISCOVERY not in manifest.capabilities:
+            raise ValueError(f"connector {manifest.id} does not declare discovery")
         started_at = self.clock()
         request = DiscoveryRequest(
             query_plan_id=plan.id,
@@ -70,6 +69,7 @@ class OfflineResearchRunner:
 
         candidates: list[DiscoveryCandidate] = []
         cursors: list[str] = []
+        response_hashes: list[str] = []
         seen: set[tuple[str, str]] = set()
         duplicate_count = 0
         rejection_count = 0
@@ -78,12 +78,14 @@ class OfflineResearchRunner:
         empty_pages = 0
         truncated = False
         termination = "connector_exhausted"
-        for page in self.connector.discover(request):
+        for page in connector.discover(request):
             page_count += 1
             rejection_count += page.rejected_count
             error_count += page.error_count
             if page.cursor is not None:
                 cursors.append(page.cursor)
+            if page.response_sha256 is not None:
+                response_hashes.append(page.response_sha256)
             if not page.candidates:
                 empty_pages += 1
                 if empty_pages >= plan.stop_after_empty_pages:
@@ -110,7 +112,7 @@ class OfflineResearchRunner:
                 break
 
         ended_at = self.clock()
-        normalized_query = f"{plan.match.value}(" + ",".join(plan.exact_terms) + ")"
+        normalized_query = connector.normalize_query(request)
         run_fields = {
             "query_plan_id": plan.id,
             "connector_id": manifest.id,
@@ -119,13 +121,14 @@ class OfflineResearchRunner:
             "started_at": started_at,
             "ended_at": ended_at,
             "pagination_cursors": tuple(cursors),
+            "response_sha256s": tuple(response_hashes),
             "termination_reason": termination,
             "result_count": len(candidates),
             "duplicate_count": duplicate_count,
             "rejection_count": rejection_count,
             "error_count": error_count,
             "truncated": truncated,
-            "runner_version": self.version,
+            "executor_version": self.version,
         }
         discovery_run = DiscoveryRun(
             id=identified("discovery-run", run_fields),
@@ -136,6 +139,7 @@ class OfflineResearchRunner:
             started_at=started_at,
             ended_at=ended_at,
             pagination_cursors=tuple(cursors),
+            response_sha256s=tuple(response_hashes),
             termination_reason=termination,
             result_count=len(candidates),
             duplicate_count=duplicate_count,
@@ -143,11 +147,60 @@ class OfflineResearchRunner:
             error_count=error_count,
             truncated=truncated,
         )
-
         hits = tuple(
             self._hit(candidate, discovery_run.id, rank)
             for rank, candidate in enumerate(candidates, start=1)
         )
+        return DiscoveryExecution(discovery_run=discovery_run, hits=hits)
+
+    @staticmethod
+    def _hit(candidate: DiscoveryCandidate, run_id: str, rank: int) -> DiscoveryHit:
+        fields = {
+            "upstream_id": candidate.upstream_id,
+            "canonical_locator": candidate.canonical_locator,
+            "title": candidate.title,
+            "media_type": candidate.media_type,
+            "language": candidate.language,
+            "snippet": candidate.snippet,
+            "discovery_run_id": run_id,
+        }
+        return DiscoveryHit(
+            id=identified("discovery-hit", fields),
+            upstream_id=candidate.upstream_id,
+            canonical_locator=candidate.canonical_locator,
+            title=candidate.title,
+            media_type=candidate.media_type,
+            language=candidate.language,
+            upstream_rank=rank,
+            snippet=candidate.snippet,
+            discovery_run_id=run_id,
+            acquisition_eligible=True,
+        )
+
+
+class OfflineResearchRunner:
+    """Executes a validated plan without a model, network, credentials, or graph writes."""
+
+    version = "offline-research-runner/1"
+
+    def __init__(
+        self,
+        *,
+        store: ImmutableStore,
+        connector: ResearchConnector,
+        clock: Callable[[], datetime] = utc_now,
+        freshness: timedelta = timedelta(days=7),
+    ) -> None:
+        self.store = store
+        self.connector = connector
+        self.clock = clock
+        self.freshness = freshness
+
+    def run(self, plan: QueryPlan, *, topic_branch: str = "topic:local") -> OfflineResearchResult:
+        manifest = self.connector.manifest
+        discovery = DiscoveryExecutor(clock=self.clock).run(plan, self.connector)
+        discovery_run = discovery.discovery_run
+        hits = discovery.hits
         attempts: list[AcquisitionAttempt] = []
         sources: list[SourceVersion] = []
         constraints: list[AccessConstraint] = []
@@ -297,30 +350,6 @@ class OfflineResearchRunner:
             access_constraints=tuple(constraints),
             coverage=coverage,
             record_hashes=record_hashes,
-        )
-
-    @staticmethod
-    def _hit(candidate: DiscoveryCandidate, run_id: str, rank: int) -> DiscoveryHit:
-        fields = {
-            "upstream_id": candidate.upstream_id,
-            "canonical_locator": candidate.canonical_locator,
-            "title": candidate.title,
-            "media_type": candidate.media_type,
-            "language": candidate.language,
-            "snippet": candidate.snippet,
-            "discovery_run_id": run_id,
-        }
-        return DiscoveryHit(
-            id=identified("discovery-hit", fields),
-            upstream_id=candidate.upstream_id,
-            canonical_locator=candidate.canonical_locator,
-            title=candidate.title,
-            media_type=candidate.media_type,
-            language=candidate.language,
-            upstream_rank=rank,
-            snippet=candidate.snippet,
-            discovery_run_id=run_id,
-            acquisition_eligible=True,
         )
 
     @staticmethod

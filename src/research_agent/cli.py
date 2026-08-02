@@ -2,15 +2,23 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from pathlib import Path
 
-from research_agent.connectors import LocalFileConnector
-from research_agent.discovery import CompilerIdentity
+from pydantic_core import to_jsonable_python
+
+from research_agent.connectors import LocalFileConnector, MojeekDiscoveryConnector
+from research_agent.discovery import (
+    CompilerIdentity,
+    ConnectorCapability,
+    SourceClass,
+)
 from research_agent.models import (
     PolicyStage,
     ThreatObservation,
     ThreatTarget,
 )
+from research_agent.operator_policy import ResearchPolicy
 from research_agent.planning import (
     ConceptVocabulary,
     ModelQueryCompiler,
@@ -20,14 +28,14 @@ from research_agent.planning import (
 )
 from research_agent.policy import PolicyEngine
 from research_agent.providers import ModelClient, load_provider_configs
-from research_agent.research import OfflineResearchRunner
+from research_agent.research import DiscoveryExecutor, OfflineResearchRunner
+from research_agent.secrets import load_env_file
 from research_agent.store import ImmutableStore
 from research_agent.workflow import ActorKind, WorkflowEngine, WorkflowState
 
 
 def _json(value: object) -> None:
-    if hasattr(value, "model_dump"):
-        value = value.model_dump(mode="json")
+    value = to_jsonable_python(value)
     print(json.dumps(value, indent=2, sort_keys=True))
 
 
@@ -44,6 +52,18 @@ def _build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path("config/source-policy.yaml"),
         help="deterministic source policy path",
+    )
+    parser.add_argument(
+        "--research-policy",
+        type=Path,
+        default=Path("config/research-policy.yaml"),
+        help="connector priority, storage, and cost policy path",
+    )
+    parser.add_argument(
+        "--env-file",
+        type=Path,
+        default=Path(".env"),
+        help="ignored secret environment file",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -82,6 +102,22 @@ def _build_parser() -> argparse.ArgumentParser:
         help="tool-free configured model provider; omit for deterministic lexical compilation",
     )
     offline.add_argument("--topic-branch", default="topic:local")
+
+    mojeek = subparsers.add_parser(
+        "discover-mojeek",
+        help="run discovery-only search; results are not evidence",
+    )
+    mojeek.add_argument("question")
+    mojeek.add_argument("--root", type=Path, default=Path("data"))
+    mojeek.add_argument("--term", action="append", default=[])
+    mojeek.add_argument("--concept", action="append", default=[])
+    mojeek.add_argument(
+        "--vocabulary",
+        type=Path,
+        default=Path("config/query-vocabulary.yaml"),
+    )
+    mojeek.add_argument("--result-limit", type=int, default=10)
+    mojeek.add_argument("--approve-budget", action="store_true")
 
     policy = subparsers.add_parser("policy-check", help="evaluate source policy")
     policy.add_argument("--workflow-id", required=True)
@@ -216,6 +252,76 @@ def main() -> None:
             topic_branch=args.topic_branch,
         )
         _json(result)
+        return
+
+    if args.command == "discover-mojeek":
+        research_policy = ResearchPolicy.from_yaml(args.research_policy)
+        provider_policy = research_policy.provider("connector:mojeek")
+        if not provider_policy.enabled:
+            raise ValueError("Mojeek is disabled by the research policy")
+        load_env_file(
+            args.env_file,
+            allowed_names=frozenset({provider_policy.credential_env}),
+        )
+        connector = MojeekDiscoveryConnector()
+        vocabulary = ConceptVocabulary.from_yaml(args.vocabulary)
+        base = deterministic_proposal(
+            args.question,
+            connector_id=connector.manifest.id,
+            concept_ids=tuple(args.concept),
+        )
+        proposal = QueryProposal.model_validate(
+            {
+                **base.model_dump(mode="json"),
+                "exact_terms": args.term or base.exact_terms,
+                "source_classes": [SourceClass.WEB],
+                "capabilities": [
+                    ConnectorCapability.DISCOVERY,
+                    ConnectorCapability.METADATA,
+                ],
+                "result_limit": args.result_limit,
+                "page_limit": min(
+                    math.ceil(args.result_limit / 40),
+                    provider_policy.max_requests_per_run,
+                ),
+            }
+        )
+        plan = QueryPlanValidator(
+            vocabulary=vocabulary,
+            manifests={connector.manifest.id: connector.manifest},
+        ).validate(
+            proposal,
+            compiler=CompilerIdentity(id="compiler:deterministic-lexical", version="1"),
+            human_approved=args.approve_budget,
+        )
+        execution = DiscoveryExecutor().run(plan, connector)
+        store = ImmutableStore(args.root)
+        store.initialize()
+        record_hashes = {
+            "research-policy": (store.put_record("research-policy", research_policy),),
+            "query-plan": (store.put_record("query-plan", plan),),
+            "connector-manifest": (store.put_record("connector-manifest", connector.manifest),),
+            "discovery-run": (store.put_record("discovery-run", execution.discovery_run),),
+        }
+        if provider_policy.persist_normalized_results:
+            record_hashes["discovery-hit"] = tuple(
+                store.put_record("discovery-hit", hit) for hit in execution.hits
+            )
+        _json(
+            {
+                "query_plan": plan,
+                "discovery_run": execution.discovery_run,
+                "hits": execution.hits,
+                "persistence": {
+                    "normalized_results": provider_policy.persist_normalized_results,
+                    "storage_rights": provider_policy.storage_rights,
+                    "raw_response_retention_days": (provider_policy.raw_response_retention_days),
+                    "note": "Search results are discovery metadata, never evidence.",
+                },
+                "record_hashes": record_hashes,
+                "acquisition_priority": research_policy.open_source_acquisition_order,
+            }
+        )
         return
 
     if args.command == "policy-check":

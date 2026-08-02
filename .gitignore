@@ -7,4 +7,6 @@ dist/
 build/
 *.egg-info/
 .env
+.env.*
+.*.swp
 data/

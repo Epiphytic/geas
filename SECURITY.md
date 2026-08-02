@@ -20,6 +20,12 @@ boundary.
   roots and do not follow symlinks outside them.
 - Connector manifests are trusted code/configuration, while snippets and
   connector results remain untrusted records.
+- Secret environment files and editor swap files are ignored. The deterministic
+  loader reads only explicitly allowlisted variable names and performs no shell
+  evaluation or interpolation.
+- The Mojeek transport has a fixed HTTPS destination. Although Mojeek requires
+  its key as a query parameter, full request URLs and upstream error bodies are
+  never placed in audit records or propagated through connector exceptions.
 - External providers are opt-in. The local DeepSeek endpoint is the default.
 
 The current repository implements the data models, immutable store, deterministic

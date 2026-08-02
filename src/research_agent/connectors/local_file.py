@@ -76,6 +76,9 @@ class LocalFileConnector:
             raise ValueError("local acquisition target escapes configured roots")
         return candidate
 
+    def normalize_query(self, request: DiscoveryRequest) -> str:
+        return f"{request.match.value}(" + ",".join(request.exact_terms) + ")"
+
     def discover(self, request: DiscoveryRequest) -> Iterable[DiscoveryPage]:
         files = sorted(
             {

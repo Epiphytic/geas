@@ -25,7 +25,8 @@ Network connectors, graph persistence, lexical/faceted graph query, ontology
 projection, gap ranking, and scheduled refresh are subsequent milestones. See
 [STATE_OF_THE_ART.md](STATE_OF_THE_ART.md) for the design and research basis,
 and [docs/NEXT_PHASE.md](docs/NEXT_PHASE.md) for the executable discovery and
-acquisition plan.
+acquisition plan. Accepted cost, licensing, and deployment choices are recorded
+in [docs/OPERATOR_DECISIONS.md](docs/OPERATOR_DECISIONS.md).
 
 ## Why this is not conventional RAG
 
@@ -120,6 +121,20 @@ uv run research-agent policy-check \
 
 Global options such as `--policy` and `--providers` go before the subcommand.
 The `data/` directory is intentionally ignored by Git.
+
+Run bounded Mojeek discovery using `MOJEEK_API_KEY` from the ignored `.env`
+file:
+
+```bash
+uv run research-agent discover-mojeek \
+  "ontology-backed research agents" \
+  --result-limit 10
+```
+
+This command is discovery-only. It retains the query plan, aggregate run record,
+and response hashes. Normalized hits are not persisted until the operator
+confirms that the Mojeek subscription has storage rights. Search hits and
+snippets are never evidence.
 
 ## Tainted-source intelligence
 
