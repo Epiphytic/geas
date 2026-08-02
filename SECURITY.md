@@ -26,6 +26,13 @@ boundary.
 - The Mojeek transport has a fixed HTTPS destination. Although Mojeek requires
   its key as a query parameter, full request URLs and upstream error bodies are
   never placed in audit records or propagated through connector exceptions.
+- Canonical authority is one-way: version-controlled ontology and schemas plus
+  immutable records and blobs produce truth snapshots; SQLite and Markdown are
+  disposable projections. Projection data can never authorize changes to
+  canonical state.
+- Projection stamps bind SQLite to an exact truth snapshot and logical
+  schema/row digest. Canonical drift requires a reviewed successor snapshot;
+  projection drift requires discard and rebuild.
 - External providers are opt-in. The local DeepSeek endpoint is the default.
 
 The current repository implements the data models, immutable store, deterministic

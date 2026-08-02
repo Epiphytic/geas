@@ -26,7 +26,9 @@ projection, gap ranking, and scheduled refresh are subsequent milestones. See
 [STATE_OF_THE_ART.md](STATE_OF_THE_ART.md) for the design and research basis,
 and [docs/NEXT_PHASE.md](docs/NEXT_PHASE.md) for the executable discovery and
 acquisition plan. Accepted cost, licensing, and deployment choices are recorded
-in [docs/OPERATOR_DECISIONS.md](docs/OPERATOR_DECISIONS.md).
+in [docs/OPERATOR_DECISIONS.md](docs/OPERATOR_DECISIONS.md). Canonical authority
+and projection reconciliation are defined in
+[docs/SOURCE_OF_TRUTH.md](docs/SOURCE_OF_TRUTH.md).
 
 ## Why this is not conventional RAG
 
@@ -135,6 +137,23 @@ This command is discovery-only. It retains the query plan, aggregate run record,
 and response hashes. Normalized hits are not persisted until the operator
 confirms that the Mojeek subscription has storage rights. Search hits and
 snippets are never evidence.
+
+Capture canonical state and detect later ontology, record, blob, or SQLite
+projection drift:
+
+```bash
+uv run research-agent truth-snapshot \
+  --root data \
+  --created-by operator:example
+
+uv run research-agent projection-check \
+  data/records/truth-snapshot/aa/snapshot.json \
+  data/query.sqlite \
+  --root data
+```
+
+SQLite is a rebuildable query projection. It is never a source for automatic
+changes to canonical ontology or knowledge records.
 
 ## Tainted-source intelligence
 

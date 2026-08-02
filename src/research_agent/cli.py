@@ -31,6 +31,7 @@ from research_agent.providers import ModelClient, load_provider_configs
 from research_agent.research import DiscoveryExecutor, OfflineResearchRunner
 from research_agent.secrets import load_env_file
 from research_agent.store import ImmutableStore
+from research_agent.truth import SQLiteProjectionGuard, TruthManager, TruthPolicy, TruthSnapshot
 from research_agent.workflow import ActorKind, WorkflowEngine, WorkflowState
 
 
@@ -64,6 +65,12 @@ def _build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path(".env"),
         help="ignored secret environment file",
+    )
+    parser.add_argument(
+        "--truth-policy",
+        type=Path,
+        default=Path("config/truth-policy.yaml"),
+        help="canonical-source and projection reconciliation policy",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -118,6 +125,41 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     mojeek.add_argument("--result-limit", type=int, default=10)
     mojeek.add_argument("--approve-budget", action="store_true")
+
+    truth_snapshot = subparsers.add_parser(
+        "truth-snapshot",
+        help="capture the canonical ontology, schemas, records, and blobs",
+    )
+    truth_snapshot.add_argument("--root", type=Path, default=Path("data"))
+    truth_snapshot.add_argument("--workspace", type=Path, default=Path("."))
+    truth_snapshot.add_argument("--created-by", required=True)
+    truth_snapshot.add_argument("--predecessor")
+
+    truth_check = subparsers.add_parser(
+        "truth-check",
+        help="detect drift from a canonical truth snapshot",
+    )
+    truth_check.add_argument("snapshot", type=Path)
+    truth_check.add_argument("--root", type=Path, default=Path("data"))
+    truth_check.add_argument("--workspace", type=Path, default=Path("."))
+
+    projection_stamp = subparsers.add_parser(
+        "projection-stamp",
+        help="stamp a completely built SQLite projection",
+    )
+    projection_stamp.add_argument("snapshot", type=Path)
+    projection_stamp.add_argument("database", type=Path)
+    projection_stamp.add_argument("--schema-version", type=int, required=True)
+    projection_stamp.add_argument("--builder-version", required=True)
+
+    projection_check = subparsers.add_parser(
+        "projection-check",
+        help="detect canonical or SQLite projection drift",
+    )
+    projection_check.add_argument("snapshot", type=Path)
+    projection_check.add_argument("database", type=Path)
+    projection_check.add_argument("--root", type=Path, default=Path("data"))
+    projection_check.add_argument("--workspace", type=Path, default=Path("."))
 
     policy = subparsers.add_parser("policy-check", help="evaluate source policy")
     policy.add_argument("--workflow-id", required=True)
@@ -322,6 +364,68 @@ def main() -> None:
                 "acquisition_priority": research_policy.open_source_acquisition_order,
             }
         )
+        return
+
+    if args.command == "truth-snapshot":
+        store = ImmutableStore(args.root)
+        store.initialize()
+        manager = TruthManager(
+            workspace_root=args.workspace,
+            store_root=store.root,
+            policy=TruthPolicy.from_yaml(args.truth_policy),
+        )
+        snapshot = manager.capture(
+            created_by=args.created_by,
+            predecessor=args.predecessor,
+        )
+        digest = store.put_record("truth-snapshot", snapshot)
+        _json(
+            {
+                "snapshot": snapshot,
+                "record_digest": digest,
+                "record_path": str(store.record_path("truth-snapshot", digest)),
+            }
+        )
+        return
+
+    if args.command == "truth-check":
+        snapshot = TruthSnapshot.model_validate_json(args.snapshot.read_text())
+        report = TruthManager(
+            workspace_root=args.workspace,
+            store_root=args.root,
+            policy=TruthPolicy.from_yaml(args.truth_policy),
+        ).verify(snapshot)
+        _json(report)
+        if not report.clean:
+            raise SystemExit(2)
+        return
+
+    if args.command == "projection-stamp":
+        snapshot = TruthSnapshot.model_validate_json(args.snapshot.read_text())
+        stamp = SQLiteProjectionGuard().stamp(
+            args.database,
+            snapshot,
+            schema_version=args.schema_version,
+            builder_version=args.builder_version,
+        )
+        _json(stamp)
+        return
+
+    if args.command == "projection-check":
+        snapshot = TruthSnapshot.model_validate_json(args.snapshot.read_text())
+        truth_report = TruthManager(
+            workspace_root=args.workspace,
+            store_root=args.root,
+            policy=TruthPolicy.from_yaml(args.truth_policy),
+        ).verify(snapshot)
+        report = SQLiteProjectionGuard().verify(
+            args.database,
+            snapshot,
+            truth_report=truth_report,
+        )
+        _json(report)
+        if not report.clean:
+            raise SystemExit(2)
         return
 
     if args.command == "policy-check":

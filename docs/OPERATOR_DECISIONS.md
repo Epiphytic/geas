@@ -50,3 +50,32 @@ References:
 - [Mojeek Search API](https://www.mojeek.com/services/search/web-search-api/)
 - [Mojeek request parameters](https://www.mojeek.com/support/api/search/request_parameters.html)
 - [Mojeek JSON response](https://www.mojeek.com/support/api/search/json_response.html)
+
+## 2. Persistent query backend
+
+**Status:** accepted on 2026-08-02.
+
+### Decision
+
+- Use SQLite as the deterministic query projection.
+- Keep ontology definitions and controlled vocabulary in version-controlled,
+  inspectable text.
+- Keep knowledge history and evidence in immutable, content-addressed records
+  and blobs.
+- Bind canonical state with versioned `TruthSnapshot` records.
+- Treat SQLite as disposable: it may be rebuilt from canonical state but may
+  never update canonical state through reconciliation.
+- Defer PostgreSQL, Apache AGE, Neo4j, or RDF-store deployment until measured
+  concurrency, scale, availability, or traversal requirements justify it.
+
+### Drift response
+
+- Canonical changes require review, a successor truth snapshot, and projection
+  rebuild.
+- A stale or mutated SQLite projection is discarded and rebuilt.
+- Direct SQLite edits never become ontology patches or accepted claims.
+- Every projection records the truth snapshot, schema version, builder version,
+  and logical database digest from which it was produced.
+
+The complete contract and operational commands are documented in
+`docs/SOURCE_OF_TRUTH.md`.

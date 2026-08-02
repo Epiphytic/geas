@@ -70,6 +70,13 @@ class ImmutableStore:
                 raise RuntimeError(f"immutable record mismatch at {path}") from None
         return digest
 
+    def record_path(self, kind: str, digest: str) -> Path:
+        if not kind.replace("-", "").replace("_", "").isalnum():
+            raise ValueError("record kind must be alphanumeric with '-' or '_'")
+        if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+            raise ValueError("record digest must be a lowercase SHA-256 value")
+        return self.record_root / kind / digest[:2] / f"{digest}.json"
+
     def ingest_file(
         self,
         path: Path,
