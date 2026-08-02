@@ -25,6 +25,14 @@ from research_agent.discovery import (
     ConnectorCapability,
     SourceClass,
 )
+from research_agent.model_policy import (
+    DataClass,
+    InputKind,
+    ModelOperation,
+    ModelUseContext,
+    ModelUseGate,
+    ModelUsePolicy,
+)
 from research_agent.models import (
     PolicyStage,
     ThreatObservation,
@@ -90,12 +98,20 @@ def _build_parser() -> argparse.ArgumentParser:
         default=Path("config/deposit-policy.yaml"),
         help="user-deposit defaults and authorization-boundary policy",
     )
+    parser.add_argument(
+        "--model-policy",
+        type=Path,
+        default=Path("config/model-policy.yaml"),
+        help="deterministic local and external model-use policy",
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     subparsers.add_parser("providers", help="list configured providers without secrets")
 
     smoke = subparsers.add_parser("model-smoke", help="run a tool-free model smoke test")
     smoke.add_argument("--provider")
+    smoke.add_argument("--root", type=Path, default=Path("data"))
+    smoke.add_argument("--approve-external-provider", action="store_true")
 
     init = subparsers.add_parser("store-init", help="initialize an immutable store")
     init.add_argument("--root", type=Path, default=Path("data"))
@@ -182,6 +198,14 @@ def _build_parser() -> argparse.ArgumentParser:
         "--compiler-provider",
         help="tool-free configured model provider; omit for deterministic lexical compilation",
     )
+    offline.add_argument(
+        "--compiler-data-class",
+        type=DataClass,
+        choices=list(DataClass),
+        default=DataClass.UNKNOWN,
+        help="trusted classification of compiler input; unknown forbids external use",
+    )
+    offline.add_argument("--approve-external-provider", action="store_true")
     offline.add_argument("--topic-branch", default="topic:local")
 
     mojeek = subparsers.add_parser(
@@ -286,7 +310,20 @@ def main() -> None:
     if args.command == "model-smoke":
         default, providers = load_provider_configs(args.providers)
         name = args.provider or default
-        client = ModelClient(name, providers[name])
+        gate = ModelUseGate(
+            ModelUsePolicy.from_yaml(args.model_policy),
+            ModelUseContext(
+                operation=ModelOperation.MODEL_SMOKE,
+                data_class=DataClass.PUBLIC,
+                input_kind=InputKind.METADATA_ONLY,
+                human_approved=args.approve_external_provider,
+            ),
+        )
+        client = ModelClient(
+            name,
+            providers[name],
+            gate=gate,
+        )
         result = client.complete_json(
             system=(
                 "Return one JSON object only. Do not call tools. "
@@ -295,7 +332,20 @@ def main() -> None:
             user="Report that the tool-free research extraction model endpoint is available.",
             max_output_tokens=256,
         )
-        _json({"provider": name, "result": result})
+        store = ImmutableStore(args.root)
+        store.initialize()
+        authorization_hash = store.put_record(
+            "model-authorization",
+            gate.last_authorization,
+        )
+        _json(
+            {
+                "provider": name,
+                "result": result,
+                "authorization": gate.last_authorization,
+                "authorization_record_hash": authorization_hash,
+            }
+        )
         return
 
     if args.command == "store-init":
@@ -375,11 +425,26 @@ def main() -> None:
             if args.compiler_provider not in providers:
                 raise ValueError(f"unknown provider: {args.compiler_provider}")
             provider = providers[args.compiler_provider]
-            proposal = ModelQueryCompiler(ModelClient(args.compiler_provider, provider)).compile(
+            gate = ModelUseGate(
+                ModelUsePolicy.from_yaml(args.model_policy),
+                ModelUseContext(
+                    operation=ModelOperation.QUERY_COMPILATION,
+                    data_class=args.compiler_data_class,
+                    input_kind=InputKind.METADATA_ONLY,
+                    human_approved=args.approve_external_provider,
+                ),
+            )
+            client = ModelClient(
+                args.compiler_provider,
+                provider,
+                gate=gate,
+            )
+            proposal = ModelQueryCompiler(client).compile(
                 args.question,
                 vocabulary=vocabulary,
                 manifests={connector.manifest.id: connector.manifest},
             )
+            store.put_record("model-authorization", gate.last_authorization)
             compiler = CompilerIdentity(
                 id=f"compiler:model:{args.compiler_provider}:{provider.model}",
                 version=ModelQueryCompiler.version,

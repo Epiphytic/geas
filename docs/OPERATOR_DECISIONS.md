@@ -131,3 +131,29 @@ key. A matching NIP-94 `x` or `ox` tag binds that signed event to a file hash.
 Neither fact alone proves the signer's legal identity or ownership. The system
 therefore records the signature as evidence supporting a declared relation,
 not as a conclusive ownership determination.
+
+## 5. External model authorization
+
+**Status:** accepted on 2026-08-02.
+
+### Decision
+
+- Use deterministic preauthorization with escalation for OpenAI, z.ai, and
+  future external model providers.
+- Local DeepSeek use is automatic.
+- Bind external authorization to an allowlisted provider, exact endpoint,
+  exact model, operation, data class, input kind, content route, input hash,
+  output limit, and policy version.
+- Models and retrieved source material cannot authorize a call, change its
+  classification, choose a destination, or waive a limit.
+- Unknown data is local-only. Source content requires an `external_allowed`
+  route in addition to provider and operation authorization.
+- Preserve successful authorizations as immutable audit records.
+
+### Temporary approval threshold
+
+Automatic external calls remain disabled until enforceable cost thresholds and
+a persistent usage ledger are implemented. External calls therefore require
+explicit approval in addition to matching the deterministic allowlist.
+
+See `docs/MODEL_USE_POLICY.md` for the enforcement contract.

@@ -346,9 +346,7 @@ the persistent, queryable knowledge state and its audit history.
 
 ## Decisions still requiring operator input
 
-- General search API provider or providers, cost ceiling, and retention terms.
 - Production graph backend after the SQLite vertical slice is measured.
-- Browser-deposit mechanism and handling of licensed private material.
-- Default redistribution policy for acquired content.
-- Human-approval thresholds for external-provider use and high-cost searches.
+- Numeric automatic-approval and cost thresholds for external-provider use.
+- Authenticated or signed human-approval mechanism.
 - Repository open-source license.

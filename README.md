@@ -174,6 +174,11 @@ initial version assumes the entire deployment is authorization-gated; it does
 not enforce record- or branch-level ACLs. Rights fields default to unknown, and
 valid NIP-01/NIP-94 events may be attached as file-bound cryptographic evidence.
 
+External model use is separately controlled by a deterministic gate that binds
+the provider, endpoint, model, operation, data class, content route, and exact
+input hash. Automatic external calls remain disabled pending an enforceable
+cost ledger. See [docs/MODEL_USE_POLICY.md](docs/MODEL_USE_POLICY.md).
+
 ## Tainted-source intelligence
 
 [`intelligence/sources.yaml`](intelligence/sources.yaml) catalogs maintained

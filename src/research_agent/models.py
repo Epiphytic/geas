@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -226,3 +227,18 @@ class ProviderConfig(StrictModel):
     api_key_env: str = ""
     external: bool
     max_output_tokens: int = Field(gt=0, le=65536)
+
+    @model_validator(mode="after")
+    def endpoint_matches_trust_boundary(self) -> ProviderConfig:
+        host = self.base_url.host
+        if self.external:
+            if self.base_url.scheme != "https":
+                raise ValueError("external model providers require HTTPS")
+            return self
+        try:
+            address = ipaddress.ip_address(host)
+        except ValueError as exc:
+            raise ValueError("local model providers require a literal loopback address") from exc
+        if not address.is_loopback:
+            raise ValueError("local model providers require a loopback address")
+        return self

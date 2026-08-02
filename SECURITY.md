@@ -38,7 +38,12 @@ boundary.
   confidentiality. Anyone authorized for a deployment may be able to query all
   indexed deposits; hard isolation currently requires a separate deployment or
   store root.
-- External providers are opt-in. The local DeepSeek endpoint is the default.
+- External model clients require deterministic authorization before network
+  I/O. Provider names are bound to exact HTTPS endpoints and models; local
+  providers must use literal loopback addresses, redirects are rejected,
+  unknown data is local-only, and source content must be explicitly marked
+  `external_allowed`. Model text cannot supply or change these authorization
+  inputs.
 
 The current repository implements the data models, immutable store, deterministic
 policy decision logic, fixed workflow transitions, typed query validation, and
