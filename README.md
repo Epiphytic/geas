@@ -17,7 +17,9 @@ This repository currently provides the Phase 0 control plane:
 
 Graph persistence, connectors, lexical/faceted query, ontology projection,
 gap analysis, and scheduled refresh are the next implementation phases. See
-[STATE_OF_THE_ART.md](STATE_OF_THE_ART.md) for the design and research basis.
+[STATE_OF_THE_ART.md](STATE_OF_THE_ART.md) for the design and research basis,
+and [docs/NEXT_PHASE.md](docs/NEXT_PHASE.md) for the executable discovery and
+acquisition plan.
 
 ## Why this is not conventional RAG
 
