@@ -4,6 +4,7 @@ import hashlib
 import json
 import mimetypes
 import os
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -76,19 +77,40 @@ class ImmutableStore:
         source_uri: str | None = None,
         connector_id: str = "connector:local-file",
         license: str | None = None,
+        acquired_at: datetime | None = None,
     ) -> SourceVersion:
         resolved = path.resolve(strict=True)
         if not resolved.is_file():
             raise ValueError(f"not a regular file: {resolved}")
         content = resolved.read_bytes()
-        digest = self.put_blob(content)
         media_type = mimetypes.guess_type(resolved.name)[0] or "application/octet-stream"
-        source = SourceVersion.from_bytes(
+        return self.ingest_bytes(
+            content,
             source_uri=source_uri or resolved.as_uri(),
+            media_type=media_type,
+            connector_id=connector_id,
+            license=license,
+            acquired_at=acquired_at,
+        )
+
+    def ingest_bytes(
+        self,
+        content: bytes,
+        *,
+        source_uri: str,
+        media_type: str,
+        connector_id: str,
+        license: str | None = None,
+        acquired_at: datetime | None = None,
+    ) -> SourceVersion:
+        digest = self.put_blob(content)
+        source = SourceVersion.from_bytes(
+            source_uri=source_uri,
             content=content,
             media_type=media_type,
             connector_id=connector_id,
             license=license,
+            acquired_at=acquired_at,
         )
         if source.content_sha256 != digest:
             raise RuntimeError("source and blob hashes diverged")

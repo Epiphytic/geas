@@ -5,18 +5,24 @@ knowledge base. Its durable product is a versioned graph of claims, evidence,
 concepts, disagreements, and source-threat observations—not a periodically
 regenerated report.
 
-This repository currently provides the Phase 0 control plane:
+This repository currently provides the Phase 0 control plane and the M1 offline
+research slice:
 
 - strict records for sources, evidence, claims, and threat observations;
+- strict records for query plans, discovery, acquisition, access constraints,
+  and coverage;
 - an immutable, content-addressed local store;
 - a deterministic source-policy engine loaded from validated YAML;
 - fixed workflow transitions that models cannot authorize;
+- connector capability manifests and narrow discovery/acquisition contracts;
+- deterministic query validation with controlled synonyms and budget clamps;
+- path-confined local-file discovery and acquisition;
 - a tool-free client for local DeepSeek and optional external providers;
 - a starter LinkML ontology and a maintained upstream intelligence registry;
 - tests for the principal prompt-injection security invariants.
 
-Graph persistence, connectors, lexical/faceted query, ontology projection,
-gap analysis, and scheduled refresh are the next implementation phases. See
+Network connectors, graph persistence, lexical/faceted graph query, ontology
+projection, gap ranking, and scheduled refresh are subsequent milestones. See
 [STATE_OF_THE_ART.md](STATE_OF_THE_ART.md) for the design and research basis,
 and [docs/NEXT_PHASE.md](docs/NEXT_PHASE.md) for the executable discovery and
 acquisition plan.
@@ -83,6 +89,25 @@ uv run research-agent store-init --root data
 uv run research-agent source-add README.md --root data
 ```
 
+Run the offline research slice over one or more operator-selected directories:
+
+```bash
+uv run research-agent research-local \
+  "How should prompt injection be handled?" \
+  --corpus docs \
+  --concept concept:prompt-injection \
+  --compiler-provider deepseek_local \
+  --root data
+```
+
+The command emits the validated query plan, exact connector query, discovery
+hits, acquisition attempts, source hashes, coverage gaps, and immutable record
+hashes. Repeated `--term` options replace the conservative question-token
+compiler. `--compiler-provider deepseek_local` uses the tool-free local
+DeepSeek client to propose a plan; the same deterministic validator still
+controls connector selection and execution. Result budgets above the configured
+approval threshold require `--approve-budget`.
+
 Evaluate deterministic policy against zero or more threat-observation JSON
 records:
 
@@ -112,10 +137,10 @@ caveats are recorded per source. The research and selection rationale are in
 ## Repository map
 
 ```text
-config/        trusted provider and deterministic policy configuration
+config/        trusted provider, vocabulary, and deterministic policy configuration
 docs/          intelligence-source research
 intelligence/  machine-readable upstream source registry
 ontology/      starter persistent-knowledge schema
-src/           models, store, policy, workflow, provider client, CLI
+src/           models, planning, connectors, store, policy, workflow, providers, CLI
 tests/         security-invariant and behavior tests
 ```

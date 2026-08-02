@@ -4,13 +4,23 @@ import argparse
 import json
 from pathlib import Path
 
+from research_agent.connectors import LocalFileConnector
+from research_agent.discovery import CompilerIdentity
 from research_agent.models import (
     PolicyStage,
     ThreatObservation,
     ThreatTarget,
 )
+from research_agent.planning import (
+    ConceptVocabulary,
+    ModelQueryCompiler,
+    QueryPlanValidator,
+    QueryProposal,
+    deterministic_proposal,
+)
 from research_agent.policy import PolicyEngine
 from research_agent.providers import ModelClient, load_provider_configs
+from research_agent.research import OfflineResearchRunner
 from research_agent.store import ImmutableStore
 from research_agent.workflow import ActorKind, WorkflowEngine, WorkflowState
 
@@ -50,6 +60,28 @@ def _build_parser() -> argparse.ArgumentParser:
     source.add_argument("--root", type=Path, default=Path("data"))
     source.add_argument("--uri")
     source.add_argument("--license")
+
+    offline = subparsers.add_parser(
+        "research-local",
+        help="run deterministic discovery and acquisition over local roots",
+    )
+    offline.add_argument("question")
+    offline.add_argument("--root", type=Path, default=Path("data"))
+    offline.add_argument("--corpus", type=Path, action="append", required=True)
+    offline.add_argument("--term", action="append", default=[])
+    offline.add_argument("--concept", action="append", default=[])
+    offline.add_argument(
+        "--vocabulary",
+        type=Path,
+        default=Path("config/query-vocabulary.yaml"),
+    )
+    offline.add_argument("--result-limit", type=int, default=50)
+    offline.add_argument("--approve-budget", action="store_true")
+    offline.add_argument(
+        "--compiler-provider",
+        help="tool-free configured model provider; omit for deterministic lexical compilation",
+    )
+    offline.add_argument("--topic-branch", default="topic:local")
 
     policy = subparsers.add_parser("policy-check", help="evaluate source policy")
     policy.add_argument("--workflow-id", required=True)
@@ -129,6 +161,61 @@ def main() -> None:
             license=args.license,
         )
         _json(source)
+        return
+
+    if args.command == "research-local":
+        store = ImmutableStore(args.root)
+        store.initialize()
+        connector = LocalFileConnector(args.corpus)
+        vocabulary = ConceptVocabulary.from_yaml(args.vocabulary)
+        if args.compiler_provider:
+            _, providers = load_provider_configs(args.providers)
+            if args.compiler_provider not in providers:
+                raise ValueError(f"unknown provider: {args.compiler_provider}")
+            provider = providers[args.compiler_provider]
+            proposal = ModelQueryCompiler(ModelClient(args.compiler_provider, provider)).compile(
+                args.question,
+                vocabulary=vocabulary,
+                manifests={connector.manifest.id: connector.manifest},
+            )
+            compiler = CompilerIdentity(
+                id=f"compiler:model:{args.compiler_provider}:{provider.model}",
+                version=ModelQueryCompiler.version,
+            )
+        else:
+            proposal = deterministic_proposal(
+                args.question,
+                connector_id=connector.manifest.id,
+                concept_ids=tuple(args.concept),
+            )
+            compiler = CompilerIdentity(id="compiler:deterministic-lexical", version="1")
+        if args.concept:
+            proposal = proposal.model_copy(
+                update={"concept_ids": tuple(sorted(set(proposal.concept_ids) | set(args.concept)))}
+            )
+        if args.term:
+            proposal = QueryProposal.model_validate(
+                {
+                    **proposal.model_dump(mode="json"),
+                    "exact_terms": args.term,
+                    "result_limit": args.result_limit,
+                }
+            )
+        else:
+            proposal = proposal.model_copy(update={"result_limit": args.result_limit})
+        plan = QueryPlanValidator(
+            vocabulary=vocabulary,
+            manifests={connector.manifest.id: connector.manifest},
+        ).validate(
+            proposal,
+            compiler=compiler,
+            human_approved=args.approve_budget,
+        )
+        result = OfflineResearchRunner(store=store, connector=connector).run(
+            plan,
+            topic_branch=args.topic_branch,
+        )
+        _json(result)
         return
 
     if args.command == "policy-check":

@@ -7,12 +7,12 @@ from enum import StrEnum
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator, model_validator
+from pydantic_core import to_jsonable_python
 
 
 def canonical_json(value: Any) -> bytes:
     """Return the stable JSON representation used for record hashes."""
-    if isinstance(value, BaseModel):
-        value = value.model_dump(mode="json", exclude_none=True)
+    value = to_jsonable_python(value, exclude_none=True)
     return json.dumps(
         value,
         ensure_ascii=False,

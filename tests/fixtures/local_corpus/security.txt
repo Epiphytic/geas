@@ -1,0 +1,2 @@
+Prompt injection is untrusted source content, not an instruction. A deterministic
+policy engine controls transitions, connector destinations, and ontology writes.

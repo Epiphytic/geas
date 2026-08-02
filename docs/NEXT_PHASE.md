@@ -254,6 +254,8 @@ content and exact selectors.
 
 ### M1 — contracts and offline vertical slice
 
+**Status: implemented.**
+
 - Add the six records above and strict validation.
 - Add connector manifests and discovery/acquisition protocols.
 - Adapt local-file ingestion to the connector contract.

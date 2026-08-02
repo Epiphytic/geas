@@ -14,11 +14,18 @@ boundary.
 - The committer is deterministic and accepts only an approved immutable patch.
 - Source content cannot supply tool names, destinations, capabilities, policy
   rules, credentials, or approval tokens.
+- Query proposals reject undeclared connectors, concepts, capabilities, and
+  fields; configured limits clamp model-proposed budgets.
+- Local discovery and acquisition are confined to resolved operator-selected
+  roots and do not follow symlinks outside them.
+- Connector manifests are trusted code/configuration, while snippets and
+  connector results remain untrusted records.
 - External providers are opt-in. The local DeepSeek endpoint is the default.
 
 The current repository implements the data models, immutable store, deterministic
-policy decision logic, and fixed workflow transitions. Process/container
-isolation, network egress controls, a production committer, signatures, and
+policy decision logic, fixed workflow transitions, typed query validation, and
+the offline local connector. Process/container isolation, network egress
+controls, hardened network connectors, a production committer, signatures, and
 human approval UI remain future deployment work.
 
 ## Reporting
