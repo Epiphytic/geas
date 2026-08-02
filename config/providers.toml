@@ -1,0 +1,24 @@
+default_provider = "deepseek_local"
+
+[providers.deepseek_local]
+kind = "openai_compatible"
+base_url = "http://127.0.0.1:8000/v1"
+model = "deepseek-v4-flash"
+api_key_env = ""
+external = false
+max_output_tokens = 4096
+
+[providers.openai]
+kind = "openai_compatible"
+base_url = "https://api.openai.com/v1"
+model = "gpt-5.2"
+api_key_env = "OPENAI_API_KEY"
+external = true
+max_output_tokens = 8192
+[providers.zai]
+kind = "openai_compatible"
+base_url = "https://api.z.ai/api/paas/v4"
+model = "glm-5.2"
+api_key_env = "ZAI_API_KEY"
+external = true
+max_output_tokens = 8192

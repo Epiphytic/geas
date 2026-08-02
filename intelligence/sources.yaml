@@ -1,0 +1,211 @@
+version: 1
+reviewed_at: 2026-08-02
+policy: >-
+  Registry entries describe upstream intelligence sources, not endorsed truth.
+  Every imported item becomes an attributed observation with its upstream
+  identifier, timestamp, license, and exact target scope.
+
+sources:
+  - id: disarm-framework
+    name: DISARM Red Framework
+    category: behavior_ontology
+    url: https://github.com/DISARMFoundation/DISARMframeworks
+    access: git
+    maintenance: active
+    license: CC-BY-SA-4.0
+    priority: 1
+    automated_ingest: true
+    use: Map influence-operation tactics, techniques, and procedures.
+    caveat: Framework vocabulary, not a blocklist or verdict feed.
+
+  - id: disinfox
+    name: DISINFOX
+    category: incident_exchange
+    url: https://github.com/CyberDataLab/disinfox
+    access: api_or_self_hosted
+    maintenance: active
+    license: verify_per_deployment
+    priority: 1
+    automated_ingest: false
+    use: Import STIX2/DISARM incident observations when an API deployment is configured.
+    caveat: Assess instance governance and data licensing before enabling a feed.
+
+  - id: datacommons-claimreview
+    name: Data Commons Fact Check data
+    category: claim_review
+    url: https://datacommons.org/factcheck/download
+    access: daily_feed
+    maintenance: active
+    license: CC-BY compilation; inspect sdLicense per item
+    priority: 1
+    automated_ingest: true
+    use: Import attributed ClaimReview records and original claim appearances.
+    caveat: Publisher ratings differ and the dataset is not representative of all fact checks.
+
+  - id: google-fact-check-tools
+    name: Google Fact Check Tools API
+    category: claim_review_search
+    url: https://developers.google.com/fact-check/tools/api/
+    access: api_key
+    credential_env: GOOGLE_FACTCHECK_API_KEY
+    maintenance: active
+    license: Google API terms; publisher-specific content terms
+    priority: 2
+    automated_ingest: false
+    use: Search current fact-checked claims by text, image, publisher, language, or age.
+    caveat: Results are evidence of a publisher review, not system truth.
+
+  - id: open-feedback
+    name: Open Feedback
+    category: claim_and_source_reviews
+    url: https://open.feedback.org/
+    access: permission_required
+    maintenance: active
+    license: contact_provider
+    priority: 2
+    automated_ingest: false
+    use: Correlate reviews, flagged content URLs, and source-level patterns.
+    caveat: API/database access requires contacting the project.
+
+  - id: wikipedia-rsp
+    name: Wikipedia Reliable Sources/Perennial Sources
+    category: community_source_assessment
+    url: https://en.wikipedia.org/wiki/Wikipedia:Reliable_sources/Perennial_sources
+    access: mediawiki_api
+    maintenance: active
+    license: CC-BY-SA-4.0
+    priority: 2
+    automated_ingest: false
+    use: Import time-versioned community assessments and linked discussion evidence.
+    caveat: Contested editorial consensus; never use directly as a deny rule.
+
+  - id: misp-taxonomies
+    name: MISP taxonomies
+    category: threat_ontology
+    url: https://github.com/MISP/misp-taxonomies
+    access: git
+    maintenance: active
+    license: mixed; inspect taxonomy
+    priority: 2
+    automated_ingest: true
+    use: Reuse threat and misinformation labels where current and licensed.
+    caveat: The misinformation-website-label taxonomy derives from a 2019 source list.
+
+  - id: misp-warninglists
+    name: MISP warning lists
+    category: indicator_context
+    url: https://github.com/MISP/misp-warninglists
+    access: git
+    maintenance: active
+    license: CC0-1.0
+    priority: 2
+    automated_ingest: true
+    use: Prevent false-positive indicator matches and identify infrastructure context.
+    caveat: Warning lists are context/allowlist signals, not source credibility ratings.
+
+  - id: urlhaus
+    name: URLhaus
+    category: malicious_url
+    url: https://urlhaus.abuse.ch/api/
+    access: auth_key
+    credential_env: URLHAUS_AUTH_KEY
+    maintenance: active
+    license: provider_terms
+    priority: 1
+    automated_ingest: false
+    use: Detect URLs distributing malware and track payload observations.
+    caveat: URL-level evidence must not automatically condemn an entire host.
+
+  - id: phishtank
+    name: PhishTank
+    category: phishing_url
+    url: https://phishtank.org/developer_info.php
+    access: hourly_download
+    credential_env: PHISHTANK_APP_KEY
+    maintenance: active
+    license: provider_terms
+    priority: 1
+    automated_ingest: false
+    use: Import verified, currently online phishing URLs and community evidence.
+    caveat: Shared hosting and compromised paths require URL/version-level scope.
+
+  - id: spamhaus-dbl
+    name: Spamhaus Domain Blocklist
+    category: domain_reputation
+    url: https://www.spamhaus.org/blocklists/domain-blocklist/
+    access: dns
+    maintenance: active
+    license: Spamhaus fair-use terms
+    priority: 2
+    automated_ingest: false
+    use: Query spam, phishing, malware, botnet, and abused-legitimate domain codes.
+    caveat: Respect fair-use limits; error return codes are not listings.
+
+  - id: ublock-uassets
+    name: uBlock Origin uAssets
+    category: badware_and_abuse_filters
+    url: https://github.com/uBlockOrigin/uAssets
+    access: git
+    maintenance: active
+    license: GPL-3.0
+    priority: 3
+    automated_ingest: false
+    use: Technical badware, abuse, privacy, and nuisance indicators.
+    caveat: Filter syntax and license require a dedicated adapter; not a truth rating.
+
+  - id: blocklist-project
+    name: The Block List Project
+    category: domain_blocklists
+    url: https://github.com/blocklistproject/Lists
+    access: git
+    maintenance: active
+    license: Unlicense
+    priority: 3
+    automated_ingest: false
+    use: Supplemental category-specific domain observations.
+    caveat: Preserve the original upstream and category for every match.
+
+  - id: fda-health-fraud
+    name: FDA Health Fraud Product Database and Online Advisory Letters
+    category: regulatory_misleading_marketing
+    url: https://www.fda.gov/consumers/health-fraud-scams/health-fraud-product-database
+    access: web
+    maintenance: active
+    license: US government terms
+    priority: 1
+    automated_ingest: false
+    use: Import attributed regulatory observations about misleading health claims.
+    caveat: The FDA states that its list covers only a small fraction of potentially hazardous products.
+
+  - id: ftc-legal-library
+    name: FTC Cases and Proceedings
+    category: regulatory_deceptive_marketing
+    url: https://www.ftc.gov/legal-library/browse/cases-proceedings
+    access: web
+    maintenance: active
+    license: US government terms
+    priority: 2
+    automated_ingest: false
+    use: Import complaints, orders, case status, and deceptive-marketing allegations.
+    caveat: Preserve allegation, settlement, order, and closed-case status distinctions.
+
+  - id: truth-in-advertising-dssrc
+    name: Truth in Advertising DSSRC database
+    category: deceptive_marketing_review
+    url: https://truthinadvertising.org/evidence/dssrc-database/
+    access: permission_review
+    maintenance: active
+    license: provider_terms
+    priority: 3
+    automated_ingest: false
+    use: Research persistent deceptive MLM claims following DSSRC decisions.
+    caveat: Confirm reuse and automated-access terms before ingestion.
+
+excluded_as_live_authorities:
+  - name: Generic fake-news GitHub lists and ML training corpora
+    reason: Commonly stale, context-poor, and unsuitable for current policy decisions.
+  - name: MISP misinformation-website-label values as a blocklist
+    reason: The underlying domain classifications originate from a 2019 list.
+  - name: Commercial ratings without licensed API access
+    examples: [NewsGuard, Global Disinformation Index, Ad Fontes]
+    reason: Useful potential enrichments, but not open bulk intelligence.

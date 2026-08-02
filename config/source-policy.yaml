@@ -1,0 +1,34 @@
+version: 1
+default_actions:
+  retrieval: sandbox
+  extraction: sandbox
+  commit: require_approval
+rules:
+  - id: confirmed-high-threat
+    statuses: [confirmed]
+    severities: [high, critical]
+    actions:
+      retrieval: allow_metadata_only
+      extraction: deny
+      commit: deny
+  - id: confirmed-threat
+    statuses: [confirmed]
+    severities: [low, medium]
+    actions:
+      retrieval: quarantine
+      extraction: quarantine
+      commit: deny
+  - id: suspected-threat
+    statuses: [suspected]
+    severities: [low, medium, high, critical]
+    actions:
+      retrieval: quarantine
+      extraction: quarantine
+      commit: deny
+  - id: remediated-threat
+    statuses: [remediated]
+    severities: [low, medium, high, critical]
+    actions:
+      retrieval: sandbox
+      extraction: sandbox
+      commit: require_approval

@@ -1,0 +1,224 @@
+id: https://epiphytic.org/research-agent/schema
+name: research_knowledge
+title: Epiphytic Research Knowledge Schema
+description: >-
+  Claim-centric records for persistent research knowledge, provenance,
+  controversy, and hostile-source observations.
+license: https://creativecommons.org/publicdomain/zero/1.0/
+prefixes:
+  linkml: https://w3id.org/linkml/
+  schema: https://schema.org/
+  prov: http://www.w3.org/ns/prov#
+  skos: http://www.w3.org/2004/02/skos/core#
+  ep: https://epiphytic.org/research-agent/
+default_prefix: ep
+imports:
+  - linkml:types
+
+enums:
+  ReviewState:
+    permissible_values:
+      proposed:
+      accepted:
+      rejected:
+      superseded:
+  ThreatStatus:
+    permissible_values:
+      suspected:
+      confirmed:
+      remediated:
+      false_positive:
+  ThreatSeverity:
+    permissible_values:
+      low:
+      medium:
+      high:
+      critical:
+  DetectorKind:
+    permissible_values:
+      deterministic_rule:
+      sandbox_observation:
+      human:
+      model:
+      external_feed:
+
+slots:
+  id:
+    identifier: true
+    required: true
+    range: uriorcurie
+  source_uri:
+    range: uri
+  content_sha256:
+    range: string
+    pattern: "^[0-9a-f]{64}$"
+  acquired_at:
+    range: datetime
+  media_type:
+    range: string
+  byte_length:
+    range: integer
+    minimum_value: 0
+  connector_id:
+    range: uriorcurie
+  trust_zone:
+    range: string
+  source_version:
+    range: uriorcurie
+  evidence_fragment:
+    range: uriorcurie
+  subject:
+    range: uriorcurie
+  predicate:
+    range: uriorcurie
+  object:
+    range: Any
+  stance:
+    range: string
+  epistemic_status:
+    range: string
+  asserted_by:
+    range: uriorcurie
+  evidence:
+    range: uriorcurie
+    multivalued: true
+    minimum_cardinality: 1
+  recorded_at:
+    range: datetime
+  review_state:
+    range: ReviewState
+  threat_type:
+    range: uriorcurie
+  status:
+    range: ThreatStatus
+  severity:
+    range: ThreatSeverity
+  detected_at:
+    range: datetime
+  detector_kind:
+    range: DetectorKind
+  detector_id:
+    range: uriorcurie
+  observation_ids:
+    range: uriorcurie
+    multivalued: true
+    minimum_cardinality: 1
+  rationale:
+    range: string
+  assessed_at:
+    range: datetime
+
+classes:
+  SourceVersion:
+    slots:
+      - id
+      - source_uri
+      - content_sha256
+      - acquired_at
+      - media_type
+      - byte_length
+      - connector_id
+      - trust_zone
+    slot_usage:
+      source_uri:
+        required: true
+      content_sha256:
+        required: true
+      acquired_at:
+        required: true
+      media_type:
+        required: true
+      byte_length:
+        required: true
+      connector_id:
+        required: true
+  EvidenceFragment:
+    slots:
+      - id
+      - source_version
+      - content_sha256
+    slot_usage:
+      source_version:
+        required: true
+      content_sha256:
+        required: true
+  Claim:
+    slots:
+      - id
+      - subject
+      - predicate
+      - object
+      - stance
+      - epistemic_status
+      - asserted_by
+      - evidence
+      - recorded_at
+      - review_state
+    slot_usage:
+      subject:
+        required: true
+      predicate:
+        required: true
+      object:
+        required: true
+      stance:
+        required: true
+      epistemic_status:
+        required: true
+      asserted_by:
+        required: true
+      recorded_at:
+        required: true
+  ThreatObservation:
+    slots:
+      - id
+      - source_version
+      - evidence_fragment
+      - threat_type
+      - status
+      - severity
+      - detected_at
+      - detector_kind
+      - detector_id
+      - evidence
+    slot_usage:
+      source_version:
+        required: true
+      threat_type:
+        required: true
+      status:
+        required: true
+      severity:
+        required: true
+      detected_at:
+        required: true
+      detector_kind:
+        required: true
+      detector_id:
+        required: true
+  ThreatAssessment:
+    slots:
+      - id
+      - source_version
+      - observation_ids
+      - status
+      - severity
+      - assessed_at
+      - detector_kind
+      - detector_id
+      - rationale
+    slot_usage:
+      source_version:
+        required: true
+      status:
+        required: true
+      severity:
+        required: true
+      assessed_at:
+        required: true
+      detector_kind:
+        required: true
+      detector_id:
+        required: true
+      rationale:
+        required: true
