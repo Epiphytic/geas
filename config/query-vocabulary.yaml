@@ -1,0 +1,17 @@
+concepts:
+  concept:ontology:
+    - ontology
+    - ontological
+    - knowledge graph
+  concept:prompt-injection:
+    - prompt injection
+    - indirect prompt injection
+    - instruction hierarchy
+  concept:source-poisoning:
+    - source poisoning
+    - poisoned source
+    - tainted source
+  concept:retrieval:
+    - information retrieval
+    - lexical search
+    - deterministic search

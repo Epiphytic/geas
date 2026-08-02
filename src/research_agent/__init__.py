@@ -1,5 +1,13 @@
 """Ontology-backed research agent control plane."""
 
+from research_agent.discovery import (
+    AccessConstraint,
+    AcquisitionAttempt,
+    CoverageRun,
+    DiscoveryHit,
+    DiscoveryRun,
+    QueryPlan,
+)
 from research_agent.models import (
     Claim,
     EvidenceFragment,
@@ -14,4 +22,10 @@ __all__ = [
     "SourceVersion",
     "ThreatAssessment",
     "ThreatObservation",
+    "AccessConstraint",
+    "AcquisitionAttempt",
+    "CoverageRun",
+    "DiscoveryHit",
+    "DiscoveryRun",
+    "QueryPlan",
 ]
