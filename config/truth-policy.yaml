@@ -7,6 +7,12 @@ ontology_globs:
   - config/query-vocabulary.yaml
   - intelligence/sources.yaml
 
+# Trusted policies affect ingestion, routing, and projection semantics.
+operational_policy_paths:
+  - config/source-policy.yaml
+  - config/research-policy.yaml
+  - config/deposit-policy.yaml
+
 # Pydantic is currently authoritative for operational record envelopes.
 record_schema_paths:
   - src/research_agent/models.py
@@ -15,6 +21,7 @@ record_schema_paths:
   - src/research_agent/policy.py
   - src/research_agent/planning.py
   - src/research_agent/operator_policy.py
+  - src/research_agent/deposits.py
   - src/research_agent/truth.py
   - src/research_agent/store.py
 

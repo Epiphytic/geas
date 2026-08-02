@@ -1,0 +1,16 @@
+version: 1
+
+# Authentication and authorization are responsibilities of the deployment
+# boundary. The initial ontology does not enforce per-record or per-branch ACLs.
+authorization_boundary: deployment
+per_record_access_control: false
+labels_are_advisory: true
+
+# Operators may edit these defaults. Individual deposits may override them.
+defaults:
+  scope_label: workspace_ungated
+  index_content: true
+  include_in_ontology: true
+  model_route: local_preferred
+  redistribution_status: unknown
+  retention_policy: operator_managed

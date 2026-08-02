@@ -28,7 +28,9 @@ and [docs/NEXT_PHASE.md](docs/NEXT_PHASE.md) for the executable discovery and
 acquisition plan. Accepted cost, licensing, and deployment choices are recorded
 in [docs/OPERATOR_DECISIONS.md](docs/OPERATOR_DECISIONS.md). Canonical authority
 and projection reconciliation are defined in
-[docs/SOURCE_OF_TRUTH.md](docs/SOURCE_OF_TRUTH.md).
+[docs/SOURCE_OF_TRUTH.md](docs/SOURCE_OF_TRUTH.md). User-deposit defaults and
+the deployment-level authorization boundary are documented in
+[docs/DEPOSITS.md](docs/DEPOSITS.md).
 
 ## Why this is not conventional RAG
 
@@ -154,6 +156,19 @@ uv run research-agent projection-check \
 
 SQLite is a rebuildable query projection. It is never a source for automatic
 changes to canonical ontology or knowledge records.
+
+Archive a user-provided source with explicit provenance:
+
+```bash
+uv run research-agent deposit-add paper.pdf \
+  --deposited-by user:researcher \
+  --method browser_save \
+  --original-locator https://publisher.example/paper
+```
+
+Deposit defaults are operator-configurable and individually overridable. The
+initial version assumes the entire deployment is authorization-gated; it does
+not enforce record- or branch-level ACLs.
 
 ## Tainted-source intelligence
 

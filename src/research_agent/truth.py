@@ -18,6 +18,7 @@ from research_agent.models import StrictModel, canonical_json, content_id, utc_n
 
 class ArtifactRole(StrEnum):
     ONTOLOGY = "ontology"
+    OPERATIONAL_POLICY = "operational_policy"
     RECORD_SCHEMA = "record_schema"
     IMMUTABLE_RECORD = "immutable_record"
     SOURCE_BLOB = "source_blob"
@@ -34,6 +35,7 @@ class TruthArtifact(StrictModel):
 class TruthPolicy(StrictModel):
     version: int = Field(ge=1)
     ontology_globs: tuple[str, ...] = Field(min_length=1)
+    operational_policy_paths: tuple[str, ...] = ()
     record_schema_paths: tuple[str, ...] = Field(min_length=1)
     record_directory: str
     blob_directory: str
@@ -43,6 +45,7 @@ class TruthPolicy(StrictModel):
 
     @field_validator(
         "ontology_globs",
+        "operational_policy_paths",
         "record_schema_paths",
         "record_directory",
         "blob_directory",
@@ -204,6 +207,13 @@ class TruthManager:
             raise ValueError("truth policy did not resolve any canonical ontology files")
         for path in sorted(ontology_paths):
             artifacts.append(self._file_artifact(path, ArtifactRole.ONTOLOGY, "workspace"))
+        for relative in self.policy.operational_policy_paths:
+            path = self.workspace_root / relative
+            if not path.is_file():
+                raise ValueError(f"missing canonical operational policy: {relative}")
+            artifacts.append(
+                self._file_artifact(path, ArtifactRole.OPERATIONAL_POLICY, "workspace")
+            )
         for relative in self.policy.record_schema_paths:
             path = self.workspace_root / relative
             if not path.is_file():

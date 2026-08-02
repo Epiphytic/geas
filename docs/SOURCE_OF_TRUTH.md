@@ -6,14 +6,16 @@ The system has one-way authority:
 
 1. Version-controlled ontology and controlled-vocabulary files define semantic
    meaning.
-2. Version-controlled Pydantic schema source defines operational record
+2. Version-controlled ingestion, research, and source policies define trusted
+   operational defaults.
+3. Version-controlled Pydantic schema source defines operational record
    envelopes and validation.
-3. Immutable, content-addressed JSON records and source blobs preserve knowledge
+4. Immutable, content-addressed JSON records and source blobs preserve knowledge
    history and evidence.
-4. A `TruthSnapshot` binds the exact policy, ontology, schemas, records, and
+5. A `TruthSnapshot` binds the exact policy, ontology, schemas, records, and
    blobs into one content-derived state.
-5. SQLite and generated Markdown are disposable projections of that snapshot.
-6. Reports and model answers are transient views of a selected projection.
+6. SQLite and generated Markdown are disposable projections of that snapshot.
+7. Reports and model answers are transient views of a selected projection.
 
 Later layers cannot silently modify earlier layers. In particular, SQLite is
 never reconciled back into ontology files or immutable records.

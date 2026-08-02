@@ -8,6 +8,14 @@ from pathlib import Path
 from pydantic_core import to_jsonable_python
 
 from research_agent.connectors import LocalFileConnector, MojeekDiscoveryConnector
+from research_agent.deposits import (
+    AcquisitionMethod,
+    DepositManager,
+    DepositOverrides,
+    DepositPolicy,
+    ModelRoute,
+    RedistributionStatus,
+)
 from research_agent.discovery import (
     CompilerIdentity,
     ConnectorCapability,
@@ -72,6 +80,12 @@ def _build_parser() -> argparse.ArgumentParser:
         default=Path("config/truth-policy.yaml"),
         help="canonical-source and projection reconciliation policy",
     )
+    parser.add_argument(
+        "--deposit-policy",
+        type=Path,
+        default=Path("config/deposit-policy.yaml"),
+        help="user-deposit defaults and authorization-boundary policy",
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     subparsers.add_parser("providers", help="list configured providers without secrets")
@@ -87,6 +101,43 @@ def _build_parser() -> argparse.ArgumentParser:
     source.add_argument("--root", type=Path, default=Path("data"))
     source.add_argument("--uri")
     source.add_argument("--license")
+
+    deposit = subparsers.add_parser(
+        "deposit-add",
+        help="archive a file with provenance and user-controlled handling defaults",
+    )
+    deposit.add_argument("path", type=Path)
+    deposit.add_argument("--root", type=Path, default=Path("data"))
+    deposit.add_argument("--deposited-by", required=True)
+    deposit.add_argument(
+        "--method",
+        type=AcquisitionMethod,
+        choices=list(AcquisitionMethod),
+        default=AcquisitionMethod.LOCAL_FILE,
+    )
+    deposit.add_argument("--original-locator")
+    deposit.add_argument("--source-uri")
+    deposit.add_argument("--license")
+    deposit.add_argument("--rights-basis")
+    deposit.add_argument("--provenance-note")
+    deposit.add_argument("--scope-label")
+    deposit.add_argument(
+        "--index-content",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    deposit.add_argument(
+        "--include-in-ontology",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
+    deposit.add_argument("--model-route", type=ModelRoute, choices=list(ModelRoute))
+    deposit.add_argument(
+        "--redistribution-status",
+        type=RedistributionStatus,
+        choices=list(RedistributionStatus),
+    )
+    deposit.add_argument("--retention-policy")
 
     offline = subparsers.add_parser(
         "research-local",
@@ -239,6 +290,33 @@ def main() -> None:
             license=args.license,
         )
         _json(source)
+        return
+
+    if args.command == "deposit-add":
+        store = ImmutableStore(args.root)
+        store.initialize()
+        result = DepositManager(
+            store=store,
+            policy=DepositPolicy.from_yaml(args.deposit_policy),
+        ).deposit_file(
+            args.path,
+            deposited_by=args.deposited_by,
+            acquisition_method=args.method,
+            original_locator=args.original_locator,
+            source_uri=args.source_uri,
+            license=args.license,
+            rights_basis=args.rights_basis,
+            provenance_note=args.provenance_note,
+            overrides=DepositOverrides(
+                scope_label=args.scope_label,
+                index_content=args.index_content,
+                include_in_ontology=args.include_in_ontology,
+                model_route=args.model_route,
+                redistribution_status=args.redistribution_status,
+                retention_policy=args.retention_policy,
+            ),
+        )
+        _json(result)
         return
 
     if args.command == "research-local":

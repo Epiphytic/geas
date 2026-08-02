@@ -33,6 +33,11 @@ boundary.
 - Projection stamps bind SQLite to an exact truth snapshot and logical
   schema/row digest. Canonical drift requires a reviewed successor snapshot;
   projection drift requires discard and rebuild.
+- Access to deposited content is enforced by the deployment boundary, not
+  ontology records. Handling labels are advisory and do not provide
+  confidentiality. Anyone authorized for a deployment may be able to query all
+  indexed deposits; hard isolation currently requires a separate deployment or
+  store root.
 - External providers are opt-in. The local DeepSeek endpoint is the default.
 
 The current repository implements the data models, immutable store, deterministic

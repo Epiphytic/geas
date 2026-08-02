@@ -79,3 +79,30 @@ References:
 
 The complete contract and operational commands are documented in
 `docs/SOURCE_OF_TRUTH.md`.
+
+## 3. User deposits and private or licensed material
+
+**Status:** accepted on 2026-08-02.
+
+### Decision
+
+- Authorization is enforced at the site and deployment boundary.
+- Per-record, per-claim, and per-ontology-branch access control is out of scope
+  for the initial version.
+- Operators control deposit defaults, and individual users may override them.
+- The default may make all deposited information ungated within the authorized
+  deployment without making it publicly accessible.
+- Provenance, acquisition method, rights basis, redistribution, retention, and
+  handling intent remain recorded.
+- Handling labels are advisory metadata, not ACLs.
+- Use local files and user-created exports initially; do not give agents browser
+  credentials or authenticated sessions.
+
+### Operational consequence
+
+Anyone admitted to a deployment may be able to access all indexed content in
+that deployment. Hard isolation requires a separate deployment or store root
+until nuanced access control is deliberately added.
+
+The detailed boundary and deposit workflow are documented in
+`docs/DEPOSITS.md`.
