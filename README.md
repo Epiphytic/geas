@@ -163,12 +163,16 @@ Archive a user-provided source with explicit provenance:
 uv run research-agent deposit-add paper.pdf \
   --deposited-by user:researcher \
   --method browser_save \
-  --original-locator https://publisher.example/paper
+  --original-locator https://publisher.example/paper \
+  --author "Ada Example" \
+  --license CC-BY-4.0 \
+  --usage-condition "Attribution required"
 ```
 
 Deposit defaults are operator-configurable and individually overridable. The
 initial version assumes the entire deployment is authorization-gated; it does
-not enforce record- or branch-level ACLs.
+not enforce record- or branch-level ACLs. Rights fields default to unknown, and
+valid NIP-01/NIP-94 events may be attached as file-bound cryptographic evidence.
 
 ## Tainted-source intelligence
 

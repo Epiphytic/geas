@@ -26,6 +26,7 @@ Consequences:
 - whether it should be considered for ontology extraction;
 - local-preferred or external-allowed model routing;
 - redistribution status;
+- permission to archive, quote, transform, or redistribute the original;
 - retention policy.
 
 Each deposit may override every default. The checked-in default is
@@ -51,6 +52,59 @@ A deposit record always binds:
 Rights and redistribution metadata do not determine who may read the ontology.
 They preserve enough context for later review, export decisions, and migration
 to more nuanced controls if needed.
+
+## Unknown and known metadata
+
+The default is explicitly unknown for:
+
+- authorship;
+- license;
+- usage conditions;
+- rights basis and source provenance;
+- redistribution status;
+- archive, quotation, transformation, and original-content redistribution
+  permissions.
+
+Unknown means “not yet established,” not prohibited. When supplied, authors,
+license, conditions, rights basis, and provenance are stored with a `declared`
+status. Permission states are independently `unknown`, `allowed`, or
+`not_allowed`; a license string does not silently infer permissions. The legacy
+redistribution status and `redistribute_original` permission are kept
+deterministically synchronized and contradictory values are rejected.
+
+```bash
+uv run research-agent deposit-add paper.pdf \
+  --deposited-by user:researcher \
+  --author "Ada Example" \
+  --author "Lin Example" \
+  --license CC-BY-4.0 \
+  --usage-condition "Attribution required" \
+  --quote-permission allowed \
+  --redistribute-original-permission allowed
+```
+
+## Nostr signature evidence
+
+The deposit command accepts repeatable Nostr event files:
+
+```bash
+uv run research-agent deposit-add dataset.csv \
+  --deposited-by user:researcher \
+  --nostr-ownership-event ownership-event.json
+```
+
+Authorship and publication evidence use `--nostr-authorship-event` and
+`--nostr-publication-event`. The verifier fails closed unless:
+
+1. the event ID matches the exact NIP-01 serialization;
+2. its BIP-340 Schnorr signature verifies against its Nostr public key;
+3. it is a NIP-94 kind `1063` file-metadata event; and
+4. an `x` or `ox` tag equals the deposited file's SHA-256 hash.
+
+The complete event, claimed relation, binding tag, file hash, and verification
+method are preserved in the immutable deposit record. This is cryptographic
+evidence that a Nostr key signed a file-bound event. It is not, by itself,
+proof of the signer's civil identity, copyright ownership, or legal authority.
 
 ## Deposit mechanisms
 

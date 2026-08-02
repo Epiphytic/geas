@@ -1,4 +1,4 @@
-version: 1
+version: 2
 
 # Authentication and authorization are responsibilities of the deployment
 # boundary. The initial ontology does not enforce per-record or per-branch ACLs.
@@ -13,4 +13,9 @@ defaults:
   include_in_ontology: true
   model_route: local_preferred
   redistribution_status: unknown
+  usage_permissions:
+    archive: unknown
+    quote: unknown
+    transform: unknown
+    redistribute_original: unknown
   retention_policy: operator_managed

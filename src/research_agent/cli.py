@@ -14,7 +14,11 @@ from research_agent.deposits import (
     DepositOverrides,
     DepositPolicy,
     ModelRoute,
+    NostrClaim,
+    NostrEvent,
+    PermissionStatus,
     RedistributionStatus,
+    UsagePermissionOverrides,
 )
 from research_agent.discovery import (
     CompilerIdentity,
@@ -118,8 +122,13 @@ def _build_parser() -> argparse.ArgumentParser:
     deposit.add_argument("--original-locator")
     deposit.add_argument("--source-uri")
     deposit.add_argument("--license")
+    deposit.add_argument("--author", action="append", default=[])
+    deposit.add_argument("--usage-condition", action="append", default=[])
     deposit.add_argument("--rights-basis")
     deposit.add_argument("--provenance-note")
+    deposit.add_argument("--nostr-ownership-event", type=Path, action="append", default=[])
+    deposit.add_argument("--nostr-authorship-event", type=Path, action="append", default=[])
+    deposit.add_argument("--nostr-publication-event", type=Path, action="append", default=[])
     deposit.add_argument("--scope-label")
     deposit.add_argument(
         "--index-content",
@@ -136,6 +145,20 @@ def _build_parser() -> argparse.ArgumentParser:
         "--redistribution-status",
         type=RedistributionStatus,
         choices=list(RedistributionStatus),
+    )
+    deposit.add_argument(
+        "--archive-permission", type=PermissionStatus, choices=list(PermissionStatus)
+    )
+    deposit.add_argument(
+        "--quote-permission", type=PermissionStatus, choices=list(PermissionStatus)
+    )
+    deposit.add_argument(
+        "--transform-permission", type=PermissionStatus, choices=list(PermissionStatus)
+    )
+    deposit.add_argument(
+        "--redistribute-original-permission",
+        type=PermissionStatus,
+        choices=list(PermissionStatus),
     )
     deposit.add_argument("--retention-policy")
 
@@ -295,6 +318,21 @@ def main() -> None:
     if args.command == "deposit-add":
         store = ImmutableStore(args.root)
         store.initialize()
+        nostr_evidence = tuple(
+            (NostrEvent.model_validate_json(path.read_bytes()), claim)
+            for paths, claim in (
+                (args.nostr_ownership_event, NostrClaim.OWNERSHIP),
+                (args.nostr_authorship_event, NostrClaim.AUTHORSHIP),
+                (args.nostr_publication_event, NostrClaim.PUBLICATION),
+            )
+            for path in paths
+        )
+        permission_values = {
+            "archive": args.archive_permission,
+            "quote": args.quote_permission,
+            "transform": args.transform_permission,
+            "redistribute_original": args.redistribute_original_permission,
+        }
         result = DepositManager(
             store=store,
             policy=DepositPolicy.from_yaml(args.deposit_policy),
@@ -305,14 +343,22 @@ def main() -> None:
             original_locator=args.original_locator,
             source_uri=args.source_uri,
             license=args.license,
+            authors=tuple(args.author),
+            usage_conditions=tuple(args.usage_condition),
             rights_basis=args.rights_basis,
             provenance_note=args.provenance_note,
+            nostr_evidence=nostr_evidence,
             overrides=DepositOverrides(
                 scope_label=args.scope_label,
                 index_content=args.index_content,
                 include_in_ontology=args.include_in_ontology,
                 model_route=args.model_route,
                 redistribution_status=args.redistribution_status,
+                usage_permissions=(
+                    UsagePermissionOverrides.model_validate(permission_values)
+                    if any(value is not None for value in permission_values.values())
+                    else None
+                ),
                 retention_policy=args.retention_policy,
             ),
         )

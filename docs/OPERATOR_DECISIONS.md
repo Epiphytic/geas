@@ -106,3 +106,28 @@ until nuanced access control is deliberately added.
 
 The detailed boundary and deposit workflow are documented in
 `docs/DEPOSITS.md`.
+
+## 4. Rights, authorship, and signed ownership evidence
+
+**Status:** accepted on 2026-08-02.
+
+### Decision
+
+- Unknown is the default for redistribution, license, authorship, usage
+  conditions, rights basis, source provenance, and each usage permission.
+- Fill known authors, provenance, license, rights basis, and usage conditions
+  when they are available instead of treating missing metadata as negative
+  evidence.
+- Track archive, quotation, transformation, and redistribution-of-original
+  permissions independently.
+- Preserve cryptographically verified Nostr events as evidence for ownership,
+  authorship, or publication claims when the event is bound to the exact
+  deposited content.
+
+### Evidence boundary
+
+A valid Nostr signature proves that the event was signed by the corresponding
+key. A matching NIP-94 `x` or `ox` tag binds that signed event to a file hash.
+Neither fact alone proves the signer's legal identity or ownership. The system
+therefore records the signature as evidence supporting a declared relation,
+not as a conclusive ownership determination.
