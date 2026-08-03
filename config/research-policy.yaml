@@ -1,4 +1,4 @@
-version: 2
+version: 3
 
 # Discovery rankings and snippets identify candidates; they never support claims.
 general_search_results_are_evidence: false
@@ -38,6 +38,16 @@ domain_index_providers:
     # the API-reported cost. The allowance is a hard provider-specific ceiling.
     cost_accounting: provider_reported_only
     daily_free_allowance_usd: 1.0
+
+  - connector_id: connector:europe-pmc
+    enabled: true
+    priority: 3
+    credential_env: ""
+    metadata_license: unknown; lite bibliographic metadata only
+    persist_normalized_metadata: true
+    raw_response_retention_days: 0
+    max_requests_per_run: 20
+    cost_accounting: none
 
 general_search_providers:
   - connector_id: connector:mojeek

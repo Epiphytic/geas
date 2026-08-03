@@ -1,0 +1,36 @@
+{
+  "version": "6.9",
+  "hitCount": 2,
+  "nextCursorMark": "fixture-next",
+  "resultList": {
+    "result": [
+      {
+        "id": "25472792",
+        "source": "MED",
+        "pmid": "25472792",
+        "pmcid": "PMC123456",
+        "doi": "10.1002/14651858.CD010856.pub3",
+        "title": "Water fluoridation for the prevention of dental caries",
+        "authorString": "Iheozor-Ejiofor Z, Walsh T",
+        "journalTitle": "Cochrane Database of Systematic Reviews",
+        "journalIssn": "1469-493X",
+        "pubYear": "2024",
+        "firstPublicationDate": "2024-10-04",
+        "citedByCount": 24,
+        "isOpenAccess": "Y",
+        "inEPMC": "Y",
+        "inPMC": "Y"
+      },
+      {
+        "id": "valid-record",
+        "source": "MED",
+        "pmid": "bad",
+        "doi": "bad",
+        "journalIssn": "bad",
+        "firstPublicationDate": "bad",
+        "title": "Valid record with malformed optional metadata",
+        "citedByCount": 0
+      }
+    ]
+  }
+}

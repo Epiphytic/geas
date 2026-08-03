@@ -29,6 +29,11 @@ def test_checked_in_policy_prefers_mojeek_and_open_acquisition() -> None:
     assert openalex.metadata_license == "CC0-1.0"
     assert openalex.cost_accounting == "provider_reported_only"
     assert openalex.daily_free_allowance_usd == 1.0
+    europe_pmc = policy.domain_index("connector:europe-pmc")
+    assert europe_pmc.enabled
+    assert europe_pmc.priority == 3
+    assert europe_pmc.metadata_license.startswith("unknown")
+    assert europe_pmc.persist_normalized_metadata
 
 
 def test_persistence_requires_confirmed_storage_rights() -> None:

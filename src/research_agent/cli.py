@@ -16,6 +16,7 @@ from research_agent.benchmark import ProjectionBenchmark
 from research_agent.budget import BudgetPolicy, UsageLedger
 from research_agent.connectors import (
     CrossrefDiscoveryConnector,
+    EuropePmcDiscoveryConnector,
     LocalFileConnector,
     MojeekDiscoveryConnector,
     OpenAlexDiscoveryConnector,
@@ -286,6 +287,22 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     crossref.add_argument("--result-limit", type=int, default=20)
     crossref.add_argument("--approve-budget", action="store_true")
+
+    europe_pmc = subparsers.add_parser(
+        "discover-europe-pmc",
+        help="run Europe PMC lite bibliographic metadata discovery",
+    )
+    europe_pmc.add_argument("question")
+    europe_pmc.add_argument("--root", type=Path, default=Path("data"))
+    europe_pmc.add_argument("--term", action="append", default=[])
+    europe_pmc.add_argument("--concept", action="append", default=[])
+    europe_pmc.add_argument(
+        "--vocabulary",
+        type=Path,
+        default=Path("config/query-vocabulary.yaml"),
+    )
+    europe_pmc.add_argument("--result-limit", type=int, default=20)
+    europe_pmc.add_argument("--approve-budget", action="store_true")
 
     openalex = subparsers.add_parser(
         "discover-openalex",
@@ -877,6 +894,75 @@ def main() -> None:
                         execution.discovery_run.reported_cost_microusd
                     ),
                     "daily_ceiling_usd": provider_policy.daily_free_allowance_usd,
+                },
+                "record_hashes": record_hashes,
+            }
+        )
+        return
+
+    if args.command == "discover-europe-pmc":
+        research_policy = ResearchPolicy.from_yaml(args.research_policy)
+        provider_policy = research_policy.domain_index("connector:europe-pmc")
+        if not provider_policy.enabled:
+            raise ValueError("Europe PMC is disabled by the research policy")
+        connector = EuropePmcDiscoveryConnector()
+        vocabulary = ConceptVocabulary.from_yaml(args.vocabulary)
+        base = deterministic_proposal(
+            args.question,
+            connector_id=connector.manifest.id,
+            concept_ids=tuple(args.concept),
+        )
+        proposal = QueryProposal.model_validate(
+            {
+                **base.model_dump(mode="json"),
+                "exact_terms": args.term or base.exact_terms,
+                "source_classes": [SourceClass.SCHOLARLY],
+                "capabilities": [
+                    ConnectorCapability.DISCOVERY,
+                    ConnectorCapability.METADATA,
+                ],
+                "result_limit": args.result_limit,
+                "page_limit": min(
+                    provider_policy.max_requests_per_run,
+                    math.ceil(args.result_limit / 100),
+                ),
+            }
+        )
+        plan = QueryPlanValidator(
+            vocabulary=vocabulary,
+            manifests={connector.manifest.id: connector.manifest},
+        ).validate(
+            proposal,
+            compiler=CompilerIdentity(id="compiler:deterministic-lexical", version="1"),
+            human_approved=args.approve_budget,
+        )
+        execution = DiscoveryExecutor().run(plan, connector)
+        store = ImmutableStore(args.root)
+        store.initialize()
+        record_hashes = {
+            "research-policy": (store.put_record("research-policy", research_policy),),
+            "query-plan": (store.put_record("query-plan", plan),),
+            "connector-manifest": (store.put_record("connector-manifest", connector.manifest),),
+            "discovery-run": (store.put_record("discovery-run", execution.discovery_run),),
+        }
+        if provider_policy.persist_normalized_metadata:
+            record_hashes["discovery-hit"] = tuple(
+                store.put_record("discovery-hit", hit) for hit in execution.hits
+            )
+        _json(
+            {
+                "query_plan": plan,
+                "discovery_run": execution.discovery_run,
+                "hits": execution.hits,
+                "persistence": {
+                    "normalized_metadata": provider_policy.persist_normalized_metadata,
+                    "metadata_license": provider_policy.metadata_license,
+                    "raw_response_retention_days": (
+                        provider_policy.raw_response_retention_days
+                    ),
+                    "abstracts": False,
+                    "full_text": False,
+                    "note": "Lite bibliographic metadata is discovery, not evidence.",
                 },
                 "record_hashes": record_hashes,
             }

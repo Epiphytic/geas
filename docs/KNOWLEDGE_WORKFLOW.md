@@ -53,6 +53,22 @@ uv run research-agent --env-file .env discover-openalex \
 The API response body is hashed for audit but not retained. Normalized metadata
 is discovery—not evidence—and linked full text retains its own license.
 
+Europe PMC supplies credential-free life-sciences discovery. The accepted
+initial boundary retains only lite bibliographic metadata:
+
+```bash
+uv run research-agent discover-europe-pmc \
+  "community water fluoridation neurodevelopment" \
+  --concept concept:community-water-fluoridation \
+  --term "community water fluoridation" \
+  --term "fluoride neurodevelopment IQ" \
+  --root data
+```
+
+The request is fixed to `resultType=lite`. The connector schema contains no
+abstract or full-text field, and raw responses are hash-only. Invalid optional
+identifiers are omitted; an invalid record identity rejects the record.
+
 Mojeek remains a discovery-only fallback. Its transient hits are not persisted
 until the operator confirms the account's storage terms:
 

@@ -273,3 +273,28 @@ References:
 - [OpenAlex authentication](https://developers.openalex.org/api-reference/authentication)
 - [OpenAlex search syntax and pricing](https://developers.openalex.org/guides/searching)
 - [OpenAlex works list API](https://developers.openalex.org/api-reference/works/list-works)
+
+## 12. Europe PMC discovery persistence
+
+**Status:** accepted on 2026-08-03.
+
+### Decision
+
+- Use Europe PMC lite bibliographic metadata only for the initial connector.
+- Persist normalized titles, authors, journals, dates, availability flags,
+  citation counts, and identifiers with license status `unknown`.
+- Do not request or persist abstracts, full text, or raw API responses.
+- Require a later license-aware acquisition path for abstract or full-text
+  material.
+- Treat all Europe PMC results as discovery metadata, never claim evidence.
+
+The connector uses the fixed EBI HTTPS endpoint, refuses redirects and
+non-JSON responses, bounds response size, and always sends
+`resultType=lite`. Invalid optional identifiers are omitted without discarding
+an otherwise valid record; invalid record/source identities are rejected.
+
+References:
+
+- [Europe PMC REST API](https://europepmc.org/RestfulWebService)
+- [Europe PMC content and copyright guidance](https://europepmc.org/help)
+- [Europe PMC developer resources](https://europepmc.org/developers)

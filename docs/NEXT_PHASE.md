@@ -276,7 +276,8 @@ tools or write authority.
 - [x] Add deterministic DOI normalization.
 - [x] Add deterministic PMID, PMCID, ORCID, ROR, and ISSN normalization.
 - [ ] Add broader canonical URL normalization.
-- Implement Unpaywall and Europe PMC resolution/acquisition.
+- [x] Implement Europe PMC lite bibliographic discovery.
+- Implement Unpaywall and license-aware Europe PMC resolution/acquisition.
 - Represent works separately from manifestations.
 - Add citation-following with depth and budget limits.
 
