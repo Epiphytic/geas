@@ -326,6 +326,10 @@ that format without changing canonical records.
   controversy, gaps, and coverage.
 - [x] Add FTS5 lexical search and exact record-class facets.
 - [x] Add hierarchy traversal and valid-time queries.
+- [x] Add immutable structural derivations for documents, pages, sections,
+  headings, paragraphs, lists, footnotes, and captions.
+- [x] Verify exact structural selectors during projection and expose them as an
+  FTS record class.
 - [x] Generate topic, controversy, provenance, threat, and gap pages.
 - Add optional Semble indexing over generated pages.
 

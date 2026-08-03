@@ -26,6 +26,11 @@ The registry currently supports:
 - DOCX, PPTX, XLSX, ODT and related safe XML text parts;
 - PDF text through Poppler `pdftotext` inside a bounded Bubblewrap sandbox.
 
+HTML block and heading structure is rendered into inert text deterministically.
+PDF form-feed page boundaries are retained. These markers feed the separate
+structural derivation described in
+[`STRUCTURAL_DERIVATIONS.md`](STRUCTURAL_DERIVATIONS.md).
+
 HTML scripts, styles, templates, SVG, and remote resources are discarded.
 Office macros, embedded media, external resources, and layout are not opened.
 Office archives have entry-count and total-uncompressed-size caps. PDF actions,

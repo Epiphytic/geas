@@ -94,14 +94,20 @@ uv run research-agent acquire-open-access \
 The original document and derived text are separate immutable blobs and source
 records connected by a `TextDerivation`. Preferred locations that deny access
 fall through to the next licensed manifestation. Unsupported formats preserve
-the original and create a parser constraint. The same parsing pipeline can be
-used for an operator-selected local file:
+the original and create a parser constraint. Successful text derivation also
+creates immutable document, page, section, heading, paragraph, list-item,
+footnote, and caption anchors with exact offsets. The same parsing pipeline can
+be used for an operator-selected local file:
 
 ```bash
 uv run research-agent parse-document paper.pdf \
   --license CC-BY-4.0 \
   --root data
 ```
+
+Re-run the versioned structural extractor over an existing text derivation with
+`derive-structure`. Identical input and extractor configuration produce the same
+derivation and anchor identities.
 
 Mojeek remains a discovery-only fallback. Its transient hits are not persisted
 until the operator confirms the account's storage terms:
@@ -168,6 +174,10 @@ uv run research-agent knowledge-query \
   --kind gap \
   --database data/query.sqlite
 ```
+
+Select `--kind anchor` to search exact document blocks and headings. Results
+remain deterministic FTS snippets tied to immutable anchor IDs and source
+ranges.
 
 An exact topic view traverses descendants with a recursive CTE and joins claims
 to exact evidence and source versions. It also returns topic-scoped sources,

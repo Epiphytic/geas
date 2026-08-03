@@ -37,6 +37,7 @@ record_schema_paths:
   - src/research_agent/identifiers.py
   - src/research_agent/render.py
   - src/research_agent/parsing.py
+  - src/research_agent/structure.py
   - src/research_agent/remote_acquisition.py
 
 # These roots are relative to the selected immutable store root.

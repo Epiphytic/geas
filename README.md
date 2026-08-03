@@ -29,6 +29,8 @@ slice:
 - deterministic JSON and Markdown topic views;
 - format-neutral original preservation with versioned text derivations for
   text, JSON, HTML, XML, OpenDocument/OpenXML office files, and PDF;
+- immutable document/page/section/heading/block anchors with exact offsets,
+  hierarchy, and deterministic full-text projection;
 - a tool-free client for local DeepSeek and optional external providers;
 - a starter LinkML ontology and a maintained upstream intelligence registry;
 - tests for the principal prompt-injection security invariants.
@@ -219,7 +221,10 @@ uv run research-agent acquire-open-access \
 
 Original bytes remain immutable. Parsed text is a separate quarantined,
 content-addressed derivation with parser provenance and deterministic threat
-scanning. See [docs/PARSING.md](docs/PARSING.md).
+scanning. Stable structural anchors are generated automatically and can be
+searched with `knowledge-query --kind anchor`. See
+[docs/PARSING.md](docs/PARSING.md) and
+[docs/STRUCTURAL_DERIVATIONS.md](docs/STRUCTURAL_DERIVATIONS.md).
 
 Capture canonical state and detect later ontology, record, blob, or SQLite
 projection drift:

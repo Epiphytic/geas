@@ -373,3 +373,23 @@ See `docs/PARSING.md` for the implemented safety and provenance contract.
 Native sandbox availability is a deployment prerequisite, not something source
 content or a model may negotiate. Unsupported deployments preserve the original
 and report a parser constraint.
+
+## 16. First structured semantic derivation
+
+**Status:** accepted and implemented on 2026-08-03.
+
+### Decision
+
+- Build structural anchors before table or figure semantics.
+- Use exact Unicode code-point ranges over content-addressed derived text.
+- Represent documents, pages, nested sections, headings, paragraphs, list
+  items, footnotes, and captions as immutable typed records.
+- Preserve real PDF page boundaries and mark a single fallback page as
+  synthetic when pagination is unavailable.
+- Extract only explicit deterministic structure; do not use a model to guess
+  headings or authorize canonical structure.
+- Verify every selector hash during SQLite projection and expose anchors as a
+  deterministic lexical query class.
+
+These anchors are the shared coordinate system for later table, figure,
+evidence-selector, and model-assisted proposal work.

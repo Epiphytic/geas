@@ -81,6 +81,7 @@ from research_agent.render import render_topic_markdown
 from research_agent.research import DiscoveryExecutor, OfflineResearchRunner
 from research_agent.secrets import load_env_file
 from research_agent.store import ImmutableStore
+from research_agent.structure import StructuralDocumentManager
 from research_agent.truth import SQLiteProjectionGuard, TruthManager, TruthPolicy, TruthSnapshot
 from research_agent.workflow import ActorKind, WorkflowEngine, WorkflowState
 from research_agent.workload import WorkloadPolicy
@@ -347,6 +348,13 @@ def _build_parser() -> argparse.ArgumentParser:
     parse_document.add_argument("--source-uri")
     parse_document.add_argument("--media-type")
     parse_document.add_argument("--license")
+
+    derive_structure = subparsers.add_parser(
+        "derive-structure",
+        help="derive stable structural anchors from a stored text derivation",
+    )
+    derive_structure.add_argument("text_derivation_id")
+    derive_structure.add_argument("--root", type=Path, default=Path("data"))
 
     acquire_oa = subparsers.add_parser(
         "acquire-open-access",
@@ -1097,6 +1105,16 @@ def main() -> None:
             license=args.license,
         )
         _json(receipt)
+        return
+
+    if args.command == "derive-structure":
+        store = ImmutableStore(args.root)
+        store.initialize()
+        _json(
+            StructuralDocumentManager(store=store).derive_stored(
+                args.text_derivation_id
+            )
+        )
         return
 
     if args.command == "acquire-open-access":
