@@ -6,6 +6,7 @@ import pytest
 
 from research_agent.connectors import (
     CrossrefDiscoveryConnector,
+    EuropePmcDiscoveryConnector,
     LocalFileConnector,
     OpenAlexDiscoveryConnector,
 )
@@ -51,6 +52,11 @@ class _CrossrefFixtureTransport:
 class _OpenAlexFixtureTransport:
     def request(self, parameters: dict[str, str]) -> bytes:
         return Path("tests/fixtures/openalex/search.json").read_bytes()
+
+
+class _EuropePmcFixtureTransport:
+    def request(self, parameters: dict[str, str]) -> bytes:
+        return Path("tests/fixtures/europe_pmc/search.json").read_bytes()
 
 
 def _researched_store(tmp_path: Path) -> tuple[ImmutableStore, object]:
@@ -124,6 +130,34 @@ def _researched_store(tmp_path: Path) -> tuple[ImmutableStore, object]:
     store.put_record("connector-manifest", openalex.manifest)
     store.put_record("discovery-run", openalex_results.discovery_run)
     for hit in openalex_results.hits:
+        store.put_record("discovery-hit", hit)
+
+    europe_pmc = EuropePmcDiscoveryConnector(_EuropePmcFixtureTransport())
+    europe_pmc_plan = QueryPlanValidator(
+        vocabulary=ConceptVocabulary(concepts={}),
+        manifests={europe_pmc.manifest.id: europe_pmc.manifest},
+    ).validate(
+        QueryProposal(
+            question="community water fluoridation life sciences evidence",
+            exact_terms=("community water fluoridation",),
+            source_classes=frozenset({SourceClass.SCHOLARLY}),
+            connector_ids=(europe_pmc.manifest.id,),
+            capabilities=frozenset(
+                {ConnectorCapability.DISCOVERY, ConnectorCapability.METADATA}
+            ),
+            result_limit=10,
+            page_limit=1,
+        ),
+        compiler=CompilerIdentity(id="compiler:fixture", version="1"),
+    )
+    europe_pmc_results = DiscoveryExecutor(clock=lambda: INSTANT).run(
+        europe_pmc_plan,
+        europe_pmc,
+    )
+    store.put_record("query-plan", europe_pmc_plan)
+    store.put_record("connector-manifest", europe_pmc.manifest)
+    store.put_record("discovery-run", europe_pmc_results.discovery_run)
+    for hit in europe_pmc_results.hits:
         store.put_record("discovery-hit", hit)
     return store, result
 
@@ -226,7 +260,7 @@ def test_projection_supports_lexical_hierarchy_dissent_gaps_and_provenance(
     assert build.counts["claims"] == 7
     assert build.counts["topic_source_associations"] == 5
     assert build.counts["threat_observations"] == 3
-    assert build.counts["discovery_hits"] == 7
+    assert build.counts["discovery_hits"] == 9
     markdown = render_topic_markdown(topic)
     assert "## Dissent and controversy" in markdown
     assert "## Knowledge gaps" in markdown

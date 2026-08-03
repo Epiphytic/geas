@@ -169,6 +169,21 @@ from the response's reported cost. The checked-in policy caps OpenAlex at 10
 requests per run and its US$1 daily API allowance. Raw responses and credentials
 are never placed in the knowledge store.
 
+Run Europe PMC lite bibliographic discovery without credentials:
+
+```bash
+uv run research-agent discover-europe-pmc \
+  "community water fluoridation neurodevelopment" \
+  --concept concept:community-water-fluoridation \
+  --term "community water fluoridation" \
+  --term "fluoride neurodevelopment IQ"
+```
+
+The connector persists normalized bibliographic metadata with an `unknown`
+license label. It deterministically requests `resultType=lite`; abstracts, full
+text, and raw responses are excluded and require a separate license-aware
+acquisition path.
+
 Capture canonical state and detect later ontology, record, blob, or SQLite
 projection drift:
 
