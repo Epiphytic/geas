@@ -4,6 +4,7 @@ import argparse
 import getpass
 import json
 import math
+import mimetypes
 import os
 from datetime import UTC, datetime
 from pathlib import Path
@@ -40,6 +41,7 @@ from research_agent.discovery import (
     AccessConstraintReason,
     CompilerIdentity,
     ConnectorCapability,
+    OpenAccessResolution,
     SourceClass,
     identified,
 )
@@ -59,6 +61,7 @@ from research_agent.models import (
     ThreatTarget,
 )
 from research_agent.operator_policy import ResearchPolicy
+from research_agent.parsing import ParsedDocumentManager
 from research_agent.planning import (
     ConceptVocabulary,
     ModelQueryCompiler,
@@ -73,6 +76,7 @@ from research_agent.projection import (
     SQLiteKnowledgeProjection,
 )
 from research_agent.providers import ModelClient, load_provider_configs
+from research_agent.remote_acquisition import LicenseGatedAcquirer
 from research_agent.render import render_topic_markdown
 from research_agent.research import DiscoveryExecutor, OfflineResearchRunner
 from research_agent.secrets import load_env_file
@@ -333,6 +337,23 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     unpaywall.add_argument("doi", nargs="+")
     unpaywall.add_argument("--root", type=Path, default=Path("data"))
+
+    parse_document = subparsers.add_parser(
+        "parse-document",
+        help="preserve original bytes and derive quarantined inert text",
+    )
+    parse_document.add_argument("path", type=Path)
+    parse_document.add_argument("--root", type=Path, default=Path("data"))
+    parse_document.add_argument("--source-uri")
+    parse_document.add_argument("--media-type")
+    parse_document.add_argument("--license")
+
+    acquire_oa = subparsers.add_parser(
+        "acquire-open-access",
+        help="fetch and parse a stored license-qualified DOI resolution",
+    )
+    acquire_oa.add_argument("doi")
+    acquire_oa.add_argument("--root", type=Path, default=Path("data"))
 
     truth_snapshot = subparsers.add_parser(
         "truth-snapshot",
@@ -1055,6 +1076,47 @@ def main() -> None:
                 },
                 "record_hashes": record_hashes,
             }
+        )
+        return
+
+    if args.command == "parse-document":
+        path = args.path.resolve(strict=True)
+        if not path.is_file():
+            raise ValueError("document path must be a regular file")
+        media_type = (
+            args.media_type
+            or mimetypes.guess_type(path.name)[0]
+            or "application/octet-stream"
+        )
+        store = ImmutableStore(args.root)
+        receipt = ParsedDocumentManager(store=store).ingest(
+            path.read_bytes(),
+            source_uri=args.source_uri or path.as_uri(),
+            media_type=media_type,
+            connector_id="connector:operator-file",
+            license=args.license,
+        )
+        _json(receipt)
+        return
+
+    if args.command == "acquire-open-access":
+        doi = normalize_doi(args.doi)
+        store = ImmutableStore(args.root)
+        store.initialize()
+        resolutions = sorted(
+            (
+                OpenAccessResolution.model_validate(value)
+                for value in store.iter_records("open-access-resolution")
+                if value.get("doi") == doi
+            ),
+            key=lambda item: (item.resolved_at, item.id),
+        )
+        if not resolutions:
+            raise ValueError(
+                "no stored Unpaywall resolution for DOI; run resolve-unpaywall first"
+            )
+        _json(
+            LicenseGatedAcquirer(store=store).acquire(resolutions[-1])
         )
         return
 

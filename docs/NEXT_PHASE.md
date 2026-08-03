@@ -278,7 +278,9 @@ tools or write authority.
 - [ ] Add broader canonical URL normalization.
 - [x] Implement Europe PMC lite bibliographic discovery.
 - [x] Implement Unpaywall DOI resolution with location-level license gates.
-- Implement license-aware Europe PMC and Unpaywall content acquisition.
+- [x] Implement license-aware Unpaywall content acquisition with immutable
+  originals and quarantined derived text.
+- Implement direct license-aware Europe PMC content acquisition.
 - Represent works separately from manifestations.
 - Add citation-following with depth and budget limits.
 

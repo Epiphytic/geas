@@ -23,6 +23,7 @@ from research_agent.knowledge import (
     KnowledgeImporter,
     KnowledgePack,
 )
+from research_agent.parsing import ParsedDocumentManager
 from research_agent.planning import (
     ConceptVocabulary,
     QueryPlanValidator,
@@ -170,6 +171,13 @@ def _researched_store(tmp_path: Path) -> tuple[ImmutableStore, object]:
         clock=lambda: INSTANT,
     ).resolve("10.1002/14651858.cd010856.pub3")
     store.put_record("open-access-resolution", resolution)
+    ParsedDocumentManager(store=store, clock=lambda: INSTANT).ingest(
+        b"<html><body>Longitudinal fluoridation evidence update.</body></html>",
+        source_uri="https://repository.example/derived-fixture",
+        media_type="text/html",
+        connector_id="connector:fixture",
+        license="cc-by",
+    )
     return store, result
 
 
@@ -253,12 +261,18 @@ def test_projection_supports_lexical_hierarchy_dissent_gaps_and_provenance(
         record_types=(QueryRecordType.RESOLUTION,),
         limit=10,
     )
+    parsed_document = engine.query(
+        "longitudinal fluoridation evidence",
+        record_types=(QueryRecordType.DOCUMENT,),
+        limit=10,
+    )
     topic = engine.topic("concept:community-water-fluoridation")
 
     assert query.projection_snapshot_id == snapshot.id
     assert any("prevention of dental caries" in hit.title for hit in scholarly.hits)
     assert any("prevention of dental caries" in hit.title for hit in openalex_metadata.hits)
     assert len(oa_resolution.hits) == 1
+    assert len(parsed_document.hits) == 1
     assert query.plan.compiler_version == "deterministic-local-query/1"
     assert "MATCH ?" in query.plan.sql
     assert {hit.record_type for hit in query.hits} >= {
@@ -280,6 +294,7 @@ def test_projection_supports_lexical_hierarchy_dissent_gaps_and_provenance(
     assert build.counts["discovery_hits"] == 9
     assert build.counts["open_access_resolutions"] == 1
     assert build.counts["open_access_locations"] == 3
+    assert build.counts["text_derivations"] == 1
     markdown = render_topic_markdown(topic)
     assert "## Dissent and controversy" in markdown
     assert "## Knowledge gaps" in markdown

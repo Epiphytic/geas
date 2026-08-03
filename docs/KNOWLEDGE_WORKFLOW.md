@@ -83,6 +83,26 @@ location URLs, versions, repository identities, and per-location licenses.
 Private or credential-bearing URLs are discarded. A reported value such as
 `other-oa` is not treated as a specific permission grant.
 
+Acquire a stored, explicitly licensed resolution and derive inert text:
+
+```bash
+uv run research-agent acquire-open-access \
+  10.1289/ehp.1104912 \
+  --root data
+```
+
+The original document and derived text are separate immutable blobs and source
+records connected by a `TextDerivation`. Preferred locations that deny access
+fall through to the next licensed manifestation. Unsupported formats preserve
+the original and create a parser constraint. The same parsing pipeline can be
+used for an operator-selected local file:
+
+```bash
+uv run research-agent parse-document paper.pdf \
+  --license CC-BY-4.0 \
+  --root data
+```
+
 Mojeek remains a discovery-only fallback. Its transient hits are not persisted
 until the operator confirms the account's storage terms:
 

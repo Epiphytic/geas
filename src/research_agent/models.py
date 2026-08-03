@@ -96,6 +96,7 @@ class SourceVersion(StrictModel):
         acquired_at: datetime | None = None,
         predecessor: str | None = None,
         license: str | None = None,
+        trust_zone: Literal["trusted", "untrusted", "quarantined"] = "untrusted",
     ) -> SourceVersion:
         digest = hashlib.sha256(content).hexdigest()
         return cls(
@@ -108,6 +109,7 @@ class SourceVersion(StrictModel):
             predecessor=predecessor,
             connector_id=connector_id,
             license=license,
+            trust_zone=trust_zone,
         )
 
 

@@ -27,6 +27,8 @@ slice:
 - atomic SQLite projection builds with FTS5, hierarchy, provenance, dissent,
   gap, threat, and valid-time queries;
 - deterministic JSON and Markdown topic views;
+- format-neutral original preservation with versioned text derivations for
+  text, JSON, HTML, XML, OpenDocument/OpenXML office files, and PDF;
 - a tool-free client for local DeepSeek and optional external providers;
 - a starter LinkML ontology and a maintained upstream intelligence registry;
 - tests for the principal prompt-injection security invariants.
@@ -198,6 +200,26 @@ reported licenses become immutable resolution records and searchable SQLite
 projection rows. Only explicit CC0/public-domain, CC-BY, and CC-BY-SA license
 families are automatically acquisition-eligible; `other-oa`, unknown,
 noncommercial, and no-derivatives terms require operator review.
+
+Preserve and parse an operator-selected document:
+
+```bash
+uv run research-agent parse-document paper.pdf \
+  --license CC-BY-4.0 \
+  --root data
+```
+
+Acquire a previously resolved, deterministically licensed manifestation:
+
+```bash
+uv run research-agent acquire-open-access \
+  10.1289/ehp.1104912 \
+  --root data
+```
+
+Original bytes remain immutable. Parsed text is a separate quarantined,
+content-addressed derivation with parser provenance and deterministic threat
+scanning. See [docs/PARSING.md](docs/PARSING.md).
 
 Capture canonical state and detect later ontology, record, blob, or SQLite
 projection drift:
