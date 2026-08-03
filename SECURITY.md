@@ -26,6 +26,10 @@ boundary.
 - The Mojeek transport has a fixed HTTPS destination. Although Mojeek requires
   its key as a query parameter, full request URLs and upstream error bodies are
   never placed in audit records or propagated through connector exceptions.
+- The Unpaywall project contact is treated like a credential: it is injected
+  only by the fixed-host transport and never persisted. Returned OA URLs are
+  rejected if private, local, credential-bearing, or non-HTTP(S), and vague
+  license classes cannot authorize automatic acquisition.
 - Canonical authority is one-way: version-controlled ontology and schemas plus
   immutable records and blobs produce truth snapshots; SQLite and Markdown are
   disposable projections. Projection data can never authorize changes to

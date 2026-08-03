@@ -69,6 +69,20 @@ The request is fixed to `resultType=lite`. The connector schema contains no
 abstract or full-text field, and raw responses are hash-only. Invalid optional
 identifiers are omitted; an invalid record identity rejects the record.
 
+Resolve DOI-bearing works to attributed open-access manifestations:
+
+```bash
+uv run research-agent --env-file .env resolve-unpaywall \
+  10.1002/14651858.CD010856.pub3 \
+  --root data
+```
+
+`UNPAYWALL_EMAIL` is injected only by the fixed-host transport and never enters
+records or errors. Resolution records preserve response hashes, OA status,
+location URLs, versions, repository identities, and per-location licenses.
+Private or credential-bearing URLs are discarded. A reported value such as
+`other-oa` is not treated as a specific permission grant.
+
 Mojeek remains a discovery-only fallback. Its transient hits are not persisted
 until the operator confirms the account's storage terms:
 

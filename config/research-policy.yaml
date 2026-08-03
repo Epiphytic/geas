@@ -1,4 +1,4 @@
-version: 3
+version: 4
 
 # Discovery rankings and snippets identify candidates; they never support claims.
 general_search_results_are_evidence: false
@@ -47,6 +47,16 @@ domain_index_providers:
     persist_normalized_metadata: true
     raw_response_retention_days: 0
     max_requests_per_run: 20
+    cost_accounting: none
+
+  - connector_id: connector:unpaywall
+    enabled: true
+    priority: 4
+    credential_env: UNPAYWALL_EMAIL
+    metadata_license: unknown; location-level licenses retained separately
+    persist_normalized_metadata: true
+    raw_response_retention_days: 0
+    max_requests_per_run: 50
     cost_accounting: none
 
 general_search_providers:

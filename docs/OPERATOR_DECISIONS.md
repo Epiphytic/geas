@@ -298,3 +298,33 @@ References:
 - [Europe PMC REST API](https://europepmc.org/RestfulWebService)
 - [Europe PMC content and copyright guidance](https://europepmc.org/help)
 - [Europe PMC developer resources](https://europepmc.org/developers)
+
+## 13. Unpaywall contact identity and license gate
+
+**Status:** accepted and implemented on 2026-08-03.
+
+### Decision
+
+- Use a dedicated project contact supplied through `UNPAYWALL_EMAIL`.
+- Inject the contact only in transport requests to the fixed Unpaywall API
+  endpoint; never persist it in plans, records, logs, errors, or response hashes.
+- Resolve operator-supplied normalized DOIs rather than using Unpaywall as
+  unbounded general search.
+- Persist OA locations, versions, host types, repository attribution, and
+  location-level reported licenses without retaining raw responses.
+- Automatically permit later acquisition only for explicit CC0/public-domain,
+  CC-BY, and CC-BY-SA families.
+- Preserve but gate `other-oa`, unknown, noncommercial, and no-derivatives
+  licenses for operator review.
+
+Unpaywall explicitly warns that API text can contain externally sourced markup.
+All response fields therefore remain inert data, URLs are structurally
+validated, and no response value can change endpoints, credentials, budgets,
+policy, or canonical write authority.
+
+References:
+
+- [Unpaywall REST API](https://unpaywall.org/api)
+- [Unpaywall API privacy policy](https://unpaywall.org/legal/privacy)
+- [Unpaywall OA license interpretation](https://support.unpaywall.org/support/solutions/articles/44002063718-what-is-an-oa-license-)
+- [Unpaywall code-injection guidance](https://support.unpaywall.org/support/solutions/articles/44002216436-preventing-code-injection-using-text-from-unpaywall-safely)

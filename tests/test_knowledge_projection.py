@@ -9,6 +9,7 @@ from research_agent.connectors import (
     EuropePmcDiscoveryConnector,
     LocalFileConnector,
     OpenAlexDiscoveryConnector,
+    UnpaywallResolver,
 )
 from research_agent.discovery import (
     CompilerIdentity,
@@ -57,6 +58,11 @@ class _OpenAlexFixtureTransport:
 class _EuropePmcFixtureTransport:
     def request(self, parameters: dict[str, str]) -> bytes:
         return Path("tests/fixtures/europe_pmc/search.json").read_bytes()
+
+
+class _UnpaywallFixtureTransport:
+    def request(self, doi: str) -> bytes:
+        return Path("tests/fixtures/unpaywall/doi.json").read_bytes()
 
 
 def _researched_store(tmp_path: Path) -> tuple[ImmutableStore, object]:
@@ -159,6 +165,11 @@ def _researched_store(tmp_path: Path) -> tuple[ImmutableStore, object]:
     store.put_record("discovery-run", europe_pmc_results.discovery_run)
     for hit in europe_pmc_results.hits:
         store.put_record("discovery-hit", hit)
+    resolution = UnpaywallResolver(
+        _UnpaywallFixtureTransport(),
+        clock=lambda: INSTANT,
+    ).resolve("10.1002/14651858.cd010856.pub3")
+    store.put_record("open-access-resolution", resolution)
     return store, result
 
 
@@ -237,11 +248,17 @@ def test_projection_supports_lexical_hierarchy_dissent_gaps_and_provenance(
         record_types=(QueryRecordType.DISCOVERY,),
         limit=10,
     )
+    oa_resolution = engine.query(
+        "PubMed Central cc-by publishedVersion",
+        record_types=(QueryRecordType.RESOLUTION,),
+        limit=10,
+    )
     topic = engine.topic("concept:community-water-fluoridation")
 
     assert query.projection_snapshot_id == snapshot.id
     assert any("prevention of dental caries" in hit.title for hit in scholarly.hits)
     assert any("prevention of dental caries" in hit.title for hit in openalex_metadata.hits)
+    assert len(oa_resolution.hits) == 1
     assert query.plan.compiler_version == "deterministic-local-query/1"
     assert "MATCH ?" in query.plan.sql
     assert {hit.record_type for hit in query.hits} >= {
@@ -261,6 +278,8 @@ def test_projection_supports_lexical_hierarchy_dissent_gaps_and_provenance(
     assert build.counts["topic_source_associations"] == 5
     assert build.counts["threat_observations"] == 3
     assert build.counts["discovery_hits"] == 9
+    assert build.counts["open_access_resolutions"] == 1
+    assert build.counts["open_access_locations"] == 3
     markdown = render_topic_markdown(topic)
     assert "## Dissent and controversy" in markdown
     assert "## Knowledge gaps" in markdown

@@ -184,6 +184,21 @@ license label. It deterministically requests `resultType=lite`; abstracts, full
 text, and raw responses are excluded and require a separate license-aware
 acquisition path.
 
+Resolve known DOIs to license-attributed OA manifestations with the project
+contact from the ignored `.env` file:
+
+```bash
+uv run research-agent resolve-unpaywall \
+  10.1002/14651858.CD010856.pub3 \
+  --root data
+```
+
+The contact identity is transport-only. Locations, versions, host types, and
+reported licenses become immutable resolution records and searchable SQLite
+projection rows. Only explicit CC0/public-domain, CC-BY, and CC-BY-SA license
+families are automatically acquisition-eligible; `other-oa`, unknown,
+noncommercial, and no-derivatives terms require operator review.
+
 Capture canonical state and detect later ontology, record, blob, or SQLite
 projection drift:
 
