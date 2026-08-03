@@ -347,6 +347,5 @@ the persistent, queryable knowledge state and its audit history.
 ## Decisions still requiring operator input
 
 - Production graph backend after the SQLite vertical slice is measured.
-- Numeric automatic-approval and cost thresholds for external-provider use.
 - Authenticated or signed human-approval mechanism.
 - Repository open-source license.

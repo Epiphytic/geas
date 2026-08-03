@@ -1,0 +1,32 @@
+version: 1
+currency: USD
+
+automatic_envelope:
+  max_cost_microusd_per_call: 250000
+  max_cost_microusd_per_run: 2000000
+  max_cost_microusd_per_day: 5000000
+  max_cost_microusd_per_month: 25000000
+  max_calls_per_run: 10
+  max_input_tokens_per_call: 32000
+  max_output_tokens_per_call: 8192
+
+# Operators may change treatment to excluded_from_cost for subscription or
+# enterprise-accounted services. Exclusions still consume call and token caps.
+accounts:
+  - service: model
+    provider: openai
+    model: gpt-5.2
+    billing_basis: metered
+    budget_treatment: counted
+    accounting_note: OpenAI API pay-as-you-go
+    input_cost_microusd_per_million_tokens: 1750000
+    output_cost_microusd_per_million_tokens: 14000000
+
+  - service: model
+    provider: zai
+    model: glm-5.2
+    billing_basis: metered
+    budget_treatment: counted
+    accounting_note: Z.AI API pay-as-you-go
+    input_cost_microusd_per_million_tokens: 1400000
+    output_cost_microusd_per_million_tokens: 4400000

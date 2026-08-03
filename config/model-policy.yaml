@@ -1,8 +1,8 @@
-version: 1
+version: 2
 
-# Automatic external calls remain off until enforceable cost thresholds and a
-# persistent usage ledger are accepted by the operator.
-automatic_external_calls: false
+# Automatic calls require the persistent ledger and budget policy. A direct
+# client without those components remains forbidden.
+automatic_external_calls: true
 
 # Unknown content must be classified before it can leave the deployment.
 unknown_data_class_external: forbidden

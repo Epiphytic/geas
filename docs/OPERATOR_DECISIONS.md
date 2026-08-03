@@ -150,10 +150,24 @@ not as a conclusive ownership determination.
   route in addition to provider and operation authorization.
 - Preserve successful authorizations as immutable audit records.
 
-### Temporary approval threshold
-
-Automatic external calls remain disabled until enforceable cost thresholds and
-a persistent usage ledger are implemented. External calls therefore require
-explicit approval in addition to matching the deterministic allowlist.
-
 See `docs/MODEL_USE_POLICY.md` for the enforcement contract.
+
+## 6. Automatic external-use budget and account treatment
+
+**Status:** accepted on 2026-08-02.
+
+### Decision
+
+- Use the conservative automatic envelope: US$0.25 per call, US$2 and 10 calls
+  per run, US$5 per UTC day, and US$25 per UTC month.
+- Limit each call to 32,000 reserved input tokens and 8,192 output tokens.
+- Reserve worst-case cost transactionally before network access and reconcile
+  provider-reported usage afterward.
+- Allow operators to classify an account as metered, subscription-included,
+  enterprise-commit, no-marginal-cost, or another documented basis.
+- Allow non-metered accounts to be excluded from dollar totals without
+  excluding them from call counts, token limits, authorization, or auditing.
+- Treat unknown accounting as ineligible for automatic use.
+
+The checked-in OpenAI and Z.ai API accounts remain metered and counted. See
+`docs/BUDGET_POLICY.md`.

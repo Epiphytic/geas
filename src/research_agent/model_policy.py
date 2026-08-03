@@ -8,6 +8,14 @@ from typing import Literal
 import yaml
 from pydantic import Field, HttpUrl, model_validator
 
+from research_agent.budget import (
+    BudgetPolicy,
+    BudgetTreatment,
+    UsageLedger,
+    UsageReservation,
+    UsageSettlement,
+    reserved_model_input_tokens,
+)
 from research_agent.deposits import ModelRoute
 from research_agent.models import ProviderConfig, StrictModel, content_id
 
@@ -44,7 +52,7 @@ class ExternalProviderRule(StrictModel):
 
 class ModelUsePolicy(StrictModel):
     version: int = Field(ge=1)
-    automatic_external_calls: Literal[False]
+    automatic_external_calls: bool
     unknown_data_class_external: Literal["forbidden"]
     external_providers: tuple[ExternalProviderRule, ...]
 
@@ -74,6 +82,7 @@ class ModelUseContext(StrictModel):
     input_kind: InputKind
     model_route: ModelRoute = ModelRoute.LOCAL_PREFERRED
     human_approved: bool = False
+    run_id: str = Field(min_length=1)
 
 
 class ModelUseAuthorization(StrictModel):
@@ -88,6 +97,8 @@ class ModelUseAuthorization(StrictModel):
     input_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     max_output_tokens: int = Field(gt=0)
     human_approved: bool
+    usage_reservation_id: str | None = None
+    budget_treatment: BudgetTreatment | None = None
     policy_version: int
     decision: Literal["allow"]
 
@@ -95,10 +106,21 @@ class ModelUseAuthorization(StrictModel):
 class ModelUseGate:
     """Deterministic, non-model authorization for one declared call context."""
 
-    def __init__(self, policy: ModelUsePolicy, context: ModelUseContext) -> None:
+    def __init__(
+        self,
+        policy: ModelUsePolicy,
+        context: ModelUseContext,
+        *,
+        budget_policy: BudgetPolicy | None = None,
+        usage_ledger: UsageLedger | None = None,
+    ) -> None:
         self.policy = policy
         self.context = context
+        self.budget_policy = budget_policy
+        self.usage_ledger = usage_ledger
         self.last_authorization: ModelUseAuthorization | None = None
+        self.last_reservation: UsageReservation | None = None
+        self.last_settlement: UsageSettlement | None = None
 
     def authorize(
         self,
@@ -112,6 +134,21 @@ class ModelUseGate:
         if config.external:
             self._authorize_external(provider, config)
         input_sha256 = hashlib.sha256(system.encode() + b"\x00" + user.encode()).hexdigest()
+        reservation = None
+        if config.external:
+            if self.budget_policy is None or self.usage_ledger is None:
+                raise ValueError("external model use requires budget policy and usage ledger")
+            reservation = self.usage_ledger.reserve_model(
+                policy=self.budget_policy,
+                provider=provider,
+                model=config.model,
+                run_id=self.context.run_id,
+                request_key=input_sha256,
+                input_tokens=reserved_model_input_tokens(system, user),
+                output_tokens=max_output_tokens,
+                human_approved=self.context.human_approved,
+            )
+            self.last_reservation = reservation
         fields = {
             "provider": provider,
             "model": config.model,
@@ -119,6 +156,8 @@ class ModelUseGate:
             **self.context.model_dump(mode="json"),
             "input_sha256": input_sha256,
             "max_output_tokens": max_output_tokens,
+            "usage_reservation_id": reservation.id if reservation else None,
+            "budget_treatment": reservation.budget_treatment if reservation else None,
             "policy_version": self.policy.version,
             "decision": "allow",
         }
@@ -134,11 +173,28 @@ class ModelUseGate:
             input_sha256=input_sha256,
             max_output_tokens=max_output_tokens,
             human_approved=self.context.human_approved,
+            usage_reservation_id=reservation.id if reservation else None,
+            budget_treatment=reservation.budget_treatment if reservation else None,
             policy_version=self.policy.version,
             decision="allow",
         )
         self.last_authorization = authorization
         return authorization
+
+    def settle(self, *, input_tokens: int | None, output_tokens: int | None) -> None:
+        if self.last_reservation is None:
+            return
+        assert self.budget_policy is not None
+        assert self.usage_ledger is not None
+        settlement = self.usage_ledger.settle_model(
+            self.last_reservation,
+            policy=self.budget_policy,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+        )
+        self.last_settlement = settlement
+        if settlement.status == "overrun":
+            raise ValueError("provider token usage exceeded the deterministic reservation")
 
     def _authorize_external(self, provider: str, config: ProviderConfig) -> None:
         rule = self.policy.rule(provider)

@@ -1,7 +1,10 @@
+import io
+import json
 from pathlib import Path
 
 import pytest
 
+from research_agent.budget import BudgetPolicy, UsageLedger
 from research_agent.deposits import ModelRoute
 from research_agent.model_policy import (
     DataClass,
@@ -27,6 +30,7 @@ def _external_config(*, model: str = "gpt-5.2") -> ProviderConfig:
 
 
 def _gate(
+    tmp_path: Path,
     *,
     data_class: DataClass = DataClass.PUBLIC,
     input_kind: InputKind = InputKind.METADATA_ONLY,
@@ -41,18 +45,17 @@ def _gate(
             input_kind=input_kind,
             model_route=model_route,
             human_approved=human_approved,
+            run_id="run:test",
         ),
+        budget_policy=BudgetPolicy.from_yaml(Path("config/budget-policy.yaml")),
+        usage_ledger=UsageLedger(tmp_path / "usage.sqlite"),
     )
 
 
-def test_checked_in_policy_cannot_enable_automatic_external_calls_yet() -> None:
+def test_checked_in_policy_enables_only_budget_gated_automatic_external_calls() -> None:
     policy = ModelUsePolicy.from_yaml(Path("config/model-policy.yaml"))
 
-    assert policy.automatic_external_calls is False
-    with pytest.raises(ValueError):
-        ModelUsePolicy.model_validate(
-            {**policy.model_dump(mode="json"), "automatic_external_calls": True}
-        )
+    assert policy.automatic_external_calls is True
 
 
 def test_external_client_cannot_be_constructed_without_gate() -> None:
@@ -60,9 +63,18 @@ def test_external_client_cannot_be_constructed_without_gate() -> None:
         ModelClient("openai", _external_config())
 
 
-def test_external_use_requires_human_approval_until_budget_policy_exists() -> None:
-    with pytest.raises(ValueError, match="requires human approval"):
-        _gate().authorize(
+def test_external_use_requires_budget_policy_and_ledger() -> None:
+    gate = ModelUseGate(
+        ModelUsePolicy.from_yaml(Path("config/model-policy.yaml")),
+        ModelUseContext(
+            operation=ModelOperation.QUERY_COMPILATION,
+            data_class=DataClass.PUBLIC,
+            input_kind=InputKind.METADATA_ONLY,
+            run_id="run:test",
+        ),
+    )
+    with pytest.raises(ValueError, match="budget policy and usage ledger"):
+        gate.authorize(
             provider="openai",
             config=_external_config(),
             system="system",
@@ -71,8 +83,10 @@ def test_external_use_requires_human_approval_until_budget_policy_exists() -> No
         )
 
 
-def test_approved_external_call_is_bound_to_exact_context_and_input() -> None:
-    authorization = _gate(human_approved=True).authorize(
+def test_automatic_external_call_is_bound_to_context_input_and_reservation(
+    tmp_path: Path,
+) -> None:
+    authorization = _gate(tmp_path).authorize(
         provider="openai",
         config=_external_config(),
         system="system",
@@ -86,11 +100,12 @@ def test_approved_external_call_is_bound_to_exact_context_and_input() -> None:
     assert authorization.data_class is DataClass.PUBLIC
     assert authorization.max_output_tokens == 100
     assert authorization.input_sha256
+    assert authorization.usage_reservation_id
 
 
-def test_unknown_data_is_forbidden_even_with_human_approval() -> None:
+def test_unknown_data_is_forbidden_even_with_human_approval(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="unknown data classification"):
-        _gate(data_class=DataClass.UNKNOWN, human_approved=True).authorize(
+        _gate(tmp_path, data_class=DataClass.UNKNOWN, human_approved=True).authorize(
             provider="openai",
             config=_external_config(),
             system="system",
@@ -99,9 +114,13 @@ def test_unknown_data_is_forbidden_even_with_human_approval() -> None:
         )
 
 
-def test_source_content_requires_external_allowed_route() -> None:
+def test_source_content_requires_external_allowed_route(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="not marked external_allowed"):
-        _gate(input_kind=InputKind.SOURCE_CONTENT, human_approved=True).authorize(
+        _gate(
+            tmp_path,
+            input_kind=InputKind.SOURCE_CONTENT,
+            human_approved=True,
+        ).authorize(
             provider="openai",
             config=_external_config(),
             system="system",
@@ -110,6 +129,7 @@ def test_source_content_requires_external_allowed_route() -> None:
         )
 
     authorization = _gate(
+        tmp_path,
         input_kind=InputKind.SOURCE_CONTENT,
         model_route=ModelRoute.EXTERNAL_ALLOWED,
         human_approved=True,
@@ -123,9 +143,9 @@ def test_source_content_requires_external_allowed_route() -> None:
     assert authorization.model_route is ModelRoute.EXTERNAL_ALLOWED
 
 
-def test_unallowlisted_model_is_rejected_before_network_use() -> None:
+def test_unallowlisted_model_is_rejected_before_network_use(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="not allowlisted"):
-        _gate(human_approved=True).authorize(
+        _gate(tmp_path, human_approved=True).authorize(
             provider="openai",
             config=_external_config(model="attacker-selected-model"),
             system="system",
@@ -134,10 +154,12 @@ def test_unallowlisted_model_is_rejected_before_network_use() -> None:
         )
 
 
-def test_allowlisted_name_and_model_cannot_use_an_unapproved_endpoint() -> None:
+def test_allowlisted_name_and_model_cannot_use_an_unapproved_endpoint(
+    tmp_path: Path,
+) -> None:
     config = _external_config().model_copy(update={"base_url": "https://attacker.invalid/v1"})
     with pytest.raises(ValueError, match="base URL is not allowlisted"):
-        _gate(human_approved=True).authorize(
+        _gate(tmp_path, human_approved=True).authorize(
             provider="openai",
             config=config,
             system="system",
@@ -146,9 +168,9 @@ def test_allowlisted_name_and_model_cannot_use_an_unapproved_endpoint() -> None:
         )
 
 
-def test_local_provider_remains_automatic_for_unknown_data() -> None:
+def test_local_provider_remains_automatic_for_unknown_data(tmp_path: Path) -> None:
     _, providers = load_provider_configs(Path("config/providers.toml"))
-    gate = _gate(data_class=DataClass.UNKNOWN)
+    gate = _gate(tmp_path, data_class=DataClass.UNKNOWN)
 
     authorization = gate.authorize(
         provider="deepseek_local",
@@ -160,3 +182,34 @@ def test_local_provider_remains_automatic_for_unknown_data() -> None:
 
     assert authorization.external is False
     assert not authorization.human_approved
+
+
+def test_model_client_settles_provider_reported_usage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Response(io.BytesIO):
+        def __enter__(self) -> "Response":
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            self.close()
+
+    class Opener:
+        def open(self, request: object, timeout: float) -> Response:
+            payload = {
+                "choices": [{"message": {"content": "complete"}}],
+                "usage": {"prompt_tokens": 20, "completion_tokens": 5},
+            }
+            return Response(json.dumps(payload).encode())
+
+    monkeypatch.setattr("urllib.request.build_opener", lambda *args: Opener())
+    monkeypatch.setenv("OPENAI_API_KEY", "test-only")
+    gate = _gate(tmp_path)
+    client = ModelClient("openai", _external_config(), gate=gate)
+
+    assert client.complete(system="system", user="user", max_output_tokens=100) == "complete"
+    assert gate.last_settlement is not None
+    assert gate.last_settlement.status == "settled"
+    assert gate.last_settlement.input_tokens_actual == 20
+    assert gate.last_settlement.output_tokens_actual == 5

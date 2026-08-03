@@ -176,8 +176,11 @@ valid NIP-01/NIP-94 events may be attached as file-bound cryptographic evidence.
 
 External model use is separately controlled by a deterministic gate that binds
 the provider, endpoint, model, operation, data class, content route, and exact
-input hash. Automatic external calls remain disabled pending an enforceable
-cost ledger. See [docs/MODEL_USE_POLICY.md](docs/MODEL_USE_POLICY.md).
+input hash. Automatic calls require a transactional budget reservation.
+Subscription and enterprise-accounted services may be excluded from dollar
+totals without bypassing call or token limits. See
+[docs/MODEL_USE_POLICY.md](docs/MODEL_USE_POLICY.md) and
+[docs/BUDGET_POLICY.md](docs/BUDGET_POLICY.md).
 
 ## Tainted-source intelligence
 

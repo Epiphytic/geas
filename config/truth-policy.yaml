@@ -13,6 +13,7 @@ operational_policy_paths:
   - config/research-policy.yaml
   - config/deposit-policy.yaml
   - config/model-policy.yaml
+  - config/budget-policy.yaml
 
 # Pydantic is currently authoritative for operational record envelopes.
 record_schema_paths:
@@ -24,6 +25,7 @@ record_schema_paths:
   - src/research_agent/operator_policy.py
   - src/research_agent/deposits.py
   - src/research_agent/model_policy.py
+  - src/research_agent/budget.py
   - src/research_agent/truth.py
   - src/research_agent/store.py
 

@@ -22,12 +22,9 @@ credentials.
 ## Current external policy
 
 `config/model-policy.yaml` allowlists OpenAI and z.ai endpoints, models,
-operations, and data classes. This allowlist is necessary but not currently
-sufficient for an automatic external call.
-
-Automatic external use is schema-locked off until the operator chooses cost
-thresholds and the system has a persistent usage ledger. Until then, external
-calls require `--approve-external-provider`.
+operations, and data classes. This allowlist is necessary but not sufficient
+for an automatic external call. A transactional reservation must also pass
+`config/budget-policy.yaml`.
 
 Additional fail-closed rules apply:
 
@@ -38,6 +35,8 @@ Additional fail-closed rules apply:
 - external endpoints require HTTPS;
 - providers marked local must use a literal loopback address;
 - model HTTP redirects are rejected;
+- unknown accounting disables automatic use;
+- reservations are made before network I/O and reconciled afterward;
 - credentials, destinations, operations, and authorization fields are never
   accepted from model output or source content.
 
@@ -51,15 +50,14 @@ uv run research-agent research-local "Map this topic" \
   --compiler-provider deepseek_local
 ```
 
-An external compiler requires both a trusted classification and explicit
-approval while automatic calls are disabled:
+An external compiler within the automatic envelope requires a trusted
+classification:
 
 ```bash
 uv run research-agent research-local "Map this topic" \
   --corpus corpus \
   --compiler-provider openai \
-  --compiler-data-class authorized_workspace \
-  --approve-external-provider
+  --compiler-data-class authorized_workspace
 ```
 
 The model compiler receives the research question, controlled vocabulary, and
@@ -75,3 +73,6 @@ route, operation, endpoint, or approval state used by the gate.
 The current CLI approval flag records that approval occurred; it is not proof
 of an authenticated human identity. A later operator decision may select a
 signed or authenticated approval mechanism.
+
+See `docs/BUDGET_POLICY.md` for cost reservations, account exclusions, and
+failure behavior.

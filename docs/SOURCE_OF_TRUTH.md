@@ -6,8 +6,8 @@ The system has one-way authority:
 
 1. Version-controlled ontology and controlled-vocabulary files define semantic
    meaning.
-2. Version-controlled ingestion, research, and source policies define trusted
-   operational defaults.
+2. Version-controlled ingestion, research, model-use, budget, deposit, and
+   source policies define trusted operational defaults.
 3. Version-controlled Pydantic schema source defines operational record
    envelopes and validation.
 4. Immutable, content-addressed JSON records and source blobs preserve knowledge
@@ -19,6 +19,18 @@ The system has one-way authority:
 
 Later layers cannot silently modify earlier layers. In particular, SQLite is
 never reconciled back into ontology files or immutable records.
+
+### Operational ledger exception
+
+“SQLite is disposable” applies to ontology/query projections. The separate
+`usage.sqlite` database is authoritative operational state for budget
+reservations and settlements. It has no authority over ontology meaning,
+claims, evidence, or truth snapshots and is never reconciled into them.
+
+The usage ledger must be protected and backed up as deployment state. A pending
+reservation remains charged conservatively after a failed or interrupted
+request. Agents and model processes receive no direct database-write authority;
+only the deterministic budget component may reserve or settle usage.
 
 The exact canonical paths and reconciliation actions are declared in
 `config/truth-policy.yaml`. A policy change is itself detected as canonical

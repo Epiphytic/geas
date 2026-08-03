@@ -44,6 +44,12 @@ boundary.
   unknown data is local-only, and source content must be explicitly marked
   `external_allowed`. Model text cannot supply or change these authorization
   inputs.
+- Automatic external calls reserve worst-case usage in a transactional SQLite
+  ledger before network I/O. Non-metered account exclusions affect dollar
+  totals only; call caps, token limits, routing rules, and audit records remain.
+- The usage ledger is authoritative only for operational budget enforcement,
+  not ontology truth. Deployment permissions and backups must protect it;
+  model processes and retrieved content have no direct ledger-write path.
 
 The current repository implements the data models, immutable store, deterministic
 policy decision logic, fixed workflow transitions, typed query validation, and

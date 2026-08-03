@@ -119,6 +119,18 @@ class ModelClient:
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
             raise ProviderError(f"{self.name} request failed: {error}") from error
 
+        if self.gate is not None:
+            usage = payload.get("usage") if isinstance(payload, dict) else None
+            input_tokens = usage.get("prompt_tokens") if isinstance(usage, dict) else None
+            output_tokens = usage.get("completion_tokens") if isinstance(usage, dict) else None
+            try:
+                self.gate.settle(
+                    input_tokens=input_tokens if isinstance(input_tokens, int) else None,
+                    output_tokens=output_tokens if isinstance(output_tokens, int) else None,
+                )
+            except ValueError as error:
+                raise ProviderError(f"{self.name} usage settlement failed: {error}") from error
+
         try:
             message = payload["choices"][0]["message"]
             if message.get("tool_calls"):

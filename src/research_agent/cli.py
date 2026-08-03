@@ -4,9 +4,11 @@ import argparse
 import json
 import math
 from pathlib import Path
+from uuid import uuid4
 
 from pydantic_core import to_jsonable_python
 
+from research_agent.budget import BudgetPolicy, UsageLedger
 from research_agent.connectors import LocalFileConnector, MojeekDiscoveryConnector
 from research_agent.deposits import (
     AcquisitionMethod,
@@ -104,6 +106,12 @@ def _build_parser() -> argparse.ArgumentParser:
         default=Path("config/model-policy.yaml"),
         help="deterministic local and external model-use policy",
     )
+    parser.add_argument(
+        "--budget-policy",
+        type=Path,
+        default=Path("config/budget-policy.yaml"),
+        help="automatic external-use envelope and accounting treatment",
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     subparsers.add_parser("providers", help="list configured providers without secrets")
@@ -111,6 +119,7 @@ def _build_parser() -> argparse.ArgumentParser:
     smoke = subparsers.add_parser("model-smoke", help="run a tool-free model smoke test")
     smoke.add_argument("--provider")
     smoke.add_argument("--root", type=Path, default=Path("data"))
+    smoke.add_argument("--run-id")
     smoke.add_argument("--approve-external-provider", action="store_true")
 
     init = subparsers.add_parser("store-init", help="initialize an immutable store")
@@ -206,6 +215,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="trusted classification of compiler input; unknown forbids external use",
     )
     offline.add_argument("--approve-external-provider", action="store_true")
+    offline.add_argument("--run-id")
     offline.add_argument("--topic-branch", default="topic:local")
 
     mojeek = subparsers.add_parser(
@@ -317,7 +327,10 @@ def main() -> None:
                 data_class=DataClass.PUBLIC,
                 input_kind=InputKind.METADATA_ONLY,
                 human_approved=args.approve_external_provider,
+                run_id=args.run_id or f"run:model-smoke:{uuid4()}",
             ),
+            budget_policy=BudgetPolicy.from_yaml(args.budget_policy),
+            usage_ledger=UsageLedger(args.root / "usage.sqlite"),
         )
         client = ModelClient(
             name,
@@ -338,12 +351,19 @@ def main() -> None:
             "model-authorization",
             gate.last_authorization,
         )
+        settlement_hash = (
+            store.put_record("usage-settlement", gate.last_settlement)
+            if gate.last_settlement is not None
+            else None
+        )
         _json(
             {
                 "provider": name,
                 "result": result,
                 "authorization": gate.last_authorization,
                 "authorization_record_hash": authorization_hash,
+                "usage_settlement": gate.last_settlement,
+                "usage_settlement_record_hash": settlement_hash,
             }
         )
         return
@@ -432,7 +452,10 @@ def main() -> None:
                     data_class=args.compiler_data_class,
                     input_kind=InputKind.METADATA_ONLY,
                     human_approved=args.approve_external_provider,
+                    run_id=args.run_id or f"run:research-local:{uuid4()}",
                 ),
+                budget_policy=BudgetPolicy.from_yaml(args.budget_policy),
+                usage_ledger=UsageLedger(args.root / "usage.sqlite"),
             )
             client = ModelClient(
                 args.compiler_provider,
@@ -445,6 +468,8 @@ def main() -> None:
                 manifests={connector.manifest.id: connector.manifest},
             )
             store.put_record("model-authorization", gate.last_authorization)
+            if gate.last_settlement is not None:
+                store.put_record("usage-settlement", gate.last_settlement)
             compiler = CompilerIdentity(
                 id=f"compiler:model:{args.compiler_provider}:{provider.model}",
                 version=ModelQueryCompiler.version,
