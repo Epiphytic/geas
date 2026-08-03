@@ -180,8 +180,8 @@ class DeterministicQueryCompiler:
 
 
 class SQLiteKnowledgeProjection:
-    schema_version = 4
-    builder_version = "sqlite-knowledge-projection/4"
+    schema_version = 5
+    builder_version = "sqlite-knowledge-projection/5"
 
     def __init__(self, *, store: ImmutableStore, workspace_root: Path) -> None:
         self.store = store
@@ -510,6 +510,7 @@ class SQLiteKnowledgeProjection:
                 output_media_type TEXT NOT NULL,
                 parser_id TEXT NOT NULL,
                 parser_version TEXT NOT NULL,
+                parser_runtime TEXT NOT NULL,
                 extraction_scope TEXT NOT NULL,
                 extracted_at TEXT NOT NULL,
                 character_count INTEGER NOT NULL,
@@ -910,7 +911,7 @@ class SQLiteKnowledgeProjection:
         for item in derivations:
             counts["text_derivations"] += 1
             connection.execute(
-                "INSERT INTO text_derivation VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO text_derivation VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     item.id,
                     item.original_source_version_id,
@@ -921,6 +922,7 @@ class SQLiteKnowledgeProjection:
                     item.output_media_type,
                     item.parser_id,
                     item.parser_version,
+                    item.parser_runtime,
                     item.extraction_scope,
                     item.extracted_at.isoformat(),
                     item.character_count,

@@ -5,7 +5,6 @@ import io
 import json
 import re
 import shutil
-import subprocess
 import unicodedata
 import xml.etree.ElementTree as ET
 import zipfile
@@ -13,11 +12,13 @@ from collections.abc import Callable
 from datetime import datetime
 from html.parser import HTMLParser
 from pathlib import PurePosixPath
+from typing import Literal
 
 from pydantic import Field
 
 from research_agent.knowledge import DeterministicThreatScanner
 from research_agent.models import SourceVersion, StrictModel, content_id, utc_now
+from research_agent.sandbox import BubblewrapSandbox, SandboxError
 from research_agent.store import ImmutableStore
 
 
@@ -35,6 +36,9 @@ class TextDerivation(StrictModel):
     output_media_type: str = "text/plain"
     parser_id: str
     parser_version: str
+    parser_runtime: Literal[
+        "in_process_deterministic", "bubblewrap_native", "wasi"
+    ] = "in_process_deterministic"
     extraction_scope: str = "body_text"
     extracted_at: datetime
     character_count: int = Field(ge=0)
@@ -54,6 +58,9 @@ class ParsedText(StrictModel):
     text: str
     parser_id: str
     parser_version: str
+    parser_runtime: Literal[
+        "in_process_deterministic", "bubblewrap_native", "wasi"
+    ] = "in_process_deterministic"
     warnings: tuple[str, ...] = ()
 
 
@@ -85,7 +92,8 @@ class DocumentParserRegistry:
     max_zip_entries = 10_000
     max_zip_uncompressed_bytes = 100_000_000
 
-    def __init__(self) -> None:
+    def __init__(self, *, native_sandbox: BubblewrapSandbox | None = None) -> None:
+        self.native_sandbox = native_sandbox or BubblewrapSandbox()
         self.parsers: dict[str, Callable[[bytes], ParsedText]] = {
             "application/json": self._json,
             "application/pdf": self._pdf,
@@ -224,29 +232,23 @@ class DocumentParserRegistry:
             or bool(re.fullmatch(r"xl/worksheets/sheet[0-9]+\.xml", name))
         )
 
-    @staticmethod
-    def _pdf(content: bytes) -> ParsedText:
+    def _pdf(self, content: bytes) -> ParsedText:
         executable = shutil.which("pdftotext")
         if executable is None:
             raise ParserError("pdftotext is unavailable")
         try:
-            completed = subprocess.run(
-                [executable, "-enc", "UTF-8", "-nopgbrk", "-", "-"],
-                input=content,
-                capture_output=True,
-                timeout=30,
-                check=False,
-                close_fds=True,
-                env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"},
+            output = self.native_sandbox.run(
+                executable,
+                ("-enc", "UTF-8", "-nopgbrk", "-", "-"),
+                input_bytes=content,
             )
-        except subprocess.TimeoutExpired:
-            raise ParserError("PDF text extraction timed out") from None
-        if completed.returncode != 0:
-            raise ParserError("PDF text extraction failed")
+        except SandboxError as error:
+            raise ParserError(str(error)) from None
         return ParsedText(
-            text=completed.stdout.decode("utf-8", errors="replace"),
+            text=output.decode("utf-8", errors="replace"),
             parser_id="parser:poppler-pdftotext",
             parser_version="1",
+            parser_runtime="bubblewrap_native",
             warnings=("images, layout, annotations, actions, and embedded files were discarded",),
         )
 
@@ -317,6 +319,7 @@ class ParsedDocumentManager:
             "derived_source_version_id": derived.id,
             "parser_id": parsed.parser_id,
             "parser_version": parsed.parser_version,
+            "parser_runtime": parsed.parser_runtime,
             "extracted_at": acquired_at,
         }
         derivation = TextDerivation(
@@ -328,6 +331,7 @@ class ParsedDocumentManager:
             input_media_type=media_type,
             parser_id=parsed.parser_id,
             parser_version=parsed.parser_version,
+            parser_runtime=parsed.parser_runtime,
             extracted_at=acquired_at,
             character_count=len(parsed.text),
             warnings=parsed.warnings,
