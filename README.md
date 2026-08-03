@@ -157,6 +157,10 @@ uv run research-agent projection-check \
 SQLite is a rebuildable query projection. It is never a source for automatic
 changes to canonical ontology or knowledge records.
 
+The initial production target is a local single-user CLI with one serialized
+canonical writer and million-claim scale testing. A different graph backend
+requires measured evidence against [the workload contract](docs/WORKLOAD_TARGET.md).
+
 Archive a user-provided source with explicit provenance:
 
 ```bash

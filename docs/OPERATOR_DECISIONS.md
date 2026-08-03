@@ -208,3 +208,20 @@ See `docs/APPROVALS.md`.
   sources, provider content, or referenced third-party datasets.
 
 The complete boundary is documented in `docs/LICENSING.md`.
+
+## 9. Initial workload target
+
+**Status:** accepted on 2026-08-02.
+
+### Decision
+
+- Target a local, single-user CLI for initial production use.
+- Use one serialized canonical writer with bounded parallel research workers
+  and query readers.
+- Benchmark reproducible 10,000-, 100,000-, and 1,000,000-claim fixtures.
+- Prioritize inspectability, deterministic rebuilds, crash recovery, and
+  portability before raw query latency.
+- Defer a production graph-backend migration until measurements or a changed
+  deployment target justify it.
+
+See `docs/WORKLOAD_TARGET.md`.

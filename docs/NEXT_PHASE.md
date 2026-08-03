@@ -344,6 +344,7 @@ Each research run should produce:
 Reports are optional projections of a selected snapshot. The reusable result is
 the persistent, queryable knowledge state and its audit history.
 
-## Decisions still requiring operator input
+## Deferred operator decision
 
-- Production graph backend after the SQLite vertical slice is measured.
+- Select a production graph backend only after the SQLite vertical slice is
+  measured against `config/workload-policy.yaml`.
