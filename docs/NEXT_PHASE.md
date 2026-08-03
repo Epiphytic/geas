@@ -268,10 +268,11 @@ tools or write authority.
 
 ### M2 — scholarly and identifier discovery
 
-**Status: partially implemented.**
+**Status: in progress; Crossref and OpenAlex discovery are implemented.**
 
 - [x] Implement Crossref discovery.
-- [ ] Implement OpenAlex discovery; the current API requires an operator API key.
+- [x] Implement authenticated OpenAlex discovery with transactional cost
+  reservation, reported-cost settlement, and CC0 metadata persistence.
 - [x] Add deterministic DOI normalization.
 - [ ] Add PMID, ORCID, ROR, ISSN, and broader URL normalization.
 - Implement Unpaywall and Europe PMC resolution/acquisition.

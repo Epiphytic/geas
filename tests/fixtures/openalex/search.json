@@ -1,0 +1,64 @@
+{
+  "meta": {
+    "count": 2,
+    "db_response_time_ms": 12,
+    "page": null,
+    "per_page": 10,
+    "next_cursor": "fixture-next",
+    "cost_usd": 0.001
+  },
+  "results": [
+    {
+      "id": "https://openalex.org/W4401234567",
+      "doi": "https://doi.org/10.1002/14651858.CD010856.pub3",
+      "display_name": "Water fluoridation for the prevention of dental caries",
+      "publication_date": "2024-10-04",
+      "type": "review",
+      "language": "en",
+      "cited_by_count": 24,
+      "is_retracted": false,
+      "referenced_works_count": 157,
+      "relevance_score": 98.5,
+      "authorships": [
+        {
+          "author": {
+            "id": "https://openalex.org/A501",
+            "display_name": "Zipporah Iheozor-Ejiofor"
+          }
+        },
+        {
+          "author": {
+            "id": "https://openalex.org/A502",
+            "display_name": "Tanya Walsh"
+          }
+        }
+      ],
+      "primary_location": {
+        "landing_page_url": "https://doi.org/10.1002/14651858.CD010856.pub3",
+        "source": {
+          "id": "https://openalex.org/S4210203846",
+          "display_name": "Cochrane Database of Systematic Reviews"
+        },
+        "license": "cc-by"
+      },
+      "open_access": {
+        "is_oa": true,
+        "oa_status": "gold",
+        "oa_url": "https://doi.org/10.1002/14651858.CD010856.pub3"
+      }
+    },
+    {
+      "id": "https://evil.example/W999",
+      "doi": null,
+      "display_name": "Malformed upstream work",
+      "cited_by_count": 0,
+      "referenced_works_count": 0,
+      "relevance_score": 1,
+      "authorships": [],
+      "open_access": {
+        "is_oa": false
+      }
+    }
+  ],
+  "group_by": []
+}

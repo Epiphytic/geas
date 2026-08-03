@@ -18,6 +18,7 @@ from research_agent.connectors import (
     CrossrefDiscoveryConnector,
     LocalFileConnector,
     MojeekDiscoveryConnector,
+    OpenAlexDiscoveryConnector,
 )
 from research_agent.deposits import (
     AcquisitionMethod,
@@ -285,6 +286,23 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     crossref.add_argument("--result-limit", type=int, default=20)
     crossref.add_argument("--approve-budget", action="store_true")
+
+    openalex = subparsers.add_parser(
+        "discover-openalex",
+        help="run authenticated OpenAlex scholarly metadata discovery",
+    )
+    openalex.add_argument("question")
+    openalex.add_argument("--root", type=Path, default=Path("data"))
+    openalex.add_argument("--term", action="append", default=[])
+    openalex.add_argument("--concept", action="append", default=[])
+    openalex.add_argument(
+        "--vocabulary",
+        type=Path,
+        default=Path("config/query-vocabulary.yaml"),
+    )
+    openalex.add_argument("--result-limit", type=int, default=20)
+    openalex.add_argument("--approve-budget", action="store_true")
+    openalex.add_argument("--run-id")
 
     truth_snapshot = subparsers.add_parser(
         "truth-snapshot",
@@ -631,7 +649,7 @@ def main() -> None:
         ).validate(
             proposal,
             compiler=compiler,
-            human_approved=args.approve_budget,
+            human_approved=False,
         )
         result = OfflineResearchRunner(store=store, connector=connector).run(
             plan,
@@ -711,6 +729,10 @@ def main() -> None:
         return
 
     if args.command == "discover-crossref":
+        research_policy = ResearchPolicy.from_yaml(args.research_policy)
+        provider_policy = research_policy.domain_index("connector:crossref")
+        if not provider_policy.enabled:
+            raise ValueError("Crossref is disabled by the research policy")
         connector = CrossrefDiscoveryConnector()
         vocabulary = ConceptVocabulary.from_yaml(args.vocabulary)
         base = deterministic_proposal(
@@ -728,7 +750,10 @@ def main() -> None:
                     ConnectorCapability.METADATA,
                 ],
                 "result_limit": args.result_limit,
-                "page_limit": min(20, math.ceil(args.result_limit / 100)),
+                "page_limit": min(
+                    provider_policy.max_requests_per_run,
+                    math.ceil(args.result_limit / 100),
+                ),
             }
         )
         plan = QueryPlanValidator(
@@ -743,6 +768,7 @@ def main() -> None:
         store = ImmutableStore(args.root)
         store.initialize()
         record_hashes = {
+            "research-policy": (store.put_record("research-policy", research_policy),),
             "query-plan": (store.put_record("query-plan", plan),),
             "connector-manifest": (store.put_record("connector-manifest", connector.manifest),),
             "discovery-run": (store.put_record("discovery-run", execution.discovery_run),),
@@ -756,9 +782,101 @@ def main() -> None:
                 "discovery_run": execution.discovery_run,
                 "hits": execution.hits,
                 "persistence": {
-                    "normalized_metadata": True,
-                    "raw_response": False,
+                    "normalized_metadata": provider_policy.persist_normalized_metadata,
+                    "metadata_license": provider_policy.metadata_license,
+                    "raw_response_retention_days": (
+                        provider_policy.raw_response_retention_days
+                    ),
                     "note": "Bibliographic metadata is discovery, not claim evidence.",
+                },
+                "record_hashes": record_hashes,
+            }
+        )
+        return
+
+    if args.command == "discover-openalex":
+        research_policy = ResearchPolicy.from_yaml(args.research_policy)
+        provider_policy = research_policy.domain_index("connector:openalex")
+        if not provider_policy.enabled:
+            raise ValueError("OpenAlex is disabled by the research policy")
+        load_env_file(
+            args.env_file,
+            allowed_names=frozenset({provider_policy.credential_env}),
+        )
+        run_id = args.run_id or f"openalex:{uuid4()}"
+        store = ImmutableStore(args.root)
+        store.initialize()
+        connector = OpenAlexDiscoveryConnector(
+            usage_ledger=UsageLedger(args.root / "usage.sqlite"),
+            budget_policy=BudgetPolicy.from_yaml(args.budget_policy),
+            run_id=run_id,
+            human_approved=args.approve_budget,
+            max_calls_per_run=provider_policy.max_requests_per_run,
+            daily_cost_ceiling_microusd=math.floor(
+                (provider_policy.daily_free_allowance_usd or 0) * 1_000_000
+            ),
+        )
+        vocabulary = ConceptVocabulary.from_yaml(args.vocabulary)
+        base = deterministic_proposal(
+            args.question,
+            connector_id=connector.manifest.id,
+            concept_ids=tuple(args.concept),
+        )
+        proposal = QueryProposal.model_validate(
+            {
+                **base.model_dump(mode="json"),
+                "exact_terms": args.term or base.exact_terms,
+                "source_classes": [SourceClass.SCHOLARLY],
+                "capabilities": [
+                    ConnectorCapability.DISCOVERY,
+                    ConnectorCapability.METADATA,
+                ],
+                "result_limit": args.result_limit,
+                "page_limit": min(
+                    provider_policy.max_requests_per_run,
+                    math.ceil(args.result_limit / 100),
+                ),
+            }
+        )
+        plan = QueryPlanValidator(
+            vocabulary=vocabulary,
+            manifests={connector.manifest.id: connector.manifest},
+        ).validate(
+            proposal,
+            compiler=CompilerIdentity(id="compiler:deterministic-lexical", version="1"),
+            human_approved=args.approve_budget,
+        )
+        execution = DiscoveryExecutor().run(plan, connector)
+        record_hashes = {
+            "research-policy": (store.put_record("research-policy", research_policy),),
+            "query-plan": (store.put_record("query-plan", plan),),
+            "connector-manifest": (store.put_record("connector-manifest", connector.manifest),),
+            "discovery-run": (store.put_record("discovery-run", execution.discovery_run),),
+        }
+        if provider_policy.persist_normalized_metadata:
+            record_hashes["discovery-hit"] = tuple(
+                store.put_record("discovery-hit", hit) for hit in execution.hits
+            )
+        _json(
+            {
+                "run_id": run_id,
+                "query_plan": plan,
+                "discovery_run": execution.discovery_run,
+                "hits": execution.hits,
+                "persistence": {
+                    "normalized_metadata": provider_policy.persist_normalized_metadata,
+                    "metadata_license": provider_policy.metadata_license,
+                    "raw_response_retention_days": (
+                        provider_policy.raw_response_retention_days
+                    ),
+                    "note": "OpenAlex metadata is discovery, not claim evidence.",
+                },
+                "cost_control": {
+                    "transactional_ledger": str((args.root / "usage.sqlite").resolve()),
+                    "reported_cost_microusd": (
+                        execution.discovery_run.reported_cost_microusd
+                    ),
+                    "daily_ceiling_usd": provider_policy.daily_free_allowance_usd,
                 },
                 "record_hashes": record_hashes,
             }

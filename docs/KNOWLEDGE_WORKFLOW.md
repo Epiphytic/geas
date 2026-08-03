@@ -37,6 +37,22 @@ uv run research-agent discover-crossref \
   --root data
 ```
 
+OpenAlex adds authenticated, CC0 scholarly metadata including stable OpenAlex
+and DOI identifiers, authorship, retraction status, citation/reference counts,
+and open-access state. API usage is reserved and settled transactionally:
+
+```bash
+uv run research-agent --env-file .env discover-openalex \
+  "community water fluoridation neurodevelopment" \
+  --concept concept:community-water-fluoridation \
+  --term "community water fluoridation" \
+  --term "fluoride neurodevelopment IQ" \
+  --root data
+```
+
+The API response body is hashed for audit but not retained. Normalized metadata
+is discovery—not evidence—and linked full text retains its own license.
+
 Mojeek remains a discovery-only fallback. Its transient hits are not persisted
 until the operator confirms the account's storage terms:
 

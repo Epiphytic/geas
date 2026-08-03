@@ -4,7 +4,11 @@ from pathlib import Path
 
 import pytest
 
-from research_agent.connectors import CrossrefDiscoveryConnector, LocalFileConnector
+from research_agent.connectors import (
+    CrossrefDiscoveryConnector,
+    LocalFileConnector,
+    OpenAlexDiscoveryConnector,
+)
 from research_agent.discovery import (
     CompilerIdentity,
     ConnectorCapability,
@@ -42,6 +46,11 @@ INSTANT = datetime(2026, 8, 2, 12, 0, tzinfo=UTC)
 class _CrossrefFixtureTransport:
     def request(self, parameters: dict[str, str]) -> bytes:
         return Path("tests/fixtures/crossref/search.json").read_bytes()
+
+
+class _OpenAlexFixtureTransport:
+    def request(self, parameters: dict[str, str]) -> bytes:
+        return Path("tests/fixtures/openalex/search.json").read_bytes()
 
 
 def _researched_store(tmp_path: Path) -> tuple[ImmutableStore, object]:
@@ -87,6 +96,34 @@ def _researched_store(tmp_path: Path) -> tuple[ImmutableStore, object]:
     store.put_record("connector-manifest", crossref.manifest)
     store.put_record("discovery-run", scholarly.discovery_run)
     for hit in scholarly.hits:
+        store.put_record("discovery-hit", hit)
+
+    openalex = OpenAlexDiscoveryConnector(_OpenAlexFixtureTransport())
+    openalex_plan = QueryPlanValidator(
+        vocabulary=ConceptVocabulary(concepts={}),
+        manifests={openalex.manifest.id: openalex.manifest},
+    ).validate(
+        QueryProposal(
+            question="community water fluoridation dissent",
+            exact_terms=("community water fluoridation", "neurodevelopment"),
+            source_classes=frozenset({SourceClass.SCHOLARLY}),
+            connector_ids=(openalex.manifest.id,),
+            capabilities=frozenset(
+                {ConnectorCapability.DISCOVERY, ConnectorCapability.METADATA}
+            ),
+            result_limit=10,
+            page_limit=1,
+        ),
+        compiler=CompilerIdentity(id="compiler:fixture", version="1"),
+    )
+    openalex_results = DiscoveryExecutor(clock=lambda: INSTANT).run(
+        openalex_plan,
+        openalex,
+    )
+    store.put_record("query-plan", openalex_plan)
+    store.put_record("connector-manifest", openalex.manifest)
+    store.put_record("discovery-run", openalex_results.discovery_run)
+    for hit in openalex_results.hits:
         store.put_record("discovery-hit", hit)
     return store, result
 
@@ -161,10 +198,16 @@ def test_projection_supports_lexical_hierarchy_dissent_gaps_and_provenance(
         record_types=(QueryRecordType.DISCOVERY,),
         limit=10,
     )
+    openalex_metadata = engine.query(
+        "openalex cited_by_count gold",
+        record_types=(QueryRecordType.DISCOVERY,),
+        limit=10,
+    )
     topic = engine.topic("concept:community-water-fluoridation")
 
     assert query.projection_snapshot_id == snapshot.id
     assert any("prevention of dental caries" in hit.title for hit in scholarly.hits)
+    assert any("prevention of dental caries" in hit.title for hit in openalex_metadata.hits)
     assert query.plan.compiler_version == "deterministic-local-query/1"
     assert "MATCH ?" in query.plan.sql
     assert {hit.record_type for hit in query.hits} >= {
@@ -183,7 +226,7 @@ def test_projection_supports_lexical_hierarchy_dissent_gaps_and_provenance(
     assert build.counts["claims"] == 7
     assert build.counts["topic_source_associations"] == 5
     assert build.counts["threat_observations"] == 3
-    assert build.counts["discovery_hits"] == 6
+    assert build.counts["discovery_hits"] == 7
     markdown = render_topic_markdown(topic)
     assert "## Dissent and controversy" in markdown
     assert "## Knowledge gaps" in markdown

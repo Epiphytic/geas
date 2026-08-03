@@ -2,7 +2,7 @@
 
 ## Conservative automatic envelope
 
-External model calls may run automatically only after a transactional
+External model and supported metered search calls may run automatically only after a transactional
 reservation succeeds in `data/usage.sqlite`. The checked-in limits are:
 
 - US$0.25 reserved cost per call;
@@ -53,11 +53,15 @@ The accounting vocabulary is service-neutral and includes model, search, and
 other usage. A search account may likewise be classified as metered,
 subscription-included, or covered by an enterprise commitment.
 
-The initial transactional adapter is connected to model calls. Mojeek retains
-its existing hard per-run request cap, while its monthly cost enforcement and
-generic search-ledger adapter remain disabled until the account's tier and unit
-accounting are confirmed. Excluding search cost in the future will not remove
-its request caps.
+The OpenAlex adapter reserves US$0.001 before each request, enforces its
+operator-configured 10-call run cap and US$1 UTC-day provider ceiling, then
+settles against `meta.cost_usd`. A provider cost above the reservation is
+recorded as an overrun and its response is rejected. Transport or parsing
+failures leave the conservative reservation charged.
+
+Mojeek retains its existing hard per-run request cap, while its monthly cost
+enforcement remains disabled until the account's tier and unit accounting are
+confirmed. Excluding search cost in the future will not remove request caps.
 
 ## Human overrides
 

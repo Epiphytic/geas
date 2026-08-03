@@ -18,7 +18,8 @@ slice:
 - connector capability manifests and narrow discovery/acquisition contracts;
 - deterministic query validation with controlled synonyms and budget clamps;
 - path-confined local-file discovery and acquisition;
-- public Crossref scholarly discovery with DOI, author, publisher, and date normalization;
+- Crossref and authenticated OpenAlex scholarly discovery with normalized
+  identifiers, authorship, publication, open-access, citation, and cost metadata;
 - reviewed knowledge-pack import with exact source selectors;
 - deterministic indirect-prompt-injection scanning and topic-scoped tainted-source records;
 - content-addressed, inspectable JSON record batches for larger claim sets;
@@ -148,6 +149,24 @@ This command is discovery-only. It retains the query plan, aggregate run record,
 and response hashes. Normalized hits are not persisted until the operator
 confirms that the Mojeek subscription has storage rights. Search hits and
 snippets are never evidence.
+
+Run authenticated OpenAlex discovery using `OPENALEX_API_KEY` from the same
+ignored file:
+
+```bash
+uv run research-agent --env-file .env discover-openalex \
+  "community water fluoridation neurodevelopment" \
+  --concept concept:community-water-fluoridation \
+  --term "community water fluoridation" \
+  --term "fluoride neurodevelopment IQ" \
+  --result-limit 20
+```
+
+OpenAlex metadata is persisted under CC0; linked content is not downloaded.
+Every API request is transactionally reserved before network access and settled
+from the response's reported cost. The checked-in policy caps OpenAlex at 10
+requests per run and its US$1 daily API allowance. Raw responses and credentials
+are never placed in the knowledge store.
 
 Capture canonical state and detect later ontology, record, blob, or SQLite
 projection drift:

@@ -77,11 +77,13 @@ class DiscoveryExecutor:
         page_count = 0
         empty_pages = 0
         truncated = False
+        reported_cost_microusd = 0
         termination = "connector_exhausted"
         for page in connector.discover(request):
             page_count += 1
             rejection_count += page.rejected_count
             error_count += page.error_count
+            reported_cost_microusd += page.reported_cost_microusd
             if page.cursor is not None:
                 cursors.append(page.cursor)
             if page.response_sha256 is not None:
@@ -128,6 +130,7 @@ class DiscoveryExecutor:
             "rejection_count": rejection_count,
             "error_count": error_count,
             "truncated": truncated,
+            "reported_cost_microusd": reported_cost_microusd,
             "executor_version": self.version,
         }
         discovery_run = DiscoveryRun(
@@ -146,6 +149,7 @@ class DiscoveryExecutor:
             rejection_count=rejection_count,
             error_count=error_count,
             truncated=truncated,
+            reported_cost_microusd=reported_cost_microusd,
         )
         hits = tuple(
             self._hit(candidate, discovery_run.id, rank)
@@ -165,6 +169,8 @@ class DiscoveryExecutor:
             "media_type": candidate.media_type,
             "language": candidate.language,
             "snippet": candidate.snippet,
+            "known_entity_ids": candidate.known_entity_ids,
+            "metadata": candidate.metadata,
             "discovery_run_id": run_id,
         }
         return DiscoveryHit(
@@ -180,7 +186,9 @@ class DiscoveryExecutor:
             upstream_rank=rank,
             snippet=candidate.snippet,
             discovery_run_id=run_id,
+            known_entity_ids=candidate.known_entity_ids,
             acquisition_eligible=True,
+            metadata=candidate.metadata,
         )
 
 

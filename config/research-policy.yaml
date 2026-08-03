@@ -1,4 +1,4 @@
-version: 1
+version: 2
 
 # Discovery rankings and snippets identify candidates; they never support claims.
 general_search_results_are_evidence: false
@@ -14,6 +14,30 @@ open_source_acquisition_order:
   - common_crawl
   - allowlisted_public_web
   - user_deposit
+
+domain_index_providers:
+  - connector_id: connector:crossref
+    enabled: true
+    priority: 1
+    credential_env: ""
+    metadata_license: Crossref public metadata; publisher abstracts excluded
+    persist_normalized_metadata: true
+    raw_response_retention_days: 0
+    max_requests_per_run: 20
+    cost_accounting: none
+
+  - connector_id: connector:openalex
+    enabled: true
+    priority: 2
+    credential_env: OPENALEX_API_KEY
+    metadata_license: CC0-1.0
+    persist_normalized_metadata: true
+    raw_response_retention_days: 0
+    max_requests_per_run: 10
+    # Calls are reserved transactionally before network access and settled from
+    # the API-reported cost. The allowance is a hard provider-specific ceiling.
+    cost_accounting: provider_reported_only
+    daily_free_allowance_usd: 1.0
 
 general_search_providers:
   - connector_id: connector:mojeek
