@@ -33,16 +33,30 @@ def render_topic_markdown(topic: TopicView) -> str:
 
     lines.extend(("## Sources", ""))
     for source in topic.sources:
+        authors = source.get("authors_json") or "[]"
         lines.extend(
             (
-                f"### `{source['id']}`",
+                f"### {source.get('title') or source['id']}",
                 "",
-                f"- Locator: {source['source_uri']}",
+                f"- Source version: `{source['id']}`",
+                f"- Archived locator: {source['source_uri']}",
+                f"- Original locator: {source.get('original_locator') or 'unknown'}",
+                f"- Authors: {authors}",
+                f"- Authorship status: `{source.get('authorship_status') or 'unknown'}`",
+                f"- Publisher: {source.get('publisher') or 'unknown'}",
+                f"- Published: {source.get('published_at') or 'unknown'}",
                 f"- Acquired: {source['acquired_at']}",
                 f"- Content SHA-256: `{source['content_sha256']}`",
                 f"- Connector: `{source['connector_id']}`",
                 f"- Trust zone: `{source['trust_zone']}`",
                 f"- License: {source['license'] or 'unknown'}",
+                f"- License status: `{source.get('license_status') or 'unknown'}`",
+                (
+                    "- Usage conditions: "
+                    f"{source.get('usage_conditions_json') or 'unknown'}"
+                ),
+                f"- Rights basis: {source.get('rights_basis') or 'unknown'}",
+                f"- Provenance: {source.get('provenance_note') or 'unknown'}",
                 f"- Topic roles: {source['roles_json']}",
                 "",
             )
@@ -93,6 +107,35 @@ def render_topic_markdown(topic: TopicView) -> str:
                 f"- Priority: {gap['priority']}",
                 f"- Freshness deadline: {gap['freshness_deadline'] or 'none'}",
                 f"- Related claims: {gap['related_claim_ids'] or 'none'}",
+                "",
+            )
+        )
+
+    lines.extend(("## Citation and reference graph", ""))
+    if not topic.references:
+        lines.extend(("No topic-scoped citation references.", ""))
+    for reference in topic.references:
+        lines.extend(
+            (
+                (
+                    f"### `{reference['relation']}` "
+                    f"`{reference['identifier_kind']}:{reference['identifier_value']}`"
+                ),
+                "",
+                f"- Canonical locator: {reference['canonical_locator']}",
+                f"- Source: `{reference['source_id']}` ({reference['source_uri']})",
+                f"- Structural anchor: `{reference['structural_anchor_id']}`",
+                f"- Page: {reference['page_number'] or 'unknown'}",
+                f"- Exact range: {reference['start']}..{reference['end']}",
+                f"- Deterministic signal: `{reference['signal']}`",
+                (
+                    "- Matched discovery records: "
+                    f"{reference['resolved_discovery_hit_ids'] or 'none'}"
+                ),
+                (
+                    "- Matched open-access resolutions: "
+                    f"{reference['resolved_open_access_resolution_ids'] or 'none'}"
+                ),
                 "",
             )
         )

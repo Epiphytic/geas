@@ -16,6 +16,7 @@ from typing import Literal
 
 from pydantic import Field
 
+from research_agent.citations import CitationDocumentManager
 from research_agent.knowledge import DeterministicThreatScanner
 from research_agent.models import SourceVersion, StrictModel, content_id, utc_now
 from research_agent.sandbox import BubblewrapSandbox, SandboxError
@@ -52,6 +53,9 @@ class ParsedIngestReceipt(StrictModel):
     derivation_id: str
     structural_derivation_id: str
     structural_anchor_ids: tuple[str, ...]
+    citation_derivation_id: str
+    research_identifier_ids: tuple[str, ...] = ()
+    bibliographic_reference_ids: tuple[str, ...] = ()
     evidence_fragment_ids: tuple[str, ...] = ()
     threat_observation_ids: tuple[str, ...] = ()
     record_hashes: dict[str, tuple[str, ...]]
@@ -333,9 +337,10 @@ class ParsedDocumentManager:
         media_type: str,
         connector_id: str,
         license: str | None,
+        acquired_at: datetime | None = None,
     ) -> ParsedIngestReceipt:
         self.store.initialize()
-        acquired_at = self.clock()
+        acquired_at = acquired_at or self.clock()
         original = SourceVersion.from_bytes(
             source_uri=source_uri,
             content=content,
@@ -416,6 +421,10 @@ class ParsedDocumentManager:
             input_media_type=media_type,
             extracted_at=acquired_at,
         )
+        citations = CitationDocumentManager(
+            store=self.store,
+            clock=self.clock,
+        ).derive_stored(structure.structural_derivation_id)
         hashes = {
             "source-version": tuple(
                 dict.fromkeys((original_record_hash, derived_record_hash))
@@ -425,12 +434,16 @@ class ParsedDocumentManager:
             "threat-observation": observation_hashes,
         }
         hashes.update(structure.record_hashes)
+        hashes.update(citations.record_hashes)
         return ParsedIngestReceipt(
             original_source_version_id=original.id,
             derived_source_version_id=derived.id,
             derivation_id=derivation.id,
             structural_derivation_id=structure.structural_derivation_id,
             structural_anchor_ids=structure.structural_anchor_ids,
+            citation_derivation_id=citations.citation_derivation_id,
+            research_identifier_ids=citations.research_identifier_ids,
+            bibliographic_reference_ids=citations.bibliographic_reference_ids,
             evidence_fragment_ids=tuple(item.id for item in fragments),
             threat_observation_ids=tuple(item.id for item in observations),
             record_hashes=hashes,

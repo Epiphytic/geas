@@ -96,8 +96,9 @@ records connected by a `TextDerivation`. Preferred locations that deny access
 fall through to the next licensed manifestation. Unsupported formats preserve
 the original and create a parser constraint. Successful text derivation also
 creates immutable document, page, section, heading, paragraph, list-item,
-footnote, and caption anchors with exact offsets. The same parsing pipeline can
-be used for an operator-selected local file:
+footnote, and caption anchors with exact offsets. It then derives normalized
+identifier nodes and conservative citation relations tied to those anchors.
+The same parsing pipeline can be used for an operator-selected local file:
 
 ```bash
 uv run research-agent parse-document paper.pdf \
@@ -107,7 +108,8 @@ uv run research-agent parse-document paper.pdf \
 
 Re-run the versioned structural extractor over an existing text derivation with
 `derive-structure`. Identical input and extractor configuration produce the same
-derivation and anchor identities.
+derivation and anchor identities. `derive-citations` idempotently re-runs the
+citation layer over a stored structural derivation.
 
 Mojeek remains a discovery-only fallback. Its transient hits are not persisted
 until the operator confirms the account's storage terms:
@@ -133,6 +135,34 @@ Source text is scanned as inert bytes by fixed rules. Matches create suspected
 threat observations and topic/source associations. No model sees the text in
 order to make the security decision, and a suspected source cannot support a
 claim through this import path.
+
+A maintained bundle adds confined, hash-pinned source files and complete source
+metadata to the same import path:
+
+```bash
+uv run research-agent bundle-import \
+  ontology/open-source-research-agents/bundle.yaml \
+  --root data \
+  --imported-by operator:alice
+```
+
+See [MAINTAINED_ONTOLOGIES.md](MAINTAINED_ONTOLOGIES.md).
+
+Ask the default local DeepSeek provider for a proposal grounded only in
+operator-selected exact leaf anchors:
+
+```bash
+uv run research-agent propose-extraction \
+  structural-derivation:sha256:... \
+  --anchor structural-anchor:sha256:... \
+  --question "Which supported claims and gaps are present?" \
+  --concept concept:topic \
+  --root data
+```
+
+Validated output remains `proposed` with no commit authority. It is searchable
+with `knowledge-query --kind proposal` but cannot enter accepted topic claims.
+See [MODEL_EXTRACTION.md](MODEL_EXTRACTION.md).
 
 ## Snapshot and projection
 
@@ -177,7 +207,9 @@ uv run research-agent knowledge-query \
 
 Select `--kind anchor` to search exact document blocks and headings. Results
 remain deterministic FTS snippets tied to immutable anchor IDs and source
-ranges.
+ranges. `--kind reference` and `--kind identifier` search the citation graph.
+Use `identifier-show` for exact inbound traversal and exact joins to discovery
+or open-access metadata.
 
 An exact topic view traverses descendants with a recursive CTE and joins claims
 to exact evidence and source versions. It also returns topic-scoped sources,
@@ -201,3 +233,12 @@ uv run research-agent topic-export \
 
 The generated page is a projection, not a report of record and not canonical.
 It explicitly marks source/evidence content as untrusted data.
+
+Run a model-free maintenance audit with an explicit time:
+
+```bash
+uv run research-agent knowledge-audit \
+  --root data \
+  --as-of 2026-08-03T16:00:00+00:00 \
+  --fail-on-error
+```

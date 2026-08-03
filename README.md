@@ -31,6 +31,15 @@ slice:
   text, JSON, HTML, XML, OpenDocument/OpenXML office files, and PDF;
 - immutable document/page/section/heading/block anchors with exact offsets,
   hierarchy, and deterministic full-text projection;
+- deterministic DOI, PMID, PMCID, arXiv, and public-URL references linked to
+  exact anchors and exact discovery/open-access metadata matches;
+- SHA-256-pinned maintained ontology bundles with source authorship, license,
+  usage, rights, and provenance metadata;
+- deterministic maintenance audits for tainted evidence, dissent quality,
+  freshness deadlines, missing evidence, and retraction signals;
+- proposal-only local DeepSeek extraction grounded in operator-selected exact
+  anchors, with deterministic schema, scope, hierarchy, and quote validation;
+- an executable maintained ontology of open-source research agents;
 - a tool-free client for local DeepSeek and optional external providers;
 - a starter LinkML ontology and a maintained upstream intelligence registry;
 - tests for the principal prompt-injection security invariants.
@@ -222,7 +231,25 @@ uv run research-agent acquire-open-access \
 Original bytes remain immutable. Parsed text is a separate quarantined,
 content-addressed derivation with parser provenance and deterministic threat
 scanning. Stable structural anchors are generated automatically and can be
-searched with `knowledge-query --kind anchor`. See
+searched with `knowledge-query --kind anchor`. Citation identifiers and
+relations are also generated automatically. Traverse one identifier exactly:
+
+```bash
+uv run research-agent identifier-show \
+  doi 10.18653/v1/2024.naacl-long.347 \
+  --database data/query.sqlite
+```
+
+Build and exercise the maintained open-source research-agent ontology:
+
+```bash
+demo_root=$(mktemp -d /tmp/research-agent-demo.XXXXXX)
+./ontology/open-source-research-agents/demo.sh "$demo_root"
+```
+
+See [docs/CITATION_GRAPH.md](docs/CITATION_GRAPH.md),
+[docs/MAINTAINED_ONTOLOGIES.md](docs/MAINTAINED_ONTOLOGIES.md),
+[docs/MODEL_EXTRACTION.md](docs/MODEL_EXTRACTION.md),
 [docs/PARSING.md](docs/PARSING.md) and
 [docs/STRUCTURAL_DERIVATIONS.md](docs/STRUCTURAL_DERIVATIONS.md).
 

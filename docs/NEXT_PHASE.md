@@ -268,18 +268,23 @@ tools or write authority.
 
 ### M2 — scholarly and identifier discovery
 
-**Status: in progress; Crossref and OpenAlex discovery are implemented.**
+**Status: in progress; deterministic citation extraction and exact metadata
+resolution are also implemented.**
 
 - [x] Implement Crossref discovery.
 - [x] Implement authenticated OpenAlex discovery with transactional cost
   reservation, reported-cost settlement, and CC0 metadata persistence.
 - [x] Add deterministic DOI normalization.
 - [x] Add deterministic PMID, PMCID, ORCID, ROR, and ISSN normalization.
-- [ ] Add broader canonical URL normalization.
+- [x] Add conservative canonical public-URL normalization for citation records.
 - [x] Implement Europe PMC lite bibliographic discovery.
 - [x] Implement Unpaywall DOI resolution with location-level license gates.
 - [x] Implement license-aware Unpaywall content acquisition with immutable
   originals and quarantined derived text.
+- [x] Extract DOI, PMID, PMCID, arXiv, and URL reference nodes with exact
+  structural anchors and conservative relation types.
+- [x] Join references to discovery and open-access records by exact normalized
+  identity without fuzzy entity inference.
 - Implement direct license-aware Europe PMC content acquisition.
 - Represent works separately from manifestations.
 - Add citation-following with depth and budget limits.
@@ -330,6 +335,8 @@ that format without changing canonical records.
   headings, paragraphs, lists, footnotes, and captions.
 - [x] Verify exact structural selectors during projection and expose them as an
   FTS record class.
+- [x] Add identifier, reference, exact-resolution, and source-provenance tables.
+- [x] Add exact identifier traversal and topic-scoped citation views.
 - [x] Generate topic, controversy, provenance, threat, and gap pages.
 - Add optional Semble indexing over generated pages.
 
@@ -343,6 +350,9 @@ distinguishes unknown, inaccessible, contradicted, and false.
 
 - [x] Convert reviewed missing coverage into explicit gap records.
 - [x] Store deterministic operator-assigned gap priority, status, and freshness.
+- [x] Audit overdue gaps, missing evidence, tainted accepted evidence, weakly
+  represented dissent, and explicit retraction signals.
+- [x] Add SHA-256-pinned maintained ontology bundles and an end-to-end example.
 - [ ] Rank proposals automatically by expected coverage gain, source diversity,
   age, and cost.
 - Add standing query plans and freshness deadlines.
@@ -352,6 +362,26 @@ distinguishes unknown, inaccessible, contradicted, and false.
 **Acceptance:** the system can state which declared sources it searched, what
 was inaccessible, which branches are stale, and which bounded search would most
 improve coverage.
+
+### M6 — model-assisted ontology proposals
+
+**Status: proposal-only anchor-grounded extraction is implemented.**
+
+- [x] Select exact structural leaf anchors outside the model.
+- [x] Use local DeepSeek by default through the tool-free model client.
+- [x] Validate strict concepts, claims, controversies, gaps, concept scope,
+  hierarchy cycles, anchor membership, exact quotes, ranges, and hashes.
+- [x] Force proposals to remain `proposed` with no commit authority.
+- [x] Retain sanitized request and failure audit records without invalid raw
+  model output.
+- [x] Index valid proposals as a visibly separate SQLite query class.
+- [ ] Define the operator-approved review and promotion workflow.
+- [ ] Add conflict analysis against already accepted claims.
+- [ ] Connect reviewed gap records to bounded extraction tasks.
+
+**Acceptance for promotion:** no proposal becomes accepted knowledge without a
+deterministic review receipt bound to exact proposal and evidence hashes. The
+promotion policy is an operator decision.
 
 ## Test strategy
 

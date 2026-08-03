@@ -1,6 +1,6 @@
 # Persistent, ontology-backed research agents
 
-**Investigation date:** 2026-08-02
+**Investigation date:** 2026-08-03
 
 **Goal:** A broad, precise, searchable, continuously maintainable understanding
 of a topic, including provenance, uncertainty, dissent, freshness, and
@@ -114,6 +114,27 @@ opaque web search harms reproducibility and introduces a fixed corpus to
 separate retriever and agent quality
 ([paper](https://arxiv.org/abs/2508.06600)). These are valuable evaluations, but
 they do not test whether a system maintains a coherent ontology for years.
+
+The maintained executable survey in
+[`ontology/open-source-research-agents/`](ontology/open-source-research-agents/)
+adds pinned 2026 observations for GPT Researcher, STORM/Co-STORM, LangChain Open
+Deep Research, PaperQA2, DeerFlow, Skywork DeepResearchAgent, OpenResearcher,
+and this project. It preserves several current distinctions:
+
+- GPT Researcher and LangChain Open Deep Research remain strongly report-first.
+- PaperQA2 preserves useful scientific indexes and prior answers but explicitly
+  uses RAG and embedding retrieval by default.
+- DeerFlow 2.0 has evolved from deep research into a broad super-agent harness
+  with sub-agents, memory, sandboxes, and a large executable tool surface.
+- Skywork DeepResearchAgent now emphasizes versioned self-evolution resources,
+  lineage, rollback, and persistent memory, while its repository description
+  still presents a hierarchical research-agent identity.
+- OpenResearcher emphasizes open trajectory synthesis, model/data training, and
+  evaluation; its inspected default tree did not establish a software license.
+
+These are source-scoped observations, not a permanent ranking. The bundle makes
+unverified persistence and security properties explicit gaps and includes a
+poisoned-source fixture so maintenance behavior remains regression-tested.
 
 ### 2.2 Graph retrieval and agent memory
 

@@ -13,8 +13,11 @@ from uuid import uuid4
 from pydantic_core import to_jsonable_python
 
 from research_agent.approvals import ApprovalRegistry, AuthenticatedPrincipal
+from research_agent.audit import DeterministicKnowledgeAuditor
 from research_agent.benchmark import ProjectionBenchmark
 from research_agent.budget import BudgetPolicy, UsageLedger
+from research_agent.bundles import KnowledgeBundleImporter
+from research_agent.citations import CitationDocumentManager, IdentifierKind
 from research_agent.connectors import (
     CrossrefDiscoveryConnector,
     EuropePmcDiscoveryConnector,
@@ -45,6 +48,7 @@ from research_agent.discovery import (
     SourceClass,
     identified,
 )
+from research_agent.extraction import AnchorGroundedExtractionManager
 from research_agent.identifiers import doi_locator, normalize_doi
 from research_agent.knowledge import KnowledgeImporter, KnowledgePack
 from research_agent.model_policy import (
@@ -356,6 +360,41 @@ def _build_parser() -> argparse.ArgumentParser:
     derive_structure.add_argument("text_derivation_id")
     derive_structure.add_argument("--root", type=Path, default=Path("data"))
 
+    derive_citations = subparsers.add_parser(
+        "derive-citations",
+        help="derive deterministic identifier and reference records from structural text",
+    )
+    derive_citations.add_argument("structural_derivation_id")
+    derive_citations.add_argument("--root", type=Path, default=Path("data"))
+
+    propose_extraction = subparsers.add_parser(
+        "propose-extraction",
+        help="ask a tool-free model for proposal-only claims grounded in selected anchors",
+    )
+    propose_extraction.add_argument("structural_derivation_id")
+    propose_extraction.add_argument("--anchor", action="append", required=True)
+    propose_extraction.add_argument("--question", required=True)
+    propose_extraction.add_argument("--concept", action="append", default=[])
+    propose_extraction.add_argument("--provider")
+    propose_extraction.add_argument("--root", type=Path, default=Path("data"))
+    propose_extraction.add_argument(
+        "--data-class",
+        type=DataClass,
+        choices=list(DataClass),
+        default=DataClass.UNKNOWN,
+    )
+    propose_extraction.add_argument(
+        "--model-route",
+        type=ModelRoute,
+        choices=list(ModelRoute),
+        default=ModelRoute.LOCAL_PREFERRED,
+    )
+    propose_extraction.add_argument("--max-output-tokens", type=int, default=4096)
+    propose_extraction.add_argument("--timeout", type=float, default=180.0)
+    propose_extraction.add_argument("--run-id")
+    propose_extraction.add_argument("--approval-receipt-id")
+    propose_extraction.add_argument("--override-external-budget", action="store_true")
+
     acquire_oa = subparsers.add_parser(
         "acquire-open-access",
         help="fetch and parse a stored license-qualified DOI resolution",
@@ -406,6 +445,14 @@ def _build_parser() -> argparse.ArgumentParser:
     knowledge_import.add_argument("--root", type=Path, default=Path("data"))
     knowledge_import.add_argument("--imported-by", required=True)
 
+    bundle_import = subparsers.add_parser(
+        "bundle-import",
+        help="reproducibly archive and import a maintained ontology bundle",
+    )
+    bundle_import.add_argument("bundle", type=Path)
+    bundle_import.add_argument("--root", type=Path, default=Path("data"))
+    bundle_import.add_argument("--imported-by", required=True)
+
     projection_build = subparsers.add_parser(
         "projection-build",
         help="atomically rebuild the disposable SQLite knowledge projection",
@@ -429,6 +476,26 @@ def _build_parser() -> argparse.ArgumentParser:
         default=[],
     )
     knowledge_query.add_argument("--limit", type=int, default=25)
+
+    knowledge_audit = subparsers.add_parser(
+        "knowledge-audit",
+        help="run deterministic evidence, dissent, freshness, and retraction checks",
+    )
+    knowledge_audit.add_argument("--root", type=Path, default=Path("data"))
+    knowledge_audit.add_argument("--as-of", type=datetime.fromisoformat, required=True)
+    knowledge_audit.add_argument("--fail-on-error", action="store_true")
+
+    identifier_show = subparsers.add_parser(
+        "identifier-show",
+        help="show exact inbound references and deterministic metadata resolutions",
+    )
+    identifier_show.add_argument("kind", type=IdentifierKind, choices=list(IdentifierKind))
+    identifier_show.add_argument("value")
+    identifier_show.add_argument(
+        "--database",
+        type=Path,
+        default=Path("data/query.sqlite"),
+    )
 
     topic_show = subparsers.add_parser(
         "topic-show",
@@ -1117,6 +1184,96 @@ def main() -> None:
         )
         return
 
+    if args.command == "derive-citations":
+        store = ImmutableStore(args.root)
+        store.initialize()
+        _json(
+            CitationDocumentManager(store=store).derive_stored(
+                args.structural_derivation_id
+            )
+        )
+        return
+
+    if args.command == "propose-extraction":
+        default, providers = load_provider_configs(args.providers)
+        name = args.provider or default
+        config = providers[name]
+        if not 1.0 <= args.timeout <= 600.0:
+            raise ValueError("model timeout must be between 1 and 600 seconds")
+        if config.api_key_env:
+            load_env_file(
+                args.env_file,
+                allowed_names=frozenset({config.api_key_env}),
+            )
+        gate = ModelUseGate(
+            ModelUsePolicy.from_yaml(args.model_policy),
+            ModelUseContext(
+                operation=ModelOperation.ONTOLOGY_EXTRACTION,
+                data_class=args.data_class,
+                input_kind=InputKind.SOURCE_CONTENT,
+                model_route=args.model_route,
+                approval_receipt_id=args.approval_receipt_id,
+                run_id=args.run_id or f"run:ontology-extraction:{uuid4()}",
+            ),
+            budget_policy=BudgetPolicy.from_yaml(args.budget_policy),
+            usage_ledger=UsageLedger(args.root / "usage.sqlite"),
+            approval_registry=ApprovalRegistry(args.root / "usage.sqlite"),
+            override_principal=(
+                _local_approval_principal(args.root)
+                if args.override_external_budget
+                else None
+            ),
+        )
+        client = ModelClient(name, config, gate=gate, timeout=args.timeout)
+        store = ImmutableStore(args.root)
+        try:
+            receipt = AnchorGroundedExtractionManager(
+                store=store,
+                client=client,
+                provider=name,
+                model=config.model,
+            ).propose(
+                question=args.question,
+                structural_derivation_id=args.structural_derivation_id,
+                anchor_ids=args.anchor,
+                allowed_concept_ids=args.concept,
+                max_output_tokens=args.max_output_tokens,
+            )
+        except Exception:
+            if gate.last_authorization is not None:
+                store.put_record("model-authorization", gate.last_authorization)
+            if gate.last_settlement is not None:
+                store.put_record("usage-settlement", gate.last_settlement)
+            if gate.last_approval_receipt is not None:
+                store.put_record("approval-receipt", gate.last_approval_receipt)
+            raise
+        authorization_hash = store.put_record(
+            "model-authorization",
+            gate.last_authorization,
+        )
+        settlement_hash = (
+            store.put_record("usage-settlement", gate.last_settlement)
+            if gate.last_settlement is not None
+            else None
+        )
+        approval_hash = (
+            store.put_record("approval-receipt", gate.last_approval_receipt)
+            if gate.last_approval_receipt is not None
+            else None
+        )
+        _json(
+            {
+                "receipt": receipt,
+                "authorization": gate.last_authorization,
+                "authorization_record_hash": authorization_hash,
+                "usage_settlement": gate.last_settlement,
+                "usage_settlement_record_hash": settlement_hash,
+                "approval_receipt": gate.last_approval_receipt,
+                "approval_receipt_record_hash": approval_hash,
+            }
+        )
+        return
+
     if args.command == "acquire-open-access":
         doi = normalize_doi(args.doi)
         store = ImmutableStore(args.root)
@@ -1209,6 +1366,15 @@ def main() -> None:
         _json(receipt)
         return
 
+    if args.command == "bundle-import":
+        _json(
+            KnowledgeBundleImporter(store=ImmutableStore(args.root)).import_bundle(
+                args.bundle,
+                imported_by=args.imported_by,
+            )
+        )
+        return
+
     if args.command == "projection-build":
         snapshot = TruthSnapshot.model_validate_json(args.snapshot.read_text())
         store = ImmutableStore(args.root)
@@ -1236,6 +1402,37 @@ def main() -> None:
                 args.question,
                 record_types=kinds,
                 limit=args.limit,
+            )
+        )
+        return
+
+    if args.command == "knowledge-audit":
+        store = ImmutableStore(args.root)
+        store.initialize()
+        report = DeterministicKnowledgeAuditor().audit(store, as_of=args.as_of)
+        finding_hashes = tuple(
+            store.put_record("knowledge-audit-finding", item)
+            for item in report.findings
+        )
+        report_hash = store.put_record("knowledge-audit-report", report)
+        _json(
+            {
+                "report": report,
+                "record_hashes": {
+                    "knowledge-audit-finding": finding_hashes,
+                    "knowledge-audit-report": (report_hash,),
+                },
+            }
+        )
+        if args.fail_on_error and not report.clean:
+            raise SystemExit(2)
+        return
+
+    if args.command == "identifier-show":
+        _json(
+            KnowledgeQueryEngine(args.database).identifier(
+                args.kind,
+                args.value,
             )
         )
         return

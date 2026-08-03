@@ -14,7 +14,16 @@ from typing import Any
 import yaml
 from pydantic import Field
 
+from research_agent.bundles import SourceMetadata
+from research_agent.citations import (
+    BibliographicReference,
+    CitationDerivation,
+    IdentifierKind,
+    ResearchIdentifier,
+    normalize_research_identifier,
+)
 from research_agent.discovery import CoverageRun, DiscoveryHit, OpenAccessResolution
+from research_agent.extraction import ValidatedExtractionProposal
 from research_agent.knowledge import (
     Concept,
     Controversy,
@@ -47,6 +56,10 @@ class QueryRecordType(StrEnum):
     RESOLUTION = "resolution"
     DOCUMENT = "document"
     ANCHOR = "anchor"
+    IDENTIFIER = "identifier"
+    REFERENCE = "reference"
+    SOURCE_METADATA = "source_metadata"
+    PROPOSAL = "proposal"
 
 
 class KnowledgeQueryPlan(StrictModel):
@@ -85,12 +98,34 @@ class KnowledgeHit(StrictModel):
     anchor_page_number: int | None = None
     anchor_parent_id: str | None = None
     anchor_synthetic: bool | None = None
+    identifier_kind: str | None = None
+    identifier_value: str | None = None
+    canonical_locator: str | None = None
+    reference_relation: str | None = None
+    reference_signal: str | None = None
+    resolved_discovery_hit_ids: tuple[str, ...] = ()
+    resolved_open_access_resolution_ids: tuple[str, ...] = ()
+    proposal_provider: str | None = None
+    proposal_model: str | None = None
+    proposal_review_state: str | None = None
+    proposal_commit_authority: str | None = None
 
 
 class KnowledgeQueryResult(StrictModel):
     plan: KnowledgeQueryPlan
     hits: tuple[KnowledgeHit, ...]
     truncated: bool
+    projection_snapshot_id: str
+
+
+class IdentifierView(StrictModel):
+    identifier_id: str
+    kind: IdentifierKind
+    value: str
+    canonical_locator: str
+    references: tuple[dict[str, Any], ...]
+    discovery_hits: tuple[dict[str, Any], ...]
+    open_access_resolutions: tuple[dict[str, Any], ...]
     projection_snapshot_id: str
 
 
@@ -104,6 +139,7 @@ class TopicView(StrictModel):
     controversies: tuple[dict[str, Any], ...]
     gaps: tuple[dict[str, Any], ...]
     threats: tuple[dict[str, Any], ...]
+    references: tuple[dict[str, Any], ...] = ()
     query_mode: str = "exact_recursive_provenance"
     projection_snapshot_id: str
 
@@ -202,8 +238,8 @@ class DeterministicQueryCompiler:
 
 
 class SQLiteKnowledgeProjection:
-    schema_version = 6
-    builder_version = "sqlite-knowledge-projection/6"
+    schema_version = 8
+    builder_version = "sqlite-knowledge-projection/8"
 
     def __init__(self, *, store: ImmutableStore, workspace_root: Path) -> None:
         self.store = store
@@ -267,6 +303,10 @@ class SQLiteKnowledgeProjection:
                     TopicSourceAssociation.model_validate(value)
                     for value in self.store.iter_records("topic-source")
                 ),
+                source_metadata=(
+                    SourceMetadata.model_validate(value)
+                    for value in self.store.iter_records("source-metadata")
+                ),
                 fragments=(
                     EvidenceFragment.model_validate(value)
                     for value in self.store.iter_records("evidence-fragment")
@@ -311,6 +351,22 @@ class SQLiteKnowledgeProjection:
                 structural_anchors=(
                     StructuralAnchor.model_validate(value)
                     for value in self.store.iter_records("structural-anchor")
+                ),
+                citation_derivations=(
+                    CitationDerivation.model_validate(value)
+                    for value in self.store.iter_records("citation-derivation")
+                ),
+                research_identifiers=(
+                    ResearchIdentifier.model_validate(value)
+                    for value in self.store.iter_records("research-identifier")
+                ),
+                bibliographic_references=(
+                    BibliographicReference.model_validate(value)
+                    for value in self.store.iter_records("bibliographic-reference")
+                ),
+                extraction_proposals=(
+                    ValidatedExtractionProposal.model_validate(value)
+                    for value in self.store.iter_records("extraction-proposal")
                 ),
             )
             connection.execute("PRAGMA optimize")
@@ -381,6 +437,27 @@ class SQLiteKnowledgeProjection:
                 topic_concept_id TEXT NOT NULL REFERENCES concept(id),
                 source_version_id TEXT NOT NULL REFERENCES source(id),
                 roles_json TEXT NOT NULL,
+                recorded_at TEXT NOT NULL,
+                recorded_by TEXT NOT NULL
+            );
+            CREATE TABLE source_metadata (
+                id TEXT PRIMARY KEY,
+                source_version_id TEXT NOT NULL REFERENCES source(id),
+                original_locator TEXT NOT NULL,
+                title TEXT NOT NULL,
+                authors_json TEXT NOT NULL,
+                authorship_status TEXT NOT NULL,
+                publisher TEXT,
+                published_at TEXT,
+                license TEXT,
+                license_status TEXT NOT NULL,
+                usage_conditions_json TEXT NOT NULL,
+                usage_conditions_status TEXT NOT NULL,
+                usage_permissions_json TEXT NOT NULL,
+                rights_basis TEXT,
+                rights_basis_status TEXT NOT NULL,
+                provenance_note TEXT NOT NULL,
+                provenance_status TEXT NOT NULL,
                 recorded_at TEXT NOT NULL,
                 recorded_by TEXT NOT NULL
             );
@@ -577,6 +654,69 @@ class SQLiteKnowledgeProjection:
                 synthetic INTEGER NOT NULL,
                 UNIQUE (structural_derivation_id, ordinal)
             );
+            CREATE TABLE citation_derivation (
+                id TEXT PRIMARY KEY,
+                structural_derivation_id TEXT NOT NULL
+                    REFERENCES structural_derivation(id),
+                source_version_id TEXT NOT NULL REFERENCES source(id),
+                source_content_sha256 TEXT NOT NULL,
+                extractor_id TEXT NOT NULL,
+                extractor_version TEXT NOT NULL,
+                extracted_at TEXT NOT NULL,
+                relation_counts_json TEXT NOT NULL
+            );
+            CREATE TABLE research_identifier (
+                id TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                value TEXT NOT NULL,
+                canonical_locator TEXT NOT NULL,
+                UNIQUE (kind, value)
+            );
+            CREATE TABLE bibliographic_reference (
+                id TEXT PRIMARY KEY,
+                citation_derivation_id TEXT NOT NULL
+                    REFERENCES citation_derivation(id),
+                structural_anchor_id TEXT NOT NULL REFERENCES structural_anchor(id),
+                source_version_id TEXT NOT NULL REFERENCES source(id),
+                source_content_sha256 TEXT NOT NULL,
+                identifier_id TEXT NOT NULL REFERENCES research_identifier(id),
+                relation TEXT NOT NULL,
+                signal TEXT NOT NULL,
+                start INTEGER NOT NULL,
+                end INTEGER NOT NULL,
+                exact_sha256 TEXT NOT NULL
+            );
+            CREATE TABLE identifier_discovery_hit (
+                identifier_id TEXT NOT NULL REFERENCES research_identifier(id),
+                discovery_hit_id TEXT NOT NULL REFERENCES discovery_hit(id),
+                match_rule TEXT NOT NULL,
+                PRIMARY KEY (identifier_id, discovery_hit_id)
+            );
+            CREATE TABLE identifier_open_access_resolution (
+                identifier_id TEXT NOT NULL REFERENCES research_identifier(id),
+                resolution_id TEXT NOT NULL REFERENCES open_access_resolution(id),
+                match_rule TEXT NOT NULL,
+                PRIMARY KEY (identifier_id, resolution_id)
+            );
+            CREATE TABLE extraction_proposal (
+                id TEXT PRIMARY KEY,
+                extraction_request_id TEXT NOT NULL,
+                structural_derivation_id TEXT NOT NULL
+                    REFERENCES structural_derivation(id),
+                source_version_id TEXT NOT NULL REFERENCES source(id),
+                source_content_sha256 TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                model TEXT NOT NULL,
+                proposed_at TEXT NOT NULL,
+                concepts_json TEXT NOT NULL,
+                claims_json TEXT NOT NULL,
+                controversies_json TEXT NOT NULL,
+                gaps_json TEXT NOT NULL,
+                raw_output_sha256 TEXT NOT NULL,
+                review_state TEXT NOT NULL,
+                validator_version TEXT NOT NULL,
+                commit_authority TEXT NOT NULL
+            );
             CREATE VIRTUAL TABLE knowledge_fts USING fts5(
                 record_type UNINDEXED,
                 record_id UNINDEXED,
@@ -587,6 +727,8 @@ class SQLiteKnowledgeProjection:
             CREATE INDEX claim_subject_idx ON claim(subject);
             CREATE INDEX topic_source_topic_idx
                 ON topic_source_association(topic_concept_id, source_version_id);
+            CREATE INDEX source_metadata_source_idx
+                ON source_metadata(source_version_id, id);
             CREATE INDEX claim_validity_idx ON claim(valid_from, valid_until);
             CREATE INDEX controversy_topic_idx ON controversy(topic_concept_id);
             CREATE INDEX gap_topic_status_idx ON knowledge_gap(topic_concept_id, status, priority);
@@ -598,6 +740,14 @@ class SQLiteKnowledgeProjection:
                 ON structural_anchor(parent_id, ordinal);
             CREATE INDEX structural_anchor_kind_idx
                 ON structural_anchor(structural_derivation_id, kind, ordinal);
+            CREATE INDEX bibliographic_reference_identifier_idx
+                ON bibliographic_reference(identifier_id, relation);
+            CREATE INDEX bibliographic_reference_anchor_idx
+                ON bibliographic_reference(structural_anchor_id, start);
+            CREATE INDEX citation_derivation_structure_idx
+                ON citation_derivation(structural_derivation_id);
+            CREATE INDEX extraction_proposal_review_idx
+                ON extraction_proposal(review_state, proposed_at, id);
             """
         )
 
@@ -608,6 +758,7 @@ class SQLiteKnowledgeProjection:
         concepts: tuple[Concept, ...],
         sources: Iterable[SourceVersion],
         topic_sources: Iterable[TopicSourceAssociation],
+        source_metadata: Iterable[SourceMetadata],
         fragments: Iterable[EvidenceFragment],
         claims: Iterable[Claim],
         controversies: Iterable[Controversy],
@@ -620,11 +771,16 @@ class SQLiteKnowledgeProjection:
         derivations: Iterable[TextDerivation],
         structural_derivations: Iterable[StructuralDerivation],
         structural_anchors: Iterable[StructuralAnchor],
+        citation_derivations: Iterable[CitationDerivation],
+        research_identifiers: Iterable[ResearchIdentifier],
+        bibliographic_references: Iterable[BibliographicReference],
+        extraction_proposals: Iterable[ValidatedExtractionProposal],
     ) -> dict[str, int]:
         counts = {
             "concepts": 0,
             "sources": 0,
             "topic_source_associations": 0,
+            "source_metadata": 0,
             "evidence_fragments": 0,
             "claims": 0,
             "controversies": 0,
@@ -638,6 +794,12 @@ class SQLiteKnowledgeProjection:
             "text_derivations": 0,
             "structural_derivations": 0,
             "structural_anchors": 0,
+            "citation_derivations": 0,
+            "research_identifiers": 0,
+            "bibliographic_references": 0,
+            "identifier_discovery_links": 0,
+            "identifier_open_access_links": 0,
+            "extraction_proposals": 0,
         }
 
         def add_fts(record_type: QueryRecordType, record_id: str, title: str, body: str) -> None:
@@ -711,6 +873,50 @@ class SQLiteKnowledgeProjection:
                     json.dumps([role.value for role in item.roles]),
                     item.recorded_at.isoformat(),
                     item.recorded_by,
+                ),
+            )
+        for item in source_metadata:
+            counts["source_metadata"] += 1
+            connection.execute(
+                """
+                INSERT INTO source_metadata
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    item.id,
+                    item.source_version_id,
+                    item.original_locator,
+                    item.title,
+                    json.dumps(item.authors, ensure_ascii=False),
+                    item.authorship_status,
+                    item.publisher,
+                    item.published_at.isoformat() if item.published_at else None,
+                    item.license,
+                    item.license_status,
+                    json.dumps(item.usage_conditions, ensure_ascii=False),
+                    item.usage_conditions_status,
+                    json.dumps(item.usage_permissions.model_dump(mode="json"), sort_keys=True),
+                    item.rights_basis,
+                    item.rights_basis_status,
+                    item.provenance_note,
+                    item.provenance_status,
+                    item.recorded_at.isoformat(),
+                    item.recorded_by,
+                ),
+            )
+            add_fts(
+                QueryRecordType.SOURCE_METADATA,
+                item.id,
+                item.title,
+                " ".join(
+                    (
+                        *item.authors,
+                        item.publisher or "",
+                        item.original_locator,
+                        item.license or "unknown license",
+                        *item.usage_conditions,
+                        item.provenance_note,
+                    )
                 ),
             )
         for item in fragments:
@@ -1084,6 +1290,189 @@ class SQLiteKnowledgeProjection:
                     item.label or f"{item.kind.value} {item.ordinal}",
                     exact,
                 )
+        identifiers = tuple(research_identifiers)
+        identifiers_by_id = {item.id: item for item in identifiers}
+        for item in identifiers:
+            counts["research_identifiers"] += 1
+            connection.execute(
+                "INSERT INTO research_identifier VALUES (?, ?, ?, ?)",
+                (item.id, item.kind, item.value, item.canonical_locator),
+            )
+            add_fts(
+                QueryRecordType.IDENTIFIER,
+                item.id,
+                f"{item.kind.value} {item.value}",
+                item.canonical_locator,
+            )
+        discovery_rows = connection.execute(
+            """
+            SELECT id, canonical_locator, known_entity_ids_json
+            FROM discovery_hit
+            ORDER BY id
+            """
+        ).fetchall()
+        resolution_rows = connection.execute(
+            "SELECT id, doi FROM open_access_resolution ORDER BY id"
+        ).fetchall()
+        for item in identifiers:
+            entity_id = f"{item.kind.value}:{item.value}"
+            for discovery_id, locator, known_ids_json in discovery_rows:
+                known_ids = set(json.loads(known_ids_json))
+                rule = None
+                if entity_id in known_ids:
+                    rule = "exact_known_entity_id"
+                elif item.canonical_locator == locator:
+                    rule = "exact_canonical_locator"
+                if rule is not None:
+                    connection.execute(
+                        "INSERT INTO identifier_discovery_hit VALUES (?, ?, ?)",
+                        (item.id, discovery_id, rule),
+                    )
+                    counts["identifier_discovery_links"] += 1
+            if item.kind.value == "doi":
+                for resolution_id, doi in resolution_rows:
+                    if item.value == doi:
+                        connection.execute(
+                            "INSERT INTO identifier_open_access_resolution VALUES (?, ?, ?)",
+                            (item.id, resolution_id, "exact_normalized_doi"),
+                        )
+                        counts["identifier_open_access_links"] += 1
+        references = tuple(bibliographic_references)
+        references_by_derivation: dict[str, list[BibliographicReference]] = {}
+        for reference in references:
+            references_by_derivation.setdefault(
+                reference.citation_derivation_id,
+                [],
+            ).append(reference)
+        for item in citation_derivations:
+            selected = sorted(
+                references_by_derivation.get(item.id, []),
+                key=lambda reference: (reference.start, reference.end, reference.identifier_id),
+            )
+            if tuple(reference.id for reference in selected) != item.reference_ids:
+                raise ValueError("citation derivation reference index mismatch")
+            if tuple(
+                sorted({reference.identifier_id for reference in selected})
+            ) != item.identifier_ids:
+                raise ValueError("citation derivation identifier index mismatch")
+            counts["citation_derivations"] += 1
+            connection.execute(
+                "INSERT INTO citation_derivation VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    item.id,
+                    item.structural_derivation_id,
+                    item.source_version_id,
+                    item.source_content_sha256,
+                    item.extractor_id,
+                    item.extractor_version,
+                    item.extracted_at.isoformat(),
+                    json.dumps(item.relation_counts, sort_keys=True),
+                ),
+            )
+        anchors_by_id = {item.id: item for item in anchors}
+        for item in references:
+            identifier = identifiers_by_id.get(item.identifier_id)
+            anchor = anchors_by_id.get(item.structural_anchor_id)
+            if identifier is None or anchor is None:
+                raise ValueError("bibliographic reference has an unknown identifier or anchor")
+            text = self.store.read_blob(item.source_content_sha256).decode(
+                "utf-8",
+                errors="strict",
+            )
+            if (
+                item.end > len(text)
+                or not (anchor.start <= item.start < item.end <= anchor.end)
+                or hashlib.sha256(text[item.start : item.end].encode()).hexdigest()
+                != item.exact_sha256
+            ):
+                raise ValueError("bibliographic reference selector mismatch")
+            counts["bibliographic_references"] += 1
+            connection.execute(
+                "INSERT INTO bibliographic_reference VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    item.id,
+                    item.citation_derivation_id,
+                    item.structural_anchor_id,
+                    item.source_version_id,
+                    item.source_content_sha256,
+                    item.identifier_id,
+                    item.relation,
+                    item.signal,
+                    item.start,
+                    item.end,
+                    item.exact_sha256,
+                ),
+            )
+            add_fts(
+                QueryRecordType.REFERENCE,
+                item.id,
+                f"{item.relation.value} {identifier.kind.value} {identifier.value}",
+                (
+                    f"{identifier.canonical_locator} {item.signal} "
+                    f"{text[anchor.start:anchor.end]}"
+                ),
+            )
+        for item in extraction_proposals:
+            counts["extraction_proposals"] += 1
+            concepts_json = json.dumps(
+                [value.model_dump(mode="json") for value in item.concepts],
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            claims_json = json.dumps(
+                [value.model_dump(mode="json") for value in item.claims],
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            controversies_json = json.dumps(
+                [value.model_dump(mode="json") for value in item.controversies],
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            gaps_json = json.dumps(
+                [value.model_dump(mode="json") for value in item.gaps],
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            connection.execute(
+                """
+                INSERT INTO extraction_proposal
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    item.id,
+                    item.extraction_request_id,
+                    item.structural_derivation_id,
+                    item.source_version_id,
+                    item.source_content_sha256,
+                    item.provider,
+                    item.model,
+                    item.proposed_at.isoformat(),
+                    concepts_json,
+                    claims_json,
+                    controversies_json,
+                    gaps_json,
+                    item.raw_output_sha256,
+                    item.review_state,
+                    item.validator_version,
+                    item.commit_authority,
+                ),
+            )
+            add_fts(
+                QueryRecordType.PROPOSAL,
+                item.id,
+                f"Proposed ontology extraction by {item.provider}:{item.model}",
+                " ".join(
+                    (
+                        concepts_json,
+                        claims_json,
+                        controversies_json,
+                        gaps_json,
+                        item.review_state.value,
+                        item.validator_version,
+                    )
+                ),
+            )
         return counts
 
 
@@ -1115,6 +1504,78 @@ class KnowledgeQueryEngine:
             plan=plan,
             hits=hits,
             truncated=truncated,
+            projection_snapshot_id=snapshot_id,
+        )
+
+    def identifier(self, kind: IdentifierKind, value: str) -> IdentifierView:
+        normalized, locator = normalize_research_identifier(kind, value)
+        with self._connect() as connection:
+            identifier = connection.execute(
+                """
+                SELECT id, kind, value, canonical_locator
+                FROM research_identifier
+                WHERE kind = ? AND value = ?
+                """,
+                (kind.value, normalized),
+            ).fetchone()
+            if identifier is None:
+                raise ValueError(f"unknown research identifier: {kind.value}:{normalized}")
+            references = self._rows(
+                connection,
+                """
+                SELECT br.id, br.relation, br.signal, br.start, br.end,
+                       br.structural_anchor_id, a.kind AS anchor_kind,
+                       a.page_number, original.id AS source_id,
+                       original.source_uri, original.trust_zone,
+                       COALESCE((
+                           SELECT group_concat(t.id)
+                           FROM threat_observation t
+                           WHERE t.source_version = a.source_version_id
+                       ), '') AS threat_observation_ids
+                FROM bibliographic_reference br
+                JOIN structural_anchor a ON a.id = br.structural_anchor_id
+                JOIN structural_derivation sd
+                  ON sd.id = a.structural_derivation_id
+                JOIN text_derivation td ON td.id = sd.text_derivation_id
+                JOIN source original ON original.id = td.original_source_version_id
+                WHERE br.identifier_id = ?
+                ORDER BY original.source_uri, br.start, br.id
+                """,
+                (identifier["id"],),
+            )
+            discovery_hits = self._rows(
+                connection,
+                """
+                SELECT d.*, idh.match_rule
+                FROM identifier_discovery_hit idh
+                JOIN discovery_hit d ON d.id = idh.discovery_hit_id
+                WHERE idh.identifier_id = ?
+                ORDER BY d.id
+                """,
+                (identifier["id"],),
+            )
+            resolutions = self._rows(
+                connection,
+                """
+                SELECT r.*, ioar.match_rule
+                FROM identifier_open_access_resolution ioar
+                JOIN open_access_resolution r ON r.id = ioar.resolution_id
+                WHERE ioar.identifier_id = ?
+                ORDER BY r.id
+                """,
+                (identifier["id"],),
+            )
+            snapshot_id = self._snapshot_id(connection)
+        if identifier["canonical_locator"] != locator:
+            raise ValueError("stored identifier locator does not match current normalization")
+        return IdentifierView(
+            identifier_id=identifier["id"],
+            kind=IdentifierKind(identifier["kind"]),
+            value=identifier["value"],
+            canonical_locator=identifier["canonical_locator"],
+            references=references,
+            discovery_hits=discovery_hits,
+            open_access_resolutions=resolutions,
             projection_snapshot_id=snapshot_id,
         )
 
@@ -1181,6 +1642,155 @@ class KnowledgeQueryEngine:
                 "anchor_page_number": anchor["page_number"],
                 "anchor_parent_id": anchor["parent_id"],
                 "anchor_synthetic": bool(anchor["synthetic"]),
+            }
+        elif record_type is QueryRecordType.IDENTIFIER:
+            identifier = connection.execute(
+                """
+                SELECT kind, value, canonical_locator
+                FROM research_identifier
+                WHERE id = ?
+                """,
+                (row["record_id"],),
+            ).fetchone()
+            if identifier is None:
+                raise ValueError("identifier FTS row has no identifier record")
+            metadata = {
+                "identifier_kind": identifier["kind"],
+                "identifier_value": identifier["value"],
+                "canonical_locator": identifier["canonical_locator"],
+            }
+        elif record_type is QueryRecordType.REFERENCE:
+            reference = connection.execute(
+                """
+                SELECT br.relation, br.signal, br.start, br.end,
+                       ri.kind AS identifier_kind, ri.value AS identifier_value,
+                       ri.canonical_locator,
+                       a.id AS anchor_id, a.kind AS anchor_kind,
+                       a.page_number, a.parent_id, a.synthetic,
+                       a.source_version_id AS derived_source_version_id,
+                       original.id AS source_version_id,
+                       original.source_uri, original.trust_zone
+                FROM bibliographic_reference AS br
+                JOIN research_identifier AS ri ON ri.id = br.identifier_id
+                JOIN structural_anchor AS a ON a.id = br.structural_anchor_id
+                JOIN structural_derivation AS sd
+                  ON sd.id = a.structural_derivation_id
+                JOIN text_derivation AS td ON td.id = sd.text_derivation_id
+                JOIN source AS original ON original.id = td.original_source_version_id
+                WHERE br.id = ?
+                """,
+                (row["record_id"],),
+            ).fetchone()
+            if reference is None:
+                raise ValueError("reference FTS row has no bibliographic record")
+            threats = connection.execute(
+                """
+                SELECT id, threat_type, status, severity
+                FROM threat_observation
+                WHERE source_version = ?
+                ORDER BY id
+                """,
+                (reference["derived_source_version_id"],),
+            ).fetchall()
+            discovery_links = connection.execute(
+                """
+                SELECT idh.discovery_hit_id
+                FROM identifier_discovery_hit idh
+                JOIN bibliographic_reference br
+                  ON br.identifier_id = idh.identifier_id
+                WHERE br.id = ?
+                ORDER BY idh.discovery_hit_id
+                """,
+                (row["record_id"],),
+            ).fetchall()
+            resolution_links = connection.execute(
+                """
+                SELECT ioar.resolution_id
+                FROM identifier_open_access_resolution ioar
+                JOIN bibliographic_reference br
+                  ON br.identifier_id = ioar.identifier_id
+                WHERE br.id = ?
+                ORDER BY ioar.resolution_id
+                """,
+                (row["record_id"],),
+            ).fetchall()
+            metadata = {
+                "source_version_id": reference["source_version_id"],
+                "derived_source_version_id": reference["derived_source_version_id"],
+                "source_uri": reference["source_uri"],
+                "trust_zone": reference["trust_zone"],
+                "threat_observation_ids": tuple(item["id"] for item in threats),
+                "threats": tuple(
+                    KnowledgeThreatContext(
+                        id=item["id"],
+                        threat_type=item["threat_type"],
+                        status=item["status"],
+                        severity=item["severity"],
+                    )
+                    for item in threats
+                ),
+                "anchor_kind": reference["anchor_kind"],
+                "anchor_start": reference["start"],
+                "anchor_end": reference["end"],
+                "anchor_page_number": reference["page_number"],
+                "anchor_parent_id": reference["parent_id"],
+                "anchor_synthetic": bool(reference["synthetic"]),
+                "identifier_kind": reference["identifier_kind"],
+                "identifier_value": reference["identifier_value"],
+                "canonical_locator": reference["canonical_locator"],
+                "reference_relation": reference["relation"],
+                "reference_signal": reference["signal"],
+                "resolved_discovery_hit_ids": tuple(item[0] for item in discovery_links),
+                "resolved_open_access_resolution_ids": tuple(
+                    item[0] for item in resolution_links
+                ),
+            }
+        elif record_type is QueryRecordType.PROPOSAL:
+            proposal = connection.execute(
+                """
+                SELECT ep.provider, ep.model, ep.review_state, ep.commit_authority,
+                       ep.source_version_id AS derived_source_version_id,
+                       original.id AS source_version_id,
+                       original.source_uri, original.trust_zone
+                FROM extraction_proposal ep
+                JOIN structural_derivation sd
+                  ON sd.id = ep.structural_derivation_id
+                JOIN text_derivation td ON td.id = sd.text_derivation_id
+                JOIN source original ON original.id = td.original_source_version_id
+                WHERE ep.id = ?
+                """,
+                (row["record_id"],),
+            ).fetchone()
+            if proposal is None:
+                raise ValueError("proposal FTS row has no extraction proposal")
+            threats = connection.execute(
+                """
+                SELECT id, threat_type, status, severity
+                FROM threat_observation
+                WHERE source_version = ?
+                ORDER BY id
+                """,
+                (proposal["derived_source_version_id"],),
+            ).fetchall()
+            metadata = {
+                "source_version_id": proposal["source_version_id"],
+                "derived_source_version_id": proposal["derived_source_version_id"],
+                "source_uri": proposal["source_uri"],
+                "trust_zone": proposal["trust_zone"],
+                "threat_observation_ids": tuple(item["id"] for item in threats),
+                "threats": tuple(
+                    KnowledgeThreatContext(
+                        id=item["id"],
+                        threat_type=item["threat_type"],
+                        status=item["status"],
+                        severity=item["severity"],
+                    )
+                    for item in threats
+                ),
+                "proposal_provider": proposal["provider"],
+                "proposal_model": proposal["model"],
+                "proposal_review_state": proposal["review_state"],
+                "proposal_commit_authority": proposal["commit_authority"],
             }
         return KnowledgeHit(
             record_type=record_type,
@@ -1259,9 +1869,16 @@ class KnowledgeQueryEngine:
                 connection,
                 f"""
                 SELECT DISTINCT s.*, tsa.roles_json, tsa.recorded_at AS associated_at,
-                       tsa.recorded_by AS associated_by
+                       tsa.recorded_by AS associated_by,
+                       sm.id AS metadata_id, sm.original_locator, sm.title,
+                       sm.authors_json, sm.authorship_status, sm.publisher,
+                       sm.published_at, sm.license_status, sm.usage_conditions_json,
+                       sm.usage_conditions_status, sm.usage_permissions_json,
+                       sm.rights_basis, sm.rights_basis_status, sm.provenance_note,
+                       sm.provenance_status
                 FROM topic_source_association tsa
                 JOIN source s ON s.id = tsa.source_version_id
+                LEFT JOIN source_metadata sm ON sm.source_version_id = s.id
                 WHERE tsa.topic_concept_id IN ({placeholders})
                 ORDER BY s.source_uri, s.id
                 """,
@@ -1308,6 +1925,38 @@ class KnowledgeQueryEngine:
                 """,
                 descendants,
             )
+            references = self._rows(
+                connection,
+                f"""
+                SELECT br.id, br.relation, br.signal, br.start, br.end,
+                       br.structural_anchor_id, ri.kind AS identifier_kind,
+                       ri.value AS identifier_value, ri.canonical_locator,
+                       original.id AS source_id, original.source_uri,
+                       a.page_number,
+                       COALESCE((
+                           SELECT group_concat(idh.discovery_hit_id)
+                           FROM identifier_discovery_hit idh
+                           WHERE idh.identifier_id = ri.id
+                       ), '') AS resolved_discovery_hit_ids,
+                       COALESCE((
+                           SELECT group_concat(ioar.resolution_id)
+                           FROM identifier_open_access_resolution ioar
+                           WHERE ioar.identifier_id = ri.id
+                       ), '') AS resolved_open_access_resolution_ids
+                FROM bibliographic_reference br
+                JOIN research_identifier ri ON ri.id = br.identifier_id
+                JOIN structural_anchor a ON a.id = br.structural_anchor_id
+                JOIN structural_derivation sd
+                  ON sd.id = a.structural_derivation_id
+                JOIN text_derivation td ON td.id = sd.text_derivation_id
+                JOIN source original ON original.id = td.original_source_version_id
+                JOIN topic_source_association tsa
+                  ON tsa.source_version_id = original.id
+                WHERE tsa.topic_concept_id IN ({placeholders})
+                ORDER BY ri.kind, ri.value, br.id
+                """,
+                descendants,
+            )
             snapshot_id = self._snapshot_id(connection)
         return TopicView(
             topic_concept_id=concept_id,
@@ -1319,6 +1968,7 @@ class KnowledgeQueryEngine:
             controversies=controversies,
             gaps=gaps,
             threats=threats,
+            references=references,
             projection_snapshot_id=snapshot_id,
         )
 
