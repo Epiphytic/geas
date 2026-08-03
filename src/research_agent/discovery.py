@@ -127,6 +127,7 @@ class DiscoveryRun(StrictModel):
     ended_at: datetime
     index_snapshot: str | None = None
     pagination_cursors: tuple[str, ...] = ()
+    response_sha256s: tuple[str, ...] = ()
     termination_reason: str
     result_count: int = Field(ge=0)
     duplicate_count: int = Field(ge=0)
@@ -263,10 +264,13 @@ class DiscoveryCandidate(StrictModel):
     upstream_id: str
     canonical_locator: str
     title: str
+    authors: tuple[str, ...] = ()
+    publisher: str | None = None
+    published_at: datetime | None = None
     media_type: str
     language: str | None = None
     snippet: str | None = None
-    score: int = Field(ge=0)
+    score: float = Field(ge=0)
 
 
 class DiscoveryPage(StrictModel):
@@ -275,6 +279,7 @@ class DiscoveryPage(StrictModel):
     next_cursor: str | None = None
     rejected_count: int = Field(default=0, ge=0)
     error_count: int = Field(default=0, ge=0)
+    response_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
 
 class AcquisitionRequest(StrictModel):
@@ -291,6 +296,8 @@ class AcquisitionResult(StrictModel):
 
 class DiscoveryConnector(Protocol):
     manifest: ConnectorManifest
+
+    def normalize_query(self, request: DiscoveryRequest) -> str: ...
 
     def discover(self, request: DiscoveryRequest) -> Iterable[DiscoveryPage]: ...
 

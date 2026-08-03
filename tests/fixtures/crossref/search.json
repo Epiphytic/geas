@@ -1,0 +1,26 @@
+{
+  "status": "ok",
+  "message": {
+    "total-results": 2,
+    "next-cursor": "fixture-next",
+    "items": [
+      {
+        "DOI": "10.1002/14651858.CD010856.pub3",
+        "title": ["Water fluoridation for the prevention of dental caries"],
+        "author": [
+          {"given": "Zipporah", "family": "Iheozor-Ejiofor"},
+          {"given": "Tanya", "family": "Walsh"}
+        ],
+        "publisher": "Wiley",
+        "published": {"date-parts": [[2024, 10, 4]]},
+        "language": "en",
+        "score": 42.5
+      },
+      {
+        "DOI": "not-a-doi",
+        "title": ["Malformed upstream record"],
+        "score": 1
+      }
+    ]
+  }
+}

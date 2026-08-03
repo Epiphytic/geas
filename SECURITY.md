@@ -20,7 +20,39 @@ boundary.
   roots and do not follow symlinks outside them.
 - Connector manifests are trusted code/configuration, while snippets and
   connector results remain untrusted records.
-- External providers are opt-in. The local DeepSeek endpoint is the default.
+- Secret environment files and editor swap files are ignored. The deterministic
+  loader reads only explicitly allowlisted variable names and performs no shell
+  evaluation or interpolation.
+- The Mojeek transport has a fixed HTTPS destination. Although Mojeek requires
+  its key as a query parameter, full request URLs and upstream error bodies are
+  never placed in audit records or propagated through connector exceptions.
+- Canonical authority is one-way: version-controlled ontology and schemas plus
+  immutable records and blobs produce truth snapshots; SQLite and Markdown are
+  disposable projections. Projection data can never authorize changes to
+  canonical state.
+- Projection stamps bind SQLite to an exact truth snapshot and logical
+  schema/row digest. Canonical drift requires a reviewed successor snapshot;
+  projection drift requires discard and rebuild.
+- Access to deposited content is enforced by the deployment boundary, not
+  ontology records. Handling labels are advisory and do not provide
+  confidentiality. Anyone authorized for a deployment may be able to query all
+  indexed deposits; hard isolation currently requires a separate deployment or
+  store root.
+- External model clients require deterministic authorization before network
+  I/O. Provider names are bound to exact HTTPS endpoints and models; local
+  providers must use literal loopback addresses, redirects are rejected,
+  unknown data is local-only, and source content must be explicitly marked
+  `external_allowed`. Model text cannot supply or change these authorization
+  inputs.
+- Automatic external calls reserve worst-case usage in a transactional SQLite
+  ledger before network I/O. Non-metered account exclusions affect dollar
+  totals only; call caps, token limits, routing rules, and audit records remain.
+- The usage ledger is authoritative only for operational budget enforcement,
+  not ontology truth. Deployment permissions and backups must protect it;
+  model processes and retrieved content have no direct ledger-write path.
+- CLI budget overrides derive an authenticated principal from the local OS
+  account and become expiring, single-use receipts bound to an exact request.
+  A bare model/source-provided approval boolean is not accepted.
 
 The current repository implements the data models, immutable store, deterministic
 policy decision logic, fixed workflow transitions, typed query validation, and

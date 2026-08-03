@@ -1,0 +1,45 @@
+version: 3
+
+# Automatic calls require the persistent ledger and budget policy. A direct
+# client without those components remains forbidden.
+automatic_external_calls: true
+
+# Unknown content must be classified before it can leave the deployment.
+unknown_data_class_external: forbidden
+
+external_providers:
+  - provider: openai
+    base_urls:
+      - https://api.openai.com/v1
+    models:
+      - gpt-5.2
+    operations:
+      - model_smoke
+      - query_compilation
+      - ontology_extraction
+      - ontology_design
+      - conflict_analysis
+      - gap_analysis
+    data_classes:
+      - public
+      - authorized_workspace
+      - licensed
+      - private
+
+  - provider: zai
+    base_urls:
+      - https://api.z.ai/api/paas/v4
+    models:
+      - glm-5.2
+    operations:
+      - model_smoke
+      - query_compilation
+      - ontology_extraction
+      - ontology_design
+      - conflict_analysis
+      - gap_analysis
+    data_classes:
+      - public
+      - authorized_workspace
+      - licensed
+      - private

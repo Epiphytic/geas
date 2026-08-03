@@ -8,11 +8,25 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+from research_agent.model_policy import ModelUseGate
 from research_agent.models import ProviderConfig
 
 
 class ProviderError(RuntimeError):
     pass
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> None:
+        return None
 
 
 def load_provider_configs(path: Path) -> tuple[str, dict[str, ProviderConfig]]:
@@ -35,9 +49,19 @@ class ModelClient:
     untrusted data and must pass a typed validator before use.
     """
 
-    def __init__(self, name: str, config: ProviderConfig, *, timeout: float = 180.0) -> None:
+    def __init__(
+        self,
+        name: str,
+        config: ProviderConfig,
+        *,
+        gate: ModelUseGate | None = None,
+        timeout: float = 180.0,
+    ) -> None:
+        if config.external and gate is None:
+            raise ValueError("external model clients require a deterministic authorization gate")
         self.name = name
         self.config = config
+        self.gate = gate
         self.timeout = timeout
 
     def complete(
@@ -51,6 +75,14 @@ class ModelClient:
             max_output_tokens or self.config.max_output_tokens,
             self.config.max_output_tokens,
         )
+        if self.gate is not None:
+            self.gate.authorize(
+                provider=self.name,
+                config=self.config,
+                system=system,
+                user=user,
+                max_output_tokens=token_limit,
+            )
         body = {
             "model": self.config.model,
             "messages": [
@@ -81,10 +113,23 @@ class ModelClient:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            opener = urllib.request.build_opener(_NoRedirect)
+            with opener.open(request, timeout=self.timeout) as response:
                 payload = json.load(response)
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
             raise ProviderError(f"{self.name} request failed: {error}") from error
+
+        if self.gate is not None:
+            usage = payload.get("usage") if isinstance(payload, dict) else None
+            input_tokens = usage.get("prompt_tokens") if isinstance(usage, dict) else None
+            output_tokens = usage.get("completion_tokens") if isinstance(usage, dict) else None
+            try:
+                self.gate.settle(
+                    input_tokens=input_tokens if isinstance(input_tokens, int) else None,
+                    output_tokens=output_tokens if isinstance(output_tokens, int) else None,
+                )
+            except ValueError as error:
+                raise ProviderError(f"{self.name} usage settlement failed: {error}") from error
 
         try:
             message = payload["choices"][0]["message"]

@@ -5,8 +5,9 @@ knowledge base. Its durable product is a versioned graph of claims, evidence,
 concepts, disagreements, and source-threat observations—not a periodically
 regenerated report.
 
-This repository currently provides the Phase 0 control plane and the M1 offline
-research slice:
+This repository provides the deterministic control plane, offline acquisition,
+open scholarly discovery, and a persistent SQLite knowledge-query vertical
+slice:
 
 - strict records for sources, evidence, claims, and threat observations;
 - strict records for query plans, discovery, acquisition, access constraints,
@@ -17,15 +18,27 @@ research slice:
 - connector capability manifests and narrow discovery/acquisition contracts;
 - deterministic query validation with controlled synonyms and budget clamps;
 - path-confined local-file discovery and acquisition;
+- public Crossref scholarly discovery with DOI, author, publisher, and date normalization;
+- reviewed knowledge-pack import with exact source selectors;
+- deterministic indirect-prompt-injection scanning and topic-scoped tainted-source records;
+- content-addressed, inspectable JSON record batches for larger claim sets;
+- atomic SQLite projection builds with FTS5, hierarchy, provenance, dissent,
+  gap, threat, and valid-time queries;
+- deterministic JSON and Markdown topic views;
 - a tool-free client for local DeepSeek and optional external providers;
 - a starter LinkML ontology and a maintained upstream intelligence registry;
 - tests for the principal prompt-injection security invariants.
 
-Network connectors, graph persistence, lexical/faceted graph query, ontology
-projection, gap ranking, and scheduled refresh are subsequent milestones. See
+Additional scholarly/open-web connectors, automated extraction proposals, and
+scheduled gap refresh remain subsequent milestones. See
 [STATE_OF_THE_ART.md](STATE_OF_THE_ART.md) for the design and research basis,
 and [docs/NEXT_PHASE.md](docs/NEXT_PHASE.md) for the executable discovery and
-acquisition plan.
+acquisition plan. Accepted cost, licensing, and deployment choices are recorded
+in [docs/OPERATOR_DECISIONS.md](docs/OPERATOR_DECISIONS.md). Canonical authority
+and projection reconciliation are defined in
+[docs/SOURCE_OF_TRUTH.md](docs/SOURCE_OF_TRUTH.md). User-deposit defaults and
+the deployment-level authorization boundary are documented in
+[docs/DEPOSITS.md](docs/DEPOSITS.md).
 
 ## Why this is not conventional RAG
 
@@ -80,6 +93,7 @@ uv run pytest
 uv run ruff check .
 uv run research-agent providers
 uv run research-agent model-smoke
+uv run research-agent projection-benchmark --tier smoke
 ```
 
 Create an immutable store and archive a source:
@@ -121,6 +135,75 @@ uv run research-agent policy-check \
 Global options such as `--policy` and `--providers` go before the subcommand.
 The `data/` directory is intentionally ignored by Git.
 
+Run bounded Mojeek discovery using `MOJEEK_API_KEY` from the ignored `.env`
+file:
+
+```bash
+uv run research-agent discover-mojeek \
+  "ontology-backed research agents" \
+  --result-limit 10
+```
+
+This command is discovery-only. It retains the query plan, aggregate run record,
+and response hashes. Normalized hits are not persisted until the operator
+confirms that the Mojeek subscription has storage rights. Search hits and
+snippets are never evidence.
+
+Capture canonical state and detect later ontology, record, blob, or SQLite
+projection drift:
+
+```bash
+uv run research-agent truth-snapshot \
+  --root data \
+  --created-by operator:example
+
+uv run research-agent projection-check \
+  data/records/truth-snapshot/aa/snapshot.json \
+  data/query.sqlite \
+  --root data
+```
+
+SQLite is a rebuildable query projection. It is never a source for automatic
+changes to canonical ontology or knowledge records.
+
+The complete import, snapshot, query, and topic-export workflow is documented
+in [docs/KNOWLEDGE_WORKFLOW.md](docs/KNOWLEDGE_WORKFLOW.md). Measured local
+performance is recorded in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+
+The initial production target is a local single-user CLI with one serialized
+canonical writer and million-claim scale testing. A different graph backend
+requires measured evidence against [the workload contract](docs/WORKLOAD_TARGET.md).
+
+Archive a user-provided source with explicit provenance:
+
+```bash
+uv run research-agent deposit-add paper.pdf \
+  --deposited-by user:researcher \
+  --method browser_save \
+  --original-locator https://publisher.example/paper \
+  --author "Ada Example" \
+  --license CC-BY-4.0 \
+  --usage-condition "Attribution required"
+```
+
+Deposit defaults are operator-configurable and individually overridable. The
+initial version assumes the entire deployment is authorization-gated; it does
+not enforce record- or branch-level ACLs. Rights fields default to unknown, and
+valid NIP-01/NIP-94 events may be attached as file-bound cryptographic evidence.
+
+External model use is separately controlled by a deterministic gate that binds
+the provider, endpoint, model, operation, data class, content route, and exact
+input hash. Automatic calls require a transactional budget reservation.
+Subscription and enterprise-accounted services may be excluded from dollar
+totals without bypassing call or token limits. See
+[docs/MODEL_USE_POLICY.md](docs/MODEL_USE_POLICY.md) and
+[docs/BUDGET_POLICY.md](docs/BUDGET_POLICY.md).
+
+For CLI use, `--override-external-budget` creates a single-use approval bound
+to the exact request and attributed to the local OS account. It cannot override
+classification, routing, provider, accounting, or hard token safeguards. See
+[docs/APPROVALS.md](docs/APPROVALS.md).
+
 ## Tainted-source intelligence
 
 [`intelligence/sources.yaml`](intelligence/sources.yaml) catalogs maintained
@@ -133,6 +216,13 @@ URLhaus, PhishTank, Spamhaus DBL, FDA and FTC resources, and several
 supplementary sources. Licensing, access, scope, staleness, and false-positive
 caveats are recorded per source. The research and selection rationale are in
 [docs/THREAT_INTELLIGENCE_SOURCES.md](docs/THREAT_INTELLIGENCE_SOURCES.md).
+
+## License
+
+Repository software and original project material are licensed under
+[Apache License 2.0](LICENSE). Explicitly licensed ontology material,
+third-party sources, user deposits, and acquired content retain their own
+terms. See [docs/LICENSING.md](docs/LICENSING.md).
 
 ## Repository map
 
