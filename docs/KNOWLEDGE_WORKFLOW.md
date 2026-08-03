@@ -25,7 +25,9 @@ uv run research-agent research-local \
 ```
 
 Run open scholarly discovery, which retains normalized DOI metadata but does
-not treat it as evidence:
+not treat it as evidence. The initial connector uses Crossref's anonymous
+public pool; an operator-confirmed contact identity can enable the polite pool
+later:
 
 ```bash
 uv run research-agent discover-crossref \

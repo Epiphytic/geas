@@ -60,7 +60,7 @@ class HttpsCrossrefTransport:
             f"{self.endpoint}?{query}",
             headers={
                 "Accept": "application/json",
-                "User-Agent": "Epiphytic-Research-Agent/0.1 (mailto:research@epiphytic.org)",
+                "User-Agent": "Epiphytic-Research-Agent/0.1",
             },
         )
         try:
@@ -172,7 +172,6 @@ class CrossrefDiscoveryConnector:
                     "query.bibliographic": query,
                     "rows": str(rows),
                     "cursor": cursor,
-                    "mailto": "research@epiphytic.org",
                 }
             )
             envelope = self._parse(body)
