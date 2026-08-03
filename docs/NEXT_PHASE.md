@@ -274,7 +274,8 @@ tools or write authority.
 - [x] Implement authenticated OpenAlex discovery with transactional cost
   reservation, reported-cost settlement, and CC0 metadata persistence.
 - [x] Add deterministic DOI normalization.
-- [ ] Add PMID, ORCID, ROR, ISSN, and broader URL normalization.
+- [x] Add deterministic PMID, PMCID, ORCID, ROR, and ISSN normalization.
+- [ ] Add broader canonical URL normalization.
 - Implement Unpaywall and Europe PMC resolution/acquisition.
 - Represent works separately from manifestations.
 - Add citation-following with depth and budget limits.

@@ -7,7 +7,7 @@ import re
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from datetime import UTC, datetime
 from decimal import ROUND_CEILING, Decimal, InvalidOperation
 from typing import Any, Protocol
@@ -24,7 +24,15 @@ from research_agent.discovery import (
     SourceClass,
     TermMatch,
 )
-from research_agent.identifiers import doi_locator, normalize_doi
+from research_agent.identifiers import (
+    doi_locator,
+    normalize_doi,
+    normalize_issn,
+    normalize_orcid,
+    normalize_pmcid,
+    normalize_pmid,
+    normalize_ror,
+)
 
 
 class OpenAlexError(RuntimeError):
@@ -98,15 +106,23 @@ class _ExternalModel(BaseModel):
 class _Author(_ExternalModel):
     id: str | None = None
     display_name: str = ""
+    orcid: str | None = None
+
+
+class _Institution(_ExternalModel):
+    ror: str | None = None
 
 
 class _Authorship(_ExternalModel):
     author: _Author
+    institutions: tuple[_Institution, ...] = ()
 
 
 class _Source(_ExternalModel):
     id: str | None = None
     display_name: str = ""
+    issn_l: str | None = None
+    issn: tuple[str, ...] = ()
 
 
 class _Location(_ExternalModel):
@@ -119,6 +135,11 @@ class _OpenAccess(_ExternalModel):
     is_oa: bool = False
     oa_status: str | None = None
     oa_url: str | None = None
+
+
+class _WorkIds(_ExternalModel):
+    pmid: str | None = None
+    pmcid: str | None = None
 
 
 class _Work(_ExternalModel):
@@ -135,6 +156,7 @@ class _Work(_ExternalModel):
     authorships: tuple[_Authorship, ...] = ()
     primary_location: _Location | None = None
     open_access: _OpenAccess = Field(default_factory=_OpenAccess)
+    ids: _WorkIds = Field(default_factory=_WorkIds)
 
 
 class _Meta(_ExternalModel):
@@ -194,6 +216,7 @@ class OpenAlexDiscoveryConnector:
             "authorships",
             "primary_location",
             "open_access",
+            "ids",
         )
     )
 
@@ -296,12 +319,32 @@ class OpenAlexDiscoveryConnector:
             known_ids.append(f"doi:{doi}")
         else:
             locator = work.id
+        self._append_identifier(known_ids, "pmid", work.ids.pmid, normalize_pmid)
+        self._append_identifier(known_ids, "pmcid", work.ids.pmcid, normalize_pmcid)
+        for authorship in work.authorships:
+            self._append_identifier(
+                known_ids,
+                "orcid",
+                authorship.author.orcid,
+                normalize_orcid,
+            )
+            for institution in authorship.institutions:
+                self._append_identifier(
+                    known_ids,
+                    "ror",
+                    institution.ror,
+                    normalize_ror,
+                )
         authors = tuple(
             item.author.display_name.strip()
             for item in work.authorships
             if item.author.display_name.strip()
         )
         source = work.primary_location.source if work.primary_location else None
+        if source:
+            self._append_identifier(known_ids, "issn", source.issn_l, normalize_issn)
+            for issn in source.issn:
+                self._append_identifier(known_ids, "issn", issn, normalize_issn)
         publisher = source.display_name.strip() if source and source.display_name.strip() else None
         publication = self._publication_date(work.publication_date)
         metadata: dict[str, str | int | float | bool] = {
@@ -335,7 +378,7 @@ class OpenAlexDiscoveryConnector:
             language=work.language or request.languages[0],
             snippet=snippet,
             score=work.relevance_score,
-            known_entity_ids=tuple(known_ids),
+            known_entity_ids=tuple(dict.fromkeys(known_ids)),
             metadata=metadata,
         )
 
@@ -369,6 +412,21 @@ class OpenAlexDiscoveryConnector:
     def _query_text(self, request: DiscoveryRequest) -> str:
         separator = " OR " if request.match is TermMatch.ANY else " AND "
         return separator.join(self._quote_term(term) for term in request.exact_terms)
+
+    @staticmethod
+    def _append_identifier(
+        identifiers: list[str],
+        kind: str,
+        value: str | None,
+        normalizer: Callable[[str], str],
+    ) -> None:
+        if value is None:
+            return
+        try:
+            normalized = normalizer(value)
+        except ValueError:
+            return
+        identifiers.append(f"{kind}:{normalized}")
 
     @staticmethod
     def _quote_term(term: str) -> str:

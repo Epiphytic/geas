@@ -51,6 +51,11 @@ def test_openalex_fixture_preserves_open_metadata_and_reported_cost() -> None:
     assert work.known_entity_ids == (
         "openalex:W4401234567",
         "doi:10.1002/14651858.cd010856.pub3",
+        "pmid:25472792",
+        "pmcid:PMC123456",
+        "orcid:0000-0002-1825-0097",
+        "ror:03yrm5c26",
+        "issn:1469-493X",
     )
     assert work.metadata == {
         "cited_by_count": 24,
