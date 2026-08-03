@@ -30,6 +30,10 @@ boundary.
   only by the fixed-host transport and never persisted. Returned OA URLs are
   rejected if private, local, credential-bearing, or non-HTTP(S), and vague
   license classes cannot authorize automatic acquisition.
+- Remote acquisition is HTTPS-only, resolves and pins a public IPv4 address,
+  disables proxy inheritance and automatic redirects, and independently
+  validates every redirect. Original bytes remain quarantined. Versioned
+  parsers emit inert text with size/time bounds; parsing never upgrades trust.
 - Canonical authority is one-way: version-controlled ontology and schemas plus
   immutable records and blobs produce truth snapshots; SQLite and Markdown are
   disposable projections. Projection data can never authorize changes to

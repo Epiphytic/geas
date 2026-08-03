@@ -28,6 +28,7 @@ from research_agent.models import (
     ThreatAssessment,
     ThreatObservation,
 )
+from research_agent.parsing import TextDerivation
 from research_agent.store import ImmutableStore
 from research_agent.truth import SQLiteProjectionGuard, TruthManager, TruthSnapshot
 
@@ -42,6 +43,7 @@ class QueryRecordType(StrEnum):
     THREAT = "threat"
     DISCOVERY = "discovery"
     RESOLUTION = "resolution"
+    DOCUMENT = "document"
 
 
 class KnowledgeQueryPlan(StrictModel):
@@ -178,8 +180,8 @@ class DeterministicQueryCompiler:
 
 
 class SQLiteKnowledgeProjection:
-    schema_version = 3
-    builder_version = "sqlite-knowledge-projection/3"
+    schema_version = 4
+    builder_version = "sqlite-knowledge-projection/4"
 
     def __init__(self, *, store: ImmutableStore, workspace_root: Path) -> None:
         self.store = store
@@ -275,6 +277,10 @@ class SQLiteKnowledgeProjection:
                 resolutions=(
                     OpenAccessResolution.model_validate(value)
                     for value in self.store.iter_records("open-access-resolution")
+                ),
+                derivations=(
+                    TextDerivation.model_validate(value)
+                    for value in self.store.iter_records("text-derivation")
                 ),
             )
             connection.execute("PRAGMA optimize")
@@ -494,6 +500,21 @@ class SQLiteKnowledgeProjection:
                 automatic_acquisition_eligible INTEGER NOT NULL,
                 PRIMARY KEY (resolution_id, ordinal)
             );
+            CREATE TABLE text_derivation (
+                id TEXT PRIMARY KEY,
+                original_source_version_id TEXT NOT NULL REFERENCES source(id),
+                derived_source_version_id TEXT NOT NULL REFERENCES source(id),
+                original_content_sha256 TEXT NOT NULL,
+                derived_content_sha256 TEXT NOT NULL,
+                input_media_type TEXT NOT NULL,
+                output_media_type TEXT NOT NULL,
+                parser_id TEXT NOT NULL,
+                parser_version TEXT NOT NULL,
+                extraction_scope TEXT NOT NULL,
+                extracted_at TEXT NOT NULL,
+                character_count INTEGER NOT NULL,
+                warnings_json TEXT NOT NULL
+            );
             CREATE VIRTUAL TABLE knowledge_fts USING fts5(
                 record_type UNINDEXED,
                 record_id UNINDEXED,
@@ -512,8 +533,8 @@ class SQLiteKnowledgeProjection:
             """
         )
 
-    @staticmethod
     def _insert(
+        self,
         connection: sqlite3.Connection,
         *,
         concepts: tuple[Concept, ...],
@@ -528,6 +549,7 @@ class SQLiteKnowledgeProjection:
         coverage: Iterable[CoverageRun],
         discovery_hits: Iterable[DiscoveryHit],
         resolutions: Iterable[OpenAccessResolution],
+        derivations: Iterable[TextDerivation],
     ) -> dict[str, int]:
         counts = {
             "concepts": 0,
@@ -543,6 +565,7 @@ class SQLiteKnowledgeProjection:
             "discovery_hits": 0,
             "open_access_resolutions": 0,
             "open_access_locations": 0,
+            "text_derivations": 0,
         }
 
         def add_fts(record_type: QueryRecordType, record_id: str, title: str, body: str) -> None:
@@ -883,6 +906,36 @@ class SQLiteKnowledgeProjection:
                         ),
                     )
                 ),
+            )
+        for item in derivations:
+            counts["text_derivations"] += 1
+            connection.execute(
+                "INSERT INTO text_derivation VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    item.id,
+                    item.original_source_version_id,
+                    item.derived_source_version_id,
+                    item.original_content_sha256,
+                    item.derived_content_sha256,
+                    item.input_media_type,
+                    item.output_media_type,
+                    item.parser_id,
+                    item.parser_version,
+                    item.extraction_scope,
+                    item.extracted_at.isoformat(),
+                    item.character_count,
+                    json.dumps(item.warnings, ensure_ascii=False),
+                ),
+            )
+            text = self.store.read_blob(item.derived_content_sha256).decode(
+                "utf-8",
+                errors="strict",
+            )
+            add_fts(
+                QueryRecordType.DOCUMENT,
+                item.id,
+                f"Untrusted derived text from {item.original_source_version_id}",
+                text,
             )
         return counts
 

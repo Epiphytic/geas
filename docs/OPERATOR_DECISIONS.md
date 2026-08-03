@@ -328,3 +328,28 @@ References:
 - [Unpaywall API privacy policy](https://unpaywall.org/legal/privacy)
 - [Unpaywall OA license interpretation](https://support.unpaywall.org/support/solutions/articles/44002063718-what-is-an-oa-license-)
 - [Unpaywall code-injection guidance](https://support.unpaywall.org/support/solutions/articles/44002216436-preventing-code-injection-using-text-from-unpaywall-safely)
+
+## 14. Format-neutral originals and parsed text
+
+**Status:** accepted and implemented on 2026-08-03.
+
+### Decision
+
+- Treat every document format as potentially first-class when a bounded,
+  deterministic parser adapter exists.
+- Always preserve immutable original bytes for later reprocessing.
+- Represent extracted text as a separate content-addressed derivation with the
+  parser identity, version, hashes, warnings, and extraction scope.
+- Keep both original and derived content quarantined; parsing removes active
+  structure but does not make source assertions trusted.
+- Add tables, figures, diagrams, layout, audio, video, and other non-text
+  semantics later as additional typed derivations from the same original.
+- Preserve unsupported originals and create an explicit parser-availability
+  constraint.
+
+The initial registry supports text, JSON, HTML, XML, OpenDocument/OpenXML
+office formats, and PDF text. Remote acquisition uses pinned HTTPS, bounded
+redirects, response size and timeout caps, deterministic license gates, and
+fallback across independently attributed manifestations.
+
+See `docs/PARSING.md` for the implemented safety and provenance contract.
