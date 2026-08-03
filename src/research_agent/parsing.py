@@ -20,6 +20,7 @@ from research_agent.knowledge import DeterministicThreatScanner
 from research_agent.models import SourceVersion, StrictModel, content_id, utc_now
 from research_agent.sandbox import BubblewrapSandbox, SandboxError
 from research_agent.store import ImmutableStore
+from research_agent.structure import StructuralDocumentManager
 
 
 class ParserError(ValueError):
@@ -49,6 +50,8 @@ class ParsedIngestReceipt(StrictModel):
     original_source_version_id: str
     derived_source_version_id: str
     derivation_id: str
+    structural_derivation_id: str
+    structural_anchor_ids: tuple[str, ...]
     evidence_fragment_ids: tuple[str, ...] = ()
     threat_observation_ids: tuple[str, ...] = ()
     record_hashes: dict[str, tuple[str, ...]]
@@ -66,6 +69,34 @@ class ParsedText(StrictModel):
 
 class _VisibleHtmlParser(HTMLParser):
     ignored = frozenset({"script", "style", "template", "noscript", "svg"})
+    blocks = frozenset(
+        {
+            "address",
+            "article",
+            "aside",
+            "blockquote",
+            "dd",
+            "div",
+            "dl",
+            "dt",
+            "footer",
+            "header",
+            "main",
+            "nav",
+            "ol",
+            "p",
+            "pre",
+            "section",
+            "table",
+            "tbody",
+            "td",
+            "tfoot",
+            "th",
+            "thead",
+            "tr",
+            "ul",
+        }
+    )
 
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
@@ -73,12 +104,33 @@ class _VisibleHtmlParser(HTMLParser):
         self.parts: list[str] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        if tag.casefold() in self.ignored:
+        tag = tag.casefold()
+        if tag in self.ignored:
             self.depth += 1
+            return
+        if self.depth:
+            return
+        if re.fullmatch(r"h[1-6]", tag):
+            self.parts.append(f"\n\n{'#' * int(tag[1])} ")
+        elif tag == "li":
+            self.parts.append("\n- ")
+        elif tag == "figcaption":
+            self.parts.append("\nFigure: ")
+        elif tag in self.blocks:
+            self.parts.append("\n")
 
     def handle_endtag(self, tag: str) -> None:
-        if tag.casefold() in self.ignored and self.depth:
+        tag = tag.casefold()
+        if tag in self.ignored and self.depth:
             self.depth -= 1
+            return
+        if not self.depth and (
+            tag in self.blocks
+            or tag == "li"
+            or tag == "figcaption"
+            or re.fullmatch(r"h[1-6]", tag)
+        ):
+            self.parts.append("\n")
 
     def handle_data(self, data: str) -> None:
         if not self.depth:
@@ -128,7 +180,8 @@ class DocumentParserRegistry:
         normalized = "".join(
             character
             for character in normalized
-            if character in "\n\t" or not unicodedata.category(character).startswith("C")
+            if character in "\n\t\f"
+            or not unicodedata.category(character).startswith("C")
         )
         normalized = re.sub(r"[ \t]+\n", "\n", normalized)
         normalized = re.sub(r"\n{4,}", "\n\n\n", normalized).strip() + "\n"
@@ -165,10 +218,13 @@ class DocumentParserRegistry:
         parser = _VisibleHtmlParser()
         parser.feed(self._decode(content))
         return ParsedText(
-            text="\n".join(parser.parts),
+            text="".join(parser.parts),
             parser_id="parser:html-visible-text",
-            parser_version="1",
-            warnings=("markup, scripts, styles, and remote resources were discarded",),
+            parser_version="2",
+            warnings=(
+                "active markup and remote resources were discarded; "
+                "block structure was rendered as inert text",
+            ),
         )
 
     def _xml(self, content: bytes) -> ParsedText:
@@ -239,7 +295,7 @@ class DocumentParserRegistry:
         try:
             output = self.native_sandbox.run(
                 executable,
-                ("-enc", "UTF-8", "-nopgbrk", "-", "-"),
+                ("-enc", "UTF-8", "-", "-"),
                 input_bytes=content,
             )
         except SandboxError as error:
@@ -247,7 +303,7 @@ class DocumentParserRegistry:
         return ParsedText(
             text=output.decode("utf-8", errors="replace"),
             parser_id="parser:poppler-pdftotext",
-            parser_version="1",
+            parser_version="2",
             parser_runtime="bubblewrap_native",
             warnings=("images, layout, annotations, actions, and embedded files were discarded",),
         )
@@ -336,25 +392,45 @@ class ParsedDocumentManager:
             character_count=len(parsed.text),
             warnings=parsed.warnings,
         )
+        derivation_record_hash = self.store.put_record(
+            "text-derivation",
+            derivation,
+        )
         findings = self.scanner.scan(derived.id, derived_content)
         fragments = tuple(item[0] for item in findings)
         observations = tuple(item[1] for item in findings)
+        fragment_hashes = tuple(
+            self.store.put_record("evidence-fragment", item) for item in fragments
+        )
+        observation_hashes = tuple(
+            self.store.put_record("threat-observation", item) for item in observations
+        )
+        structure = StructuralDocumentManager(
+            store=self.store,
+            clock=self.clock,
+        ).derive(
+            parsed.text,
+            text_derivation_id=derivation.id,
+            source_version_id=derived.id,
+            source_content_sha256=derived.content_sha256,
+            input_media_type=media_type,
+            extracted_at=acquired_at,
+        )
         hashes = {
             "source-version": tuple(
                 dict.fromkeys((original_record_hash, derived_record_hash))
             ),
-            "text-derivation": (self.store.put_record("text-derivation", derivation),),
-            "evidence-fragment": tuple(
-                self.store.put_record("evidence-fragment", item) for item in fragments
-            ),
-            "threat-observation": tuple(
-                self.store.put_record("threat-observation", item) for item in observations
-            ),
+            "text-derivation": (derivation_record_hash,),
+            "evidence-fragment": fragment_hashes,
+            "threat-observation": observation_hashes,
         }
+        hashes.update(structure.record_hashes)
         return ParsedIngestReceipt(
             original_source_version_id=original.id,
             derived_source_version_id=derived.id,
             derivation_id=derivation.id,
+            structural_derivation_id=structure.structural_derivation_id,
+            structural_anchor_ids=structure.structural_anchor_ids,
             evidence_fragment_ids=tuple(item.id for item in fragments),
             threat_observation_ids=tuple(item.id for item in observations),
             record_hashes=hashes,

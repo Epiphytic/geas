@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -30,6 +31,7 @@ from research_agent.models import (
 )
 from research_agent.parsing import TextDerivation
 from research_agent.store import ImmutableStore
+from research_agent.structure import AnchorKind, StructuralAnchor, StructuralDerivation
 from research_agent.truth import SQLiteProjectionGuard, TruthManager, TruthSnapshot
 
 
@@ -44,6 +46,7 @@ class QueryRecordType(StrEnum):
     DISCOVERY = "discovery"
     RESOLUTION = "resolution"
     DOCUMENT = "document"
+    ANCHOR = "anchor"
 
 
 class KnowledgeQueryPlan(StrictModel):
@@ -57,12 +60,31 @@ class KnowledgeQueryPlan(StrictModel):
     compiler_version: str
 
 
+class KnowledgeThreatContext(StrictModel):
+    id: str
+    threat_type: str
+    status: str
+    severity: str
+
+
 class KnowledgeHit(StrictModel):
     record_type: QueryRecordType
     record_id: str
     title: str
     snippet: str
     rank: float
+    source_version_id: str | None = None
+    derived_source_version_id: str | None = None
+    source_uri: str | None = None
+    trust_zone: str | None = None
+    threat_observation_ids: tuple[str, ...] = ()
+    threats: tuple[KnowledgeThreatContext, ...] = ()
+    anchor_kind: str | None = None
+    anchor_start: int | None = None
+    anchor_end: int | None = None
+    anchor_page_number: int | None = None
+    anchor_parent_id: str | None = None
+    anchor_synthetic: bool | None = None
 
 
 class KnowledgeQueryResult(StrictModel):
@@ -180,8 +202,8 @@ class DeterministicQueryCompiler:
 
 
 class SQLiteKnowledgeProjection:
-    schema_version = 5
-    builder_version = "sqlite-knowledge-projection/5"
+    schema_version = 6
+    builder_version = "sqlite-knowledge-projection/6"
 
     def __init__(self, *, store: ImmutableStore, workspace_root: Path) -> None:
         self.store = store
@@ -281,6 +303,14 @@ class SQLiteKnowledgeProjection:
                 derivations=(
                     TextDerivation.model_validate(value)
                     for value in self.store.iter_records("text-derivation")
+                ),
+                structural_derivations=(
+                    StructuralDerivation.model_validate(value)
+                    for value in self.store.iter_records("structural-derivation")
+                ),
+                structural_anchors=(
+                    StructuralAnchor.model_validate(value)
+                    for value in self.store.iter_records("structural-anchor")
                 ),
             )
             connection.execute("PRAGMA optimize")
@@ -516,6 +546,37 @@ class SQLiteKnowledgeProjection:
                 character_count INTEGER NOT NULL,
                 warnings_json TEXT NOT NULL
             );
+            CREATE TABLE structural_derivation (
+                id TEXT PRIMARY KEY,
+                text_derivation_id TEXT NOT NULL REFERENCES text_derivation(id),
+                source_version_id TEXT NOT NULL REFERENCES source(id),
+                source_content_sha256 TEXT NOT NULL,
+                input_media_type TEXT NOT NULL,
+                extractor_id TEXT NOT NULL,
+                extractor_version TEXT NOT NULL,
+                extracted_at TEXT NOT NULL,
+                offset_unit TEXT NOT NULL,
+                anchor_counts_json TEXT NOT NULL
+            );
+            CREATE TABLE structural_anchor (
+                id TEXT PRIMARY KEY,
+                structural_derivation_id TEXT NOT NULL
+                    REFERENCES structural_derivation(id),
+                source_version_id TEXT NOT NULL REFERENCES source(id),
+                source_content_sha256 TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                ordinal INTEGER NOT NULL,
+                start INTEGER NOT NULL,
+                end INTEGER NOT NULL,
+                exact_sha256 TEXT NOT NULL,
+                label TEXT,
+                level INTEGER,
+                parent_id TEXT REFERENCES structural_anchor(id)
+                    DEFERRABLE INITIALLY DEFERRED,
+                page_number INTEGER,
+                synthetic INTEGER NOT NULL,
+                UNIQUE (structural_derivation_id, ordinal)
+            );
             CREATE VIRTUAL TABLE knowledge_fts USING fts5(
                 record_type UNINDEXED,
                 record_id UNINDEXED,
@@ -531,6 +592,12 @@ class SQLiteKnowledgeProjection:
             CREATE INDEX gap_topic_status_idx ON knowledge_gap(topic_concept_id, status, priority);
             CREATE INDEX threat_source_status_idx
                 ON threat_observation(source_version, status, severity);
+            CREATE INDEX structural_anchor_source_range_idx
+                ON structural_anchor(source_version_id, start, end);
+            CREATE INDEX structural_anchor_parent_idx
+                ON structural_anchor(parent_id, ordinal);
+            CREATE INDEX structural_anchor_kind_idx
+                ON structural_anchor(structural_derivation_id, kind, ordinal);
             """
         )
 
@@ -551,6 +618,8 @@ class SQLiteKnowledgeProjection:
         discovery_hits: Iterable[DiscoveryHit],
         resolutions: Iterable[OpenAccessResolution],
         derivations: Iterable[TextDerivation],
+        structural_derivations: Iterable[StructuralDerivation],
+        structural_anchors: Iterable[StructuralAnchor],
     ) -> dict[str, int]:
         counts = {
             "concepts": 0,
@@ -567,6 +636,8 @@ class SQLiteKnowledgeProjection:
             "open_access_resolutions": 0,
             "open_access_locations": 0,
             "text_derivations": 0,
+            "structural_derivations": 0,
+            "structural_anchors": 0,
         }
 
         def add_fts(record_type: QueryRecordType, record_id: str, title: str, body: str) -> None:
@@ -939,6 +1010,80 @@ class SQLiteKnowledgeProjection:
                 f"Untrusted derived text from {item.original_source_version_id}",
                 text,
             )
+        anchors = tuple(structural_anchors)
+        anchors_by_derivation: dict[str, list[StructuralAnchor]] = {}
+        for anchor in anchors:
+            anchors_by_derivation.setdefault(
+                anchor.structural_derivation_id,
+                [],
+            ).append(anchor)
+        for item in structural_derivations:
+            selected = sorted(
+                anchors_by_derivation.get(item.id, []),
+                key=lambda anchor: anchor.ordinal,
+            )
+            if tuple(anchor.id for anchor in selected) != item.anchor_ids:
+                raise ValueError("structural derivation anchor index mismatch")
+            counts["structural_derivations"] += 1
+            connection.execute(
+                "INSERT INTO structural_derivation VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    item.id,
+                    item.text_derivation_id,
+                    item.source_version_id,
+                    item.source_content_sha256,
+                    item.input_media_type,
+                    item.extractor_id,
+                    item.extractor_version,
+                    item.extracted_at.isoformat(),
+                    item.offset_unit,
+                    json.dumps(item.anchor_counts, sort_keys=True),
+                ),
+            )
+        for item in anchors:
+            text = self.store.read_blob(item.source_content_sha256).decode(
+                "utf-8",
+                errors="strict",
+            )
+            if item.end > len(text):
+                raise ValueError("structural anchor exceeds source text")
+            exact = text[item.start : item.end]
+            if hashlib.sha256(exact.encode()).hexdigest() != item.exact_sha256:
+                raise ValueError("structural anchor selector hash mismatch")
+            counts["structural_anchors"] += 1
+            connection.execute(
+                "INSERT INTO structural_anchor VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    item.id,
+                    item.structural_derivation_id,
+                    item.source_version_id,
+                    item.source_content_sha256,
+                    item.kind,
+                    item.ordinal,
+                    item.start,
+                    item.end,
+                    item.exact_sha256,
+                    item.label,
+                    item.level,
+                    item.parent_id,
+                    item.page_number,
+                    int(item.synthetic),
+                ),
+            )
+            if item.kind is AnchorKind.SECTION:
+                add_fts(
+                    QueryRecordType.ANCHOR,
+                    item.id,
+                    item.label or f"section {item.ordinal}",
+                    item.label or "",
+                )
+            elif item.kind not in {AnchorKind.DOCUMENT, AnchorKind.PAGE}:
+                add_fts(
+                    QueryRecordType.ANCHOR,
+                    item.id,
+                    item.label or f"{item.kind.value} {item.ordinal}",
+                    exact,
+                )
         return counts
 
 
@@ -961,22 +1106,89 @@ class KnowledgeQueryEngine:
         with self._connect() as connection:
             rows = connection.execute(plan.sql, plan.parameters).fetchall()
             snapshot_id = self._snapshot_id(connection)
-        truncated = len(rows) > limit
-        hits = tuple(
-            KnowledgeHit(
-                record_type=QueryRecordType(row["record_type"]),
-                record_id=row["record_id"],
-                title=row["title"],
-                snippet=row["excerpt"],
-                rank=row["score"],
+            hits = tuple(
+                self._knowledge_hit(connection, row)
+                for row in rows[:limit]
             )
-            for row in rows[:limit]
-        )
+        truncated = len(rows) > limit
         return KnowledgeQueryResult(
             plan=plan,
             hits=hits,
             truncated=truncated,
             projection_snapshot_id=snapshot_id,
+        )
+
+    @staticmethod
+    def _knowledge_hit(
+        connection: sqlite3.Connection,
+        row: sqlite3.Row,
+    ) -> KnowledgeHit:
+        record_type = QueryRecordType(row["record_type"])
+        metadata: dict[str, Any] = {}
+        if record_type is QueryRecordType.ANCHOR:
+            anchor = connection.execute(
+                """
+                SELECT a.source_version_id AS derived_source_version_id,
+                       original.id AS source_version_id,
+                       original.source_uri,
+                       original.trust_zone,
+                       a.kind,
+                       a.start,
+                       a.end,
+                       a.page_number,
+                       a.parent_id,
+                       a.synthetic
+                FROM structural_anchor AS a
+                JOIN structural_derivation AS sd
+                  ON sd.id = a.structural_derivation_id
+                JOIN text_derivation AS td
+                  ON td.id = sd.text_derivation_id
+                JOIN source AS original
+                  ON original.id = td.original_source_version_id
+                WHERE a.id = ?
+                """,
+                (row["record_id"],),
+            ).fetchone()
+            if anchor is None:
+                raise ValueError("anchor FTS row has no structural record")
+            threats = connection.execute(
+                """
+                SELECT id, threat_type, status, severity
+                FROM threat_observation
+                WHERE source_version = ?
+                ORDER BY id
+                """,
+                (anchor["derived_source_version_id"],),
+            ).fetchall()
+            metadata = {
+                "source_version_id": anchor["source_version_id"],
+                "derived_source_version_id": anchor["derived_source_version_id"],
+                "source_uri": anchor["source_uri"],
+                "trust_zone": anchor["trust_zone"],
+                "threat_observation_ids": tuple(item["id"] for item in threats),
+                "threats": tuple(
+                    KnowledgeThreatContext(
+                        id=item["id"],
+                        threat_type=item["threat_type"],
+                        status=item["status"],
+                        severity=item["severity"],
+                    )
+                    for item in threats
+                ),
+                "anchor_kind": anchor["kind"],
+                "anchor_start": anchor["start"],
+                "anchor_end": anchor["end"],
+                "anchor_page_number": anchor["page_number"],
+                "anchor_parent_id": anchor["parent_id"],
+                "anchor_synthetic": bool(anchor["synthetic"]),
+            }
+        return KnowledgeHit(
+            record_type=record_type,
+            record_id=row["record_id"],
+            title=row["title"],
+            snippet=row["excerpt"],
+            rank=row["score"],
+            **metadata,
         )
 
     def topic(self, concept_id: str, *, as_of: datetime | None = None) -> TopicView:

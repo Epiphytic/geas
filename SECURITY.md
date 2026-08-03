@@ -39,6 +39,12 @@ boundary.
   dropped capabilities, closed inherited descriptors, and resource limits.
   Acquired bytes cross only through stdin. Missing host namespace support causes
   an explicit parser failure; it never enables an unsandboxed fallback.
+- Structural extraction is deterministic local code over inert derived text.
+  It emits typed, content-addressed ranges and cannot invoke models, tools,
+  network access, secrets, or policy transitions. SQLite rebuilds independently
+  verify every anchor range and exact-text hash before indexing it. Anchor
+  search hits include quarantine state and deterministic threat-observation
+  IDs; lexical relevance cannot silently strip poisoning context.
 - Canonical authority is one-way: version-controlled ontology and schemas plus
   immutable records and blobs produce truth snapshots; SQLite and Markdown are
   disposable projections. Projection data can never authorize changes to

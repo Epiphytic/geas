@@ -266,6 +266,11 @@ def test_projection_supports_lexical_hierarchy_dissent_gaps_and_provenance(
         record_types=(QueryRecordType.DOCUMENT,),
         limit=10,
     )
+    structural_anchor = engine.query(
+        "longitudinal fluoridation evidence",
+        record_types=(QueryRecordType.ANCHOR,),
+        limit=10,
+    )
     topic = engine.topic("concept:community-water-fluoridation")
 
     assert query.projection_snapshot_id == snapshot.id
@@ -273,6 +278,21 @@ def test_projection_supports_lexical_hierarchy_dissent_gaps_and_provenance(
     assert any("prevention of dental caries" in hit.title for hit in openalex_metadata.hits)
     assert len(oa_resolution.hits) == 1
     assert len(parsed_document.hits) == 1
+    assert structural_anchor.hits
+    assert all(
+        hit.record_type is QueryRecordType.ANCHOR
+        for hit in structural_anchor.hits
+    )
+    assert all(
+        hit.anchor_kind not in {"document", "page"}
+        for hit in structural_anchor.hits
+    )
+    assert all(
+        hit.source_uri == "https://repository.example/derived-fixture"
+        for hit in structural_anchor.hits
+    )
+    assert all(hit.trust_zone == "quarantined" for hit in structural_anchor.hits)
+    assert all(not hit.threat_observation_ids for hit in structural_anchor.hits)
     assert query.plan.compiler_version == "deterministic-local-query/1"
     assert "MATCH ?" in query.plan.sql
     assert {hit.record_type for hit in query.hits} >= {
@@ -295,6 +315,8 @@ def test_projection_supports_lexical_hierarchy_dissent_gaps_and_provenance(
     assert build.counts["open_access_resolutions"] == 1
     assert build.counts["open_access_locations"] == 3
     assert build.counts["text_derivations"] == 1
+    assert build.counts["structural_derivations"] == 1
+    assert build.counts["structural_anchors"] == 3
     with sqlite3.connect(database) as connection:
         assert connection.execute(
             "SELECT parser_runtime FROM text_derivation"
