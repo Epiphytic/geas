@@ -1,0 +1,47 @@
+{
+  "doi": "10.1002/14651858.cd010856.pub3",
+  "doi_url": "https://doi.org/10.1002/14651858.cd010856.pub3",
+  "title": "Water fluoridation for the prevention of dental caries",
+  "genre": "journal-article",
+  "is_paratext": false,
+  "is_oa": true,
+  "oa_status": "gold",
+  "oa_locations": [
+    {
+      "url": "https://pmc.ncbi.nlm.nih.gov/articles/PMC123456/",
+      "url_for_landing_page": "https://pmc.ncbi.nlm.nih.gov/articles/PMC123456/",
+      "url_for_pdf": "https://pmc.ncbi.nlm.nih.gov/articles/PMC123456/pdf/article.pdf",
+      "host_type": "repository",
+      "version": "publishedVersion",
+      "license": "cc-by",
+      "evidence": "oa repository (via page says license)",
+      "repository_institution": "PubMed Central",
+      "is_best": true
+    },
+    {
+      "url": "https://publisher.example/article",
+      "url_for_landing_page": "https://publisher.example/article",
+      "url_for_pdf": null,
+      "host_type": "publisher",
+      "version": "publishedVersion",
+      "license": null,
+      "evidence": "free at publisher",
+      "repository_institution": null,
+      "is_best": false
+    },
+    {
+      "url": "https://repository.example/other-oa",
+      "host_type": "repository",
+      "version": "acceptedVersion",
+      "license": "other-oa",
+      "is_best": false
+    },
+    {
+      "url": "http://127.0.0.1/private",
+      "host_type": "repository",
+      "version": "submittedVersion",
+      "license": "cc-by",
+      "is_best": false
+    }
+  ]
+}

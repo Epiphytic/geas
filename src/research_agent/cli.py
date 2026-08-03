@@ -20,7 +20,9 @@ from research_agent.connectors import (
     LocalFileConnector,
     MojeekDiscoveryConnector,
     OpenAlexDiscoveryConnector,
+    UnpaywallResolver,
 )
+from research_agent.connectors.unpaywall import UnpaywallError
 from research_agent.deposits import (
     AcquisitionMethod,
     DepositManager,
@@ -34,10 +36,14 @@ from research_agent.deposits import (
     UsagePermissionOverrides,
 )
 from research_agent.discovery import (
+    AccessConstraint,
+    AccessConstraintReason,
     CompilerIdentity,
     ConnectorCapability,
     SourceClass,
+    identified,
 )
+from research_agent.identifiers import doi_locator, normalize_doi
 from research_agent.knowledge import KnowledgeImporter, KnowledgePack
 from research_agent.model_policy import (
     DataClass,
@@ -320,6 +326,13 @@ def _build_parser() -> argparse.ArgumentParser:
     openalex.add_argument("--result-limit", type=int, default=20)
     openalex.add_argument("--approve-budget", action="store_true")
     openalex.add_argument("--run-id")
+
+    unpaywall = subparsers.add_parser(
+        "resolve-unpaywall",
+        help="resolve DOI records to license-attributed open-access locations",
+    )
+    unpaywall.add_argument("doi", nargs="+")
+    unpaywall.add_argument("--root", type=Path, default=Path("data"))
 
     truth_snapshot = subparsers.add_parser(
         "truth-snapshot",
@@ -963,6 +976,82 @@ def main() -> None:
                     "abstracts": False,
                     "full_text": False,
                     "note": "Lite bibliographic metadata is discovery, not evidence.",
+                },
+                "record_hashes": record_hashes,
+            }
+        )
+        return
+
+    if args.command == "resolve-unpaywall":
+        research_policy = ResearchPolicy.from_yaml(args.research_policy)
+        provider_policy = research_policy.domain_index("connector:unpaywall")
+        if not provider_policy.enabled:
+            raise ValueError("Unpaywall is disabled by the research policy")
+        normalized_dois = tuple(dict.fromkeys(normalize_doi(item) for item in args.doi))
+        if len(normalized_dois) > provider_policy.max_requests_per_run:
+            raise ValueError("Unpaywall DOI count exceeds the provider run limit")
+        load_env_file(
+            args.env_file,
+            allowed_names=frozenset({provider_policy.credential_env}),
+        )
+        resolver = UnpaywallResolver()
+        store = ImmutableStore(args.root)
+        store.initialize()
+        resolutions = []
+        constraints = []
+        for doi in normalized_dois:
+            try:
+                resolution = resolver.resolve(doi)
+            except UnpaywallError:
+                observed_at = datetime.now(UTC)
+                fields = {
+                    "target_id": f"doi:{doi}",
+                    "locator": doi_locator(doi),
+                    "connector_id": resolver.connector_id,
+                    "observed_at": observed_at,
+                }
+                constraints.append(
+                    AccessConstraint(
+                        id=identified("access-constraint", fields),
+                        target_id=f"doi:{doi}",
+                        locator=doi_locator(doi),
+                        reason=AccessConstraintReason.UNAVAILABLE_API,
+                        observed_at=observed_at,
+                        connector_id=resolver.connector_id,
+                        lawful_alternatives=(doi_locator(doi),),
+                        human_resolvable=True,
+                        detail="Unpaywall lookup failed; upstream content was not retained",
+                    )
+                )
+            else:
+                resolutions.append(resolution)
+        record_hashes = {
+            "research-policy": (store.put_record("research-policy", research_policy),),
+            "connector-manifest": (
+                store.put_record("connector-manifest", resolver.manifest),
+            ),
+            "open-access-resolution": tuple(
+                store.put_record("open-access-resolution", item) for item in resolutions
+            ),
+            "access-constraint": tuple(
+                store.put_record("access-constraint", item) for item in constraints
+            ),
+        }
+        _json(
+            {
+                "resolutions": resolutions,
+                "constraints": constraints,
+                "persistence": {
+                    "normalized_metadata": provider_policy.persist_normalized_metadata,
+                    "metadata_license": provider_policy.metadata_license,
+                    "raw_response_retention_days": (
+                        provider_policy.raw_response_retention_days
+                    ),
+                    "contact_identity": "transport_only",
+                    "note": (
+                        "Only locations with a reported license are automatically "
+                        "eligible for later acquisition."
+                    ),
                 },
                 "record_hashes": record_hashes,
             }

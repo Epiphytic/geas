@@ -13,7 +13,7 @@ from typing import Any
 import yaml
 from pydantic import Field
 
-from research_agent.discovery import CoverageRun, DiscoveryHit
+from research_agent.discovery import CoverageRun, DiscoveryHit, OpenAccessResolution
 from research_agent.knowledge import (
     Concept,
     Controversy,
@@ -41,6 +41,7 @@ class QueryRecordType(StrEnum):
     SOURCE = "source"
     THREAT = "threat"
     DISCOVERY = "discovery"
+    RESOLUTION = "resolution"
 
 
 class KnowledgeQueryPlan(StrictModel):
@@ -177,8 +178,8 @@ class DeterministicQueryCompiler:
 
 
 class SQLiteKnowledgeProjection:
-    schema_version = 2
-    builder_version = "sqlite-knowledge-projection/2"
+    schema_version = 3
+    builder_version = "sqlite-knowledge-projection/3"
 
     def __init__(self, *, store: ImmutableStore, workspace_root: Path) -> None:
         self.store = store
@@ -270,6 +271,10 @@ class SQLiteKnowledgeProjection:
                 discovery_hits=(
                     DiscoveryHit.model_validate(value)
                     for value in self.store.iter_records("discovery-hit")
+                ),
+                resolutions=(
+                    OpenAccessResolution.model_validate(value)
+                    for value in self.store.iter_records("open-access-resolution")
                 ),
             )
             connection.execute("PRAGMA optimize")
@@ -460,6 +465,35 @@ class SQLiteKnowledgeProjection:
                 known_entity_ids_json TEXT NOT NULL,
                 metadata_json TEXT NOT NULL
             );
+            CREATE TABLE open_access_resolution (
+                id TEXT PRIMARY KEY,
+                doi TEXT NOT NULL,
+                canonical_locator TEXT NOT NULL,
+                connector_id TEXT NOT NULL,
+                resolved_at TEXT NOT NULL,
+                response_sha256 TEXT NOT NULL,
+                is_open_access INTEGER NOT NULL,
+                oa_status TEXT NOT NULL,
+                title TEXT NOT NULL,
+                genre TEXT,
+                is_paratext INTEGER NOT NULL
+            );
+            CREATE TABLE open_access_location (
+                resolution_id TEXT NOT NULL REFERENCES open_access_resolution(id),
+                ordinal INTEGER NOT NULL,
+                url TEXT NOT NULL,
+                landing_page_url TEXT,
+                pdf_url TEXT,
+                host_type TEXT NOT NULL,
+                version TEXT NOT NULL,
+                license TEXT,
+                license_status TEXT NOT NULL,
+                evidence TEXT,
+                repository_institution TEXT,
+                is_best INTEGER NOT NULL,
+                automatic_acquisition_eligible INTEGER NOT NULL,
+                PRIMARY KEY (resolution_id, ordinal)
+            );
             CREATE VIRTUAL TABLE knowledge_fts USING fts5(
                 record_type UNINDEXED,
                 record_id UNINDEXED,
@@ -493,6 +527,7 @@ class SQLiteKnowledgeProjection:
         assessments: Iterable[ThreatAssessment],
         coverage: Iterable[CoverageRun],
         discovery_hits: Iterable[DiscoveryHit],
+        resolutions: Iterable[OpenAccessResolution],
     ) -> dict[str, int]:
         counts = {
             "concepts": 0,
@@ -506,6 +541,8 @@ class SQLiteKnowledgeProjection:
             "threat_assessments": 0,
             "coverage_runs": 0,
             "discovery_hits": 0,
+            "open_access_resolutions": 0,
+            "open_access_locations": 0,
         }
 
         def add_fts(record_type: QueryRecordType, record_id: str, title: str, body: str) -> None:
@@ -784,6 +821,66 @@ class SQLiteKnowledgeProjection:
                         item.canonical_locator,
                         item.snippet or "",
                         json.dumps(item.metadata, ensure_ascii=False, sort_keys=True),
+                    )
+                ),
+            )
+        for item in resolutions:
+            counts["open_access_resolutions"] += 1
+            connection.execute(
+                "INSERT INTO open_access_resolution VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    item.id,
+                    item.doi,
+                    item.canonical_locator,
+                    item.connector_id,
+                    item.resolved_at.isoformat(),
+                    item.response_sha256,
+                    int(item.is_open_access),
+                    item.oa_status,
+                    item.title,
+                    item.genre,
+                    int(item.is_paratext),
+                ),
+            )
+            for ordinal, location in enumerate(item.locations):
+                counts["open_access_locations"] += 1
+                connection.execute(
+                    """
+                    INSERT INTO open_access_location
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        item.id,
+                        ordinal,
+                        location.url,
+                        location.landing_page_url,
+                        location.pdf_url,
+                        location.host_type,
+                        location.version,
+                        location.license,
+                        location.license_status,
+                        location.evidence,
+                        location.repository_institution,
+                        int(location.is_best),
+                        int(location.automatic_acquisition_eligible),
+                    ),
+                )
+            add_fts(
+                QueryRecordType.RESOLUTION,
+                item.id,
+                item.title,
+                " ".join(
+                    (
+                        item.doi,
+                        item.oa_status,
+                        item.genre or "",
+                        *(
+                            f"{location.url} {location.host_type} "
+                            f"{location.version} {location.license or 'unknown'} "
+                            f"{location.repository_institution or ''} "
+                            f"{location.evidence or ''}"
+                            for location in item.locations
+                        ),
                     )
                 ),
             )

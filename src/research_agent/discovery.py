@@ -5,7 +5,7 @@ from collections.abc import Iterable
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Protocol
+from typing import Literal, Protocol
 
 from pydantic import Field, field_validator, model_validator
 
@@ -206,6 +206,44 @@ class AccessConstraint(StrictModel):
     lawful_alternatives: tuple[str, ...] = ()
     human_resolvable: bool
     detail: str | None = None
+
+
+class OpenAccessLocation(StrictModel):
+    url: str
+    landing_page_url: str | None = None
+    pdf_url: str | None = None
+    host_type: str
+    version: str
+    license: str | None = None
+    license_status: Literal["known", "unknown"]
+    evidence: str | None = None
+    repository_institution: str | None = None
+    is_best: bool
+    automatic_acquisition_eligible: bool
+
+    @model_validator(mode="after")
+    def known_license_controls_automatic_acquisition(self) -> OpenAccessLocation:
+        known = self.license is not None
+        if known != (self.license_status == "known"):
+            raise ValueError("license status must match license presence")
+        if self.automatic_acquisition_eligible and not known:
+            raise ValueError("automatic acquisition requires a known license")
+        return self
+
+
+class OpenAccessResolution(StrictModel):
+    id: str
+    doi: str
+    canonical_locator: str
+    connector_id: str
+    resolved_at: datetime
+    response_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    is_open_access: bool
+    oa_status: str
+    title: str
+    genre: str | None = None
+    is_paratext: bool = False
+    locations: tuple[OpenAccessLocation, ...] = ()
 
 
 class CoverageRun(StrictModel):

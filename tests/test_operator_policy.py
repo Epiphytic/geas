@@ -34,6 +34,10 @@ def test_checked_in_policy_prefers_mojeek_and_open_acquisition() -> None:
     assert europe_pmc.priority == 3
     assert europe_pmc.metadata_license.startswith("unknown")
     assert europe_pmc.persist_normalized_metadata
+    unpaywall = policy.domain_index("connector:unpaywall")
+    assert unpaywall.enabled
+    assert unpaywall.credential_env == "UNPAYWALL_EMAIL"
+    assert unpaywall.priority == 4
 
 
 def test_persistence_requires_confirmed_storage_rights() -> None:
