@@ -415,19 +415,28 @@ class SQLiteProjectionGuard:
             """,
             (self.metadata_table,),
         ).fetchall()
-        logical: list[dict[str, Any]] = []
+        digest = hashlib.sha256()
+
+        def update(value: Any) -> None:
+            payload = canonical_json(value)
+            digest.update(len(payload).to_bytes(8, "big"))
+            digest.update(payload)
+
         for object_type, name, sql in objects:
-            entry: dict[str, Any] = {"type": object_type, "name": name, "sql": sql}
+            update({"type": object_type, "name": name, "sql": sql})
             if object_type == "table":
                 quoted = name.replace('"', '""')
-                rows = connection.execute(f'SELECT * FROM "{quoted}"').fetchall()
-                normalized = [[_sqlite_value(value) for value in row] for row in rows]
-                entry["rows"] = sorted(
-                    normalized,
-                    key=lambda row: canonical_json(row),
-                )
-            logical.append(entry)
-        return hashlib.sha256(canonical_json(logical)).hexdigest()
+                columns = [
+                    row[1]
+                    for row in connection.execute(f'PRAGMA table_info("{quoted}")').fetchall()
+                ]
+                order = ", ".join(f'"{column.replace(chr(34), chr(34) * 2)}"' for column in columns)
+                query = f'SELECT * FROM "{quoted}"'
+                if order:
+                    query += f" ORDER BY {order}"
+                for row in connection.execute(query):
+                    update([_sqlite_value(value) for value in row])
+        return digest.hexdigest()
 
     def _read_stamp(self, connection: sqlite3.Connection) -> ProjectionStamp | None:
         exists = connection.execute(

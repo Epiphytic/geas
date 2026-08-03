@@ -5,8 +5,9 @@ knowledge base. Its durable product is a versioned graph of claims, evidence,
 concepts, disagreements, and source-threat observations—not a periodically
 regenerated report.
 
-This repository currently provides the Phase 0 control plane and the M1 offline
-research slice:
+This repository provides the deterministic control plane, offline acquisition,
+open scholarly discovery, and a persistent SQLite knowledge-query vertical
+slice:
 
 - strict records for sources, evidence, claims, and threat observations;
 - strict records for query plans, discovery, acquisition, access constraints,
@@ -17,12 +18,19 @@ research slice:
 - connector capability manifests and narrow discovery/acquisition contracts;
 - deterministic query validation with controlled synonyms and budget clamps;
 - path-confined local-file discovery and acquisition;
+- public Crossref scholarly discovery with DOI, author, publisher, and date normalization;
+- reviewed knowledge-pack import with exact source selectors;
+- deterministic indirect-prompt-injection scanning and topic-scoped tainted-source records;
+- content-addressed, inspectable JSON record batches for larger claim sets;
+- atomic SQLite projection builds with FTS5, hierarchy, provenance, dissent,
+  gap, threat, and valid-time queries;
+- deterministic JSON and Markdown topic views;
 - a tool-free client for local DeepSeek and optional external providers;
 - a starter LinkML ontology and a maintained upstream intelligence registry;
 - tests for the principal prompt-injection security invariants.
 
-Network connectors, graph persistence, lexical/faceted graph query, ontology
-projection, gap ranking, and scheduled refresh are subsequent milestones. See
+Additional scholarly/open-web connectors, automated extraction proposals, and
+scheduled gap refresh remain subsequent milestones. See
 [STATE_OF_THE_ART.md](STATE_OF_THE_ART.md) for the design and research basis,
 and [docs/NEXT_PHASE.md](docs/NEXT_PHASE.md) for the executable discovery and
 acquisition plan. Accepted cost, licensing, and deployment choices are recorded
@@ -85,6 +93,7 @@ uv run pytest
 uv run ruff check .
 uv run research-agent providers
 uv run research-agent model-smoke
+uv run research-agent projection-benchmark --tier smoke
 ```
 
 Create an immutable store and archive a source:
@@ -156,6 +165,10 @@ uv run research-agent projection-check \
 
 SQLite is a rebuildable query projection. It is never a source for automatic
 changes to canonical ontology or knowledge records.
+
+The complete import, snapshot, query, and topic-export workflow is documented
+in [docs/KNOWLEDGE_WORKFLOW.md](docs/KNOWLEDGE_WORKFLOW.md). Measured local
+performance is recorded in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
 The initial production target is a local single-user CLI with one serialized
 canonical writer and million-claim scale testing. A different graph backend

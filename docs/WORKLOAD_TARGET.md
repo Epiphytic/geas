@@ -56,5 +56,10 @@ A migration proposal must include:
 - crash/recovery and drift-check behavior;
 - comparison against at least one candidate backend.
 
-The graph-backend decision is therefore deferred evidence gathering, not an
-unanswered architectural preference.
+## Measured outcome
+
+All three configured tiers completed on the development host. The million-claim
+projection rebuilt in 62.36 seconds with 241 MiB peak RSS; an intentionally
+nonselective all-match FTS query took 1.07 seconds median. SQLite remains the
+selected backend for this workload. See `docs/BENCHMARKS.md` for the complete
+measurements and methodology.

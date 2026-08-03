@@ -225,3 +225,22 @@ The complete boundary is documented in `docs/LICENSING.md`.
   deployment target justify it.
 
 See `docs/WORKLOAD_TARGET.md`.
+
+## 10. Local query backend after measurement
+
+**Status:** resolved by measurement on 2026-08-02.
+
+### Decision
+
+- Retain SQLite/FTS5 as the disposable query projection for the accepted local
+  single-user CLI target.
+- Keep ontology, policy, immutable JSON records, content-addressed record
+  batches, and source blobs canonical and directly inspectable.
+- Reconsider a graph backend only after a workload change or measured
+  regression, not because the data is graph-shaped.
+
+The configured 10,000-, 100,000-, and 1,000,000-claim tiers all completed.
+At one million claims, canonical writes took 31.84 seconds, snapshot creation
+6.27 seconds, projection rebuild 62.36 seconds, and a deliberately global
+all-match FTS query 1.07 seconds median with 241 MiB peak RSS. See
+`docs/BENCHMARKS.md`.

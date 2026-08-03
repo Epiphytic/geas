@@ -268,8 +268,12 @@ tools or write authority.
 
 ### M2 — scholarly and identifier discovery
 
-- Implement Crossref and OpenAlex discovery.
-- Add DOI, PMID, ORCID, ROR, ISSN, and URL normalization.
+**Status: partially implemented.**
+
+- [x] Implement Crossref discovery.
+- [ ] Implement OpenAlex discovery; the current API requires an operator API key.
+- [x] Add deterministic DOI normalization.
+- [ ] Add PMID, ORCID, ROR, ISSN, and broader URL normalization.
 - Implement Unpaywall and Europe PMC resolution/acquisition.
 - Represent works separately from manifestations.
 - Add citation-following with depth and budget limits.
@@ -292,11 +296,13 @@ attempt remains auditable.
 
 ### M4 — persistent deterministic query
 
-- Add SQLite tables and migrations for sources, claims, evidence, concepts,
+**Status: implemented for the local SQLite vertical slice.**
+
+- [x] Add SQLite tables for sources, discovery metadata, claims, evidence, concepts,
   controversy, gaps, and coverage.
-- Add FTS5 lexical search and exact/faceted query.
-- Add hierarchy traversal and temporal queries.
-- Generate topic, controversy, provenance, and gap pages.
+- [x] Add FTS5 lexical search and exact record-class facets.
+- [x] Add hierarchy traversal and valid-time queries.
+- [x] Generate topic, controversy, provenance, threat, and gap pages.
 - Add optional Semble indexing over generated pages.
 
 **Acceptance:** an independent agent answers the competency questions using only
@@ -305,8 +311,12 @@ distinguishes unknown, inaccessible, contradicted, and false.
 
 ### M5 — gap-driven refresh
 
-- Convert missing competency-question coverage into explicit gap records.
-- Rank gaps by expected coverage gain, source diversity, age, and cost.
+**Status: partially implemented.**
+
+- [x] Convert reviewed missing coverage into explicit gap records.
+- [x] Store deterministic operator-assigned gap priority, status, and freshness.
+- [ ] Rank proposals automatically by expected coverage gain, source diversity,
+  age, and cost.
 - Add standing query plans and freshness deadlines.
 - Re-run only affected connectors and projections.
 - Produce review queues for changed, disputed, or suspicious material.
@@ -344,7 +354,9 @@ Each research run should produce:
 Reports are optional projections of a selected snapshot. The reusable result is
 the persistent, queryable knowledge state and its audit history.
 
-## Deferred operator decision
+## Backend decision
 
-- Select a production graph backend only after the SQLite vertical slice is
-  measured against `config/workload-policy.yaml`.
+The deferred graph-backend decision is resolved for the accepted local
+single-user CLI workload. Measured smoke, standard, and million-claim scale
+tiers support retaining SQLite. See [BENCHMARKS.md](BENCHMARKS.md). A graph
+backend is reconsidered only if the workload changes or measurements regress.

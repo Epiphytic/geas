@@ -264,10 +264,13 @@ class DiscoveryCandidate(StrictModel):
     upstream_id: str
     canonical_locator: str
     title: str
+    authors: tuple[str, ...] = ()
+    publisher: str | None = None
+    published_at: datetime | None = None
     media_type: str
     language: str | None = None
     snippet: str | None = None
-    score: int = Field(ge=0)
+    score: float = Field(ge=0)
 
 
 class DiscoveryPage(StrictModel):

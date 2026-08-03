@@ -12,8 +12,13 @@ from uuid import uuid4
 from pydantic_core import to_jsonable_python
 
 from research_agent.approvals import ApprovalRegistry, AuthenticatedPrincipal
+from research_agent.benchmark import ProjectionBenchmark
 from research_agent.budget import BudgetPolicy, UsageLedger
-from research_agent.connectors import LocalFileConnector, MojeekDiscoveryConnector
+from research_agent.connectors import (
+    CrossrefDiscoveryConnector,
+    LocalFileConnector,
+    MojeekDiscoveryConnector,
+)
 from research_agent.deposits import (
     AcquisitionMethod,
     DepositManager,
@@ -31,6 +36,7 @@ from research_agent.discovery import (
     ConnectorCapability,
     SourceClass,
 )
+from research_agent.knowledge import KnowledgeImporter, KnowledgePack
 from research_agent.model_policy import (
     DataClass,
     InputKind,
@@ -53,12 +59,19 @@ from research_agent.planning import (
     deterministic_proposal,
 )
 from research_agent.policy import PolicyEngine
+from research_agent.projection import (
+    KnowledgeQueryEngine,
+    QueryRecordType,
+    SQLiteKnowledgeProjection,
+)
 from research_agent.providers import ModelClient, load_provider_configs
+from research_agent.render import render_topic_markdown
 from research_agent.research import DiscoveryExecutor, OfflineResearchRunner
 from research_agent.secrets import load_env_file
 from research_agent.store import ImmutableStore
 from research_agent.truth import SQLiteProjectionGuard, TruthManager, TruthPolicy, TruthSnapshot
 from research_agent.workflow import ActorKind, WorkflowEngine, WorkflowState
+from research_agent.workload import WorkloadPolicy
 
 
 def _json(value: object) -> None:
@@ -126,6 +139,12 @@ def _build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path("config/budget-policy.yaml"),
         help="automatic external-use envelope and accounting treatment",
+    )
+    parser.add_argument(
+        "--workload-policy",
+        type=Path,
+        default=Path("config/workload-policy.yaml"),
+        help="local deployment workload and benchmark tiers",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -251,6 +270,22 @@ def _build_parser() -> argparse.ArgumentParser:
     mojeek.add_argument("--result-limit", type=int, default=10)
     mojeek.add_argument("--approve-budget", action="store_true")
 
+    crossref = subparsers.add_parser(
+        "discover-crossref",
+        help="run open scholarly DOI and bibliographic metadata discovery",
+    )
+    crossref.add_argument("question")
+    crossref.add_argument("--root", type=Path, default=Path("data"))
+    crossref.add_argument("--term", action="append", default=[])
+    crossref.add_argument("--concept", action="append", default=[])
+    crossref.add_argument(
+        "--vocabulary",
+        type=Path,
+        default=Path("config/query-vocabulary.yaml"),
+    )
+    crossref.add_argument("--result-limit", type=int, default=20)
+    crossref.add_argument("--approve-budget", action="store_true")
+
     truth_snapshot = subparsers.add_parser(
         "truth-snapshot",
         help="capture the canonical ontology, schemas, records, and blobs",
@@ -285,6 +320,67 @@ def _build_parser() -> argparse.ArgumentParser:
     projection_check.add_argument("database", type=Path)
     projection_check.add_argument("--root", type=Path, default=Path("data"))
     projection_check.add_argument("--workspace", type=Path, default=Path("."))
+
+    knowledge_import = subparsers.add_parser(
+        "knowledge-import",
+        help="validate and commit a trusted structured knowledge pack",
+    )
+    knowledge_import.add_argument("pack", type=Path)
+    knowledge_import.add_argument("--root", type=Path, default=Path("data"))
+    knowledge_import.add_argument("--imported-by", required=True)
+
+    projection_build = subparsers.add_parser(
+        "projection-build",
+        help="atomically rebuild the disposable SQLite knowledge projection",
+    )
+    projection_build.add_argument("snapshot", type=Path)
+    projection_build.add_argument("database", type=Path)
+    projection_build.add_argument("--root", type=Path, default=Path("data"))
+    projection_build.add_argument("--workspace", type=Path, default=Path("."))
+
+    knowledge_query = subparsers.add_parser(
+        "knowledge-query",
+        help="compile natural language into deterministic FTS5 retrieval",
+    )
+    knowledge_query.add_argument("question")
+    knowledge_query.add_argument("--database", type=Path, default=Path("data/query.sqlite"))
+    knowledge_query.add_argument(
+        "--kind",
+        type=QueryRecordType,
+        choices=list(QueryRecordType),
+        action="append",
+        default=[],
+    )
+    knowledge_query.add_argument("--limit", type=int, default=25)
+
+    topic_show = subparsers.add_parser(
+        "topic-show",
+        help="return a complete hierarchy, claim, provenance, dissent, gap, and threat view",
+    )
+    topic_show.add_argument("concept_id")
+    topic_show.add_argument("--database", type=Path, default=Path("data/query.sqlite"))
+    topic_show.add_argument("--as-of", type=datetime.fromisoformat)
+
+    topic_export = subparsers.add_parser(
+        "topic-export",
+        help="generate a deterministic agent-readable Markdown topic projection",
+    )
+    topic_export.add_argument("concept_id")
+    topic_export.add_argument("output", type=Path)
+    topic_export.add_argument("--database", type=Path, default=Path("data/query.sqlite"))
+    topic_export.add_argument("--as-of", type=datetime.fromisoformat)
+
+    benchmark = subparsers.add_parser(
+        "projection-benchmark",
+        help="measure canonical writes, rebuilds, and deterministic queries",
+    )
+    benchmark.add_argument(
+        "--tier",
+        choices=("smoke", "standard", "scale"),
+        default="smoke",
+    )
+    benchmark.add_argument("--claims", type=int)
+    benchmark.add_argument("--workspace", type=Path, default=Path("."))
 
     policy = subparsers.add_parser("policy-check", help="evaluate source policy")
     policy.add_argument("--workflow-id", required=True)
@@ -614,6 +710,61 @@ def main() -> None:
         )
         return
 
+    if args.command == "discover-crossref":
+        connector = CrossrefDiscoveryConnector()
+        vocabulary = ConceptVocabulary.from_yaml(args.vocabulary)
+        base = deterministic_proposal(
+            args.question,
+            connector_id=connector.manifest.id,
+            concept_ids=tuple(args.concept),
+        )
+        proposal = QueryProposal.model_validate(
+            {
+                **base.model_dump(mode="json"),
+                "exact_terms": args.term or base.exact_terms,
+                "source_classes": [SourceClass.SCHOLARLY],
+                "capabilities": [
+                    ConnectorCapability.DISCOVERY,
+                    ConnectorCapability.METADATA,
+                ],
+                "result_limit": args.result_limit,
+                "page_limit": min(20, math.ceil(args.result_limit / 100)),
+            }
+        )
+        plan = QueryPlanValidator(
+            vocabulary=vocabulary,
+            manifests={connector.manifest.id: connector.manifest},
+        ).validate(
+            proposal,
+            compiler=CompilerIdentity(id="compiler:deterministic-lexical", version="1"),
+            human_approved=args.approve_budget,
+        )
+        execution = DiscoveryExecutor().run(plan, connector)
+        store = ImmutableStore(args.root)
+        store.initialize()
+        record_hashes = {
+            "query-plan": (store.put_record("query-plan", plan),),
+            "connector-manifest": (store.put_record("connector-manifest", connector.manifest),),
+            "discovery-run": (store.put_record("discovery-run", execution.discovery_run),),
+            "discovery-hit": tuple(
+                store.put_record("discovery-hit", hit) for hit in execution.hits
+            ),
+        }
+        _json(
+            {
+                "query_plan": plan,
+                "discovery_run": execution.discovery_run,
+                "hits": execution.hits,
+                "persistence": {
+                    "normalized_metadata": True,
+                    "raw_response": False,
+                    "note": "Bibliographic metadata is discovery, not claim evidence.",
+                },
+                "record_hashes": record_hashes,
+            }
+        )
+        return
+
     if args.command == "truth-snapshot":
         store = ImmutableStore(args.root)
         store.initialize()
@@ -674,6 +825,89 @@ def main() -> None:
         _json(report)
         if not report.clean:
             raise SystemExit(2)
+        return
+
+    if args.command == "knowledge-import":
+        store = ImmutableStore(args.root)
+        receipt = KnowledgeImporter(store=store).import_pack(
+            KnowledgePack.from_yaml(args.pack),
+            imported_by=args.imported_by,
+        )
+        _json(receipt)
+        return
+
+    if args.command == "projection-build":
+        snapshot = TruthSnapshot.model_validate_json(args.snapshot.read_text())
+        store = ImmutableStore(args.root)
+        store.initialize()
+        manager = TruthManager(
+            workspace_root=args.workspace,
+            store_root=store.root,
+            policy=TruthPolicy.from_yaml(args.truth_policy),
+        )
+        result = SQLiteKnowledgeProjection(
+            store=store,
+            workspace_root=args.workspace,
+        ).build(
+            args.database,
+            snapshot=snapshot,
+            truth_manager=manager,
+        )
+        _json(result)
+        return
+
+    if args.command == "knowledge-query":
+        kinds = tuple(args.kind) if args.kind else tuple(QueryRecordType)
+        _json(
+            KnowledgeQueryEngine(args.database).query(
+                args.question,
+                record_types=kinds,
+                limit=args.limit,
+            )
+        )
+        return
+
+    if args.command == "topic-show":
+        _json(
+            KnowledgeQueryEngine(args.database).topic(
+                args.concept_id,
+                as_of=args.as_of,
+            )
+        )
+        return
+
+    if args.command == "topic-export":
+        topic = KnowledgeQueryEngine(args.database).topic(
+            args.concept_id,
+            as_of=args.as_of,
+        )
+        rendered = render_topic_markdown(topic)
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(rendered)
+        _json(
+            {
+                "output": str(args.output.resolve()),
+                "bytes": len(rendered.encode()),
+                "snapshot_id": topic.projection_snapshot_id,
+                "topic_concept_id": topic.topic_concept_id,
+            }
+        )
+        return
+
+    if args.command == "projection-benchmark":
+        workload = WorkloadPolicy.from_yaml(args.workload_policy)
+        configured = next(
+            item.claims for item in workload.benchmark_tiers if item.name == args.tier
+        )
+        claim_count = args.claims or configured
+        if args.claims is not None and args.claims > configured:
+            raise ValueError("custom benchmark claim count cannot exceed its selected tier")
+        _json(
+            ProjectionBenchmark(
+                workspace_root=args.workspace,
+                truth_policy=TruthPolicy.from_yaml(args.truth_policy),
+            ).run(tier=args.tier, claim_count=claim_count)
+        )
         return
 
     if args.command == "policy-check":

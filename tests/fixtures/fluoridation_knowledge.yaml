@@ -1,0 +1,181 @@
+version: 1
+topic: Community water fluoridation benefits, risks, and uncertainty
+topic_concept_id: concept:community-water-fluoridation
+
+concepts:
+  - id: concept:community-water-fluoridation
+    label: Community water fluoridation
+    description: >-
+      Deliberate adjustment of fluoride in a community water supply for dental
+      caries prevention.
+    synonyms: [CWF, water fluoridation]
+    recorded_at: 2026-08-02T12:00:00Z
+    recorded_by: operator:test-fixture
+  - id: concept:fluoridation-caries-effects
+    label: Caries effects of fluoridation
+    description: Dental-caries outcomes attributed to community water fluoridation.
+    broader: [concept:community-water-fluoridation]
+    synonyms: [cavity prevention, tooth decay]
+    recorded_at: 2026-08-02T12:00:00Z
+    recorded_by: operator:test-fixture
+  - id: concept:fluoridation-neurodevelopment
+    label: Fluoride and neurodevelopment
+    description: Neurodevelopmental outcomes considered in relation to fluoride exposure.
+    broader: [concept:community-water-fluoridation]
+    synonyms: [fluoride IQ, cognition]
+    recorded_at: 2026-08-02T12:00:00Z
+    recorded_by: operator:test-fixture
+  - id: concept:fluoridation-regulation
+    label: Fluoride drinking-water regulation
+    description: Regulatory ceilings, preventive targets, and their distinct purposes.
+    broader: [concept:community-water-fluoridation]
+    synonyms: [fluoride MCL, fluoridation target]
+    recorded_at: 2026-08-02T12:00:00Z
+    recorded_by: operator:test-fixture
+
+evidence:
+  - key: cdc-target
+    source_content_sha256: e779ad7566105a7cdc25b104871cce0927a469cf53add1f852757d1b913e868b
+    exact: The U.S. Public Health Service target for community water fluoridation is 0.7 mg/L.
+  - key: cdc-caries
+    source_content_sha256: e779ad7566105a7cdc25b104871cce0927a469cf53add1f852757d1b913e868b
+    exact: CDC reports that fluoridation at the recommended level reduces dental caries in
+  - key: cochrane-small-benefit
+    source_content_sha256: 89091affcd36b4dcd67da90d7eaa5be9347ad173cbf4ef6325284192e6f97c31
+    exact: small improvement in tooth-decay outcomes in children.
+  - key: cochrane-uncertainty
+    source_content_sha256: 89091affcd36b4dcd67da90d7eaa5be9347ad173cbf4ef6325284192e6f97c31
+    exact: evidence uncertain and found insufficient eligible evidence to determine
+  - key: ntp-high-exposure
+    source_content_sha256: 2d5d8d7f65cb132b0526b7395ac231674cb9ca869a4dc7be5ade527653cd69b6
+    exact: drinking-water concentrations above 1.5 mg/L, is associated with lower IQ in
+  - key: ntp-target-gap
+    source_content_sha256: 2d5d8d7f65cb132b0526b7395ac231674cb9ca869a4dc7be5ade527653cd69b6
+    exact: fluoridation alone. It found insufficient evidence to determine whether the
+  - key: epa-mcl
+    source_content_sha256: a508269dfbfcfb2f6a4804fbc01a5035614f6b6bcaa7b1d888ef4b6e663bbb8d
+    exact: EPA states that the federal maximum contaminant level for fluoride is 4.0 mg/L.
+  - key: epa-assessment
+    source_content_sha256: a508269dfbfcfb2f6a4804fbc01a5035614f6b6bcaa7b1d888ef4b6e663bbb8d
+    exact: The agency is conducting an accelerated assessment of newer evidence about
+
+claims:
+  - key: preventive-target
+    subject: concept:fluoridation-regulation
+    predicate: ep:recommended_concentration_mg_per_l
+    object: 0.7
+    qualifiers:
+      jurisdiction: US
+      purpose: caries prevention
+    stance: reports
+    epistemic_status: observed
+    asserted_by: organization:us-public-health-service
+    evidence_keys: [cdc-target]
+  - key: cdc-benefit
+    subject: concept:fluoridation-caries-effects
+    predicate: ep:reduces
+    object: dental caries in children and adults
+    qualifiers:
+      exposure: recommended level
+    stance: asserts
+    epistemic_status: consensus
+    asserted_by: organization:cdc
+    evidence_keys: [cdc-caries]
+  - key: cochrane-benefit
+    subject: concept:fluoridation-caries-effects
+    predicate: ep:may_reduce
+    object: tooth decay in children by a small amount
+    qualifiers:
+      evidence_certainty: uncertain
+      evidence_period: contemporary
+    stance: questions
+    epistemic_status: inferred
+    asserted_by: organization:cochrane
+    evidence_keys: [cochrane-small-benefit, cochrane-uncertainty]
+  - key: ntp-high-exposure
+    subject: concept:fluoridation-neurodevelopment
+    predicate: ep:associated_with
+    object: lower IQ in children
+    qualifiers:
+      confidence: moderate
+      example_drinking_water_mg_per_l: 1.5
+      causal: false
+    stance: asserts
+    epistemic_status: inferred
+    asserted_by: organization:ntp
+    evidence_keys: [ntp-high-exposure]
+  - key: ntp-target-unknown
+    subject: concept:fluoridation-neurodevelopment
+    predicate: ep:evidence_sufficient_at_mg_per_l
+    object: false
+    qualifiers:
+      concentration_mg_per_l: 0.7
+    stance: reports
+    epistemic_status: observed
+    asserted_by: organization:ntp
+    evidence_keys: [ntp-target-gap]
+  - key: epa-mcl
+    subject: concept:fluoridation-regulation
+    predicate: ep:maximum_contaminant_level_mg_per_l
+    object: 4.0
+    qualifiers:
+      jurisdiction: US
+      instrument: Safe Drinking Water Act
+    stance: reports
+    epistemic_status: observed
+    asserted_by: organization:epa
+    evidence_keys: [epa-mcl]
+  - key: epa-reassessment
+    subject: concept:fluoridation-regulation
+    predicate: ep:assessment_status
+    object: accelerated review underway
+    stance: reports
+    epistemic_status: observed
+    asserted_by: organization:epa
+    evidence_keys: [epa-assessment]
+
+controversies:
+  - topic_concept_id: concept:fluoridation-caries-effects
+    question: How large is the contemporary caries-prevention benefit?
+    description: >-
+      Public-health guidance presents a substantial population benefit, while
+      the contemporary Cochrane evidence characterizes the measured child
+      benefit as small and uncertain.
+    claim_keys: [cdc-benefit, cochrane-benefit]
+    status: open
+  - topic_concept_id: concept:fluoridation-neurodevelopment
+    question: Do neurodevelopment findings at higher exposure apply at 0.7 mg/L?
+    description: >-
+      Higher-exposure associations motivate concern, but the cited review says
+      evidence is insufficient for the U.S. fluoridation target.
+    claim_keys: [ntp-high-exposure, ntp-target-unknown]
+    status: open
+
+gaps:
+  - topic_concept_id: concept:fluoridation-caries-effects
+    question: What happens to contemporary caries outcomes after fluoridation stops?
+    kind: insufficient_evidence
+    rationale: The 2024 review found insufficient eligible cessation evidence.
+    related_claim_keys: [cochrane-benefit]
+    priority: 70
+    status: open
+  - topic_concept_id: concept:fluoridation-neurodevelopment
+    question: Does total fluoride exposure near a 0.7 mg/L water concentration affect child IQ?
+    kind: insufficient_evidence
+    rationale: >-
+      Existing higher-exposure associations do not determine effects at the
+      recommended U.S. community-water concentration.
+    related_claim_keys: [ntp-high-exposure, ntp-target-unknown]
+    priority: 90
+    status: open
+  - topic_concept_id: concept:fluoridation-regulation
+    question: How will EPA's accelerated assessment change federal standards?
+    kind: stale
+    rationale: The assessment is in progress and requires a standing refresh.
+    related_claim_keys: [epa-mcl, epa-reassessment]
+    priority: 85
+    status: investigating
+    freshness_deadline: 2026-11-01T00:00:00Z
+
+inspect_source_sha256s:
+  - 1cfcb858a1d0bf42162e356df39f4e5c9cc1acd4d49893f291ea9d236602e2a3
