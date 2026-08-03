@@ -9,6 +9,7 @@ from research_agent.parsing import (
     ParsedDocumentManager,
     ParserError,
 )
+from research_agent.sandbox import BubblewrapSandbox
 from research_agent.store import ImmutableStore
 
 INSTANT = datetime(2026, 8, 3, tzinfo=UTC)
@@ -102,3 +103,34 @@ def test_identity_preserving_text_parse_reuses_content_addressed_source(tmp_path
     assert receipt.original_source_version_id == receipt.derived_source_version_id
     assert len(receipt.record_hashes["source-version"]) == 1
     assert len(list(store.iter_records("source-version"))) == 1
+
+
+def test_pdf_uses_native_sandbox_and_records_runtime(monkeypatch) -> None:
+    observed: dict[str, object] = {}
+
+    def fake_run(
+        self,
+        executable,
+        arguments,
+        *,
+        input_bytes,
+        timeout_seconds=35,
+        max_output_bytes=25_000_000,
+    ):
+        observed.update(
+            executable=executable,
+            arguments=arguments,
+            input_bytes=input_bytes,
+            timeout_seconds=timeout_seconds,
+            max_output_bytes=max_output_bytes,
+        )
+        return b"Sandboxed PDF text"
+
+    monkeypatch.setattr(BubblewrapSandbox, "run", fake_run)
+
+    result = DocumentParserRegistry().parse(b"%PDF fixture", "application/pdf")
+
+    assert result.text == "Sandboxed PDF text\n"
+    assert result.parser_runtime == "bubblewrap_native"
+    assert observed["input_bytes"] == b"%PDF fixture"
+    assert observed["arguments"][-2:] == ("-", "-")

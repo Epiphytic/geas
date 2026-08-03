@@ -300,6 +300,24 @@ reported without blocking a lawful alternate copy.
 specific archived snapshot without bypassing access controls, and every route
 attempt remains auditable.
 
+### M3.1 — portable parser isolation
+
+- [x] Put native PDF extraction behind a fail-closed Bubblewrap boundary.
+- [x] Record native, in-process deterministic, or WASI runtime provenance on
+  text derivations.
+- [ ] Select a maintained WASI component runtime and define the parser component
+  interface.
+- [ ] Port or adopt the first PDF/text parser module with no host preopens or
+  network capability.
+- [ ] Pin module digests and enforce memory, fuel, time, input, and output
+  limits.
+- [ ] Run one golden and hostile-format conformance suite against both runtimes.
+
+**Acceptance:** a derivation is reproducible from the original bytes, pinned
+module, and deterministic configuration; the module cannot observe repository
+state or establish network connections, and native isolation can be removed for
+that format without changing canonical records.
+
 ### M4 — persistent deterministic query
 
 **Status: implemented for the local SQLite vertical slice.**

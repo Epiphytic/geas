@@ -295,6 +295,10 @@ def test_projection_supports_lexical_hierarchy_dissent_gaps_and_provenance(
     assert build.counts["open_access_resolutions"] == 1
     assert build.counts["open_access_locations"] == 3
     assert build.counts["text_derivations"] == 1
+    with sqlite3.connect(database) as connection:
+        assert connection.execute(
+            "SELECT parser_runtime FROM text_derivation"
+        ).fetchone() == ("in_process_deterministic",)
     markdown = render_topic_markdown(topic)
     assert "## Dissent and controversy" in markdown
     assert "## Knowledge gaps" in markdown

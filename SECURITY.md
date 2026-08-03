@@ -34,6 +34,11 @@ boundary.
   disables proxy inheritance and automatic redirects, and independently
   validates every redirect. Original bytes remain quarantined. Versioned
   parsers emit inert text with size/time bounds; parsing never upgrades trust.
+- Native document parsing is fail-closed behind Bubblewrap with fresh
+  namespaces, no network route or content-path mounts, a cleared environment,
+  dropped capabilities, closed inherited descriptors, and resource limits.
+  Acquired bytes cross only through stdin. Missing host namespace support causes
+  an explicit parser failure; it never enables an unsandboxed fallback.
 - Canonical authority is one-way: version-controlled ontology and schemas plus
   immutable records and blobs produce truth snapshots; SQLite and Markdown are
   disposable projections. Projection data can never authorize changes to
@@ -63,10 +68,11 @@ boundary.
   A bare model/source-provided approval boolean is not accepted.
 
 The current repository implements the data models, immutable store, deterministic
-policy decision logic, fixed workflow transitions, typed query validation, and
-the offline local connector. Process/container isolation, network egress
-controls, hardened network connectors, a production committer, signatures, and
-human approval UI remain future deployment work.
+policy decision logic, fixed workflow transitions, typed query validation,
+offline and governed network connectors, and a Bubblewrap boundary for native
+document parsing. Broader model-process isolation, deployment-wide network
+egress controls, a production committer, signatures, and human approval UI
+remain future deployment work.
 
 ## Reporting
 

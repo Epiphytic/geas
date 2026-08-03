@@ -353,3 +353,23 @@ redirects, response size and timeout caps, deterministic license gates, and
 fallback across independently attributed manifestations.
 
 See `docs/PARSING.md` for the implemented safety and provenance contract.
+
+## 15. Native parser isolation and eventual runtime
+
+**Status:** accepted and implemented on 2026-08-03.
+
+### Decision
+
+- Run native document parsers inside a fail-closed Bubblewrap boundary.
+- Never fall back to an unsandboxed native parser when Bubblewrap or required
+  namespace support is unavailable.
+- Pass acquired bytes only over stdin and expose no source path, workspace,
+  home directory, host configuration, inherited environment, or network route.
+- Record the parser runtime on every text derivation.
+- Treat WASI/WASM as the preferred eventual portable runtime, provided modules
+  are digest-pinned, capability-free by default, resource-bounded, and tested
+  against the same deterministic parser contract.
+
+Native sandbox availability is a deployment prerequisite, not something source
+content or a model may negotiate. Unsupported deployments preserve the original
+and report a parser constraint.
