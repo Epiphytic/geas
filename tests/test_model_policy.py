@@ -1,9 +1,11 @@
 import io
 import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
+from research_agent.approvals import ApprovalRegistry, AuthenticatedPrincipal
 from research_agent.budget import BudgetPolicy, UsageLedger
 from research_agent.deposits import ModelRoute
 from research_agent.model_policy import (
@@ -35,7 +37,7 @@ def _gate(
     data_class: DataClass = DataClass.PUBLIC,
     input_kind: InputKind = InputKind.METADATA_ONLY,
     model_route: ModelRoute = ModelRoute.LOCAL_PREFERRED,
-    human_approved: bool = False,
+    approval_receipt_id: str | None = None,
 ) -> ModelUseGate:
     return ModelUseGate(
         ModelUsePolicy.from_yaml(Path("config/model-policy.yaml")),
@@ -44,7 +46,7 @@ def _gate(
             data_class=data_class,
             input_kind=input_kind,
             model_route=model_route,
-            human_approved=human_approved,
+            approval_receipt_id=approval_receipt_id,
             run_id="run:test",
         ),
         budget_policy=BudgetPolicy.from_yaml(Path("config/budget-policy.yaml")),
@@ -105,7 +107,7 @@ def test_automatic_external_call_is_bound_to_context_input_and_reservation(
 
 def test_unknown_data_is_forbidden_even_with_human_approval(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="unknown data classification"):
-        _gate(tmp_path, data_class=DataClass.UNKNOWN, human_approved=True).authorize(
+        _gate(tmp_path, data_class=DataClass.UNKNOWN).authorize(
             provider="openai",
             config=_external_config(),
             system="system",
@@ -119,7 +121,6 @@ def test_source_content_requires_external_allowed_route(tmp_path: Path) -> None:
         _gate(
             tmp_path,
             input_kind=InputKind.SOURCE_CONTENT,
-            human_approved=True,
         ).authorize(
             provider="openai",
             config=_external_config(),
@@ -132,7 +133,6 @@ def test_source_content_requires_external_allowed_route(tmp_path: Path) -> None:
         tmp_path,
         input_kind=InputKind.SOURCE_CONTENT,
         model_route=ModelRoute.EXTERNAL_ALLOWED,
-        human_approved=True,
     ).authorize(
         provider="openai",
         config=_external_config(),
@@ -145,7 +145,7 @@ def test_source_content_requires_external_allowed_route(tmp_path: Path) -> None:
 
 def test_unallowlisted_model_is_rejected_before_network_use(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="not allowlisted"):
-        _gate(tmp_path, human_approved=True).authorize(
+        _gate(tmp_path).authorize(
             provider="openai",
             config=_external_config(model="attacker-selected-model"),
             system="system",
@@ -159,7 +159,7 @@ def test_allowlisted_name_and_model_cannot_use_an_unapproved_endpoint(
 ) -> None:
     config = _external_config().model_copy(update={"base_url": "https://attacker.invalid/v1"})
     with pytest.raises(ValueError, match="base URL is not allowlisted"):
-        _gate(tmp_path, human_approved=True).authorize(
+        _gate(tmp_path).authorize(
             provider="openai",
             config=config,
             system="system",
@@ -213,3 +213,105 @@ def test_model_client_settles_provider_reported_usage(
     assert gate.last_settlement.status == "settled"
     assert gate.last_settlement.input_tokens_actual == 20
     assert gate.last_settlement.output_tokens_actual == 5
+
+
+def test_only_matching_authenticated_receipt_can_override_automatic_cost_limit(
+    tmp_path: Path,
+) -> None:
+    raw = BudgetPolicy.from_yaml(Path("config/budget-policy.yaml")).model_dump(mode="json")
+    raw["automatic_envelope"]["max_cost_microusd_per_call"] = 1
+    budget_policy = BudgetPolicy.model_validate(raw)
+    model_policy = ModelUsePolicy.from_yaml(Path("config/model-policy.yaml"))
+    ledger = UsageLedger(tmp_path / "usage.sqlite")
+    registry = ApprovalRegistry(tmp_path / "usage.sqlite")
+    context = ModelUseContext(
+        operation=ModelOperation.QUERY_COMPILATION,
+        data_class=DataClass.PUBLIC,
+        input_kind=InputKind.METADATA_ONLY,
+        run_id="run:approved",
+    )
+    pending_gate = ModelUseGate(
+        model_policy,
+        context,
+        budget_policy=budget_policy,
+        usage_ledger=ledger,
+        approval_registry=registry,
+    )
+    with pytest.raises(ValueError, match="per-call limit"):
+        pending_gate.authorize(
+            provider="openai",
+            config=_external_config(),
+            system="system",
+            user="user",
+            max_output_tokens=100,
+        )
+    assert pending_gate.last_approval_request is not None
+    now = datetime.now(UTC)
+    receipt = registry.issue(
+        pending_gate.last_approval_request,
+        AuthenticatedPrincipal(
+            actor_id="user:operator",
+            deployment_id="deployment:research",
+            session_id="session:authenticated",
+            authenticated_at=now,
+            authentication_method="deployment_session",
+        ),
+        expires_at=now + timedelta(minutes=10),
+        now=now,
+    )
+    approved_gate = ModelUseGate(
+        model_policy,
+        context.model_copy(update={"approval_receipt_id": receipt.id}),
+        budget_policy=budget_policy,
+        usage_ledger=ledger,
+        approval_registry=registry,
+    )
+
+    authorization = approved_gate.authorize(
+        provider="openai",
+        config=_external_config(),
+        system="system",
+        user="user",
+        max_output_tokens=100,
+    )
+    assert authorization.human_approved
+    assert authorization.approved_by == "user:operator"
+    assert authorization.approval_receipt_id == receipt.id
+
+
+def test_local_cli_principal_can_issue_a_bound_budget_override(tmp_path: Path) -> None:
+    raw = BudgetPolicy.from_yaml(Path("config/budget-policy.yaml")).model_dump(mode="json")
+    raw["automatic_envelope"]["max_cost_microusd_per_call"] = 1
+    budget_policy = BudgetPolicy.model_validate(raw)
+    now = datetime.now(UTC)
+    gate = ModelUseGate(
+        ModelUsePolicy.from_yaml(Path("config/model-policy.yaml")),
+        ModelUseContext(
+            operation=ModelOperation.QUERY_COMPILATION,
+            data_class=DataClass.PUBLIC,
+            input_kind=InputKind.METADATA_ONLY,
+            run_id="run:cli-override",
+        ),
+        budget_policy=budget_policy,
+        usage_ledger=UsageLedger(tmp_path / "usage.sqlite"),
+        approval_registry=ApprovalRegistry(tmp_path / "usage.sqlite"),
+        override_principal=AuthenticatedPrincipal(
+            actor_id="os-user:1000:operator",
+            deployment_id="local:test",
+            session_id="process:123",
+            authenticated_at=now,
+            authentication_method="local_os_session",
+        ),
+    )
+
+    authorization = gate.authorize(
+        provider="openai",
+        config=_external_config(),
+        system="system",
+        user="user",
+        max_output_tokens=100,
+    )
+    assert authorization.human_approved
+    assert authorization.approved_by == "os-user:1000:operator"
+    assert gate.last_approval_receipt is not None
+    assert gate.last_approval_receipt.authentication_method == "local_os_session"

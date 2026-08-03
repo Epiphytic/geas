@@ -65,5 +65,6 @@ An explicitly approved call may exceed automatic call or dollar limits, but it
 cannot exceed hard per-call token limits, use unknown accounting, send
 unknown-classification data, or bypass source-content routing rules.
 
-The current CLI approval is an auditable assertion, not authenticated identity
-proof. Selecting the approval mechanism remains a separate operator decision.
+For this CLI-first application, the local OS account is the authenticated
+identity. The override flag creates and consumes a single-use receipt bound to
+the exact request. See `docs/APPROVALS.md`.

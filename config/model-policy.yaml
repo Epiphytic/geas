@@ -1,4 +1,4 @@
-version: 2
+version: 3
 
 # Automatic calls require the persistent ledger and budget policy. A direct
 # client without those components remains forbidden.

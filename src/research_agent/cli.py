@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import math
+import os
+from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
 from pydantic_core import to_jsonable_python
 
+from research_agent.approvals import ApprovalRegistry, AuthenticatedPrincipal
 from research_agent.budget import BudgetPolicy, UsageLedger
 from research_agent.connectors import LocalFileConnector, MojeekDiscoveryConnector
 from research_agent.deposits import (
@@ -60,6 +64,17 @@ from research_agent.workflow import ActorKind, WorkflowEngine, WorkflowState
 def _json(value: object) -> None:
     value = to_jsonable_python(value)
     print(json.dumps(value, indent=2, sort_keys=True))
+
+
+def _local_approval_principal(root: Path) -> AuthenticatedPrincipal:
+    uid = getattr(os, "getuid", lambda: -1)()
+    return AuthenticatedPrincipal(
+        actor_id=f"os-user:{uid}:{getpass.getuser()}",
+        deployment_id=f"local:{root.resolve()}",
+        session_id=f"process:{os.getpid()}",
+        authenticated_at=datetime.now(UTC),
+        authentication_method="local_os_session",
+    )
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -120,7 +135,8 @@ def _build_parser() -> argparse.ArgumentParser:
     smoke.add_argument("--provider")
     smoke.add_argument("--root", type=Path, default=Path("data"))
     smoke.add_argument("--run-id")
-    smoke.add_argument("--approve-external-provider", action="store_true")
+    smoke.add_argument("--approval-receipt-id")
+    smoke.add_argument("--override-external-budget", action="store_true")
 
     init = subparsers.add_parser("store-init", help="initialize an immutable store")
     init.add_argument("--root", type=Path, default=Path("data"))
@@ -214,7 +230,8 @@ def _build_parser() -> argparse.ArgumentParser:
         default=DataClass.UNKNOWN,
         help="trusted classification of compiler input; unknown forbids external use",
     )
-    offline.add_argument("--approve-external-provider", action="store_true")
+    offline.add_argument("--approval-receipt-id")
+    offline.add_argument("--override-external-budget", action="store_true")
     offline.add_argument("--run-id")
     offline.add_argument("--topic-branch", default="topic:local")
 
@@ -326,11 +343,15 @@ def main() -> None:
                 operation=ModelOperation.MODEL_SMOKE,
                 data_class=DataClass.PUBLIC,
                 input_kind=InputKind.METADATA_ONLY,
-                human_approved=args.approve_external_provider,
+                approval_receipt_id=args.approval_receipt_id,
                 run_id=args.run_id or f"run:model-smoke:{uuid4()}",
             ),
             budget_policy=BudgetPolicy.from_yaml(args.budget_policy),
             usage_ledger=UsageLedger(args.root / "usage.sqlite"),
+            approval_registry=ApprovalRegistry(args.root / "usage.sqlite"),
+            override_principal=(
+                _local_approval_principal(args.root) if args.override_external_budget else None
+            ),
         )
         client = ModelClient(
             name,
@@ -356,6 +377,11 @@ def main() -> None:
             if gate.last_settlement is not None
             else None
         )
+        approval_hash = (
+            store.put_record("approval-receipt", gate.last_approval_receipt)
+            if gate.last_approval_receipt is not None
+            else None
+        )
         _json(
             {
                 "provider": name,
@@ -364,6 +390,8 @@ def main() -> None:
                 "authorization_record_hash": authorization_hash,
                 "usage_settlement": gate.last_settlement,
                 "usage_settlement_record_hash": settlement_hash,
+                "approval_receipt": gate.last_approval_receipt,
+                "approval_receipt_record_hash": approval_hash,
             }
         )
         return
@@ -451,11 +479,15 @@ def main() -> None:
                     operation=ModelOperation.QUERY_COMPILATION,
                     data_class=args.compiler_data_class,
                     input_kind=InputKind.METADATA_ONLY,
-                    human_approved=args.approve_external_provider,
+                    approval_receipt_id=args.approval_receipt_id,
                     run_id=args.run_id or f"run:research-local:{uuid4()}",
                 ),
                 budget_policy=BudgetPolicy.from_yaml(args.budget_policy),
                 usage_ledger=UsageLedger(args.root / "usage.sqlite"),
+                approval_registry=ApprovalRegistry(args.root / "usage.sqlite"),
+                override_principal=(
+                    _local_approval_principal(args.root) if args.override_external_budget else None
+                ),
             )
             client = ModelClient(
                 args.compiler_provider,
@@ -470,6 +502,8 @@ def main() -> None:
             store.put_record("model-authorization", gate.last_authorization)
             if gate.last_settlement is not None:
                 store.put_record("usage-settlement", gate.last_settlement)
+            if gate.last_approval_receipt is not None:
+                store.put_record("approval-receipt", gate.last_approval_receipt)
             compiler = CompilerIdentity(
                 id=f"compiler:model:{args.compiler_provider}:{provider.model}",
                 version=ModelQueryCompiler.version,

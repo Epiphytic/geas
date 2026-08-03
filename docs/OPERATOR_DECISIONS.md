@@ -171,3 +171,24 @@ See `docs/MODEL_USE_POLICY.md` for the enforcement contract.
 
 The checked-in OpenAI and Z.ai API accounts remain metered and counted. See
 `docs/BUDGET_POLICY.md`.
+
+## 7. Human approval mechanism
+
+**Status:** accepted on 2026-08-02.
+
+### Decision
+
+- Use authenticated deployment approval.
+- Treat the local OS account as the authenticated identity for the initial
+  CLI-first application.
+- Support `--override-external-budget`, but translate it into a five-minute,
+  single-use approval receipt rather than a bare boolean authorization.
+- Bind the receipt to the exact request, reserved cost, run, and policy
+  versions and record the approving OS identity.
+- Permit future site authentication middleware to issue the same receipt type.
+
+An approval may override automatic dollar or call-count limits. It cannot
+override token ceilings, classification, source routing, provider/model/
+endpoint allowlists, unknown accounting, expiry, or replay protection.
+
+See `docs/APPROVALS.md`.

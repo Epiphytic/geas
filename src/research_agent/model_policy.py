@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
 from typing import Literal
@@ -8,6 +9,12 @@ from typing import Literal
 import yaml
 from pydantic import Field, HttpUrl, model_validator
 
+from research_agent.approvals import (
+    ApprovalReceipt,
+    ApprovalRegistry,
+    ApprovalRequest,
+    AuthenticatedPrincipal,
+)
 from research_agent.budget import (
     BudgetPolicy,
     BudgetTreatment,
@@ -81,7 +88,7 @@ class ModelUseContext(StrictModel):
     data_class: DataClass
     input_kind: InputKind
     model_route: ModelRoute = ModelRoute.LOCAL_PREFERRED
-    human_approved: bool = False
+    approval_receipt_id: str | None = None
     run_id: str = Field(min_length=1)
 
 
@@ -97,6 +104,8 @@ class ModelUseAuthorization(StrictModel):
     input_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     max_output_tokens: int = Field(gt=0)
     human_approved: bool
+    approved_by: str | None = None
+    approval_receipt_id: str | None = None
     usage_reservation_id: str | None = None
     budget_treatment: BudgetTreatment | None = None
     policy_version: int
@@ -113,14 +122,22 @@ class ModelUseGate:
         *,
         budget_policy: BudgetPolicy | None = None,
         usage_ledger: UsageLedger | None = None,
+        approval_registry: ApprovalRegistry | None = None,
+        override_principal: AuthenticatedPrincipal | None = None,
     ) -> None:
+        if context.approval_receipt_id is not None and override_principal is not None:
+            raise ValueError("choose either an approval receipt or a local CLI override")
         self.policy = policy
         self.context = context
         self.budget_policy = budget_policy
         self.usage_ledger = usage_ledger
+        self.approval_registry = approval_registry
+        self.override_principal = override_principal
         self.last_authorization: ModelUseAuthorization | None = None
         self.last_reservation: UsageReservation | None = None
         self.last_settlement: UsageSettlement | None = None
+        self.last_approval_request: ApprovalRequest | None = None
+        self.last_approval_receipt: ApprovalReceipt | None = None
 
     def authorize(
         self,
@@ -135,18 +152,66 @@ class ModelUseGate:
             self._authorize_external(provider, config)
         input_sha256 = hashlib.sha256(system.encode() + b"\x00" + user.encode()).hexdigest()
         reservation = None
+        receipt = None
         if config.external:
             if self.budget_policy is None or self.usage_ledger is None:
                 raise ValueError("external model use requires budget policy and usage ledger")
+            input_tokens = reserved_model_input_tokens(system, user)
+            request = ApprovalRequest.create(
+                provider=provider,
+                model=config.model,
+                operation=self.context.operation,
+                data_class=self.context.data_class,
+                input_kind=self.context.input_kind,
+                model_route=self.context.model_route,
+                run_id=self.context.run_id,
+                input_sha256=input_sha256,
+                max_output_tokens=max_output_tokens,
+                reserved_cost_microusd=self.budget_policy.estimate_model_cost(
+                    provider,
+                    config.model,
+                    input_tokens,
+                    max_output_tokens,
+                ),
+                model_policy_version=self.policy.version,
+                budget_policy_version=self.budget_policy.version,
+            )
+            self.last_approval_request = request
+            if self.context.approval_receipt_id is not None:
+                if self.approval_registry is None:
+                    raise ValueError("approval receipt requires the deployment approval registry")
+                receipt = self.approval_registry.consume(
+                    self.context.approval_receipt_id,
+                    expected_request_id=request.id,
+                )
+                self.last_approval_receipt = receipt
+            elif self.override_principal is not None:
+                if self.approval_registry is None:
+                    raise ValueError("CLI override requires the deployment approval registry")
+                now = datetime.now(UTC)
+                issued = self.approval_registry.issue(
+                    request,
+                    self.override_principal,
+                    expires_at=now + timedelta(minutes=5),
+                    now=now,
+                )
+                receipt = self.approval_registry.consume(
+                    issued.id,
+                    expected_request_id=request.id,
+                    now=now,
+                )
+                self.last_approval_receipt = receipt
+            if not self.policy.automatic_external_calls and receipt is None:
+                raise ValueError("external provider use requires authenticated approval")
             reservation = self.usage_ledger.reserve_model(
                 policy=self.budget_policy,
                 provider=provider,
                 model=config.model,
                 run_id=self.context.run_id,
                 request_key=input_sha256,
-                input_tokens=reserved_model_input_tokens(system, user),
+                input_tokens=input_tokens,
                 output_tokens=max_output_tokens,
-                human_approved=self.context.human_approved,
+                human_approved=receipt is not None,
             )
             self.last_reservation = reservation
         fields = {
@@ -158,6 +223,8 @@ class ModelUseGate:
             "max_output_tokens": max_output_tokens,
             "usage_reservation_id": reservation.id if reservation else None,
             "budget_treatment": reservation.budget_treatment if reservation else None,
+            "approved_by": receipt.actor_id if receipt else None,
+            "approval_receipt_id": receipt.id if receipt else None,
             "policy_version": self.policy.version,
             "decision": "allow",
         }
@@ -172,7 +239,9 @@ class ModelUseGate:
             model_route=self.context.model_route,
             input_sha256=input_sha256,
             max_output_tokens=max_output_tokens,
-            human_approved=self.context.human_approved,
+            human_approved=receipt is not None,
+            approved_by=receipt.actor_id if receipt else None,
+            approval_receipt_id=receipt.id if receipt else None,
             usage_reservation_id=reservation.id if reservation else None,
             budget_treatment=reservation.budget_treatment if reservation else None,
             policy_version=self.policy.version,
@@ -219,5 +288,3 @@ class ModelUseGate:
             and self.context.model_route is not ModelRoute.EXTERNAL_ALLOWED
         ):
             raise ValueError("source content is not marked external_allowed")
-        if not self.policy.automatic_external_calls and not self.context.human_approved:
-            raise ValueError("external provider use requires human approval")

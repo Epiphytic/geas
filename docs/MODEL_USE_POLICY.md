@@ -28,8 +28,8 @@ for an automatic external call. A transactional reservation must also pass
 
 Additional fail-closed rules apply:
 
-- unknown data classifications cannot be sent externally, even with the
-  approval flag;
+- unknown data classifications cannot be sent externally, even with a budget
+  override;
 - source content must be marked `external_allowed`;
 - a provider name cannot substitute a different model or base URL;
 - external endpoints require HTTPS;
@@ -70,9 +70,10 @@ Authorization is a deterministic policy result, not a model judgment. A model
 may recommend escalation, but it cannot change the provider, classification,
 route, operation, endpoint, or approval state used by the gate.
 
-The current CLI approval flag records that approval occurred; it is not proof
-of an authenticated human identity. A later operator decision may select a
-signed or authenticated approval mechanism.
+For this CLI-first application, `--override-external-budget` derives the
+approving identity from the local OS account and creates a single-use receipt
+bound to the exact request. A future site can issue the same receipt from its
+authenticated session middleware.
 
 See `docs/BUDGET_POLICY.md` for cost reservations, account exclusions, and
-failure behavior.
+failure behavior, and `docs/APPROVALS.md` for the approval contract.

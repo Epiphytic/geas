@@ -50,6 +50,9 @@ boundary.
 - The usage ledger is authoritative only for operational budget enforcement,
   not ontology truth. Deployment permissions and backups must protect it;
   model processes and retrieved content have no direct ledger-write path.
+- CLI budget overrides derive an authenticated principal from the local OS
+  account and become expiring, single-use receipts bound to an exact request.
+  A bare model/source-provided approval boolean is not accepted.
 
 The current repository implements the data models, immutable store, deterministic
 policy decision logic, fixed workflow transitions, typed query validation, and

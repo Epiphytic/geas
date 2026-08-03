@@ -182,6 +182,11 @@ totals without bypassing call or token limits. See
 [docs/MODEL_USE_POLICY.md](docs/MODEL_USE_POLICY.md) and
 [docs/BUDGET_POLICY.md](docs/BUDGET_POLICY.md).
 
+For CLI use, `--override-external-budget` creates a single-use approval bound
+to the exact request and attributed to the local OS account. It cannot override
+classification, routing, provider, accounting, or hard token safeguards. See
+[docs/APPROVALS.md](docs/APPROVALS.md).
+
 ## Tainted-source intelligence
 
 [`intelligence/sources.yaml`](intelligence/sources.yaml) catalogs maintained

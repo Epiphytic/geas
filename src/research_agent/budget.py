@@ -97,6 +97,19 @@ class BudgetPolicy(StrictModel):
                 return account
         raise ValueError(f"accounting is unknown for {service}:{provider}:{model}")
 
+    def estimate_model_cost(
+        self,
+        provider: str,
+        model: str,
+        input_tokens: int,
+        output_tokens: int,
+    ) -> int:
+        return UsageLedger._cost(
+            self.account(ServiceKind.MODEL, provider, model),
+            input_tokens,
+            output_tokens,
+        )
+
 
 class UsageReservation(StrictModel):
     id: str
@@ -139,8 +152,7 @@ class UsageLedger:
 
     def initialize(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(self.path) as connection:
-            connection.execute("PRAGMA journal_mode=WAL")
+        with sqlite3.connect(self.path, timeout=30) as connection:
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS usage (
