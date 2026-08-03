@@ -20,6 +20,17 @@ The system has one-way authority:
 Later layers cannot silently modify earlier layers. In particular, SQLite is
 never reconciled back into ontology files or immutable records.
 
+Maintained bundle YAML and Markdown source cards under `ontology/` are
+canonical workspace inputs. Bundle imports create immutable source,
+provenance, structural, citation, claim, controversy, gap, threat, and receipt
+records. Changing a card without updating its declared SHA-256 fails before
+import; changing the card or declaration also changes the truth snapshot.
+
+Validated model extraction output is canonical audit history only as a
+quarantined proposal. Its `review_state` is fixed to `proposed`, its commit
+authority is `none_proposal_only`, and SQLite proposal search cannot promote it
+into accepted knowledge.
+
 ### Operational ledger exception
 
 “SQLite is disposable” applies to ontology/query projections. The separate

@@ -45,6 +45,21 @@ boundary.
   verify every anchor range and exact-text hash before indexing it. Anchor
   search hits include quarantine state and deterministic threat-observation
   IDs; lexical relevance cannot silently strip poisoning context.
+- Citation extraction is deterministic and tool-free. Identifier text can only
+  create typed exact-range records; it cannot initiate network access, select a
+  connector, establish an authoritative retraction, or mutate a claim. Exact
+  projection joins use normalized identifiers or canonical locators. Fuzzy
+  entity matches are never silently accepted.
+- Maintained ontology bundles reject path traversal, symlinked sources, and
+  source hash drift before knowledge import. Every source is scanned, including
+  inspected sources that provide no accepted evidence. The maintained demo
+  preserves a poisoned fixture as queryable threat data and refuses to use it
+  as accepted claim evidence.
+- Model extraction accepts only operator-selected leaf anchors and produces
+  proposal records with no commit authority. Deterministic validation checks
+  concept scope, hierarchy cycles, exact-quote occurrence, anchor membership,
+  offsets, hashes, and cross-references. Extra tool or destination fields are
+  rejected. Failed or invalid calls retain no raw model output.
 - Canonical authority is one-way: version-controlled ontology and schemas plus
   immutable records and blobs produce truth snapshots; SQLite and Markdown are
   disposable projections. Projection data can never authorize changes to

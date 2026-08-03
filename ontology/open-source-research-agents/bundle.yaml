@@ -1,0 +1,768 @@
+version: 1
+topic: State of available open-source research agents
+topic_concept_id: concept:open-source-research-agents
+recorded_at: 2026-08-03T16:00:00Z
+
+sources:
+  - key: gpt-researcher
+    path: sources/gpt-researcher.md
+    expected_sha256: affc4976ed1c0f5e808b476515afd39a60414ca1a81263b406f25c3eabbe5047
+    acquired_at: 2026-08-03T15:00:00Z
+    original_locator: https://github.com/assafelovic/gpt-researcher
+    title: GPT Researcher source card
+    authors: [Epiphytic research-agent maintainers]
+    publisher: Epiphytic
+    media_type: text/markdown
+    license: Apache-2.0
+    usage_conditions: [Project-authored summary; verify against pinned upstream references.]
+    rights_basis: Original project-authored summary
+    provenance_note: Curated from the official repository and pinned default-branch commit.
+  - key: storm
+    path: sources/storm.md
+    expected_sha256: a6018fb3af9fbe1229aed8b1d402c38bf305d1ab7002ff9859e46d9388edd74c
+    acquired_at: 2026-08-03T15:00:00Z
+    original_locator: https://github.com/stanford-oval/storm
+    title: STORM and Co-STORM source card
+    authors: [Epiphytic research-agent maintainers]
+    publisher: Epiphytic
+    media_type: text/markdown
+    license: Apache-2.0
+    usage_conditions: [Project-authored summary; verify against pinned upstream references.]
+    rights_basis: Original project-authored summary
+    provenance_note: Curated from the official repository, papers, and pinned commit.
+  - key: langchain-odr
+    path: sources/langchain-open-deep-research.md
+    expected_sha256: cfe50ad7d8e062bf518581591cba1ac0b1a250403913116194e71ff08b21f4e8
+    acquired_at: 2026-08-03T15:00:00Z
+    original_locator: https://github.com/langchain-ai/open_deep_research
+    title: LangChain Open Deep Research source card
+    authors: [Epiphytic research-agent maintainers]
+    publisher: Epiphytic
+    media_type: text/markdown
+    license: Apache-2.0
+    usage_conditions: [Project-authored summary; verify against pinned upstream references.]
+    rights_basis: Original project-authored summary
+    provenance_note: Curated from the official repository and pinned default-branch commit.
+  - key: paperqa2
+    path: sources/paperqa2.md
+    expected_sha256: 80ed26147d6b8a09d28a17b52c3614a84e9b4795a6c2cb909c11e97985b140f9
+    acquired_at: 2026-08-03T15:00:00Z
+    original_locator: https://github.com/Future-House/paper-qa
+    title: PaperQA2 source card
+    authors: [Epiphytic research-agent maintainers]
+    publisher: Epiphytic
+    media_type: text/markdown
+    license: Apache-2.0
+    usage_conditions: [Project-authored summary; verify against pinned upstream references.]
+    rights_basis: Original project-authored summary
+    provenance_note: Curated from the official repository and pinned default-branch commit.
+  - key: deerflow
+    path: sources/deerflow.md
+    expected_sha256: 388af987a1839b0fcc7423fdf369893b2eceb8423f4a712b1ebfe85238b3aec9
+    acquired_at: 2026-08-03T15:00:00Z
+    original_locator: https://github.com/bytedance/deer-flow
+    title: DeerFlow source card
+    authors: [Epiphytic research-agent maintainers]
+    publisher: Epiphytic
+    media_type: text/markdown
+    license: Apache-2.0
+    usage_conditions: [Project-authored summary; verify against pinned upstream references.]
+    rights_basis: Original project-authored summary
+    provenance_note: Curated from the official repository and pinned default-branch commit.
+  - key: deepresearchagent
+    path: sources/deepresearchagent.md
+    expected_sha256: e776d81c207267352be1dcff4368c406eda484887d5d3f51b135417e83976a99
+    acquired_at: 2026-08-03T15:00:00Z
+    original_locator: https://github.com/SkyworkAI/DeepResearchAgent
+    title: Skywork DeepResearchAgent source card
+    authors: [Epiphytic research-agent maintainers]
+    publisher: Epiphytic
+    media_type: text/markdown
+    license: Apache-2.0
+    usage_conditions: [Project-authored summary; verify against pinned upstream references.]
+    rights_basis: Original project-authored summary
+    provenance_note: Curated from the official repository metadata, README, and pinned commit.
+  - key: openresearcher
+    path: sources/openresearcher.md
+    expected_sha256: 624f12190a2f5d7ce73db62bfecbaa74dd074f0900fc3c399e91c940a95c7b90
+    acquired_at: 2026-08-03T15:00:00Z
+    original_locator: https://github.com/TIGER-AI-Lab/OpenResearcher
+    title: OpenResearcher source card
+    authors: [Epiphytic research-agent maintainers]
+    publisher: Epiphytic
+    media_type: text/markdown
+    license: Apache-2.0
+    usage_conditions: [Project-authored summary; upstream software license remains unknown.]
+    rights_basis: Original project-authored summary
+    provenance_note: Curated from the official repository, default tree, and pinned commit.
+  - key: epiphytic
+    path: sources/epiphytic-research-agent.md
+    expected_sha256: de3e838de7b28b15c7936e64bbb40af2ffc319f3879a1c33c573399a3f473857
+    acquired_at: 2026-08-03T15:00:00Z
+    original_locator: https://github.com/Epiphytic/research-agent
+    title: Epiphytic research-agent source card
+    authors: [Epiphytic research-agent maintainers]
+    publisher: Epiphytic
+    media_type: text/markdown
+    license: Apache-2.0
+    usage_conditions: [Project-authored summary; verify against this repository.]
+    rights_basis: Original project-authored summary
+    provenance_note: Curated from this repository's README, security model, and implementation.
+  - key: poison-fixture
+    path: sources/poisoned-source-fixture.md
+    expected_sha256: b6a264621bdf0976bba7c51d038ee30c77aeff6e641a8b3b6392d667d50d5dec
+    acquired_at: 2026-08-03T15:00:00Z
+    original_locator: urn:epiphytic:fixture:poisoned-source
+    title: Synthetic poisoned-source fixture
+    authors: [Epiphytic research-agent maintainers]
+    publisher: Epiphytic
+    media_type: text/markdown
+    license: Apache-2.0
+    usage_conditions: [Adversarial test fixture; never use as factual evidence.]
+    rights_basis: Original project-authored test fixture
+    provenance_note: Synthetic prompt-injection and exfiltration fixture.
+
+concepts:
+  - id: concept:open-source-research-agents
+    label: Open-source research agents
+    description: Open-source systems that plan, retrieve, synthesize, or maintain research knowledge.
+    synonyms: [open deep research, research automation]
+    recorded_at: 2026-08-03T16:00:00Z
+    recorded_by: operator:epiphytic
+  - id: concept:report-first-research
+    label: Report-first research
+    description: Research workflows whose main durable output is a generated report or answer.
+    broader: [concept:open-source-research-agents]
+    recorded_at: 2026-08-03T16:00:00Z
+    recorded_by: operator:epiphytic
+  - id: concept:persistent-research-knowledge
+    label: Persistent research knowledge
+    description: Research workflows that preserve reusable structured knowledge beyond one report.
+    broader: [concept:open-source-research-agents]
+    synonyms: [persistent ontology, research knowledge graph]
+    recorded_at: 2026-08-03T16:00:00Z
+    recorded_by: operator:epiphytic
+  - id: concept:scientific-literature-agents
+    label: Scientific literature agents
+    description: Research systems specialized for scholarly documents and scientific metadata.
+    broader: [concept:open-source-research-agents]
+    recorded_at: 2026-08-03T16:00:00Z
+    recorded_by: operator:epiphytic
+  - id: concept:multi-agent-research
+    label: Multi-agent research
+    description: Research workflows coordinated across multiple specialized agents.
+    broader: [concept:open-source-research-agents]
+    recorded_at: 2026-08-03T16:00:00Z
+    recorded_by: operator:epiphytic
+  - id: concept:deterministic-research-control
+    label: Deterministic research control
+    description: Non-model enforcement of acquisition, validation, policy, budgets, and commits.
+    broader: [concept:persistent-research-knowledge]
+    recorded_at: 2026-08-03T16:00:00Z
+    recorded_by: operator:epiphytic
+  - id: project:gpt-researcher
+    label: GPT Researcher
+    description: Open-source web and local deep-research agent.
+    broader: [concept:report-first-research, concept:multi-agent-research]
+    recorded_at: 2026-08-03T16:00:00Z
+    recorded_by: operator:epiphytic
+  - id: project:storm
+    label: STORM and Co-STORM
+    description: Knowledge-curation systems using multi-perspective questions and hierarchical outlines.
+    broader: [concept:report-first-research, concept:multi-agent-research]
+    recorded_at: 2026-08-03T16:00:00Z
+    recorded_by: operator:epiphytic
+  - id: project:langchain-open-deep-research
+    label: LangChain Open Deep Research
+    description: Configurable LangGraph deep-research agent and evaluation example.
+    broader: [concept:report-first-research, concept:multi-agent-research]
+    recorded_at: 2026-08-03T16:00:00Z
+    recorded_by: operator:epiphytic
+  - id: project:paperqa2
+    label: PaperQA2
+    description: Scientific-document question answering and retrieval system.
+    broader: [concept:scientific-literature-agents]
+    recorded_at: 2026-08-03T16:00:00Z
+    recorded_by: operator:epiphytic
+  - id: project:deerflow
+    label: DeerFlow
+    description: General super-agent harness with research ancestry and broad tools.
+    broader: [concept:multi-agent-research]
+    recorded_at: 2026-08-03T16:00:00Z
+    recorded_by: operator:epiphytic
+  - id: project:deepresearchagent
+    label: Skywork DeepResearchAgent
+    description: Self-evolution runtime with historical hierarchical research-agent positioning.
+    broader: [concept:multi-agent-research, concept:persistent-research-knowledge]
+    recorded_at: 2026-08-03T16:00:00Z
+    recorded_by: operator:epiphytic
+  - id: project:openresearcher
+    label: OpenResearcher
+    description: Open pipeline for research-agent trajectory synthesis, training, and evaluation.
+    broader: [concept:scientific-literature-agents]
+    recorded_at: 2026-08-03T16:00:00Z
+    recorded_by: operator:epiphytic
+  - id: project:epiphytic-research-agent
+    label: Epiphytic research-agent
+    description: Persistent ontology-backed research control plane in this repository.
+    broader: [concept:persistent-research-knowledge, concept:deterministic-research-control]
+    recorded_at: 2026-08-03T16:00:00Z
+    recorded_by: operator:epiphytic
+
+evidence:
+  - key: gptr-scope
+    source_key: gpt-researcher
+    exact: The official repository describes GPT Researcher as an open deep-research agent for web and local research.
+  - key: gptr-architecture
+    source_key: gpt-researcher
+    exact: Its documented architecture separates a planner, parallel execution agents, source tracking, and a publisher that produces a research report.
+  - key: gptr-recursion
+    source_key: gpt-researcher
+    exact: The project documents recursive tree-like exploration with configurable breadth and depth.
+  - key: gptr-license
+    source_key: gpt-researcher
+    exact: The repository identifies its software license as Apache-2.0.
+  - key: gptr-output
+    source_key: gpt-researcher
+    exact: The documented durable output is a cited report; this source card did not verify a maintained claim-level ontology.
+  - key: storm-outline
+    source_key: storm
+    exact: STORM performs Internet research, creates a hierarchical outline, and generates a Wikipedia-like article with citations.
+  - key: storm-questions
+    source_key: storm
+    exact: STORM uses perspective-guided questions and simulated conversations to broaden and deepen its research.
+  - key: storm-mindmap
+    source_key: storm
+    exact: Co-STORM supports human participation and maintains a dynamically updated hierarchical mind map as a shared conceptual space.
+  - key: storm-retrieval
+    source_key: storm
+    exact: The documented retrieval modules include web-search providers and VectorRM for user-provided documents.
+  - key: storm-license
+    source_key: storm
+    exact: The repository identifies its software license as MIT.
+  - key: storm-persistence-gap
+    source_key: storm
+    exact: The mind map is close to a reusable hierarchy, but this source card did not verify a versioned claim-and-evidence ontology that persists across research runs.
+  - key: odr-scope
+    source_key: langchain-odr
+    exact: Open Deep Research is documented as a configurable open-source research agent supporting multiple model providers, search tools, and MCP servers.
+  - key: odr-model-roles
+    source_key: langchain-odr
+    exact: Its documented model roles include search-result summarization, research, compression, and final-report generation.
+  - key: odr-evaluation
+    source_key: langchain-odr
+    exact: The project publishes a Deep Research Bench evaluation workflow whose leaderboard metric uses an LLM judge against expert-created reference reports.
+  - key: odr-output
+    source_key: langchain-odr
+    exact: The current implementation is report-oriented and the repository retains legacy plan-and-execute and supervisor-researcher implementations.
+  - key: odr-license
+    source_key: langchain-odr
+    exact: The repository identifies its software license as MIT.
+  - key: pqa-rag
+    source_key: paperqa2
+    exact: PaperQA2 is documented as retrieval-augmented generation over scientific documents with grounded answers and in-text citations.
+  - key: pqa-pipeline
+    source_key: paperqa2
+    exact: It indexes local PDFs and other text-bearing formats, enriches metadata through scholarly services, chunks evidence, retrieves and ranks contexts, and generates an answer.
+  - key: pqa-safety
+    source_key: paperqa2
+    exact: PaperQA2 documents contradiction detection and retraction checks as scientific-research capabilities.
+  - key: pqa-state
+    source_key: paperqa2
+    exact: Its persistent local state includes document indexes and prior answers.
+  - key: pqa-retrieval
+    source_key: paperqa2
+    exact: The default retrieval path uses embeddings, while sparse keyword retrieval and disabling evidence retrieval are documented alternatives.
+  - key: pqa-license
+    source_key: paperqa2
+    exact: The repository identifies its software license as Apache-2.0.
+  - key: deer-scope
+    source_key: deerflow
+    exact: DeerFlow 2.0 is documented as a general super-agent harness that grew from a deep-research framework.
+  - key: deer-tools
+    source_key: deerflow
+    exact: It orchestrates sub-agents and provides memory, sandboxes, skills, web search, web fetch, file operations, shell execution, and MCP-extensible tools.
+  - key: deer-agents
+    source_key: deerflow
+    exact: The project documents parallel scoped sub-agents and a lead-agent synthesis step for complex research.
+  - key: deer-rewrite
+    source_key: deerflow
+    exact: The active 2.0 line is a ground-up rewrite; the original research framework remains on a 1.x branch.
+  - key: deer-license
+    source_key: deerflow
+    exact: The repository identifies its software license as MIT.
+  - key: deer-security
+    source_key: deerflow
+    exact: Its broad tool surface and configurable sandbox modes create a different security boundary from a fixed deterministic research control plane.
+  - key: dra-old-scope
+    source_key: deepresearchagent
+    exact: The repository description presents DeepResearchAgent as a hierarchical multi-agent system with a top-level planner coordinating specialized agents.
+  - key: dra-current-scope
+    source_key: deepresearchagent
+    exact: The current README presents DeepResearchAgent as a self-evolution protocol and runtime with versioned resources, auditable lineage, rollback, structured traces, and persistent memory.
+  - key: dra-loop
+    source_key: deepresearchagent
+    exact: The current design separates a resource substrate from a proposal-assessment-commit evolution loop.
+  - key: dra-license
+    source_key: deepresearchagent
+    exact: The repository identifies its software license as MIT.
+  - key: dra-ambiguity
+    source_key: deepresearchagent
+    exact: The differing repository description and current README leave the primary present-day product scope ambiguous.
+  - key: openr-scope
+    source_key: openresearcher
+    exact: OpenResearcher is documented as a fully open pipeline for long-horizon deep-research trajectory synthesis.
+  - key: openr-assets
+    source_key: openresearcher
+    exact: The project publishes an agent model, data, training methodology, evaluation tooling, and evaluation logs.
+  - key: openr-emphasis
+    source_key: openresearcher
+    exact: Its emphasis is reproducible research-agent training and evaluation rather than maintaining a topic ontology.
+  - key: openr-license
+    source_key: openresearcher
+    exact: GitHub did not identify a repository license and no top-level license file was present in the inspected default-branch tree, so the software license is recorded as unknown.
+  - key: ep-graph
+    source_key: epiphytic
+    exact: Epiphytic research-agent treats a versioned graph of concepts, claims, exact evidence, disagreements, knowledge gaps, and source-threat observations as its durable product.
+  - key: ep-canonical
+    source_key: epiphytic
+    exact: Canonical ontology and policy remain inspectable text, while immutable content-addressed records and blobs preserve research history.
+  - key: ep-query
+    source_key: epiphytic
+    exact: SQLite is a disposable deterministic query projection with FTS, hierarchy traversal, provenance joins, temporal filters, citation references, and drift detection.
+  - key: ep-security
+    source_key: epiphytic
+    exact: Retrieved source text and model output are treated as inert data; deterministic code controls validation, policy, workflow transitions, budgets, and commits.
+  - key: ep-model
+    source_key: epiphytic
+    exact: The project prefers local DeepSeek for model-assisted proposals, but models do not receive ontology-write authority.
+  - key: ep-license
+    source_key: epiphytic
+    exact: The repository identifies its software license as Apache-2.0, while the starter ontology has a CC0 declaration.
+
+claims:
+  - key: gptr-scope
+    subject: project:gpt-researcher
+    predicate: ep:research_scope
+    object: web and local deep research
+    stance: asserts
+    epistemic_status: observed
+    asserted_by: curator:epiphytic
+    evidence_keys: [gptr-scope]
+  - key: gptr-architecture
+    subject: project:gpt-researcher
+    predicate: ep:architecture
+    object: planner, parallel executors, source tracking, and report publisher
+    stance: asserts
+    epistemic_status: observed
+    asserted_by: curator:epiphytic
+    evidence_keys: [gptr-architecture]
+  - key: gptr-recursion
+    subject: project:gpt-researcher
+    predicate: ep:exploration_strategy
+    object: configurable recursive breadth and depth
+    stance: asserts
+    epistemic_status: observed
+    asserted_by: curator:epiphytic
+    evidence_keys: [gptr-recursion]
+  - key: gptr-license
+    subject: project:gpt-researcher
+    predicate: ep:software_license
+    object: Apache-2.0
+    stance: reports
+    epistemic_status: observed
+    asserted_by: github:assafelovic/gpt-researcher
+    evidence_keys: [gptr-license]
+  - key: gptr-output
+    subject: project:gpt-researcher
+    predicate: ep:durable_output
+    object: cited report
+    qualifiers: {claim_ontology_verification: not_verified}
+    stance: asserts
+    epistemic_status: observed
+    asserted_by: curator:epiphytic
+    evidence_keys: [gptr-output]
+  - key: storm-outline
+    subject: project:storm
+    predicate: ep:durable_output
+    object: hierarchical outline and cited article
+    stance: asserts
+    epistemic_status: observed
+    asserted_by: curator:epiphytic
+    evidence_keys: [storm-outline]
+  - key: storm-questions
+    subject: project:storm
+    predicate: ep:exploration_strategy
+    object: perspective-guided questions and simulated conversations
+    stance: asserts
+    epistemic_status: observed
+    asserted_by: curator:epiphytic
+    evidence_keys: [storm-questions]
+  - key: storm-mindmap
+    subject: project:storm
+    predicate: ep:maintains_structure
+    object: dynamically updated hierarchical mind map
+    stance: asserts
+    epistemic_status: observed
+    asserted_by: curator:epiphytic
+    evidence_keys: [storm-mindmap]
+  - key: storm-retrieval
+    subject: project:storm
+    predicate: ep:retrieval_interfaces
+    object: web search providers and VectorRM
+    stance: asserts
+    epistemic_status: observed
+    asserted_by: curator:epiphytic
+    evidence_keys: [storm-retrieval]
+  - key: storm-license
+    subject: project:storm
+    predicate: ep:software_license
+    object: MIT
+    stance: reports
+    epistemic_status: observed
+    asserted_by: github:stanford-oval/storm
+    evidence_keys: [storm-license]
+  - key: storm-persistence-gap
+    subject: project:storm
+    predicate: ep:claim_ontology_persistence
+    object: not verified
+    stance: questions
+    epistemic_status: observed
+    asserted_by: curator:epiphytic
+    evidence_keys: [storm-persistence-gap]
+  - key: odr-scope
+    subject: project:langchain-open-deep-research
+    predicate: ep:integration_scope
+    object: multiple model providers, search tools, and MCP servers
+    stance: asserts
+    epistemic_status: observed
+    asserted_by: curator:epiphytic
+    evidence_keys: [odr-scope]
+  - key: odr-model-roles
+    subject: project:langchain-open-deep-research
+    predicate: ep:model_roles
+    object: summarization, research, compression, and report generation
+    stance: asserts
+    epistemic_status: observed
+    asserted_by: curator:epiphytic
+    evidence_keys: [odr-model-roles]
+  - key: odr-evaluation
+    subject: project:langchain-open-deep-research
+    predicate: ep:evaluation_method
+    object: Deep Research Bench with LLM-as-judge metric
+    stance: asserts
+    epistemic_status: observed
+    asserted_by: curator:epiphytic
+    evidence_keys: [odr-evaluation]
+  - key: odr-output
+    subject: project:langchain-open-deep-research
+    predicate: ep:durable_output
+    object: research report
+    stance: asserts
+    epistemic_status: observed
+    asserted_by: curator:epiphytic
+    evidence_keys: [odr-output]
+  - key: odr-license
+    subject: project:langchain-open-deep-research
+    predicate: ep:software_license
+    object: MIT
+    stance: reports
+    epistemic_status: observed
+    asserted_by: github:langchain-ai/open_deep_research
+    evidence_keys: [odr-license]
+  - key: pqa-rag
+    subject: project:paperqa2
+    predicate: ep:retrieval_architecture
+    object: retrieval-augmented generation over scientific documents
+    stance: asserts
+    epistemic_status: observed
+    asserted_by: curator:epiphytic
+    evidence_keys: [pqa-rag]
+  - key: pqa-pipeline
+    subject: project:paperqa2
+    predicate: ep:pipeline
+    object: metadata enrichment, chunking, retrieval, ranking, and answer generation
+    stance: asserts
+    epistemic_status: observed
+    asserted_by: curator:epiphytic
+    evidence_keys: [pqa-pipeline]
+  - key: pqa-safety
+    subject: project:paperqa2
+    predicate: ep:scientific_quality_capability
+    object: contradiction detection and retraction checks
+    stance: asserts
+    epistemic_status: observed
+    asserted_by: curator:epiphytic
+    evidence_keys: [pqa-safety]
+  - key: pqa-state
+    subject: project:paperqa2
+    predicate: ep:persistent_state
+    object: document indexes and prior answers
+    stance: asserts
+    epistemic_status: observed
+    asserted_by: curator:epiphytic
+    evidence_keys: [pqa-state]
+  - key: pqa-retrieval
+    subject: project:paperqa2
+    predicate: ep:retrieval_modes
+    object: dense embeddings by default with sparse and all-context alternatives
+    stance: asserts
+    epistemic_status: observed
+    asserted_by: curator:epiphytic
+    evidence_keys: [pqa-retrieval]
+  - key: pqa-license
+    subject: project:paperqa2
+    predicate: ep:software_license
+    object: Apache-2.0
+    stance: reports
+    epistemic_status: observed
+    asserted_by: github:Future-House/paper-qa
+    evidence_keys: [pqa-license]
+  - key: deer-scope
+    subject: project:deerflow
+    predicate: ep:current_scope
+    object: general super-agent harness evolved from deep research
+    stance: asserts
+    epistemic_status: observed
+    asserted_by: curator:epiphytic
+    evidence_keys: [deer-scope]
+  - key: deer-tools
+    subject: project:deerflow
+    predicate: ep:tool_surface
+    object: memory, sandboxes, skills, web, files, shell, and MCP tools
+    stance: asserts
+    epistemic_status: observed
+    asserted_by: curator:epiphytic
+    evidence_keys: [deer-tools]
+  - key: deer-agents
+    subject: project:deerflow
+    predicate: ep:architecture
+    object: lead agent with parallel scoped sub-agents
+    stance: asserts
+    epistemic_status: observed
+    asserted_by: curator:epiphytic
+    evidence_keys: [deer-agents]
+  - key: deer-rewrite
+    subject: project:deerflow
+    predicate: ep:version_boundary
+    object: 2.0 rewrite with research-focused 1.x branch retained
+    stance: reports
+    epistemic_status: observed
+    asserted_by: curator:epiphytic
+    evidence_keys: [deer-rewrite]
+  - key: deer-license
+    subject: project:deerflow
+    predicate: ep:software_license
+    object: MIT
+    stance: reports
+    epistemic_status: observed
+    asserted_by: github:bytedance/deer-flow
+    evidence_keys: [deer-license]
+  - key: deer-security
+    subject: project:deerflow
+    predicate: ep:security_boundary
+    object: broad configurable agent tool surface
+    stance: asserts
+    epistemic_status: inferred
+    asserted_by: curator:epiphytic
+    evidence_keys: [deer-security]
+  - key: dra-old-scope
+    subject: project:deepresearchagent
+    predicate: ep:primary_scope
+    object: hierarchical multi-agent research system
+    stance: asserts
+    epistemic_status: observed
+    asserted_by: github:SkyworkAI/DeepResearchAgent:description
+    evidence_keys: [dra-old-scope]
+  - key: dra-current-scope
+    subject: project:deepresearchagent
+    predicate: ep:primary_scope
+    object: self-evolution protocol and runtime
+    stance: asserts
+    epistemic_status: observed
+    asserted_by: github:SkyworkAI/DeepResearchAgent:README
+    evidence_keys: [dra-current-scope]
+  - key: dra-loop
+    subject: project:deepresearchagent
+    predicate: ep:evolution_architecture
+    object: resource substrate and proposal-assessment-commit loop
+    stance: asserts
+    epistemic_status: observed
+    asserted_by: curator:epiphytic
+    evidence_keys: [dra-loop]
+  - key: dra-license
+    subject: project:deepresearchagent
+    predicate: ep:software_license
+    object: MIT
+    stance: reports
+    epistemic_status: observed
+    asserted_by: github:SkyworkAI/DeepResearchAgent
+    evidence_keys: [dra-license]
+  - key: dra-ambiguity
+    subject: project:deepresearchagent
+    predicate: ep:scope_consistency
+    object: repository metadata and README differ
+    stance: questions
+    epistemic_status: observed
+    asserted_by: curator:epiphytic
+    evidence_keys: [dra-ambiguity]
+  - key: openr-scope
+    subject: project:openresearcher
+    predicate: ep:research_scope
+    object: long-horizon research trajectory synthesis
+    stance: asserts
+    epistemic_status: observed
+    asserted_by: curator:epiphytic
+    evidence_keys: [openr-scope]
+  - key: openr-assets
+    subject: project:openresearcher
+    predicate: ep:published_assets
+    object: model, data, training, evaluation tooling, and evaluation logs
+    stance: asserts
+    epistemic_status: observed
+    asserted_by: curator:epiphytic
+    evidence_keys: [openr-assets]
+  - key: openr-emphasis
+    subject: project:openresearcher
+    predicate: ep:primary_emphasis
+    object: agent training and evaluation
+    stance: asserts
+    epistemic_status: inferred
+    asserted_by: curator:epiphytic
+    evidence_keys: [openr-emphasis]
+  - key: openr-license
+    subject: project:openresearcher
+    predicate: ep:software_license
+    object: unknown
+    qualifiers: {checked_default_tree: true}
+    stance: reports
+    epistemic_status: observed
+    asserted_by: curator:epiphytic
+    evidence_keys: [openr-license]
+  - key: ep-graph
+    subject: project:epiphytic-research-agent
+    predicate: ep:durable_output
+    object: versioned claim, evidence, dissent, gap, and threat graph
+    stance: asserts
+    epistemic_status: observed
+    asserted_by: github:Epiphytic/research-agent
+    evidence_keys: [ep-graph]
+  - key: ep-canonical
+    subject: project:epiphytic-research-agent
+    predicate: ep:canonical_storage
+    object: inspectable ontology text and immutable content-addressed history
+    stance: asserts
+    epistemic_status: observed
+    asserted_by: github:Epiphytic/research-agent
+    evidence_keys: [ep-canonical]
+  - key: ep-query
+    subject: project:epiphytic-research-agent
+    predicate: ep:retrieval_architecture
+    object: deterministic SQLite graph, FTS, temporal, citation, and provenance queries
+    stance: asserts
+    epistemic_status: observed
+    asserted_by: github:Epiphytic/research-agent
+    evidence_keys: [ep-query]
+  - key: ep-security
+    subject: project:epiphytic-research-agent
+    predicate: ep:security_boundary
+    object: deterministic controls with source and model text treated as inert data
+    stance: asserts
+    epistemic_status: observed
+    asserted_by: github:Epiphytic/research-agent
+    evidence_keys: [ep-security]
+  - key: ep-model
+    subject: project:epiphytic-research-agent
+    predicate: ep:model_policy
+    object: local DeepSeek preferred with no direct ontology-write authority
+    stance: asserts
+    epistemic_status: observed
+    asserted_by: github:Epiphytic/research-agent
+    evidence_keys: [ep-model]
+  - key: ep-license
+    subject: project:epiphytic-research-agent
+    predicate: ep:software_license
+    object: Apache-2.0
+    qualifiers: {starter_ontology_license: CC0}
+    stance: reports
+    epistemic_status: observed
+    asserted_by: github:Epiphytic/research-agent
+    evidence_keys: [ep-license]
+
+controversies:
+  - topic_concept_id: concept:open-source-research-agents
+    question: Should the durable research product be a report or a reusable claim graph?
+    description: Projects make different architectural choices about whether reports or persistent structured knowledge are primary.
+    claim_keys: [gptr-output, ep-graph]
+    status: open
+  - topic_concept_id: concept:open-source-research-agents
+    question: Should local research retrieval default to dense embeddings or deterministic structured and lexical queries?
+    description: PaperQA2 documents embedding-first retrieval with alternatives; Epiphytic makes graph and lexical queries authoritative.
+    claim_keys: [pqa-retrieval, ep-query]
+    status: open
+  - topic_concept_id: concept:open-source-research-agents
+    question: How broad should an autonomous research agent's executable tool surface be?
+    description: DeerFlow exposes a configurable general tool harness, while Epiphytic confines model output behind deterministic controls.
+    claim_keys: [deer-security, ep-security]
+    status: open
+  - topic_concept_id: project:deepresearchagent
+    question: What is the current primary scope of Skywork DeepResearchAgent?
+    description: Repository metadata and the current README describe materially different primary identities.
+    claim_keys: [dra-old-scope, dra-current-scope, dra-ambiguity]
+    status: open
+  - topic_concept_id: concept:persistent-research-knowledge
+    question: Does a dynamic mind map provide the same maintenance guarantees as a versioned claim-and-evidence ontology?
+    description: Co-STORM maintains a useful hierarchy, but persistence, evidence selectors, and cross-run versioning remain unverified here.
+    claim_keys: [storm-mindmap, storm-persistence-gap, ep-graph]
+    status: open
+
+gaps:
+  - topic_concept_id: concept:open-source-research-agents
+    question: Which projects preserve claim-level evidence and ontology changes across independent research runs?
+    kind: insufficient_evidence
+    rationale: Most inspected documentation emphasizes reports, answers, indexes, traces, or memory rather than versioned claim graphs.
+    related_claim_keys: [gptr-output, storm-persistence-gap, pqa-state, ep-graph]
+    priority: 95
+    freshness_deadline: 2026-09-03T00:00:00Z
+  - topic_concept_id: concept:open-source-research-agents
+    question: How do the projects resist indirect prompt injection at retrieval, parsing, tool, and commit boundaries?
+    kind: missing_source_class
+    rationale: README-level feature documentation is insufficient for a defensible security comparison; code and security advisories require review.
+    related_claim_keys: [deer-tools, ep-security]
+    priority: 95
+    freshness_deadline: 2026-09-03T00:00:00Z
+  - topic_concept_id: concept:open-source-research-agents
+    question: Can the projects be compared on one independently reproduced benchmark with fixed model, search, corpus, and cost?
+    kind: insufficient_evidence
+    rationale: Published evaluations target different tasks and some use model-based judges, so current scores are not directly comparable.
+    related_claim_keys: [odr-evaluation, openr-assets]
+    priority: 90
+    freshness_deadline: 2026-10-03T00:00:00Z
+  - topic_concept_id: concept:persistent-research-knowledge
+    question: What are Co-STORM mind-map persistence, export, versioning, and exact-evidence semantics?
+    kind: unknown
+    rationale: The hierarchy is highly relevant, but the inspected project overview does not establish equivalence to a persistent evidence graph.
+    related_claim_keys: [storm-mindmap, storm-persistence-gap]
+    priority: 88
+    freshness_deadline: 2026-09-03T00:00:00Z
+  - topic_concept_id: project:openresearcher
+    question: Under what license may OpenResearcher code be used and redistributed?
+    kind: insufficient_evidence
+    rationale: GitHub license detection was empty and no top-level license file was present in the inspected default tree.
+    related_claim_keys: [openr-license]
+    priority: 85
+    freshness_deadline: 2026-09-03T00:00:00Z
+  - topic_concept_id: concept:open-source-research-agents
+    question: Which citation and retraction relations can be resolved against authoritative metadata rather than text signals?
+    kind: unknown
+    rationale: Textual identifier extraction is deterministic, but work resolution and authoritative retraction status need connector-backed evidence.
+    related_claim_keys: [pqa-safety, ep-query]
+    priority: 80
+    freshness_deadline: 2026-09-03T00:00:00Z
+  - topic_concept_id: concept:open-source-research-agents
+    question: Which projects can operate fully with local models and open retrieval services at documented quality levels?
+    kind: insufficient_evidence
+    rationale: Provider configurability does not establish comparable quality, cost, or privacy under local-only execution.
+    related_claim_keys: [odr-scope, ep-model]
+    priority: 75
+    freshness_deadline: 2026-10-03T00:00:00Z

@@ -41,6 +41,22 @@ enums:
       human:
       model:
       external_feed:
+  IdentifierKind:
+    permissible_values:
+      doi:
+      pmid:
+      pmcid:
+      arxiv:
+      url:
+  ReferenceRelation:
+    permissible_values:
+      mentions:
+      cites:
+      updates:
+      corrects:
+      retracts:
+      reviews:
+      replies_to:
 
 slots:
   id:
@@ -107,6 +123,39 @@ slots:
     range: string
   assessed_at:
     range: datetime
+  identifier_kind:
+    range: IdentifierKind
+  identifier_value:
+    range: string
+  canonical_locator:
+    range: uri
+  structural_anchor_id:
+    range: uriorcurie
+  identifier_id:
+    range: uriorcurie
+  reference_relation:
+    range: ReferenceRelation
+  reference_signal:
+    range: string
+  selector_start:
+    range: integer
+    minimum_value: 0
+  selector_end:
+    range: integer
+    minimum_value: 0
+  original_locator:
+    range: uri
+  title:
+    range: string
+  authors:
+    range: string
+    multivalued: true
+  publisher:
+    range: string
+  license:
+    range: string
+  provenance_note:
+    range: string
 
 classes:
   SourceVersion:
@@ -221,4 +270,65 @@ classes:
       detector_id:
         required: true
       rationale:
+        required: true
+  ResearchIdentifier:
+    slots:
+      - id
+      - identifier_kind
+      - identifier_value
+      - canonical_locator
+    slot_usage:
+      identifier_kind:
+        required: true
+      identifier_value:
+        required: true
+      canonical_locator:
+        required: true
+  BibliographicReference:
+    slots:
+      - id
+      - source_version
+      - structural_anchor_id
+      - identifier_id
+      - reference_relation
+      - reference_signal
+      - selector_start
+      - selector_end
+      - content_sha256
+    slot_usage:
+      source_version:
+        required: true
+      structural_anchor_id:
+        required: true
+      identifier_id:
+        required: true
+      reference_relation:
+        required: true
+      selector_start:
+        required: true
+      selector_end:
+        required: true
+      content_sha256:
+        required: true
+  SourceMetadata:
+    slots:
+      - id
+      - source_version
+      - original_locator
+      - title
+      - authors
+      - publisher
+      - license
+      - provenance_note
+      - recorded_at
+    slot_usage:
+      source_version:
+        required: true
+      original_locator:
+        required: true
+      title:
+        required: true
+      provenance_note:
+        required: true
+      recorded_at:
         required: true
