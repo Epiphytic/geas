@@ -18,8 +18,9 @@ slice:
 - connector capability manifests and narrow discovery/acquisition contracts;
 - deterministic query validation with controlled synonyms and budget clamps;
 - path-confined local-file discovery and acquisition;
-- Crossref and authenticated OpenAlex scholarly discovery with normalized
-  identifiers, authorship, publication, open-access, citation, and cost metadata;
+- Crossref and authenticated OpenAlex scholarly discovery with normalized DOI,
+  PMID, PMCID, ORCID, ROR, and ISSN identities plus authorship, publication,
+  open-access, citation, and cost metadata;
 - reviewed knowledge-pack import with exact source selectors;
 - deterministic indirect-prompt-injection scanning and topic-scoped tainted-source records;
 - content-addressed, inspectable JSON record batches for larger claim sets;

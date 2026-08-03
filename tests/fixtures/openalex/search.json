@@ -23,8 +23,10 @@
         {
           "author": {
             "id": "https://openalex.org/A501",
-            "display_name": "Zipporah Iheozor-Ejiofor"
-          }
+            "display_name": "Zipporah Iheozor-Ejiofor",
+            "orcid": "https://orcid.org/0000-0002-1825-0097"
+          },
+          "institutions": [{"ror": "https://ror.org/03yrm5c26"}]
         },
         {
           "author": {
@@ -37,9 +39,15 @@
         "landing_page_url": "https://doi.org/10.1002/14651858.CD010856.pub3",
         "source": {
           "id": "https://openalex.org/S4210203846",
-          "display_name": "Cochrane Database of Systematic Reviews"
+          "display_name": "Cochrane Database of Systematic Reviews",
+          "issn_l": "1469-493X",
+          "issn": ["1469-493X"]
         },
         "license": "cc-by"
+      },
+      "ids": {
+        "pmid": "https://pubmed.ncbi.nlm.nih.gov/25472792",
+        "pmcid": "https://www.ncbi.nlm.nih.gov/pmc/articles/PMC123456"
       },
       "open_access": {
         "is_oa": true,
