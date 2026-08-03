@@ -50,7 +50,6 @@ def test_crossref_fixture_preserves_doi_authorship_and_date() -> None:
         "query.bibliographic": "community water fluoridation dental caries",
         "rows": "10",
         "cursor": "*",
-        "mailto": "research@epiphytic.org",
     }
 
 
