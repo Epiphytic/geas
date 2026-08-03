@@ -192,3 +192,19 @@ override token ceilings, classification, source routing, provider/model/
 endpoint allowlists, unknown accounting, expiry, or replay protection.
 
 See `docs/APPROVALS.md`.
+
+## 8. Repository license
+
+**Status:** accepted on 2026-08-02.
+
+### Decision
+
+- License the repository software and original project material under
+  Apache License 2.0.
+- Use `Epiphytic` as the copyright holder and 2026 as the initial year.
+- Preserve more specific existing notices, including the ontology's CC0
+  declaration.
+- Do not imply that the repository license applies to user deposits, acquired
+  sources, provider content, or referenced third-party datasets.
+
+The complete boundary is documented in `docs/LICENSING.md`.

@@ -200,6 +200,13 @@ supplementary sources. Licensing, access, scope, staleness, and false-positive
 caveats are recorded per source. The research and selection rationale are in
 [docs/THREAT_INTELLIGENCE_SOURCES.md](docs/THREAT_INTELLIGENCE_SOURCES.md).
 
+## License
+
+Repository software and original project material are licensed under
+[Apache License 2.0](LICENSE). Explicitly licensed ontology material,
+third-party sources, user deposits, and acquired content retain their own
+terms. See [docs/LICENSING.md](docs/LICENSING.md).
+
 ## Repository map
 
 ```text

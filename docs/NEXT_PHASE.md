@@ -347,4 +347,3 @@ the persistent, queryable knowledge state and its audit history.
 ## Decisions still requiring operator input
 
 - Production graph backend after the SQLite vertical slice is measured.
-- Repository open-source license.
