@@ -238,3 +238,81 @@ def test_concurrent_reservations_cannot_overspend_call_limit(tmp_path: Path) -> 
         results = tuple(pool.map(reserve, range(11)))
 
     assert sum(results) == 10
+
+
+def test_search_usage_is_reserved_and_settled_from_provider_cost(
+    tmp_path: Path,
+) -> None:
+    ledger = UsageLedger(tmp_path / "usage.sqlite")
+    reservation = ledger.reserve_search(
+        policy=_policy(),
+        provider="openalex",
+        run_id="run:openalex",
+        request_key="page:0",
+        human_approved=False,
+        max_calls_per_run=10,
+        max_cost_microusd_per_day=1_000_000,
+        now=datetime(2026, 8, 2, tzinfo=UTC),
+    )
+
+    assert reservation.service is ServiceKind.SEARCH
+    assert reservation.cost_microusd_reserved == 1_000
+    settlement = ledger.settle_search(reservation, cost_microusd=1_000)
+    assert settlement.status == "settled"
+    assert settlement.cost_microusd_actual == 1_000
+
+
+def test_provider_search_call_and_daily_limits_fail_closed(tmp_path: Path) -> None:
+    ledger = UsageLedger(tmp_path / "usage.sqlite")
+    policy = _policy()
+    timestamp = datetime(2026, 8, 2, tzinfo=UTC)
+    ledger.reserve_search(
+        policy=policy,
+        provider="openalex",
+        run_id="run:one",
+        request_key="page:0",
+        human_approved=False,
+        max_calls_per_run=1,
+        max_cost_microusd_per_day=1_000,
+        now=timestamp,
+    )
+
+    with pytest.raises(ValueError, match="call count"):
+        ledger.reserve_search(
+            policy=policy,
+            provider="openalex",
+            run_id="run:one",
+            request_key="page:1",
+            human_approved=False,
+            max_calls_per_run=1,
+            max_cost_microusd_per_day=1_000,
+            now=timestamp,
+        )
+    with pytest.raises(ValueError, match="provider daily"):
+        ledger.reserve_search(
+            policy=policy,
+            provider="openalex",
+            run_id="run:two",
+            request_key="page:0",
+            human_approved=False,
+            max_calls_per_run=1,
+            max_cost_microusd_per_day=1_000,
+            now=timestamp,
+        )
+
+
+def test_search_cost_overrun_is_recorded_for_output_rejection(tmp_path: Path) -> None:
+    ledger = UsageLedger(tmp_path / "usage.sqlite")
+    reservation = ledger.reserve_search(
+        policy=_policy(),
+        provider="openalex",
+        run_id="run:openalex",
+        request_key="page:0",
+        human_approved=False,
+        max_calls_per_run=10,
+        max_cost_microusd_per_day=1_000_000,
+    )
+
+    settlement = ledger.settle_search(reservation, cost_microusd=1_001)
+
+    assert settlement.status == "overrun"

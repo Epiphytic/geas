@@ -177,8 +177,8 @@ class DeterministicQueryCompiler:
 
 
 class SQLiteKnowledgeProjection:
-    schema_version = 1
-    builder_version = "sqlite-knowledge-projection/1"
+    schema_version = 2
+    builder_version = "sqlite-knowledge-projection/2"
 
     def __init__(self, *, store: ImmutableStore, workspace_root: Path) -> None:
         self.store = store
@@ -456,7 +456,9 @@ class SQLiteKnowledgeProjection:
                 upstream_rank INTEGER NOT NULL,
                 snippet TEXT,
                 discovery_run_id TEXT NOT NULL,
-                acquisition_eligible INTEGER NOT NULL
+                acquisition_eligible INTEGER NOT NULL,
+                known_entity_ids_json TEXT NOT NULL,
+                metadata_json TEXT NOT NULL
             );
             CREATE VIRTUAL TABLE knowledge_fts USING fts5(
                 record_type UNINDEXED,
@@ -749,7 +751,10 @@ class SQLiteKnowledgeProjection:
         for item in discovery_hits:
             counts["discovery_hits"] += 1
             connection.execute(
-                "INSERT INTO discovery_hit VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                """
+                INSERT INTO discovery_hit
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
                 (
                     item.id,
                     item.upstream_id,
@@ -764,6 +769,8 @@ class SQLiteKnowledgeProjection:
                     item.snippet,
                     item.discovery_run_id,
                     int(item.acquisition_eligible),
+                    json.dumps(item.known_entity_ids, ensure_ascii=False),
+                    json.dumps(item.metadata, ensure_ascii=False, sort_keys=True),
                 ),
             )
             add_fts(
@@ -776,6 +783,7 @@ class SQLiteKnowledgeProjection:
                         item.publisher or "",
                         item.canonical_locator,
                         item.snippet or "",
+                        json.dumps(item.metadata, ensure_ascii=False, sort_keys=True),
                     )
                 ),
             )

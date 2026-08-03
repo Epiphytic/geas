@@ -316,7 +316,9 @@ class UsageLedger:
         output_tokens: int | None,
     ) -> UsageSettlement:
         if input_tokens is None or output_tokens is None:
-            status = "settled_estimate"
+            status: Literal["settled", "settled_estimate", "overrun"] = (
+                "settled_estimate"
+            )
             actual_cost = None
         else:
             account = policy.account(ServiceKind.MODEL, reservation.provider, reservation.model)
@@ -345,6 +347,163 @@ class UsageLedger:
             input_tokens_actual=input_tokens,
             output_tokens_actual=output_tokens,
             cost_microusd_actual=actual_cost,
+            status=status,
+        )
+
+    def reserve_search(
+        self,
+        *,
+        policy: BudgetPolicy,
+        provider: str,
+        run_id: str,
+        request_key: str,
+        human_approved: bool,
+        max_calls_per_run: int,
+        max_cost_microusd_per_day: int,
+        now: datetime | None = None,
+    ) -> UsageReservation:
+        if not run_id.strip():
+            raise ValueError("run_id is required for budget accounting")
+        account = policy.account(ServiceKind.SEARCH, provider, None)
+        assert account.unit_cost_microusd is not None
+        reserved_cost = (
+            account.unit_cost_microusd
+            if account.budget_treatment is BudgetTreatment.COUNTED
+            else 0
+        )
+        envelope = policy.automatic_envelope
+        if (
+            reserved_cost > envelope.max_cost_microusd_per_call
+            and not human_approved
+        ):
+            raise ValueError("reserved cost exceeds automatic per-call limit")
+        timestamp = (now or datetime.now(UTC)).astimezone(UTC)
+        created_at = timestamp.isoformat()
+        day = timestamp.date().isoformat()
+        month = day[:7]
+        self.initialize()
+        with sqlite3.connect(self.path, timeout=30, isolation_level=None) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            provider_run_calls = self._scalar(
+                connection,
+                """
+                SELECT COUNT(*) FROM usage
+                WHERE run_id = ? AND service = 'search' AND provider = ?
+                """,
+                (run_id, provider),
+            )
+            if provider_run_calls >= max_calls_per_run and not human_approved:
+                raise ValueError("automatic search call count exceeds provider run limit")
+            if account.budget_treatment is BudgetTreatment.COUNTED and not human_approved:
+                provider_daily = self._consumed_cost(
+                    connection,
+                    "day_utc = ? AND service = 'search' AND provider = ?",
+                    (day, provider),
+                )
+                if provider_daily + reserved_cost > max_cost_microusd_per_day:
+                    raise ValueError("reserved cost exceeds provider daily limit")
+                checks = (
+                    ("run", envelope.max_cost_microusd_per_run, "run_id = ?", (run_id,)),
+                    ("daily", envelope.max_cost_microusd_per_day, "day_utc = ?", (day,)),
+                    (
+                        "monthly",
+                        envelope.max_cost_microusd_per_month,
+                        "month_utc = ?",
+                        (month,),
+                    ),
+                )
+                for label, limit, clause, parameters in checks:
+                    consumed = self._consumed_cost(connection, clause, parameters)
+                    if consumed + reserved_cost > limit:
+                        raise ValueError(f"reserved cost exceeds automatic {label} limit")
+            sequence = self._scalar(connection, "SELECT COUNT(*) FROM usage", ())
+            fields = {
+                "service": ServiceKind.SEARCH,
+                "provider": provider,
+                "run_id": run_id,
+                "request_key": request_key,
+                "sequence": sequence,
+                "created_at": created_at,
+                "policy_version": policy.version,
+            }
+            reservation_id = content_id("usage-reservation", fields)
+            connection.execute(
+                """
+                INSERT INTO usage VALUES (
+                    ?, ?, ?, NULL, ?, ?, ?, ?, ?, 0, 0, ?, NULL, NULL, NULL,
+                    ?, ?, ?, ?, ?, ?
+                )
+                """,
+                (
+                    reservation_id,
+                    ServiceKind.SEARCH,
+                    provider,
+                    run_id,
+                    request_key,
+                    account.budget_treatment,
+                    account.billing_basis,
+                    account.accounting_note,
+                    reserved_cost,
+                    int(human_approved),
+                    created_at,
+                    day,
+                    month,
+                    policy.version,
+                    "reserved",
+                ),
+            )
+        return UsageReservation(
+            id=reservation_id,
+            service=ServiceKind.SEARCH,
+            provider=provider,
+            model=None,
+            run_id=run_id,
+            request_key=request_key,
+            budget_treatment=account.budget_treatment,
+            billing_basis=account.billing_basis,
+            accounting_note=account.accounting_note,
+            input_tokens_reserved=0,
+            output_tokens_reserved=0,
+            cost_microusd_reserved=reserved_cost,
+            human_approved=human_approved,
+            created_at=timestamp,
+            policy_version=policy.version,
+            status="reserved",
+        )
+
+    def settle_search(
+        self,
+        reservation: UsageReservation,
+        *,
+        cost_microusd: int,
+    ) -> UsageSettlement:
+        if reservation.service is not ServiceKind.SEARCH:
+            raise ValueError("reservation is not for search")
+        if cost_microusd < 0:
+            raise ValueError("actual search cost cannot be negative")
+        status: Literal["settled", "overrun"] = (
+            "overrun"
+            if cost_microusd > reservation.cost_microusd_reserved
+            else "settled"
+        )
+        with sqlite3.connect(self.path, timeout=30, isolation_level=None) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                """
+                UPDATE usage
+                SET input_tokens_actual = 0, output_tokens_actual = 0,
+                    cost_microusd_actual = ?, status = ?
+                WHERE id = ? AND status = 'reserved'
+                """,
+                (cost_microusd, status, reservation.id),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("usage reservation is missing or already settled")
+        return UsageSettlement(
+            reservation_id=reservation.id,
+            input_tokens_actual=0,
+            output_tokens_actual=0,
+            cost_microusd_actual=cost_microusd,
             status=status,
         )
 

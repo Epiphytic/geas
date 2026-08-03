@@ -197,6 +197,8 @@ class CrossrefDiscoveryConnector:
                         media_type="application/vnd.crossref-api-message+json",
                         language=work.language or request.languages[0],
                         score=work.score,
+                        known_entity_ids=(f"doi:{doi}",),
+                        metadata={"doi": doi},
                     )
                 )
             next_cursor = envelope.message.next_cursor

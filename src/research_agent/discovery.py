@@ -135,6 +135,7 @@ class DiscoveryRun(StrictModel):
     error_count: int = Field(ge=0)
     rate_limited: bool = False
     truncated: bool = False
+    reported_cost_microusd: int = Field(default=0, ge=0)
 
     @model_validator(mode="after")
     def validate_times(self) -> DiscoveryRun:
@@ -159,6 +160,7 @@ class DiscoveryHit(StrictModel):
     known_entity_ids: tuple[str, ...] = ()
     acquisition_eligible: bool
     threat_observation_ids: tuple[str, ...] = ()
+    metadata: dict[str, str | int | float | bool] = Field(default_factory=dict)
 
 
 class AcquisitionAttempt(StrictModel):
@@ -271,6 +273,8 @@ class DiscoveryCandidate(StrictModel):
     language: str | None = None
     snippet: str | None = None
     score: float = Field(ge=0)
+    known_entity_ids: tuple[str, ...] = ()
+    metadata: dict[str, str | int | float | bool] = Field(default_factory=dict)
 
 
 class DiscoveryPage(StrictModel):
@@ -280,6 +284,7 @@ class DiscoveryPage(StrictModel):
     rejected_count: int = Field(default=0, ge=0)
     error_count: int = Field(default=0, ge=0)
     response_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    reported_cost_microusd: int = Field(default=0, ge=0)
 
 
 class AcquisitionRequest(StrictModel):

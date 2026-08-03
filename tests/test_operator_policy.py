@@ -4,6 +4,7 @@ import pytest
 from pydantic import ValidationError
 
 from research_agent.operator_policy import ResearchPolicy
+from research_agent.planning import ConceptVocabulary
 
 
 def test_checked_in_policy_prefers_mojeek_and_open_acquisition() -> None:
@@ -21,6 +22,13 @@ def test_checked_in_policy_prefers_mojeek_and_open_acquisition() -> None:
         "open_repository",
     )
     assert not policy.general_search_results_are_evidence
+    assert policy.domain_index("connector:crossref").priority == 1
+    openalex = policy.domain_index("connector:openalex")
+    assert openalex.enabled
+    assert openalex.credential_env == "OPENALEX_API_KEY"
+    assert openalex.metadata_license == "CC0-1.0"
+    assert openalex.cost_accounting == "provider_reported_only"
+    assert openalex.daily_free_allowance_usd == 1.0
 
 
 def test_persistence_requires_confirmed_storage_rights() -> None:
@@ -46,3 +54,14 @@ def test_persistence_requires_confirmed_storage_rights() -> None:
                 ],
             }
         )
+
+
+def test_acceptance_ontology_topics_are_searchable_vocabulary() -> None:
+    vocabulary = ConceptVocabulary.from_yaml(Path("config/query-vocabulary.yaml"))
+
+    assert {
+        "concept:community-water-fluoridation",
+        "concept:fluoridation-caries-effects",
+        "concept:fluoridation-neurodevelopment",
+        "concept:fluoridation-regulation",
+    }.issubset(vocabulary.concepts)

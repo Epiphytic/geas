@@ -30,3 +30,11 @@ accounts:
     accounting_note: Z.AI API pay-as-you-go
     input_cost_microusd_per_million_tokens: 1400000
     output_cost_microusd_per_million_tokens: 4400000
+
+  - service: search
+    provider: openalex
+    model:
+    billing_basis: metered
+    budget_treatment: counted
+    accounting_note: OpenAlex API usage; free daily credit does not disable accounting
+    unit_cost_microusd: 1000

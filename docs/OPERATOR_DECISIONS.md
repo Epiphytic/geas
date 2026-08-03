@@ -244,3 +244,32 @@ At one million claims, canonical writes took 31.84 seconds, snapshot creation
 6.27 seconds, projection rebuild 62.36 seconds, and a deliberately global
 all-match FTS query 1.07 seconds median with 241 MiB peak RSS. See
 `docs/BENCHMARKS.md`.
+
+## 11. Authenticated OpenAlex scholarly discovery
+
+**Status:** implemented on 2026-08-03 after the operator supplied an API key.
+
+### Decision
+
+- Use OpenAlex after Crossref in the domain-index priority order.
+- Load `OPENALEX_API_KEY` only from the ignored environment file.
+- Persist normalized OpenAlex metadata under CC0, but retain no raw response
+  body and do not infer rights for linked documents.
+- Treat search calls as metered and counted even when OpenAlex's daily free
+  credit covers them.
+- Reserve US$0.001 transactionally before each call, settle from
+  `meta.cost_usd`, and reject responses reporting more than the reservation.
+- Enforce 10 requests per run and a US$1 provider-specific UTC-day ceiling.
+- Keep normalized index results as discovery metadata, never claim evidence.
+
+The connector uses a fixed HTTPS endpoint, refuses redirects and non-JSON
+responses, bounds response size, validates OpenAlex work IDs and DOIs, and
+redacts upstream error content. Multiword terms are quoted, Boolean structure is
+generated deterministically, and source text cannot alter the query, endpoint,
+credentials, budget, or persistence policy.
+
+References:
+
+- [OpenAlex authentication](https://developers.openalex.org/api-reference/authentication)
+- [OpenAlex search syntax and pricing](https://developers.openalex.org/guides/searching)
+- [OpenAlex works list API](https://developers.openalex.org/api-reference/works/list-works)
