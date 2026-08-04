@@ -147,6 +147,7 @@ class ExtractionRequest(StrictModel):
     max_output_tokens: int = Field(ge=1, le=524_288)
     model_parameters: ModelParameters = Field(default_factory=ModelParameters)
     debug_reasoning: bool = True
+    validator_version: str = "anchor-grounded-extraction-validator/1"
     requested_at: datetime
 
 
@@ -550,6 +551,7 @@ class AnchorGroundedExtractionManager:
             "max_output_tokens": max_output_tokens,
             "model_parameters": parameters,
             "debug_reasoning": debug_reasoning,
+            "validator_version": self.version,
             "requested_at": now,
         }
         request = ExtractionRequest(

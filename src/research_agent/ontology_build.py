@@ -1086,16 +1086,22 @@ class OntologyBuilder:
 
     def _validation_failure_counts(self) -> dict[str, int]:
         requests = {
-            value["id"]: value["source_version_id"]
-            for value in self.store.iter_records("extraction-request")
+            item.id: item
+            for item in (
+                ExtractionRequest.model_validate(value)
+                for value in self.store.iter_records("extraction-request")
+            )
+            if item.validator_version == AnchorGroundedExtractionManager.version
         }
         counts: dict[str, int] = {}
         for value in self.store.iter_records("extraction-attempt-failure"):
             if value.get("stage") != "output_validation":
                 continue
-            source_id = requests.get(value.get("extraction_request_id"))
-            if source_id is not None:
-                counts[source_id] = counts.get(source_id, 0) + 1
+            request = requests.get(value.get("extraction_request_id"))
+            if request is not None:
+                counts[request.source_version_id] = (
+                    counts.get(request.source_version_id, 0) + 1
+                )
         return counts
 
     def _proposal_is_compatible(
@@ -1111,6 +1117,7 @@ class OntologyBuilder:
             and request.model_parameters == self.config.model_parameters
             and request.debug_reasoning == self.config.debug_reasoning
             and proposal.model == configured_model
+            and request.validator_version == proposal.validator_version
             and proposal.validator_version
             in AnchorGroundedExtractionManager.compatible_proposal_versions
         )

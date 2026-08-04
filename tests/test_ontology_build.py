@@ -167,6 +167,7 @@ def test_proposal_reuse_requires_model_and_validator_contract(tmp_path) -> None:
         max_output_tokens=65_536,
         model_parameters=builder.config.model_parameters,
         debug_reasoning=True,
+        validator_version=AnchorGroundedExtractionManager.version,
     )
     proposal = ValidatedExtractionProposal.model_construct(
         model="deepseek-v4-flash",
@@ -182,7 +183,20 @@ def test_proposal_reuse_requires_model_and_validator_contract(tmp_path) -> None:
                 "validator_version": "anchor-grounded-extraction-validator/1"
             }
         ),
-        request,
+        request.model_copy(
+            update={
+                "validator_version": "anchor-grounded-extraction-validator/1"
+            }
+        ),
+        "deepseek-v4-flash",
+    )
+    assert not builder._proposal_is_compatible(
+        proposal,
+        request.model_copy(
+            update={
+                "validator_version": "anchor-grounded-extraction-validator/1"
+            }
+        ),
         "deepseek-v4-flash",
     )
     assert not builder._proposal_is_compatible(
