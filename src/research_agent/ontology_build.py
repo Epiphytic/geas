@@ -626,7 +626,12 @@ class OntologyBuilder:
         self._save_state(state)
         self.progress.event("finalize", "running", "Auditing and rebuilding projections")
         snapshot_path, database_path, topic_path, audit_clean = self._finalize()
-        state["completed"] = not model_failed and not token_exhaustions
+        state["completed"] = (
+            not model_failed
+            and not token_exhaustions
+            and not failures
+            and audit_clean
+        )
         self._save_state(state)
         completed = bool(state["completed"])
         self.progress.event(

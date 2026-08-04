@@ -282,3 +282,14 @@ def test_cli_reports_token_exhaustion_with_actionable_remedies(capsys) -> None:
     assert "ran out of output tokens" in error
     assert "Requested 131072" in error
     assert "Choose a model" in error
+
+
+def test_cli_rejects_incomplete_build_with_non_token_failures() -> None:
+    receipt = OntologyBuildReceipt(
+        config_sha256="a" * 64,
+        checked_only=False,
+        completed=False,
+        failures=("Example/Research:output-schema-quarantined",),
+    )
+
+    assert _ontology_build_exit_code(receipt) == 2
