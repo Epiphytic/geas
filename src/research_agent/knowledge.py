@@ -127,6 +127,16 @@ class EvidenceProposal(StrictModel):
     exact: str = Field(min_length=1)
     prefix: str | None = None
     suffix: str | None = None
+    start: int | None = Field(default=None, ge=0)
+    end: int | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def range_is_complete(self) -> EvidenceProposal:
+        if (self.start is None) != (self.end is None):
+            raise ValueError("evidence start and end must be supplied together")
+        if self.start is not None and self.end is not None and self.end <= self.start:
+            raise ValueError("evidence end must be greater than start")
+        return self
 
 
 class ClaimProposal(StrictModel):
@@ -360,7 +370,12 @@ class KnowledgeImporter:
             source = sources[proposal.source_content_sha256]
             content = self.store.read_blob(proposal.source_content_sha256)
             text = content.decode("utf-8", errors="strict")
-            if text.count(proposal.exact) != 1:
+            if proposal.start is not None and proposal.end is not None:
+                if text[proposal.start : proposal.end] != proposal.exact:
+                    raise ValueError(
+                        f"evidence {proposal.key!r} does not match its exact range"
+                    )
+            elif text.count(proposal.exact) != 1:
                 raise ValueError(
                     f"evidence {proposal.key!r} exact text must occur exactly once in its source"
                 )
@@ -373,6 +388,8 @@ class KnowledgeImporter:
                 exact=proposal.exact,
                 prefix=proposal.prefix,
                 suffix=proposal.suffix,
+                start=proposal.start,
+                end=proposal.end,
             )
             fragment_fields = {
                 "source_version": source["id"],

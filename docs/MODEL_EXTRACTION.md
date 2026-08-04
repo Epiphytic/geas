@@ -36,9 +36,11 @@ claims, controversies, and gaps. Code outside the model:
 - forces `review_state: proposed` and
   `commit_authority: none_proposal_only`.
 
-No command converts this record into an accepted `Claim`. That review and
-promotion workflow is intentionally deferred until the operator chooses its
-approval semantics.
+No model command converts this record into an accepted `Claim`. The separate
+Git-native promotion path renders a lossless review manifest and accepts it only
+after deterministic verification from its declared canonical branch. Forge and
+repository approval rules do not run inside the ontology engine. See
+[`PROMOTIONS.md`](PROMOTIONS.md).
 
 Model-call and output-validation failures retain the sanitized request and a
 failure record containing only stage and exception class. Invalid raw model

@@ -365,7 +365,7 @@ improve coverage.
 
 ### M6 — model-assisted ontology proposals
 
-**Status: proposal-only anchor-grounded extraction is implemented.**
+**Status: anchor-grounded extraction and Git-native promotion are implemented.**
 
 - [x] Select exact structural leaf anchors outside the model.
 - [x] Use local DeepSeek by default through the tool-free model client.
@@ -375,13 +375,18 @@ improve coverage.
 - [x] Retain sanitized request and failure audit records without invalid raw
   model output.
 - [x] Index valid proposals as a visibly separate SQLite query class.
-- [ ] Define the operator-approved review and promotion workflow.
+- [x] Define and implement provider-neutral Git patch/PR/MR promotion.
+- [x] Verify canonical-branch ancestry, immutable proposal identity, exact
+  evidence, and lossless rendering before accepting records.
+- [x] Keep repository approval and automatic-merge rules out of ontology
+  semantics.
 - [ ] Add conflict analysis against already accepted claims.
 - [ ] Connect reviewed gap records to bounded extraction tasks.
 
-**Acceptance for promotion:** no proposal becomes accepted knowledge without a
-deterministic review receipt bound to exact proposal and evidence hashes. The
-promotion policy is an operator decision.
+**Acceptance for promotion:** no proposal becomes accepted knowledge unless its
+exact manifest exists on the declared canonical Git branch and deterministic
+verification binds it to the immutable proposal, evidence ranges, hashes, and
+accepted record rendering.
 
 ## Test strategy
 

@@ -79,6 +79,7 @@ from research_agent.projection import (
     QueryRecordType,
     SQLiteKnowledgeProjection,
 )
+from research_agent.promotion import GitPromotionManager
 from research_agent.providers import ModelClient, load_provider_configs
 from research_agent.remote_acquisition import LicenseGatedAcquirer
 from research_agent.render import render_topic_markdown
@@ -394,6 +395,36 @@ def _build_parser() -> argparse.ArgumentParser:
     propose_extraction.add_argument("--run-id")
     propose_extraction.add_argument("--approval-receipt-id")
     propose_extraction.add_argument("--override-external-budget", action="store_true")
+
+    promotion_stage = subparsers.add_parser(
+        "promotion-stage",
+        help="render a validated extraction proposal as a forge-neutral Git manifest",
+    )
+    promotion_stage.add_argument("proposal_id")
+    promotion_stage.add_argument("--topic", required=True)
+    promotion_stage.add_argument("--topic-concept-id", required=True)
+    promotion_stage.add_argument("--output", type=Path, required=True)
+    promotion_stage.add_argument("--target-ref", default="refs/heads/main")
+    promotion_stage.add_argument("--root", type=Path, default=Path("data"))
+    promotion_stage.add_argument("--workspace", type=Path, default=Path("."))
+
+    promotion_verify = subparsers.add_parser(
+        "promotion-verify",
+        help="verify a promotion manifest from a canonical local Git branch",
+    )
+    promotion_verify.add_argument("manifest", type=Path)
+    promotion_verify.add_argument("--canonical-ref", default="refs/heads/main")
+    promotion_verify.add_argument("--root", type=Path, default=Path("data"))
+    promotion_verify.add_argument("--workspace", type=Path, default=Path("."))
+
+    promotion_apply = subparsers.add_parser(
+        "promotion-apply",
+        help="materialize an exact promotion only after it reaches a canonical Git branch",
+    )
+    promotion_apply.add_argument("manifest", type=Path)
+    promotion_apply.add_argument("--canonical-ref", default="refs/heads/main")
+    promotion_apply.add_argument("--root", type=Path, default=Path("data"))
+    promotion_apply.add_argument("--workspace", type=Path, default=Path("."))
 
     acquire_oa = subparsers.add_parser(
         "acquire-open-access",
@@ -1271,6 +1302,44 @@ def main() -> None:
                 "approval_receipt": gate.last_approval_receipt,
                 "approval_receipt_record_hash": approval_hash,
             }
+        )
+        return
+
+    if args.command == "promotion-stage":
+        _json(
+            GitPromotionManager(
+                store=ImmutableStore(args.root),
+                repository=args.workspace,
+            ).stage(
+                args.proposal_id,
+                topic=args.topic,
+                topic_concept_id=args.topic_concept_id,
+                output=args.output,
+                target_ref=args.target_ref,
+            )
+        )
+        return
+
+    if args.command == "promotion-verify":
+        manifest, path, commit = GitPromotionManager(
+            store=ImmutableStore(args.root),
+            repository=args.workspace,
+        ).verify_from_ref(
+            args.manifest,
+            canonical_ref=args.canonical_ref,
+        )
+        _json({"manifest": manifest, "path": path, "canonical_commit": commit})
+        return
+
+    if args.command == "promotion-apply":
+        _json(
+            GitPromotionManager(
+                store=ImmutableStore(args.root),
+                repository=args.workspace,
+            ).apply(
+                args.manifest,
+                canonical_ref=args.canonical_ref,
+            )
         )
         return
 
