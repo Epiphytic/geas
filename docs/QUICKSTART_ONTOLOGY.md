@@ -87,9 +87,12 @@ checked-out Git `HEAD`.
 Fresh files under `generated/` are therefore review candidates: they are
 excluded from truth snapshots and are not imported into accepted records until
 the repository promotion workflow tracks/approves them. The configured
-`seed_bundle_globs` resolve files from `HEAD` only, so a post-merge rerun imports
-approved generated bundles while ignoring uncommitted candidates. SQLite is
-always a discardable projection and never writes back into the ontology.
+`seed_bundle_globs` resolve files from `HEAD` only. Before import, the builder
+also requires the bundle and every referenced source file to match their exact
+Git blob byte-for-byte; dirty tracked files fail closed. A post-merge rerun
+therefore imports approved generated bundles while ignoring uncommitted
+candidates. SQLite is always a discardable projection and never writes back
+into the ontology.
 Consequently, promotion is an explicit two-pass workflow: run the builder to
 produce candidates, review and commit/merge those candidates, then run the same
 command again to import the now-canonical bundles and rebuild the final

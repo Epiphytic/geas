@@ -20,7 +20,7 @@ from pydantic import Field, ValidationError, field_validator, model_validator
 from research_agent.approvals import ApprovalRegistry
 from research_agent.audit import DeterministicKnowledgeAuditor
 from research_agent.budget import BudgetPolicy, UsageLedger
-from research_agent.bundles import KnowledgeBundleImporter
+from research_agent.bundles import KnowledgeBundle, KnowledgeBundleImporter
 from research_agent.candidate_bundles import (
     CandidateBundleError,
     CandidateBundleWriter,
@@ -341,6 +341,8 @@ class OntologyBuilder:
         unlicensed = list(state.get("skipped_unlicensed_sources", []))
 
         seed_paths = self._seed_paths()
+        for path in seed_paths:
+            self._assert_seed_matches_head(path)
         for index, path in enumerate(seed_paths, start=1):
             key = str(path)
             if key not in state["imported_bundles"]:
@@ -817,6 +819,48 @@ class OntologyBuilder:
                     and path.relative_to(self.workspace).as_posix() in tracked
                 )
         return tuple(sorted(paths, key=lambda item: item.as_posix()))
+
+    def _assert_seed_matches_head(self, relative: Path) -> None:
+        self._assert_path_matches_head(relative)
+        bundle_path = (self.workspace / relative).resolve(strict=True)
+        bundle = KnowledgeBundle.from_yaml(bundle_path)
+        for source in bundle.sources:
+            declared = Path(source.path)
+            if declared.is_absolute() or ".." in declared.parts:
+                raise ValueError("bundle source paths must be confined relative paths")
+            source_relative = relative.parent / declared
+            unresolved = self.workspace / source_relative
+            if unresolved.is_symlink():
+                raise ValueError("bundle source files must not be symbolic links")
+            resolved = unresolved.resolve(strict=True)
+            if not resolved.is_file() or not resolved.is_relative_to(bundle_path.parent):
+                raise ValueError("bundle source path escapes its bundle")
+            self._assert_path_matches_head(source_relative)
+
+    def _assert_path_matches_head(self, relative: Path) -> None:
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ValueError("canonical ontology paths must be workspace-relative")
+        result = subprocess.run(
+            (
+                "git",
+                "-C",
+                str(self.workspace),
+                "cat-file",
+                "blob",
+                f"HEAD:{relative.as_posix()}",
+            ),
+            check=False,
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            raise ValueError(
+                f"canonical ontology path is absent from Git HEAD: {relative}"
+            )
+        path = self.workspace / relative
+        if path.is_symlink() or path.read_bytes() != result.stdout:
+            raise ValueError(
+                f"canonical ontology path differs from Git HEAD: {relative}"
+            )
 
     def _queries(self) -> tuple[str, ...]:
         values = list(self.config.queries or (self.config.topic,))
