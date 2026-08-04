@@ -1112,7 +1112,7 @@ class OntologyBuilder:
             and request.debug_reasoning == self.config.debug_reasoning
             and proposal.model == configured_model
             and proposal.validator_version
-            == AnchorGroundedExtractionManager.version
+            in AnchorGroundedExtractionManager.compatible_proposal_versions
         )
 
     def _token_exhaustion(

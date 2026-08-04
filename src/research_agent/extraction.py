@@ -469,7 +469,13 @@ class ReasoningDebugLogger:
 
 
 class AnchorGroundedExtractionManager:
-    version = "anchor-grounded-extraction-validator/1"
+    version = "anchor-grounded-extraction-validator/2"
+    compatible_proposal_versions = frozenset(
+        {
+            "anchor-grounded-extraction-validator/1",
+            version,
+        }
+    )
     max_input_characters = 200_000
     allowed_anchor_kinds = frozenset(
         {
@@ -596,13 +602,17 @@ class AnchorGroundedExtractionManager:
                 recorded_at=now,
                 allow_partial_items=allow_partial_items,
             )
-            proposal = self._validate_output(
+            proposal, semantic_finding_hashes = self._validate_output(
                 envelope,
                 request=request,
                 anchors=anchors,
                 text=text,
                 proposed_at=now,
                 raw=raw,
+                allow_partial_items=allow_partial_items,
+            )
+            finding_hashes = tuple(
+                sorted({*finding_hashes, *semantic_finding_hashes})
             )
         except Exception as error:
             self._record_failure(request, "output_validation", error, now)
@@ -679,22 +689,15 @@ class AnchorGroundedExtractionManager:
             validation_type: str,
             location: tuple[str, ...],
         ) -> None:
-            fields = {
-                "extraction_request_id": request.id,
-                "section": section,
-                "item_index": index,
-                "validation_type": validation_type,
-                "location": location,
-                "recorded_at": recorded_at,
-                "source_content_retained": True,
-                "model_output_retained": False,
-            }
-            finding = ExtractionOutputFinding(
-                id=content_id("extraction-output-finding", fields),
-                **fields,
-            )
             finding_hashes.append(
-                self.store.put_record("extraction-output-finding", finding)
+                self._record_output_finding(
+                    request=request,
+                    section=section,
+                    index=index,
+                    validation_type=validation_type,
+                    location=location,
+                    recorded_at=recorded_at,
+                )
             )
 
         for key in sorted(set(raw) - allowed):
@@ -777,6 +780,32 @@ class AnchorGroundedExtractionManager:
         )
         return envelope, tuple(sorted(set(finding_hashes)))
 
+    def _record_output_finding(
+        self,
+        *,
+        request: ExtractionRequest,
+        section: Literal["envelope", "concepts", "claims", "controversies", "gaps"],
+        index: int,
+        validation_type: str,
+        location: tuple[str, ...],
+        recorded_at: datetime,
+    ) -> str:
+        fields = {
+            "extraction_request_id": request.id,
+            "section": section,
+            "item_index": index,
+            "validation_type": validation_type,
+            "location": location,
+            "recorded_at": recorded_at,
+            "source_content_retained": True,
+            "model_output_retained": False,
+        }
+        finding = ExtractionOutputFinding(
+            id=content_id("extraction-output-finding", fields),
+            **fields,
+        )
+        return self.store.put_record("extraction-output-finding", finding)
+
     def _record_failure(
         self,
         request: ExtractionRequest,
@@ -855,7 +884,8 @@ class AnchorGroundedExtractionManager:
         text: str,
         proposed_at: datetime,
         raw: dict[str, Any],
-    ) -> ValidatedExtractionProposal:
+        allow_partial_items: bool,
+    ) -> tuple[ValidatedExtractionProposal, tuple[str, ...]]:
         anchors_by_id = {item.id: item for item in anchors}
         proposed_concept_ids = {item.id for item in envelope.concepts}
         concept_collisions = sorted(
@@ -894,44 +924,103 @@ class AnchorGroundedExtractionManager:
         for concept_id in sorted(proposal_graph):
             visit(concept_id)
         claims: list[ValidatedProposedClaim] = []
-        for claim in envelope.claims:
-            if claim.subject not in allowed_subjects:
-                raise ExtractionError(f"claim subject is not allowed: {claim.subject}")
-            evidence: list[ValidatedEvidenceSelector] = []
-            for item in claim.evidence:
-                anchor = anchors_by_id.get(item.anchor_id)
-                if anchor is None:
-                    raise ExtractionError("claim cites an anchor outside the trusted selection")
-                anchor_text = text[anchor.start : anchor.end]
-                if anchor_text.count(item.exact) != 1:
+        semantic_finding_hashes: list[str] = []
+        for claim_index, claim in enumerate(envelope.claims):
+            try:
+                if claim.subject not in allowed_subjects:
                     raise ExtractionError(
-                        "proposed exact evidence must occur once in its selected anchor"
+                        f"claim subject is not allowed: {claim.subject}"
                     )
-                relative = anchor_text.index(item.exact)
-                start = anchor.start + relative
-                end = start + len(item.exact)
-                evidence.append(
-                    ValidatedEvidenceSelector(
-                        anchor_id=anchor.id,
-                        exact=item.exact,
-                        start=start,
-                        end=end,
-                        exact_sha256=hashlib.sha256(item.exact.encode()).hexdigest(),
+                evidence: list[ValidatedEvidenceSelector] = []
+                for item in claim.evidence:
+                    anchor = anchors_by_id.get(item.anchor_id)
+                    if anchor is None:
+                        raise ExtractionError(
+                            "claim cites an anchor outside the trusted selection"
+                        )
+                    anchor_text = text[anchor.start : anchor.end]
+                    if anchor_text.count(item.exact) != 1:
+                        raise ExtractionError(
+                            "proposed exact evidence must occur once in its selected anchor"
+                        )
+                    relative = anchor_text.index(item.exact)
+                    start = anchor.start + relative
+                    end = start + len(item.exact)
+                    evidence.append(
+                        ValidatedEvidenceSelector(
+                            anchor_id=anchor.id,
+                            exact=item.exact,
+                            start=start,
+                            end=end,
+                            exact_sha256=hashlib.sha256(item.exact.encode()).hexdigest(),
+                        )
+                    )
+                claims.append(
+                    ValidatedProposedClaim(
+                        key=claim.key,
+                        subject=claim.subject,
+                        predicate=claim.predicate,
+                        object=claim.object,
+                        qualifiers=claim.qualifiers,
+                        stance=claim.stance,
+                        epistemic_status=claim.epistemic_status,
+                        asserted_by=f"model:{self.provider}:{self.model}",
+                        evidence=tuple(evidence),
                     )
                 )
-            claims.append(
-                ValidatedProposedClaim(
-                    key=claim.key,
-                    subject=claim.subject,
-                    predicate=claim.predicate,
-                    object=claim.object,
-                    qualifiers=claim.qualifiers,
-                    stance=claim.stance,
-                    epistemic_status=claim.epistemic_status,
-                    asserted_by=f"model:{self.provider}:{self.model}",
-                    evidence=tuple(evidence),
+            except ExtractionError as error:
+                if not allow_partial_items:
+                    raise
+                semantic_finding_hashes.append(
+                    self._record_output_finding(
+                        request=request,
+                        section="claims",
+                        index=claim_index,
+                        validation_type=self._validation_reason(error)
+                        or "other_extraction_validation",
+                        location=(),
+                        recorded_at=proposed_at,
+                    )
                 )
+        accepted_claim_keys = {item.key for item in claims}
+        controversies = []
+        for index, item in enumerate(envelope.controversies):
+            if set(item.claim_keys) <= accepted_claim_keys:
+                controversies.append(item)
+            elif allow_partial_items:
+                semantic_finding_hashes.append(
+                    self._record_output_finding(
+                        request=request,
+                        section="controversies",
+                        index=index,
+                        validation_type="semantic_claim_reference_rejected",
+                        location=("claim_keys",),
+                        recorded_at=proposed_at,
+                    )
+                )
+            else:
+                raise ExtractionError(
+                    "controversy references a semantically rejected claim"
+                )
+        gaps = []
+        for index, item in enumerate(envelope.gaps):
+            retained_keys = tuple(
+                key for key in item.related_claim_keys if key in accepted_claim_keys
             )
+            if retained_keys != item.related_claim_keys:
+                if not allow_partial_items:
+                    raise ExtractionError("gap references a semantically rejected claim")
+                semantic_finding_hashes.append(
+                    self._record_output_finding(
+                        request=request,
+                        section="gaps",
+                        index=index,
+                        validation_type="semantic_claim_reference_removed",
+                        location=("related_claim_keys",),
+                        recorded_at=proposed_at,
+                    )
+                )
+            gaps.append(item.model_copy(update={"related_claim_keys": retained_keys}))
         raw_digest = hashlib.sha256(canonical_json(raw)).hexdigest()
         fields = {
             "extraction_request_id": request.id,
@@ -943,17 +1032,18 @@ class AnchorGroundedExtractionManager:
             "proposed_at": proposed_at,
             "concepts": envelope.concepts,
             "claims": tuple(claims),
-            "controversies": envelope.controversies,
-            "gaps": envelope.gaps,
+            "controversies": tuple(controversies),
+            "gaps": tuple(gaps),
             "raw_output_sha256": raw_digest,
             "review_state": ReviewState.PROPOSED,
             "validator_version": self.version,
             "commit_authority": "none_proposal_only",
         }
-        return ValidatedExtractionProposal(
+        proposal = ValidatedExtractionProposal(
             id=content_id("extraction-proposal", fields),
             **fields,
         )
+        return proposal, tuple(sorted(set(semantic_finding_hashes)))
 
     def _derivation(self, derivation_id: str) -> StructuralDerivation:
         values = [

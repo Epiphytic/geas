@@ -402,6 +402,36 @@ def test_partial_item_validation_quarantines_bad_item_without_raw_output(tmp_pat
     assert "INVALID KEY" not in str(findings)
 
 
+def test_partial_item_validation_quarantines_semantically_bad_claim(tmp_path) -> None:
+    store, parsed, paragraphs = _store_and_anchors(tmp_path)
+    output = _valid_output(paragraphs)
+    output["claims"][0]["evidence"][0]["exact"] = "A fabricated statement."
+
+    receipt = AnchorGroundedExtractionManager(
+        store=store,
+        client=_FakeClient(output),
+        provider="deepseek_local",
+        model="test",
+        clock=lambda: INSTANT,
+    ).propose(
+        question="Extract",
+        structural_derivation_id=parsed.structural_derivation_id,
+        anchor_ids=[item["id"] for item in paragraphs],
+        allowed_concept_ids=["concept:research-system"],
+        allow_partial_items=True,
+    )
+
+    assert len(receipt.proposal.claims) == 1
+    assert tuple(store.iter_records("extraction-attempt-failure")) == ()
+    findings = tuple(store.iter_records("extraction-output-finding"))
+    assert {item["validation_type"] for item in findings} == {
+        "claim_evidence_exact_not_unique",
+        "semantic_claim_reference_rejected",
+    }
+    assert receipt.record_hashes["extraction-output-finding"]
+    assert "fabricated" not in str(findings)
+
+
 def test_partial_validation_normalizes_harmless_envelope_variance(tmp_path) -> None:
     store, parsed, paragraphs = _store_and_anchors(tmp_path)
     valid = _valid_output(paragraphs)

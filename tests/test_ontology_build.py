@@ -176,6 +176,15 @@ def test_proposal_reuse_requires_model_and_validator_contract(tmp_path) -> None:
     assert builder._proposal_is_compatible(
         proposal, request, "deepseek-v4-flash"
     )
+    assert builder._proposal_is_compatible(
+        proposal.model_copy(
+            update={
+                "validator_version": "anchor-grounded-extraction-validator/1"
+            }
+        ),
+        request,
+        "deepseek-v4-flash",
+    )
     assert not builder._proposal_is_compatible(
         proposal.model_copy(update={"model": "stale-model"}),
         request,
