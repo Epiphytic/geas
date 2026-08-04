@@ -6,13 +6,18 @@ ontology extraction. The manifest is inspectable YAML, immutable source and
 derivation records remain authoritative, and the library's SQLite file is a
 discardable query projection.
 
+This is the primary entry point for
+[searching sources without an ontology](USE_CASES.md#search-sources-without-building-an-ontology)
+and for
+[supplying bounded context to another agent](USE_CASES.md#supply-bounded-attributable-context-to-another-agent).
+
 ## Build and query a library
 
-The maintained research-agent ontology includes a library manifest that selects
+The maintained Geas research-agent ontology includes a library manifest that selects
 all parsed sources in its runtime store:
 
 ```bash
-uv run research-agent library-build \
+uv run geas library-build \
   ontology/open-source-research-agents/library.yaml \
   --root data/open-source-research-agents \
   --database data/open-source-research-agents/library.sqlite
@@ -21,10 +26,10 @@ uv run research-agent library-build \
 Search exact structural source anchors:
 
 ```bash
-uv run research-agent library-show \
+uv run geas library-show \
   --database data/open-source-research-agents/library.sqlite
 
-uv run research-agent library-query \
+uv run geas library-query \
   "citation retrieval and persistent knowledge" \
   --database data/open-source-research-agents/library.sqlite \
   --limit 25
@@ -33,7 +38,7 @@ uv run research-agent library-query \
 Return a bounded agent context package:
 
 ```bash
-uv run research-agent library-context \
+uv run geas library-context \
   "citation retrieval and persistent knowledge" \
   --database data/open-source-research-agents/library.sqlite \
   --limit 25 \

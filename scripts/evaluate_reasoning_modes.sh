@@ -13,7 +13,7 @@ concept_id=$4
 question=$5
 output_json=$6
 existing_high_id=${7:-}
-trial_dir=$(mktemp -d -t research-agent-reasoning-eval.XXXXXXXX)
+trial_dir=$(mktemp -d -t geas-reasoning-eval.XXXXXXXX)
 anchor_json="$trial_dir/anchors.json"
 uv_bin=${UV_BIN:-/home/openclaw/.local/bin/uv}
 jq_bin=${JQ_BIN:-/usr/bin/jq}
@@ -28,7 +28,7 @@ progress() {
 }
 
 progress "selecting $anchor_limit grounded leaf anchors"
-"$uv_bin" run research-agent structure-show "$derivation_id" \
+"$uv_bin" run geas structure-show "$derivation_id" \
   --root "$runtime_root" \
   --leaf-only \
   --limit "$anchor_limit" >"$anchor_json"
@@ -48,7 +48,7 @@ run_trial() {
   local effort=$1
   local trial_json="$trial_dir/$effort.json"
   progress "starting effort=$effort anchors=${#anchor_ids[@]} output_tokens=32768"
-  "$uv_bin" run research-agent propose-extraction "$derivation_id" \
+  "$uv_bin" run geas propose-extraction "$derivation_id" \
     "${anchor_args[@]}" \
     --question "$question" \
     --concept "$concept_id" \
@@ -83,7 +83,7 @@ fi
 max_id=$(run_trial max)
 progress "completed effort=max proposal=$max_id"
 
-"$uv_bin" run research-agent compare-extractions \
+"$uv_bin" run geas compare-extractions \
   "$high_id" \
   "$max_id" \
   --root "$runtime_root" >"$output_json"

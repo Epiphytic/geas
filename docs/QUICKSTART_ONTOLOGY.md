@@ -1,4 +1,9 @@
-# Ontology-building quick start
+# Geas ontology-building quick start
+
+This is the end-to-end workflow for the
+[durable topic-knowledge use case](USE_CASES.md#build-durable-knowledge-about-a-topic).
+For source-only search or integration with another agent, start with
+[source libraries](SOURCE_LIBRARIES.md) instead.
 
 The autonomous builder needs Python 3.12+, `uv`, Git, a running configured
 model endpoint, and a Mojeek key. From the repository root, create the ignored
@@ -8,10 +13,13 @@ model endpoint, and a Mojeek key. From the repository root, create the ignored
 MOJEEK_API_KEY=replace-with-your-key
 ```
 
+The project and its installed CLI are both named Geas; invoke the CLI as
+`geas`.
+
 Create a new ontology with complete, inspectable configuration files:
 
 ```bash
-uv run research-agent ontology-init ontology/network-engineering \
+uv run geas ontology-init ontology/network-engineering \
   --topic "Network engineering for selected repositories" \
   --concept-id concept:network-engineering
 ```
@@ -26,7 +34,7 @@ unless `--force` is supplied.
 Validate the complete configuration without making network or model calls:
 
 ```bash
-uv run research-agent --env-file .env ontology-build \
+uv run geas --env-file .env ontology-build \
   ontology/open-source-research-agents/build.yaml \
   --root data/open-source-research-agents \
   --check
@@ -35,7 +43,7 @@ uv run research-agent --env-file .env ontology-build \
 Then build or resume the ontology:
 
 ```bash
-uv run research-agent --env-file .env ontology-build \
+uv run geas --env-file .env ontology-build \
   ontology/open-source-research-agents/build.yaml \
   --root data/open-source-research-agents
 ```
@@ -68,7 +76,7 @@ To deliberately refresh completed searches and re-resolve already known
 repositories at their current official commits:
 
 ```bash
-uv run research-agent --env-file .env ontology-build \
+uv run geas --env-file .env ontology-build \
   ontology/open-source-research-agents/build.yaml \
   --root data/open-source-research-agents \
   --refresh
@@ -157,7 +165,7 @@ repeat those model calls.
 Search the completed ontology deterministically:
 
 ```bash
-uv run research-agent knowledge-query \
+uv run geas knowledge-query \
   "local model support and retrieval architecture" \
   --database data/open-source-research-agents/query.sqlite \
   --limit 25

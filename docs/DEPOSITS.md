@@ -73,7 +73,7 @@ redistribution status and `redistribute_original` permission are kept
 deterministically synchronized and contradictory values are rejected.
 
 ```bash
-uv run research-agent deposit-add paper.pdf \
+uv run geas deposit-add paper.pdf \
   --deposited-by user:researcher \
   --author "Ada Example" \
   --author "Lin Example" \
@@ -88,7 +88,7 @@ uv run research-agent deposit-add paper.pdf \
 The deposit command accepts repeatable Nostr event files:
 
 ```bash
-uv run research-agent deposit-add dataset.csv \
+uv run geas deposit-add dataset.csv \
   --deposited-by user:researcher \
   --nostr-ownership-event ownership-event.json
 ```
@@ -113,7 +113,7 @@ browser saves, email exports, Zotero exports, and API exports. It does not give
 an agent browser cookies or authenticated sessions.
 
 ```bash
-uv run research-agent deposit-add paper.pdf \
+uv run geas deposit-add paper.pdf \
   --deposited-by user:researcher \
   --method browser_save \
   --original-locator https://publisher.example/paper \
@@ -123,7 +123,7 @@ uv run research-agent deposit-add paper.pdf \
 For an override:
 
 ```bash
-uv run research-agent deposit-add internal.txt \
+uv run geas deposit-add internal.txt \
   --deposited-by user:operator \
   --scope-label operator_chosen_ungated \
   --model-route external_allowed \

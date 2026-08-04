@@ -3,6 +3,8 @@
 A maintained ontology bundle packages inspectable source cards and reviewed
 knowledge records into a reproducible import unit. The first maintained bundle
 is [`ontology/open-source-research-agents/`](../ontology/open-source-research-agents/).
+For the complete build, refresh, review, and retrieval paths, see
+[common Geas use cases](USE_CASES.md).
 
 ## Bundle boundary
 
@@ -38,7 +40,7 @@ The deterministic importer:
 9. commits immutable records and a receipt.
 
 ```bash
-uv run research-agent bundle-import \
+uv run geas bundle-import \
   ontology/open-source-research-agents/bundle.yaml \
   --root data \
   --imported-by operator:local
@@ -57,7 +59,7 @@ deterministic findings for:
 - explicit textual retraction signals requiring authoritative resolution.
 
 ```bash
-uv run research-agent knowledge-audit \
+uv run geas knowledge-audit \
   --root data \
   --as-of 2026-08-03T16:00:00+00:00 \
   --fail-on-error

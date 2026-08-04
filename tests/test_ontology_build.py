@@ -563,7 +563,7 @@ def test_documented_check_command_is_executable(tmp_path) -> None:
         (
             "uv",
             "run",
-            "research-agent",
+            "geas",
             "--env-file",
             str(tmp_path / "absent.env"),
             "ontology-build",
@@ -587,7 +587,7 @@ def test_ontology_init_writes_every_default_explicitly(tmp_path: Path) -> None:
         (
             "uv",
             "run",
-            "research-agent",
+            "geas",
             "ontology-init",
             str(relative),
             "--topic",

@@ -3,7 +3,7 @@ id: library:open-source-research-agents
 title: Open-source research agent source library
 description: >
   Immutable parsed source versions used to discover, compare, and maintain the
-  open-source research-agent ontology. The library remains independently
+  open-source research-agent ontology maintained by Geas. The library remains independently
   searchable and may contain sources that have not been promoted into accepted
   ontology claims.
 include_all_parsed_sources: true

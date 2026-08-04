@@ -14,7 +14,7 @@ used as claim evidence.
 Run the complete build from a clean store:
 
 ```bash
-demo_root=$(mktemp -d /tmp/research-agent-demo.XXXXXX)
+demo_root=$(mktemp -d /tmp/geas-demo.XXXXXX)
 ./ontology/open-source-research-agents/demo.sh "$demo_root"
 ```
 

@@ -8,6 +8,9 @@ The implemented vertical slice separates four durable layers:
 3. a `TruthSnapshot` binding ontology, policy, schema, records, and blobs;
 4. a disposable SQLite/FTS5 projection and generated Markdown views.
 
+For a workflow selected by operator goal rather than subsystem, see
+[common Geas use cases](USE_CASES.md).
+
 SQLite is never reconciled back into canonical records. A changed ontology or
 new immutable record requires a successor snapshot and rebuild. A changed
 SQLite row requires the database to be discarded and rebuilt.
@@ -17,7 +20,7 @@ SQLite row requires the database to be discarded and rebuilt.
 Run deterministic local acquisition:
 
 ```bash
-uv run research-agent research-local \
+uv run geas research-local \
   "community water fluoridation caries cognition" \
   --corpus tests/fixtures/fluoridation_corpus \
   --term fluoridation \
@@ -30,7 +33,7 @@ public pool; an operator-confirmed contact identity can enable the polite pool
 later:
 
 ```bash
-uv run research-agent discover-crossref \
+uv run geas discover-crossref \
   "community water fluoridation neurodevelopment" \
   --term "community water fluoridation" \
   --term neurodevelopment \
@@ -42,7 +45,7 @@ and DOI identifiers, authorship, retraction status, citation/reference counts,
 and open-access state. API usage is reserved and settled transactionally:
 
 ```bash
-uv run research-agent --env-file .env discover-openalex \
+uv run geas --env-file .env discover-openalex \
   "community water fluoridation neurodevelopment" \
   --concept concept:community-water-fluoridation \
   --term "community water fluoridation" \
@@ -57,7 +60,7 @@ Europe PMC supplies credential-free life-sciences discovery. The accepted
 initial boundary retains only lite bibliographic metadata:
 
 ```bash
-uv run research-agent discover-europe-pmc \
+uv run geas discover-europe-pmc \
   "community water fluoridation neurodevelopment" \
   --concept concept:community-water-fluoridation \
   --term "community water fluoridation" \
@@ -72,7 +75,7 @@ identifiers are omitted; an invalid record identity rejects the record.
 Resolve DOI-bearing works to attributed open-access manifestations:
 
 ```bash
-uv run research-agent --env-file .env resolve-unpaywall \
+uv run geas --env-file .env resolve-unpaywall \
   10.1002/14651858.CD010856.pub3 \
   --root data
 ```
@@ -86,7 +89,7 @@ Private or credential-bearing URLs are discarded. A reported value such as
 Acquire a stored, explicitly licensed resolution and derive inert text:
 
 ```bash
-uv run research-agent acquire-open-access \
+uv run geas acquire-open-access \
   10.1289/ehp.1104912 \
   --root data
 ```
@@ -101,7 +104,7 @@ identifier nodes and conservative citation relations tied to those anchors.
 The same parsing pipeline can be used for an operator-selected local file:
 
 ```bash
-uv run research-agent parse-document paper.pdf \
+uv run geas parse-document paper.pdf \
   --license CC-BY-4.0 \
   --root data
 ```
@@ -115,7 +118,7 @@ Mojeek remains a discovery-only fallback. Its transient hits are not persisted
 until the operator confirms the account's storage terms:
 
 ```bash
-uv run research-agent --env-file .env discover-mojeek \
+uv run geas --env-file .env discover-mojeek \
   "community water fluoridation neurodevelopment" \
   --root data
 ```
@@ -126,7 +129,7 @@ ambiguous, cyclic concept hierarchies, missing claim/evidence references, and
 claim evidence from a source with a suspected deterministic threat:
 
 ```bash
-uv run research-agent knowledge-import reviewed-topic.yaml \
+uv run geas knowledge-import reviewed-topic.yaml \
   --root data \
   --imported-by operator:alice
 ```
@@ -140,7 +143,7 @@ A maintained bundle adds confined, hash-pinned source files and complete source
 metadata to the same import path:
 
 ```bash
-uv run research-agent bundle-import \
+uv run geas bundle-import \
   ontology/open-source-research-agents/bundle.yaml \
   --root data \
   --imported-by operator:alice
@@ -152,7 +155,7 @@ Ask the default local DeepSeek provider for a proposal grounded only in
 operator-selected exact leaf anchors:
 
 ```bash
-uv run research-agent propose-extraction \
+uv run geas propose-extraction \
   structural-derivation:sha256:... \
   --anchor structural-anchor:sha256:... \
   --question "Which supported claims and gaps are present?" \
@@ -167,16 +170,16 @@ See [MODEL_EXTRACTION.md](MODEL_EXTRACTION.md).
 ## Snapshot and projection
 
 ```bash
-uv run research-agent truth-snapshot \
+uv run geas truth-snapshot \
   --root data \
   --created-by operator:alice
 
-uv run research-agent projection-build \
+uv run geas projection-build \
   data/records/truth-snapshot/aa/<digest>.json \
   data/query.sqlite \
   --root data
 
-uv run research-agent projection-check \
+uv run geas projection-check \
   data/records/truth-snapshot/aa/<digest>.json \
   data/query.sqlite \
   --root data
@@ -198,7 +201,7 @@ parameterized FTS5 expression. Tokens, selected record classes, SQL, parameters,
 limit, truncation, and snapshot ID are returned with every result:
 
 ```bash
-uv run research-agent knowledge-query \
+uv run geas knowledge-query \
   "lower IQ uncertainty" \
   --kind claim \
   --kind gap \
@@ -216,7 +219,7 @@ to exact evidence and source versions. It also returns topic-scoped sources,
 controversies, ranked gaps, and tainted-source observations:
 
 ```bash
-uv run research-agent topic-show \
+uv run geas topic-show \
   concept:community-water-fluoridation \
   --database data/query.sqlite
 ```
@@ -225,7 +228,7 @@ Use `--as-of 2025-01-01T00:00:00+00:00` for valid-time filtering. Generate an
 agent-readable, deterministic Markdown page with:
 
 ```bash
-uv run research-agent topic-export \
+uv run geas topic-export \
   concept:community-water-fluoridation \
   generated/fluoridation.md \
   --database data/query.sqlite
@@ -237,7 +240,7 @@ It explicitly marks source/evidence content as untrusted data.
 Run a model-free maintenance audit with an explicit time:
 
 ```bash
-uv run research-agent knowledge-audit \
+uv run geas knowledge-audit \
   --root data \
   --as-of 2026-08-03T16:00:00+00:00 \
   --fail-on-error

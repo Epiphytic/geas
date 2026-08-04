@@ -41,7 +41,7 @@ Future fuzzy entity resolution must remain a separate, reviewable proposal.
 Use natural-language lexical search for discovery:
 
 ```bash
-uv run research-agent knowledge-query \
+uv run geas knowledge-query \
   "retraction DOI example" \
   --kind reference \
   --database data/query.sqlite
@@ -51,7 +51,7 @@ Use exact traversal for complete inbound references and deterministic metadata
 matches:
 
 ```bash
-uv run research-agent identifier-show \
+uv run geas identifier-show \
   doi 10.18653/v1/2024.naacl-long.347 \
   --database data/query.sqlite
 ```
@@ -59,7 +59,7 @@ uv run research-agent identifier-show \
 Re-derive an already stored structural document idempotently:
 
 ```bash
-uv run research-agent derive-citations \
+uv run geas derive-citations \
   structural-derivation:sha256:... \
   --root data
 ```

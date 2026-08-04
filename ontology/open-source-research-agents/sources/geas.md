@@ -1,8 +1,8 @@
-# Epiphytic research-agent source card
+# Geas source card
 
 Observed on 2026-08-03 in this repository.
 
-Epiphytic research-agent treats a versioned graph of concepts, claims, exact evidence, disagreements, knowledge gaps, and source-threat observations as its durable product.
+Geas treats a versioned graph of concepts, claims, exact evidence, disagreements, knowledge gaps, and source-threat observations as its durable product.
 
 Canonical ontology and policy remain inspectable text, while immutable content-addressed records and blobs preserve research history.
 
@@ -16,6 +16,6 @@ The repository identifies its software license as Apache-2.0, while the starter 
 
 ## References
 
-- https://github.com/Epiphytic/research-agent
-- https://github.com/Epiphytic/research-agent/blob/main/README.md
-- https://github.com/Epiphytic/research-agent/blob/main/SECURITY.md
+- https://github.com/Epiphytic/geas
+- https://github.com/Epiphytic/geas/blob/main/README.md
+- https://github.com/Epiphytic/geas/blob/main/SECURITY.md
