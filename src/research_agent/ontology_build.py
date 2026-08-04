@@ -1117,7 +1117,15 @@ class OntologyBuilder:
             and request.model_parameters == self.config.model_parameters
             and request.debug_reasoning == self.config.debug_reasoning
             and proposal.model == configured_model
-            and request.validator_version == proposal.validator_version
+            and (
+                request.validator_version == proposal.validator_version
+                or (
+                    request.validator_version
+                    == "anchor-grounded-extraction-validator/1"
+                    and proposal.validator_version
+                    == "anchor-grounded-extraction-validator/2"
+                )
+            )
             and proposal.validator_version
             in AnchorGroundedExtractionManager.compatible_proposal_versions
         )

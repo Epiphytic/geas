@@ -190,7 +190,7 @@ def test_proposal_reuse_requires_model_and_validator_contract(tmp_path) -> None:
         ),
         "deepseek-v4-flash",
     )
-    assert not builder._proposal_is_compatible(
+    assert builder._proposal_is_compatible(
         proposal,
         request.model_copy(
             update={
