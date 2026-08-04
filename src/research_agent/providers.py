@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import tomllib
 import urllib.error
 import urllib.request
@@ -9,10 +10,21 @@ from pathlib import Path
 from typing import Any
 
 from research_agent.model_policy import ModelUseGate
-from research_agent.models import ProviderConfig
+from research_agent.models import ModelParameters, ProviderConfig
 
 
 class ProviderError(RuntimeError):
+    pass
+
+
+class ModelOutputTruncatedError(ProviderError):
+    def __init__(self, *, output_tokens: int | None) -> None:
+        super().__init__("model output reached its configured token limit")
+        self.finish_reason = "length"
+        self.output_tokens = output_tokens
+
+
+class ModelJsonProtocolError(ProviderError):
     pass
 
 
@@ -56,6 +68,9 @@ class ModelClient:
         *,
         gate: ModelUseGate | None = None,
         timeout: float = 180.0,
+        parameters: ModelParameters | None = None,
+        connection_attempts: int = 3,
+        connection_retry_seconds: float = 1.0,
     ) -> None:
         if config.external and gate is None:
             raise ValueError("external model clients require a deterministic authorization gate")
@@ -63,6 +78,30 @@ class ModelClient:
         self.config = config
         self.gate = gate
         self.timeout = timeout
+        self.parameters = parameters or ModelParameters()
+        if not 1 <= connection_attempts <= 20:
+            raise ValueError("connection_attempts must be between 1 and 20")
+        if not 0.0 <= connection_retry_seconds <= 30.0:
+            raise ValueError("connection_retry_seconds must be between 0 and 30")
+        self.connection_attempts = connection_attempts
+        self.connection_retry_seconds = connection_retry_seconds
+        required_context = self.parameters.minimum_context_tokens
+        if required_context is not None and (
+            config.context_window_tokens is None
+            or config.context_window_tokens < required_context
+        ):
+            declared = (
+                "unknown"
+                if config.context_window_tokens is None
+                else str(config.context_window_tokens)
+            )
+            raise ValueError(
+                f"reasoning_effort=max requires at least {required_context} context "
+                f"tokens; provider {name} declares {declared}"
+            )
+        self.last_finish_reason: str | None = None
+        self.last_output_tokens: int | None = None
+        self.last_reasoning_content: str | None = None
 
     def complete(
         self,
@@ -90,9 +129,13 @@ class ModelClient:
                 {"role": "user", "content": user},
             ],
             "stream": False,
-            "temperature": 0,
             "max_tokens": token_limit,
         }
+        parameters = self.parameters.model_dump(mode="json", exclude_none=True)
+        stop = parameters.pop("stop", [])
+        body.update(parameters)
+        if stop:
+            body["stop"] = stop
         headers = {"Content-Type": "application/json"}
         if self.config.api_key_env:
             api_key = os.environ.get(self.config.api_key_env)
@@ -112,12 +155,21 @@ class ModelClient:
             headers=headers,
             method="POST",
         )
-        try:
-            opener = urllib.request.build_opener(_NoRedirect)
-            with opener.open(request, timeout=self.timeout) as response:
-                payload = json.load(response)
-        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
-            raise ProviderError(f"{self.name} request failed: {error}") from error
+        opener = urllib.request.build_opener(_NoRedirect)
+        for attempt in range(1, self.connection_attempts + 1):
+            try:
+                with opener.open(request, timeout=self.timeout) as response:
+                    payload = json.load(response)
+                break
+            except urllib.error.URLError as error:
+                refused = isinstance(error.reason, ConnectionRefusedError)
+                if not refused or attempt == self.connection_attempts:
+                    raise ProviderError(f"{self.name} request failed: {error}") from error
+                time.sleep(self.connection_retry_seconds * attempt)
+            except (TimeoutError, json.JSONDecodeError) as error:
+                # A timeout or malformed response may follow accepted work.
+                # Retrying could create concurrent duplicate generations.
+                raise ProviderError(f"{self.name} request failed: {error}") from error
 
         if self.gate is not None:
             usage = payload.get("usage") if isinstance(payload, dict) else None
@@ -132,12 +184,27 @@ class ModelClient:
                 raise ProviderError(f"{self.name} usage settlement failed: {error}") from error
 
         try:
-            message = payload["choices"][0]["message"]
+            choice = payload["choices"][0]
+            message = choice["message"]
             if message.get("tool_calls"):
                 raise ProviderError("model attempted an unauthorized tool call")
             content = message["content"]
         except (KeyError, IndexError, TypeError) as error:
             raise ProviderError(f"unexpected response shape from {self.name}") from error
+        finish_reason = choice.get("finish_reason")
+        self.last_finish_reason = finish_reason if isinstance(finish_reason, str) else None
+        reasoning = message.get("reasoning_content")
+        self.last_reasoning_content = reasoning if isinstance(reasoning, str) else None
+        usage = payload.get("usage") if isinstance(payload, dict) else None
+        output_tokens = usage.get("completion_tokens") if isinstance(usage, dict) else None
+        self.last_output_tokens = output_tokens if isinstance(output_tokens, int) else None
+        if self.last_finish_reason == "length":
+            raise ModelOutputTruncatedError(output_tokens=self.last_output_tokens)
+        if self.last_finish_reason not in {None, "stop"}:
+            raise ProviderError(
+                f"{self.name} stopped with unsupported finish reason "
+                f"{self.last_finish_reason!r}"
+            )
         if not isinstance(content, str) or not content.strip():
             raise ProviderError(f"{self.name} returned no text")
         return content
@@ -154,14 +221,15 @@ class ModelClient:
             user=user,
             max_output_tokens=max_output_tokens,
         )
-        decoder = json.JSONDecoder()
-        for index, character in enumerate(text):
-            if character != "{":
-                continue
-            try:
-                value, _ = decoder.raw_decode(text[index:])
-            except json.JSONDecodeError:
-                continue
-            if isinstance(value, dict):
-                return value
-        raise ProviderError("model output did not contain a JSON object")
+        stripped = text.strip()
+        try:
+            value, end = json.JSONDecoder().raw_decode(stripped)
+        except json.JSONDecodeError:
+            raise ModelJsonProtocolError(
+                "model output did not contain one complete top-level JSON object"
+            ) from None
+        if not isinstance(value, dict) or stripped[end:].strip():
+            raise ModelJsonProtocolError(
+                "model output must be exactly one complete top-level JSON object"
+            )
+        return value

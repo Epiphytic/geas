@@ -6,6 +6,7 @@ import json
 import math
 import mimetypes
 import os
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
@@ -48,9 +49,15 @@ from research_agent.discovery import (
     SourceClass,
     identified,
 )
+from research_agent.discovery_acquisition import GitHubDiscoveryAcquirer
 from research_agent.extraction import AnchorGroundedExtractionManager
 from research_agent.identifiers import doi_locator, normalize_doi
 from research_agent.knowledge import KnowledgeImporter, KnowledgePack
+from research_agent.model_evaluation import (
+    compare_proposals,
+    find_proposal,
+    slice_proposal,
+)
 from research_agent.model_policy import (
     DataClass,
     InputKind,
@@ -60,9 +67,15 @@ from research_agent.model_policy import (
     ModelUsePolicy,
 )
 from research_agent.models import (
+    ModelParameters,
     PolicyStage,
     ThreatObservation,
     ThreatTarget,
+)
+from research_agent.ontology_build import (
+    OntologyBuildConfig,
+    OntologyBuilder,
+    OntologyBuildReceipt,
 )
 from research_agent.operator_policy import ResearchPolicy
 from research_agent.parsing import ParsedDocumentManager
@@ -86,7 +99,7 @@ from research_agent.render import render_topic_markdown
 from research_agent.research import DiscoveryExecutor, OfflineResearchRunner
 from research_agent.secrets import load_env_file
 from research_agent.store import ImmutableStore
-from research_agent.structure import StructuralDocumentManager
+from research_agent.structure import AnchorKind, StructuralAnchor, StructuralDocumentManager
 from research_agent.truth import SQLiteProjectionGuard, TruthManager, TruthPolicy, TruthSnapshot
 from research_agent.workflow import ActorKind, WorkflowEngine, WorkflowState
 from research_agent.workload import WorkloadPolicy
@@ -95,6 +108,23 @@ from research_agent.workload import WorkloadPolicy
 def _json(value: object) -> None:
     value = to_jsonable_python(value)
     print(json.dumps(value, indent=2, sort_keys=True))
+
+
+def _ontology_build_exit_code(receipt: OntologyBuildReceipt) -> int:
+    if receipt.token_limit_exhaustions:
+        for item in receipt.token_limit_exhaustions:
+            print(
+                (
+                    "ERROR: The model ran out of output tokens while extracting "
+                    f"{item.source}. Requested {item.requested_output_tokens}; "
+                    f"provider/model capacity is {item.provider_output_token_limit}."
+                ),
+                file=sys.stderr,
+            )
+            for action in item.recommendations:
+                print(f"  - {action}", file=sys.stderr)
+        return 3
+    return 0 if receipt.completed or receipt.checked_only else 2
 
 
 def _local_approval_principal(root: Path) -> AuthenticatedPrincipal:
@@ -288,6 +318,35 @@ def _build_parser() -> argparse.ArgumentParser:
     mojeek.add_argument("--result-limit", type=int, default=10)
     mojeek.add_argument("--approve-budget", action="store_true")
 
+    acquire_discovery = subparsers.add_parser(
+        "acquire-discovery",
+        help=(
+            "resolve supported saved discovery hits through official immutable "
+            "sources and parse them as inert evidence"
+        ),
+    )
+    acquire_discovery.add_argument("discovery", type=Path)
+    acquire_discovery.add_argument("--root", type=Path, default=Path("data"))
+    acquire_discovery.add_argument("--limit", type=int, default=20)
+
+    ontology_build = subparsers.add_parser(
+        "ontology-build",
+        help="autonomously build, resume, audit, and project an ontology from one config",
+    )
+    ontology_build.add_argument("config", type=Path)
+    ontology_build.add_argument("--root", type=Path, default=Path("data/ontology-build"))
+    ontology_build.add_argument("--workspace", type=Path, default=Path("."))
+    ontology_build.add_argument(
+        "--vocabulary",
+        type=Path,
+        default=Path("config/query-vocabulary.yaml"),
+    )
+    ontology_build.add_argument(
+        "--check",
+        action="store_true",
+        help="validate configuration and local dependencies without network or model calls",
+    )
+
     crossref = subparsers.add_parser(
         "discover-crossref",
         help="run open scholarly DOI and bibliographic metadata discovery",
@@ -361,6 +420,22 @@ def _build_parser() -> argparse.ArgumentParser:
     derive_structure.add_argument("text_derivation_id")
     derive_structure.add_argument("--root", type=Path, default=Path("data"))
 
+    structure_show = subparsers.add_parser(
+        "structure-show",
+        help="list deterministic structural anchors for one derivation",
+    )
+    structure_show.add_argument("structural_derivation_id")
+    structure_show.add_argument("--root", type=Path, default=Path("data"))
+    structure_show.add_argument("--leaf-only", action="store_true")
+    structure_show.add_argument("--limit", type=int, default=1000)
+
+    structure_list = subparsers.add_parser(
+        "structure-list",
+        help="list stored structural derivations without exposing source text",
+    )
+    structure_list.add_argument("--root", type=Path, default=Path("data"))
+    structure_list.add_argument("--limit", type=int, default=100)
+
     derive_citations = subparsers.add_parser(
         "derive-citations",
         help="derive deterministic identifier and reference records from structural text",
@@ -390,11 +465,61 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=list(ModelRoute),
         default=ModelRoute.LOCAL_PREFERRED,
     )
-    propose_extraction.add_argument("--max-output-tokens", type=int, default=4096)
-    propose_extraction.add_argument("--timeout", type=float, default=180.0)
+    propose_extraction.add_argument("--max-output-tokens", type=int, default=65_536)
+    propose_extraction.add_argument(
+        "--thinking",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="enable provider reasoning for extraction",
+    )
+    propose_extraction.add_argument(
+        "--reasoning-effort",
+        choices=("none", "minimal", "low", "medium", "high", "xhigh", "max"),
+        default="high",
+    )
+    propose_extraction.add_argument("--temperature", type=float, default=0.0)
+    propose_extraction.add_argument("--top-p", type=float)
+    propose_extraction.add_argument("--top-k", type=int)
+    propose_extraction.add_argument("--min-p", type=float)
+    propose_extraction.add_argument("--seed", type=int)
+    propose_extraction.add_argument("--stop", action="append", default=[])
+    propose_extraction.add_argument(
+        "--debug-reasoning",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="write deterministically redacted reasoning to a mode-0600 debug log",
+    )
+    propose_extraction.add_argument(
+        "--allow-partial-items",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="retain individually valid items and log rejected output items",
+    )
+    propose_extraction.add_argument("--timeout", type=float, default=3600.0)
     propose_extraction.add_argument("--run-id")
     propose_extraction.add_argument("--approval-receipt-id")
     propose_extraction.add_argument("--override-external-budget", action="store_true")
+
+    compare_extractions = subparsers.add_parser(
+        "compare-extractions",
+        help="deterministically compare two validated extraction proposals",
+    )
+    compare_extractions.add_argument("baseline_proposal_id")
+    compare_extractions.add_argument("candidate_proposal_id")
+    compare_extractions.add_argument("--root", type=Path, default=Path("data"))
+
+    proposal_slice = subparsers.add_parser(
+        "proposal-slice",
+        help="return one deterministic concept subtree from a validated proposal",
+    )
+    proposal_slice.add_argument("proposal_id")
+    proposal_slice.add_argument("concept_id")
+    proposal_slice.add_argument("--root", type=Path, default=Path("data"))
+    proposal_slice.add_argument(
+        "--descendants",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
 
     promotion_stage = subparsers.add_parser(
         "promotion-stage",
@@ -598,6 +723,8 @@ def main() -> None:
                         "model": config.model,
                         "external": config.external,
                         "api_key_env": config.api_key_env or None,
+                        "max_output_tokens": config.max_output_tokens,
+                        "context_window_tokens": config.context_window_tokens,
                     }
                     for name, config in providers.items()
                 },
@@ -883,6 +1010,46 @@ def main() -> None:
                 "acquisition_priority": research_policy.open_source_acquisition_order,
             }
         )
+        return
+
+    if args.command == "acquire-discovery":
+        store = ImmutableStore(args.root)
+        store.initialize()
+        receipt = GitHubDiscoveryAcquirer(store=store).acquire_file(
+            args.discovery,
+            limit=args.limit,
+        )
+        _json(receipt)
+        return
+
+    if args.command == "ontology-build":
+        config = OntologyBuildConfig.from_yaml(args.config)
+        research_policy = ResearchPolicy.from_yaml(args.research_policy)
+        _, providers = load_provider_configs(args.providers)
+        credential_names = {
+            research_policy.provider("connector:mojeek").credential_env,
+            providers[config.provider].api_key_env,
+        }
+        load_env_file(
+            args.env_file,
+            allowed_names=frozenset(item for item in credential_names if item),
+        )
+        builder = OntologyBuilder(
+            config=config,
+            root=args.root,
+            workspace=args.workspace,
+            providers_path=args.providers,
+            research_policy_path=args.research_policy,
+            model_policy_path=args.model_policy,
+            budget_policy_path=args.budget_policy,
+            truth_policy_path=args.truth_policy,
+            vocabulary_path=args.vocabulary,
+        )
+        receipt = builder.check() if args.check else builder.run()
+        _json(receipt)
+        exit_code = _ontology_build_exit_code(receipt)
+        if exit_code:
+            raise SystemExit(exit_code)
         return
 
     if args.command == "discover-crossref":
@@ -1229,8 +1396,8 @@ def main() -> None:
         default, providers = load_provider_configs(args.providers)
         name = args.provider or default
         config = providers[name]
-        if not 1.0 <= args.timeout <= 600.0:
-            raise ValueError("model timeout must be between 1 and 600 seconds")
+        if not 1.0 <= args.timeout <= 86_400.0:
+            raise ValueError("model timeout must be between 1 and 86400 seconds")
         if config.api_key_env:
             load_env_file(
                 args.env_file,
@@ -1255,7 +1422,35 @@ def main() -> None:
                 else None
             ),
         )
-        client = ModelClient(name, config, gate=gate, timeout=args.timeout)
+        effective_output_tokens = min(args.max_output_tokens, config.max_output_tokens)
+        model_parameters = ModelParameters(
+            thinking=args.thinking,
+            reasoning_effort=(
+                args.reasoning_effort if args.thinking else "none"
+            ),
+            temperature=args.temperature,
+            top_p=args.top_p,
+            top_k=args.top_k,
+            min_p=args.min_p,
+            seed=args.seed,
+            stop=tuple(args.stop),
+        )
+        required_context = model_parameters.minimum_context_tokens
+        if required_context is not None and (
+            config.context_window_tokens is None
+            or config.context_window_tokens < required_context
+        ):
+            raise ValueError(
+                f"reasoning_effort=max requires at least {required_context} context "
+                "tokens; increase the provider/server context window or use high"
+            )
+        client = ModelClient(
+            name,
+            config,
+            gate=gate,
+            timeout=args.timeout,
+            parameters=model_parameters,
+        )
         store = ImmutableStore(args.root)
         try:
             receipt = AnchorGroundedExtractionManager(
@@ -1268,7 +1463,10 @@ def main() -> None:
                 structural_derivation_id=args.structural_derivation_id,
                 anchor_ids=args.anchor,
                 allowed_concept_ids=args.concept,
-                max_output_tokens=args.max_output_tokens,
+                max_output_tokens=effective_output_tokens,
+                model_parameters=model_parameters,
+                debug_reasoning=args.debug_reasoning,
+                allow_partial_items=args.allow_partial_items,
             )
         except Exception:
             if gate.last_authorization is not None:
@@ -1302,6 +1500,29 @@ def main() -> None:
                 "approval_receipt": gate.last_approval_receipt,
                 "approval_receipt_record_hash": approval_hash,
             }
+        )
+        return
+
+    if args.command == "compare-extractions":
+        store = ImmutableStore(args.root)
+        records = tuple(store.iter_records("extraction-proposal"))
+        comparison = compare_proposals(
+            find_proposal(records, args.baseline_proposal_id),
+            find_proposal(records, args.candidate_proposal_id),
+        )
+        digest = store.put_record("model-parameter-comparison", comparison)
+        _json({"comparison": comparison, "record_digest": digest})
+        return
+
+    if args.command == "proposal-slice":
+        records = tuple(ImmutableStore(args.root).iter_records("extraction-proposal"))
+        proposal = find_proposal(records, args.proposal_id)
+        _json(
+            slice_proposal(
+                proposal,
+                args.concept_id,
+                include_descendants=args.descendants,
+            )
         )
         return
 
@@ -1433,6 +1654,50 @@ def main() -> None:
             imported_by=args.imported_by,
         )
         _json(receipt)
+        return
+
+    if args.command == "structure-show":
+        if args.limit < 1 or args.limit > 100_000:
+            raise ValueError("structure limit must be 1..100000")
+        store = ImmutableStore(args.root)
+        store.initialize()
+        anchors = tuple(
+            sorted(
+                (
+                    StructuralAnchor.model_validate(value)
+                    for value in store.iter_records("structural-anchor")
+                    if value.get("structural_derivation_id")
+                    == args.structural_derivation_id
+                ),
+                key=lambda item: item.ordinal,
+            )
+        )
+        if args.leaf_only:
+            containers = {AnchorKind.DOCUMENT, AnchorKind.PAGE, AnchorKind.SECTION}
+            anchors = tuple(item for item in anchors if item.kind not in containers)
+        truncated = len(anchors) > args.limit
+        _json(
+            {
+                "structural_derivation_id": args.structural_derivation_id,
+                "leaf_only": args.leaf_only,
+                "total": len(anchors),
+                "truncated": truncated,
+                "anchors": anchors[: args.limit],
+            }
+        )
+        return
+
+    if args.command == "structure-list":
+        if not 1 <= args.limit <= 10_000:
+            raise ValueError("structure-list limit must be between 1 and 10000")
+        values = tuple(ImmutableStore(args.root).iter_records("structural-derivation"))
+        _json(
+            {
+                "count": min(len(values), args.limit),
+                "total": len(values),
+                "derivations": values[: args.limit],
+            }
+        )
         return
 
     if args.command == "bundle-import":

@@ -6,7 +6,8 @@ base_url = "http://127.0.0.1:8000/v1"
 model = "deepseek-v4-flash"
 api_key_env = ""
 external = false
-max_output_tokens = 4096
+max_output_tokens = 393216
+context_window_tokens = 393216
 
 [providers.openai]
 kind = "openai_compatible"

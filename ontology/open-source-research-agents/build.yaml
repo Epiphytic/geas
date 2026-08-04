@@ -1,0 +1,28 @@
+version: 1
+topic: State of available open-source research agents
+topic_concept_id: concept:open-source-research-agents
+description: >
+  Open-source systems that plan research, retrieve primary and secondary
+  sources, synthesize cited findings, and maintain reusable research knowledge.
+seed_bundles:
+  - ontology/open-source-research-agents/bundle.yaml
+seed_bundle_globs:
+  - ontology/open-source-research-agents/generated/*/bundle.yaml
+queries:
+  - open source deep research agent GitHub
+  - open source research agent retrieval citations benchmark GitHub
+include_gap_queries: true
+result_limit: 200
+approve_large_queries: true
+repository_limit_per_query: 100
+provider: deepseek_local
+max_output_tokens: 131072
+model_parameters:
+  thinking: true
+  reasoning_effort: high
+  temperature: 0
+  seed: 0
+debug_reasoning: true
+timeout_seconds: 14400
+model_parallelism: 1
+output_directory: ontology/open-source-research-agents/generated

@@ -228,7 +228,8 @@ class ProviderConfig(StrictModel):
     model: str
     api_key_env: str = ""
     external: bool
-    max_output_tokens: int = Field(gt=0, le=65536)
+    max_output_tokens: int = Field(gt=0, le=524_288)
+    context_window_tokens: int | None = Field(default=None, gt=0, le=2_097_152)
 
     @model_validator(mode="after")
     def endpoint_matches_trust_boundary(self) -> ProviderConfig:
@@ -244,3 +245,37 @@ class ProviderConfig(StrictModel):
         if not address.is_loopback:
             raise ValueError("local model providers require a loopback address")
         return self
+
+
+class ModelParameters(StrictModel):
+    thinking: bool = True
+    reasoning_effort: Literal[
+        "none", "minimal", "low", "medium", "high", "xhigh", "max"
+    ] = "high"
+    temperature: float | None = Field(default=0.0, ge=0.0, le=2.0)
+    top_p: float | None = Field(default=None, gt=0.0, le=1.0)
+    top_k: int | None = Field(default=None, ge=0)
+    min_p: float | None = Field(default=None, ge=0.0, le=1.0)
+    seed: int | None = Field(default=None, ge=0)
+    stop: tuple[str, ...] = Field(default=(), max_length=8)
+
+    @model_validator(mode="after")
+    def thinking_controls_agree(self) -> ModelParameters:
+        if not self.thinking and self.reasoning_effort != "none":
+            raise ValueError("reasoning_effort must be none when thinking is disabled")
+        if self.thinking and self.reasoning_effort == "none":
+            raise ValueError("thinking must be disabled when reasoning_effort is none")
+        if any(not item or len(item) > 200 for item in self.stop):
+            raise ValueError("stop strings must be non-empty and at most 200 characters")
+        return self
+
+    @property
+    def minimum_context_tokens(self) -> int | None:
+        """Return a provider-independent preflight requirement when one is known.
+
+        DwarfStar's DeepSeek max-thinking prompt is only activated at 384 Ki
+        tokens (393,216). Below that it deterministically falls back to high.
+        """
+        if self.thinking and self.reasoning_effort == "max":
+            return 384 * 1024
+        return None

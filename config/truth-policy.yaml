@@ -7,6 +7,7 @@ ontology_globs:
   - ontology/**/*.md
   - config/query-vocabulary.yaml
   - intelligence/sources.yaml
+ontology_git_tracking: required
 
 # Trusted policies affect ingestion, routing, and projection semantics.
 operational_policy_paths:
@@ -44,6 +45,10 @@ record_schema_paths:
   - src/research_agent/audit.py
   - src/research_agent/extraction.py
   - src/research_agent/promotion.py
+  - src/research_agent/candidate_bundles.py
+  - src/research_agent/discovery_acquisition.py
+  - src/research_agent/ontology_build.py
+  - src/research_agent/model_evaluation.py
   - src/research_agent/remote_acquisition.py
 
 # These roots are relative to the selected immutable store root.

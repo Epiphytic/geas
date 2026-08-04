@@ -5,6 +5,9 @@ knowledge base. Its durable product is a versioned graph of claims, evidence,
 concepts, disagreements, and source-threat observations—not a periodically
 regenerated report.
 
+To build or resume an ontology from one configuration, see the
+[executable ontology quick start](docs/QUICKSTART_ONTOLOGY.md).
+
 This repository provides the deterministic control plane, offline acquisition,
 open scholarly discovery, and a persistent SQLite knowledge-query vertical
 slice:

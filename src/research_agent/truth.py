@@ -4,6 +4,7 @@ import base64
 import hashlib
 import json
 import sqlite3
+import subprocess
 from collections.abc import Callable
 from datetime import datetime
 from enum import StrEnum
@@ -35,6 +36,7 @@ class TruthArtifact(StrictModel):
 class TruthPolicy(StrictModel):
     version: int = Field(ge=1)
     ontology_globs: tuple[str, ...] = Field(min_length=1)
+    ontology_git_tracking: Literal["required", "not_required"] = "not_required"
     operational_policy_paths: tuple[str, ...] = ()
     record_schema_paths: tuple[str, ...] = Field(min_length=1)
     record_directory: str
@@ -203,6 +205,13 @@ class TruthManager:
             ontology_paths.update(
                 path for path in self.workspace_root.glob(pattern) if path.is_file()
             )
+        if self.policy.ontology_git_tracking == "required":
+            tracked = self._git_tracked_paths()
+            ontology_paths = {
+                path
+                for path in ontology_paths
+                if path.relative_to(self.workspace_root).as_posix() in tracked
+            }
         if not ontology_paths:
             raise ValueError("truth policy did not resolve any canonical ontology files")
         for path in sorted(ontology_paths):
@@ -231,6 +240,33 @@ class TruthManager:
             for path in sorted(item for item in blob_root.rglob("*") if item.is_file()):
                 artifacts.append(self._blob_artifact(path, blob_root))
         return tuple(sorted(artifacts, key=lambda item: item.locator))
+
+    def _git_tracked_paths(self) -> frozenset[str]:
+        result = subprocess.run(
+            (
+                "git",
+                "-C",
+                str(self.workspace_root),
+                "ls-tree",
+                "-r",
+                "--name-only",
+                "-z",
+                "HEAD",
+                "--",
+            ),
+            check=False,
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            raise ValueError(
+                "truth policy requires Git-tracked ontology files, but the workspace "
+                "has no accessible Git HEAD"
+            )
+        return frozenset(
+            item.decode("utf-8", errors="strict")
+            for item in result.stdout.split(b"\0")
+            if item
+        )
 
     def _file_artifact(
         self,

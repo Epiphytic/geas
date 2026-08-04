@@ -1,0 +1,47 @@
+version: 1
+evaluated_at: 2026-08-04
+purpose: Select the ontology-local DeepSeek reasoning effort.
+method:
+  structural_derivation_id: structural-derivation:sha256:d9be916f1066251d162713b55477ec520fc05964c7ce2b4f0c8710bfe2b64e89
+  source_content_sha256: 09a53ca28d89af75cff46f34872bbf43d66e4e59d05f3dcf8a44d1ada3570c86
+  leaf_anchor_count: 30
+  max_output_tokens: 32768
+  context_window_tokens: 393216
+  temperature: 0
+  seed: 0
+  allow_partial_items: true
+  comparison_record_digest: 757c3a3abb894925505b86c62988d9329eeb205a2b34b9d90f66f3f0d38a5b0f
+high:
+  request_id: extraction-request:sha256:48a0e5cdb4d1bb9f705192298bbd3966340377c07e05feccaef7ba02bd2225f6
+  proposal_id: extraction-proposal:sha256:73efeeadf1ed4645adb31bfa27279662a7bb4dd4d3c4cd2309a54f9b651f1e95
+  elapsed_seconds: 2343
+  output_tokens: 19867
+  concepts: 9
+  hierarchy_edges: 9
+  claims: 27
+  distinct_predicates: 12
+  evidence_selectors: 27
+  controversies: 0
+  gaps: 5
+  unique_claim_ratio: 1.0
+max:
+  request_id: extraction-request:sha256:a44fcb99a159322413a8f55a74e693f1ca37df94f1ff837af0c385dece5717de
+  proposal_id: extraction-proposal:sha256:94adef53779939e04123a01e34c52a78c59cfcb9ad2b7db141bee5f262d6baf9
+  elapsed_seconds: 2371
+  output_tokens: 19913
+  concepts: 7
+  hierarchy_edges: 7
+  claims: 25
+  distinct_predicates: 9
+  evidence_selectors: 26
+  controversies: 0
+  gaps: 5
+  unique_claim_ratio: 1.0
+decision:
+  reasoning_effort: high
+  rationale:
+    - High produced more grounded claims.
+    - High produced more distinct predicates.
+    - High produced more concepts and hierarchy edges.
+    - High produced more evidence selectors.
+    - Max did not improve gaps, uniqueness, or elapsed time.
