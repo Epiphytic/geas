@@ -130,8 +130,13 @@ def test_required_git_tracking_excludes_unreviewed_ontology_candidates(
     (workspace / "ontology" / "knowledge.yaml").write_text(
         "concepts:\n  - dirty-unreviewed-change\n"
     )
-    with pytest.raises(ValueError, match="differs from HEAD"):
-        manager.capture(created_by="operator:test")
+    dirty_snapshot = manager.capture(created_by="operator:test")
+    assert dirty_snapshot.state_digest == snapshot.state_digest
+    assert manager.verify(snapshot).clean
+
+    (workspace / "ontology" / "knowledge.yaml").unlink()
+    missing_snapshot = manager.capture(created_by="operator:test")
+    assert missing_snapshot.state_digest == snapshot.state_digest
 
 
 def test_new_immutable_record_is_detected_as_added_truth(tmp_path: Path) -> None:
@@ -229,3 +234,14 @@ def test_policy_forbids_database_as_canonical_source() -> None:
                 "database_to_canonical": "allowed",
             }
         )
+
+
+def test_git_ontology_glob_matches_zero_or_many_directories() -> None:
+    pattern = "ontology/**/*.yaml"
+
+    assert TruthManager._glob_matches("ontology/knowledge.yaml", pattern)
+    assert TruthManager._glob_matches(
+        "ontology/topic/generated/project/bundle.yaml",
+        pattern,
+    )
+    assert not TruthManager._glob_matches("ontology/topic/source.md", pattern)

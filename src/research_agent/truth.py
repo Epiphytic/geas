@@ -8,6 +8,7 @@ import subprocess
 from collections.abc import Callable
 from datetime import datetime
 from enum import StrEnum
+from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any, Literal
 
@@ -200,24 +201,26 @@ class TruthManager:
 
     def inventory(self) -> tuple[TruthArtifact, ...]:
         artifacts: list[TruthArtifact] = []
-        ontology_paths: set[Path] = set()
-        for pattern in self.policy.ontology_globs:
-            ontology_paths.update(
-                path for path in self.workspace_root.glob(pattern) if path.is_file()
-            )
         if self.policy.ontology_git_tracking == "required":
-            tracked = self._git_tracked_paths()
-            ontology_paths = {
-                path
-                for path in ontology_paths
-                if path.relative_to(self.workspace_root).as_posix() in tracked
-            }
-        if not ontology_paths:
-            raise ValueError("truth policy did not resolve any canonical ontology files")
-        for path in sorted(ontology_paths):
-            if self.policy.ontology_git_tracking == "required":
-                self._assert_matches_git_head(path)
-            artifacts.append(self._file_artifact(path, ArtifactRole.ONTOLOGY, "workspace"))
+            ontology_paths = self._git_ontology_paths()
+            if not ontology_paths:
+                raise ValueError("truth policy did not resolve any canonical ontology files")
+            for relative in sorted(ontology_paths):
+                artifacts.append(
+                    self._git_file_artifact(relative, ArtifactRole.ONTOLOGY)
+                )
+        else:
+            ontology_paths: set[Path] = set()
+            for pattern in self.policy.ontology_globs:
+                ontology_paths.update(
+                    path for path in self.workspace_root.glob(pattern) if path.is_file()
+                )
+            if not ontology_paths:
+                raise ValueError("truth policy did not resolve any canonical ontology files")
+            for path in sorted(ontology_paths):
+                artifacts.append(
+                    self._file_artifact(path, ArtifactRole.ONTOLOGY, "workspace")
+                )
         for relative in self.policy.operational_policy_paths:
             path = self.workspace_root / relative
             if not path.is_file():
@@ -270,9 +273,58 @@ class TruthManager:
             if item
         )
 
-    def _assert_matches_git_head(self, path: Path) -> None:
-        relative = path.relative_to(self.workspace_root).as_posix()
-        result = subprocess.run(
+    def _git_ontology_paths(self) -> frozenset[str]:
+        return frozenset(
+            relative
+            for relative in self._git_tracked_paths()
+            if any(
+                self._glob_matches(relative, pattern)
+                for pattern in self.policy.ontology_globs
+            )
+        )
+
+    @staticmethod
+    def _glob_matches(value: str, pattern: str) -> bool:
+        values = value.split("/")
+        patterns = pattern.split("/")
+
+        def match(value_index: int, pattern_index: int) -> bool:
+            if pattern_index == len(patterns):
+                return value_index == len(values)
+            current = patterns[pattern_index]
+            if current == "**":
+                return match(value_index, pattern_index + 1) or (
+                    value_index < len(values)
+                    and match(value_index + 1, pattern_index)
+                )
+            return (
+                value_index < len(values)
+                and fnmatchcase(values[value_index], current)
+                and match(value_index + 1, pattern_index + 1)
+            )
+
+        return match(0, 0)
+
+    def _git_file_artifact(
+        self,
+        relative: str,
+        role: ArtifactRole,
+    ) -> TruthArtifact:
+        tree = subprocess.run(
+            (
+                "git",
+                "-C",
+                str(self.workspace_root),
+                "ls-tree",
+                "-z",
+                "HEAD",
+                "--",
+                relative,
+            ),
+            check=False,
+            capture_output=True,
+        )
+        blob = subprocess.run(
             (
                 "git",
                 "-C",
@@ -285,13 +337,22 @@ class TruthManager:
             capture_output=True,
         )
         if (
-            result.returncode != 0
-            or path.is_symlink()
-            or path.read_bytes() != result.stdout
+            tree.returncode != 0
+            or not tree.stdout
+            or tree.stdout.startswith(b"120000 ")
+            or blob.returncode != 0
         ):
             raise ValueError(
-                f"Git-tracked canonical ontology differs from HEAD: {relative}"
+                f"invalid Git canonical ontology blob: {relative}"
             )
+        digest = hashlib.sha256(blob.stdout).hexdigest()
+        return TruthArtifact(
+            locator=f"workspace:{relative}",
+            role=role,
+            canonical_sha256=digest,
+            storage_sha256=digest,
+            byte_length=len(blob.stdout),
+        )
 
     def _file_artifact(
         self,
