@@ -350,12 +350,12 @@ class OntologyBuilder:
             for path in seed_paths:
                 self._assert_seed_matches_head(path)
         for index, path in enumerate(seed_paths, start=1):
-            key = str(path)
+            key = self._seed_checkpoint_key(path)
             if key not in state["imported_bundles"]:
                 self.progress.event(
                     "seed",
                     "running",
-                    f"Importing {key}",
+                    f"Importing {path}",
                     current=index,
                     total=len(seed_paths),
                 )
@@ -369,7 +369,7 @@ class OntologyBuilder:
                 self.progress.event(
                     "seed",
                     "resumed",
-                    f"Already imported {key}",
+                    f"Already imported {path}",
                     current=index,
                     total=len(seed_paths),
                 )
@@ -842,6 +842,10 @@ class OntologyBuilder:
             if not resolved.is_file() or not resolved.is_relative_to(bundle_path.parent):
                 raise ValueError("bundle source path escapes its bundle")
             self._assert_path_matches_head(source_relative)
+
+    def _seed_checkpoint_key(self, relative: Path) -> str:
+        digest = hashlib.sha256((self.workspace / relative).read_bytes()).hexdigest()
+        return f"{relative.as_posix()}@sha256:{digest}"
 
     def _assert_path_matches_head(self, relative: Path) -> None:
         if relative.is_absolute() or ".." in relative.parts:
