@@ -124,6 +124,15 @@ def test_model_tuning_does_not_invalidate_discovery_checkpoint(tmp_path) -> None
             }
         ),
     )
+    changed_output = _builder(
+        tmp_path,
+        OntologyBuildConfig.model_validate(
+            {
+                **base,
+                "tainted_source_index": "ontology/test/other-tainted-sources.yaml",
+            }
+        ),
+    )
     changed_discovery = _builder(
         tmp_path,
         OntologyBuildConfig.model_validate({**base, "queries": ["different"]}),
@@ -131,6 +140,7 @@ def test_model_tuning_does_not_invalidate_discovery_checkpoint(tmp_path) -> None
 
     assert high.config_sha256 != maximum.config_sha256
     assert high.discovery_config_sha256 == maximum.discovery_config_sha256
+    assert high.discovery_config_sha256 == changed_output.discovery_config_sha256
     assert high.discovery_config_sha256 != changed_discovery.discovery_config_sha256
 
 

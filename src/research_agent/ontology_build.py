@@ -308,6 +308,7 @@ class OntologyBuilder:
                 "max_sources",
                 "model_parallelism",
                 "output_directory",
+                "tainted_source_index",
             }
         )
         self.discovery_config_sha256 = hashlib.sha256(
