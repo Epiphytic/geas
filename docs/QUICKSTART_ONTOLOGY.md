@@ -25,6 +25,14 @@ uv run research-agent --env-file .env ontology-build \
   --root data/open-source-research-agents
 ```
 
+Each invocation is a bounded worker. `max_run_seconds` is at most 1,800 seconds;
+when useful work remains, a clean worker checkpoint exits successfully and the
+same command resumes from immutable records. A source work claim prevents two
+workers sharing a runtime root from issuing the same extraction request.
+Validated proposals remain reusable when a later worker changes model,
+provider, output ceiling, or reasoning effort. Pass `--reextract` only to
+deliberately reconsider completed sources.
+
 To deliberately refresh completed searches and re-resolve already known
 repositories at their current official commits:
 
@@ -148,7 +156,7 @@ All generation parameters are ontology-local:
 max_output_tokens: 131072
 model_parameters:
   thinking: true
-  reasoning_effort: high  # use max only with >=393216 context tokens
+reasoning_effort: high  # use max only with >=393216 context tokens
   temperature: 0
   top_p: null
   top_k: null
@@ -157,6 +165,8 @@ model_parameters:
   stop: []
 debug_reasoning: true
 timeout_seconds: 14400
+max_run_seconds: 1800          # hard per-worker ceiling
+minimum_model_window_seconds: 300
 connection_attempts: 10        # retries connection refusal only
 connection_retry_seconds: 2
 ```

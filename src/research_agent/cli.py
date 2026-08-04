@@ -53,6 +53,11 @@ from research_agent.discovery_acquisition import GitHubDiscoveryAcquirer
 from research_agent.extraction import AnchorGroundedExtractionManager
 from research_agent.identifiers import doi_locator, normalize_doi
 from research_agent.knowledge import KnowledgeImporter, KnowledgePack
+from research_agent.library import (
+    SourceLibraryBuilder,
+    SourceLibraryManifest,
+    SourceLibraryQueryEngine,
+)
 from research_agent.model_evaluation import (
     compare_proposals,
     find_proposal,
@@ -124,6 +129,16 @@ def _ontology_build_exit_code(receipt: OntologyBuildReceipt) -> int:
             for action in item.recommendations:
                 print(f"  - {action}", file=sys.stderr)
         return 3
+    if receipt.resumable and not receipt.failures:
+        print(
+            (
+                "Ontology worker checkpointed successfully with "
+                f"{receipt.work_remaining} source(s) remaining; rerun the same "
+                "command to continue."
+            ),
+            file=sys.stderr,
+        )
+        return 0
     return 0 if receipt.completed or receipt.checked_only else 2
 
 
@@ -350,6 +365,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--refresh",
         action="store_true",
         help="refresh completed discovery queries and known repository snapshots",
+    )
+    ontology_build.add_argument(
+        "--reextract",
+        action="store_true",
+        help="reconsider sources that already have validator-compatible proposals",
     )
 
     crossref = subparsers.add_parser(
@@ -613,6 +633,53 @@ def _build_parser() -> argparse.ArgumentParser:
     bundle_import.add_argument("bundle", type=Path)
     bundle_import.add_argument("--root", type=Path, default=Path("data"))
     bundle_import.add_argument("--imported-by", required=True)
+
+    library_build = subparsers.add_parser(
+        "library-build",
+        help="build a reusable, ontology-independent source-library snapshot and index",
+    )
+    library_build.add_argument("manifest", type=Path)
+    library_build.add_argument("--root", type=Path, default=Path("data"))
+    library_build.add_argument(
+        "--database",
+        type=Path,
+        default=Path("data/source-library.sqlite"),
+    )
+
+    library_query = subparsers.add_parser(
+        "library-query",
+        help="search exact source anchors in a source-library snapshot",
+    )
+    library_query.add_argument("question")
+    library_query.add_argument(
+        "--database",
+        type=Path,
+        default=Path("data/source-library.sqlite"),
+    )
+    library_query.add_argument("--limit", type=int, default=25)
+
+    library_show = subparsers.add_parser(
+        "library-show",
+        help="show a source-library manifest, snapshot identity, and source inventory",
+    )
+    library_show.add_argument(
+        "--database",
+        type=Path,
+        default=Path("data/source-library.sqlite"),
+    )
+
+    library_context = subparsers.add_parser(
+        "library-context",
+        help="return a bounded, exact, agent-readable context package from a source library",
+    )
+    library_context.add_argument("question")
+    library_context.add_argument(
+        "--database",
+        type=Path,
+        default=Path("data/source-library.sqlite"),
+    )
+    library_context.add_argument("--limit", type=int, default=25)
+    library_context.add_argument("--max-characters", type=int, default=16_000)
 
     projection_build = subparsers.add_parser(
         "projection-build",
@@ -1050,6 +1117,7 @@ def main() -> None:
             truth_policy_path=args.truth_policy,
             vocabulary_path=args.vocabulary,
             force_refresh=args.refresh,
+            force_reextract=args.reextract,
         )
         receipt = builder.check() if args.check else builder.run()
         _json(receipt)
@@ -1711,6 +1779,38 @@ def main() -> None:
             KnowledgeBundleImporter(store=ImmutableStore(args.root)).import_bundle(
                 args.bundle,
                 imported_by=args.imported_by,
+            )
+        )
+        return
+
+    if args.command == "library-build":
+        _json(
+            SourceLibraryBuilder(store=ImmutableStore(args.root)).build(
+                SourceLibraryManifest.from_yaml(args.manifest),
+                args.database,
+            )
+        )
+        return
+
+    if args.command == "library-query":
+        _json(
+            SourceLibraryQueryEngine(args.database).query(
+                args.question,
+                limit=args.limit,
+            )
+        )
+        return
+
+    if args.command == "library-show":
+        _json(SourceLibraryQueryEngine(args.database).describe())
+        return
+
+    if args.command == "library-context":
+        _json(
+            SourceLibraryQueryEngine(args.database).context(
+                args.question,
+                limit=args.limit,
+                max_characters=args.max_characters,
             )
         )
         return

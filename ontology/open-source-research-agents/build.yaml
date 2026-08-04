@@ -4,6 +4,30 @@ topic_concept_id: concept:open-source-research-agents
 description: >
   Open-source systems that plan research, retrieve primary and secondary
   sources, synthesize cited findings, and maintain reusable research knowledge.
+scope_criteria:
+  - a research agent
+  - a framework or component explicitly intended for research agents
+  - a benchmark or dataset explicitly evaluating research agents
+  - a curated catalog explicitly about research agents
+ontology_facets:
+  - identity
+  - scope
+  - architecture
+  - retrieval
+  - inputs and outputs
+  - persistent state
+  - local-model support
+  - licensing
+  - security
+  - evaluation
+  - limitations
+  - dissent
+  - knowledge gaps
+competency_questions:
+  - What research tasks does the system perform?
+  - Which retrieval sources and strategies does it use?
+  - What persistent or reusable knowledge does it maintain?
+  - What evidence exists for quality, limitations, and security?
 seed_bundles:
   - ontology/open-source-research-agents/bundle.yaml
 seed_bundle_globs:
@@ -25,6 +49,8 @@ model_parameters:
   seed: 0
 debug_reasoning: true
 timeout_seconds: 14400
+max_run_seconds: 1800
+minimum_model_window_seconds: 300
 connection_attempts: 10
 connection_retry_seconds: 2
 model_parallelism: 1

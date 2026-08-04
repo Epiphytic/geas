@@ -1,0 +1,105 @@
+version: 1
+topic: State of available open-source research agents
+topic_concept_id: concept:open-source-research-agents
+recorded_at: '2026-08-04T20:36:44.453274Z'
+sources:
+- key: alibaba-nlp-deepresearch-4b453a820810
+  path: sources/alibaba-nlp-deepresearch-4b453a820810.md
+  expected_sha256: 4b453a820810d95071a8be84ca0a9f41500984b44a379220081d38d779b7c667
+  acquired_at: '2026-08-04T18:25:39.540645Z'
+  original_locator: https://github.com/Alibaba-NLP/DeepResearch/tree/f72f75d8c3eb842f2bbbab096a12206ff66e270f/README.md
+  title: Alibaba-NLP/DeepResearch README at f72f75d8c3eb
+  authors: []
+  publisher: GitHub
+  media_type: text/markdown
+  license: Apache-2.0
+  usage_conditions:
+  - Redistributed under SPDX license Apache-2.0.
+  rights_basis: 'SPDX license reported by the official repository API: Apache-2.0'
+  provenance_note: Resolved through the official GitHub API, pinned to immutable commit
+    f72f75d8c3eb842f2bbbab096a12206ff66e270f, and verified against Git blob 453f5ae22c8b3113e3edda928246745986d58516.
+concepts:
+- id: concept:open-source-research-agents
+  label: Open-source research agents
+  description: Open-source systems that plan, retrieve, synthesize, or maintain research
+    knowledge.
+  broader: []
+  synonyms:
+  - open deep research
+  - research automation
+  recorded_at: '2026-08-03T16:00:00Z'
+  recorded_by: operator:epiphytic
+  review_state: accepted
+- id: concept:alibaba-nlp:deepresearch:tongyi-deepresearch
+  label: Tongyi DeepResearch
+  description: An agentic large language model developed by Tongyi Lab, designed for
+    long-horizon deep information-seeking tasks, with 30.5B total parameters and 3.3B
+    activated per token, supporting ReAct and IterResearch inference paradigms.
+  broader:
+  - concept:open-source-research-agents
+  synonyms:
+  - Tongyi-DeepResearch-30B-A3B
+  recorded_at: '2026-08-04T20:36:44.453274Z'
+  recorded_by: extraction-proposal:extraction-proposal:sha256:7dc99047837bdf5df9ae4d75fb6ca9d3680eb9e83cf6d6d97cf8c1fea67d2cbe
+  review_state: accepted
+evidence:
+- key: tongyi-deepresearch-architecture-evidence-1
+  source_key: alibaba-nlp-deepresearch-4b453a820810
+  exact: an agentic large language model featuring 30.5 billion total parameters,
+    with only 3.3 billion activated per token.
+  start: 2723
+  end: 2838
+- key: tongyi-deepresearch-local-deployment-evidence-1
+  source_key: alibaba-nlp-deepresearch-4b453a820810
+  exact: For a stable experience we recommend local deployment
+  start: 2267
+  end: 2320
+- key: tongyi-deepresearch-limitation-demo-evidence-1
+  source_key: alibaba-nlp-deepresearch-4b453a820810
+  exact: Response times may vary or fail intermittently due to model latency and tool
+    QPS limits.
+  start: 2178
+  end: 2266
+claims:
+- key: tongyi-deepresearch-architecture
+  subject: concept:alibaba-nlp:deepresearch:tongyi-deepresearch
+  predicate: ep:has_parameter_count
+  object: 30.5B total, 3.3B activated per token
+  qualifiers: {}
+  stance: asserts
+  epistemic_status: observed
+  asserted_by: model:deepseek_local:deepseek-v4-flash
+  evidence_keys:
+  - tongyi-deepresearch-architecture-evidence-1
+- key: tongyi-deepresearch-local-deployment
+  subject: concept:alibaba-nlp:deepresearch:tongyi-deepresearch
+  predicate: ep:supports_local_deployment
+  object: true
+  qualifiers: {}
+  stance: asserts
+  epistemic_status: observed
+  asserted_by: model:deepseek_local:deepseek-v4-flash
+  evidence_keys:
+  - tongyi-deepresearch-local-deployment-evidence-1
+- key: tongyi-deepresearch-limitation-demo
+  subject: concept:alibaba-nlp:deepresearch:tongyi-deepresearch
+  predicate: ep:has_limitation
+  object: demo may have response time issues or fail intermittently due to model latency
+    and tool QPS limits
+  qualifiers: {}
+  stance: asserts
+  epistemic_status: observed
+  asserted_by: model:deepseek_local:deepseek-v4-flash
+  evidence_keys:
+  - tongyi-deepresearch-limitation-demo-evidence-1
+controversies: []
+gaps:
+- topic_concept_id: concept:open-source-research-agents
+  question: What is the software license for Tongyi DeepResearch?
+  kind: missing_source_class
+  rationale: The repository does not explicitly state a license in the provided anchors.
+    The model weights are available on HuggingFace but the license is not mentioned.
+  related_claim_keys: []
+  searched_query_plan_ids: []
+  priority: 30
+  status: open

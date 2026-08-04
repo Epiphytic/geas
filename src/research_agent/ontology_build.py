@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import math
 import os
 import re
+import socket
 import subprocess
 import sys
 import threading
@@ -80,8 +82,29 @@ class OntologyBuildConfig(StrictModel):
     topic: str = Field(min_length=1)
     topic_concept_id: str = Field(pattern=r"^concept:[A-Za-z0-9][A-Za-z0-9._:-]*$")
     description: str = Field(default="", max_length=4000)
+    scope_criteria: tuple[str, ...] = ()
+    ontology_facets: tuple[str, ...] = (
+        "identity",
+        "scope",
+        "architecture",
+        "interfaces",
+        "inputs",
+        "outputs",
+        "persistent state",
+        "security",
+        "evaluation",
+        "limitations",
+        "dissent",
+        "knowledge gaps",
+    )
+    competency_questions: tuple[str, ...] = ()
     seed_bundles: tuple[Path, ...] = ()
     seed_bundle_globs: tuple[str, ...] = ()
+    source_library_snapshot_id: str | None = Field(
+        default=None,
+        pattern=r"^source-library-snapshot:sha256:[0-9a-f]{64}$",
+    )
+    discovery_enabled: bool = True
     queries: tuple[str, ...] = ()
     include_gap_queries: bool = True
     refresh_after_hours: int | None = Field(default=168, ge=1, le=87_600)
@@ -94,6 +117,8 @@ class OntologyBuildConfig(StrictModel):
     model_parameters: ModelParameters = Field(default_factory=ModelParameters)
     debug_reasoning: bool = True
     timeout_seconds: float = Field(default=3600.0, ge=1.0, le=86_400.0)
+    max_run_seconds: float = Field(default=1800.0, ge=60.0, le=1800.0)
+    minimum_model_window_seconds: float = Field(default=300.0, ge=30.0, le=1500.0)
     connection_attempts: int = Field(default=10, ge=1, le=20)
     connection_retry_seconds: float = Field(default=2.0, ge=0.0, le=30.0)
     anchors_per_batch: int = Field(default=200, ge=1, le=200)
@@ -126,6 +151,10 @@ class OntologyBuildConfig(StrictModel):
     def defaults_are_safe(self) -> OntologyBuildConfig:
         if self.model_parallelism != 1:
             raise ValueError("ontology extraction currently requires model_parallelism: 1")
+        if self.minimum_model_window_seconds >= self.max_run_seconds:
+            raise ValueError(
+                "minimum_model_window_seconds must leave time inside max_run_seconds"
+            )
         return self
 
     @classmethod
@@ -194,6 +223,10 @@ class OntologyBuildReceipt(StrictModel):
     topic_path: str | None = None
     tainted_source_index_path: str | None = None
     audit_clean: bool | None = None
+    run_limit_reached: bool = False
+    resumable: bool = False
+    work_remaining: int = 0
+    run_elapsed_seconds: float = 0.0
 
 
 class BuildProgress:
@@ -253,6 +286,7 @@ class OntologyBuilder:
     """Own the deterministic, resumable ontology-building control loop."""
 
     version = "ontology-builder/1"
+    _finalization_reserve_seconds = 120.0
     _words = re.compile(r"[a-z0-9][a-z0-9_.+-]{1,}", re.IGNORECASE)
     _anchor_terms = frozenset(
         {
@@ -288,6 +322,7 @@ class OntologyBuilder:
         truth_policy_path: Path,
         vocabulary_path: Path,
         force_refresh: bool = False,
+        force_reextract: bool = False,
     ) -> None:
         self.config = config
         self.root = root.resolve()
@@ -299,15 +334,22 @@ class OntologyBuilder:
         self.truth_policy_path = truth_policy_path
         self.vocabulary_path = vocabulary_path
         self.force_refresh = force_refresh
+        self.force_reextract = force_reextract
         self.store = ImmutableStore(self.root)
         self.config_sha256 = hashlib.sha256(canonical_json(config)).hexdigest()
         discovery_fields = config.model_dump(
             exclude={
                 "provider",
+                "scope_criteria",
+                "ontology_facets",
+                "competency_questions",
+                "source_library_snapshot_id",
                 "max_output_tokens",
                 "model_parameters",
                 "debug_reasoning",
                 "timeout_seconds",
+                "max_run_seconds",
+                "minimum_model_window_seconds",
                 "connection_attempts",
                 "connection_retry_seconds",
                 "refresh_after_hours",
@@ -324,6 +366,7 @@ class OntologyBuilder:
         ).hexdigest()
         self.state_path = self.root / "ontology-build-state.json"
         self.progress = BuildProgress(root=self.root, config_sha256=self.config_sha256)
+        self._run_started_monotonic: float | None = None
 
     def check(self) -> OntologyBuildReceipt:
         self._validate_inputs()
@@ -336,6 +379,7 @@ class OntologyBuilder:
     def run(self) -> OntologyBuildReceipt:
         self._validate_inputs()
         self.store.initialize()
+        self._run_started_monotonic = time.monotonic()
         self.progress.event("build", "started", "Starting or resuming ontology build")
         state = self._load_state()
         failures: list[str] = list(state.get("failures", []))
@@ -386,7 +430,11 @@ class OntologyBuilder:
         research_policy = ResearchPolicy.from_yaml(self.research_policy_path)
         provider_policy = research_policy.provider("connector:mojeek")
         connector = MojeekDiscoveryConnector()
+        run_limit_reached = False
         for index, question in enumerate(query_strings, start=1):
+            if self._remaining_run_seconds() <= self._finalization_reserve_seconds:
+                run_limit_reached = True
+                break
             now = utc_now()
             completed = question in state["queries_completed"]
             completed_at = state["query_completed_at"].get(question)
@@ -483,14 +531,40 @@ class OntologyBuilder:
             if (
                 request := extraction_requests.get(item.extraction_request_id)
             ) is not None
-            and self._proposal_is_compatible(item, request, configured_model)
+            and (
+                source_snapshot := acquired_by_source.get(item.source_version_id)
+            )
+            is not None
+            and self._proposal_is_compatible(
+                item,
+                request,
+                configured_model,
+                expected_question=self._extraction_question(
+                    source_snapshot.repository
+                ),
+            )
         }
+        if self.force_reextract:
+            existing_proposals = {}
         model_failed = bool(token_exhaustions)
         selected_snapshots = self._rank_snapshots(tuple(acquired_by_source.values()))
+        selected_snapshots = self._library_snapshots(selected_snapshots)
         if self.config.max_sources is not None:
             selected_snapshots = selected_snapshots[: self.config.max_sources]
         validation_failures = self._validation_failure_counts()
+        work_deferred = False
         for index, snapshot in enumerate(selected_snapshots, start=1):
+            if self._remaining_run_seconds() < self.config.minimum_model_window_seconds:
+                run_limit_reached = True
+                self.progress.event(
+                    "build",
+                    "checkpointed",
+                    "Worker time budget reached; checkpointed for a later invocation",
+                    current=index - 1,
+                    total=len(selected_snapshots),
+                    remaining_seconds=round(self._remaining_run_seconds(), 3),
+                )
+                break
             if snapshot.source_version_id in existing_proposals:
                 proposal = existing_proposals[snapshot.source_version_id]
                 self.progress.event(
@@ -503,8 +577,21 @@ class OntologyBuilder:
                     proposal_id=proposal.id,
                 )
             else:
+                work_claim = self._acquire_work_claim(snapshot.source_version_id)
+                if work_claim is None:
+                    work_deferred = True
+                    self.progress.event(
+                        "extraction",
+                        "deferred",
+                        f"Another worker holds the claim for {snapshot.repository}",
+                        current=index,
+                        total=len(selected_snapshots),
+                        repository=snapshot.repository,
+                    )
+                    continue
                 receipt = self._parsed_receipt(snapshot)
                 if receipt is None:
+                    self._release_work_claim(snapshot.source_version_id, work_claim)
                     failures.append(f"{snapshot.repository}:missing-parsed-receipt")
                     self.progress.event(
                         "extraction",
@@ -516,6 +603,7 @@ class OntologyBuilder:
                     )
                     continue
                 if receipt["threat_observation_ids"]:
+                    self._release_work_claim(snapshot.source_version_id, work_claim)
                     tainted.append(snapshot.repository)
                     self.progress.event(
                         "extraction",
@@ -531,6 +619,7 @@ class OntologyBuilder:
                     validation_failures.get(snapshot.source_version_id, 0)
                     >= 2
                 ):
+                    self._release_work_claim(snapshot.source_version_id, work_claim)
                     failures.append(
                         f"{snapshot.repository}:output-schema-quarantined"
                     )
@@ -547,6 +636,7 @@ class OntologyBuilder:
                     )
                     continue
                 if model_failed:
+                    self._release_work_claim(snapshot.source_version_id, work_claim)
                     self.progress.event(
                         "extraction",
                         "deferred",
@@ -557,6 +647,14 @@ class OntologyBuilder:
                     )
                     continue
                 try:
+                    request_timeout = min(
+                        self.config.timeout_seconds,
+                        max(
+                            1.0,
+                            self._remaining_run_seconds()
+                            - self._finalization_reserve_seconds,
+                        ),
+                    )
                     self.progress.event(
                         "extraction",
                         "running",
@@ -569,7 +667,7 @@ class OntologyBuilder:
                         reasoning_effort=self.config.model_parameters.reasoning_effort,
                         thinking=self.config.model_parameters.thinking,
                         debug_reasoning=self.config.debug_reasoning,
-                        timeout_seconds=self.config.timeout_seconds,
+                        timeout_seconds=round(request_timeout, 3),
                     )
                     started = time.monotonic()
                     heartbeat_stop = threading.Event()
@@ -581,11 +679,16 @@ class OntologyBuilder:
                             index,
                             len(selected_snapshots),
                             started,
+                            request_timeout,
                         ),
                         daemon=True,
                     )
                     heartbeat.start()
-                    proposal = self._extract(snapshot, receipt["structural_derivation_id"])
+                    proposal = self._extract(
+                        snapshot,
+                        receipt["structural_derivation_id"],
+                        timeout_seconds=request_timeout,
+                    )
                 except Exception as error:
                     # A timeout may leave a non-streaming local server occupied. Never
                     # enqueue another request during this run.
@@ -627,6 +730,7 @@ class OntologyBuilder:
                         heartbeat_stop.set()
                         heartbeat.join(timeout=1)
                         del heartbeat_stop
+                    self._release_work_claim(snapshot.source_version_id, work_claim)
                 existing_proposals[snapshot.source_version_id] = proposal
                 self.progress.event(
                     "extraction",
@@ -721,16 +825,40 @@ class OntologyBuilder:
             }
         )
         self._save_state(state)
-        tainted_source_index_path = self._write_tainted_source_index(
-            self._snapshots()
-        )
-        self.progress.event("finalize", "running", "Auditing and rebuilding projections")
-        snapshot_path, database_path, topic_path, audit_clean = self._finalize()
+        remaining_source_ids = {
+            item.source_version_id
+            for item in selected_snapshots
+            if item.repository not in set(tainted)
+        } - set(existing_proposals)
+        work_remaining = len(remaining_source_ids)
+        snapshot_path: Path | None = None
+        database_path: Path | None = None
+        topic_path: Path | None = None
+        tainted_source_index_path: Path | None = None
+        audit_clean: bool | None = None
+        if not run_limit_reached and not work_deferred and work_remaining == 0:
+            finalization_lock_path = self.root / "ontology-finalization.lock"
+            with finalization_lock_path.open("a+b") as finalization_lock:
+                fcntl.flock(finalization_lock, fcntl.LOCK_EX)
+                tainted_source_index_path = self._write_tainted_source_index(
+                    self._snapshots()
+                )
+                self.progress.event(
+                    "finalize",
+                    "running",
+                    "Auditing and rebuilding projections",
+                )
+                snapshot_path, database_path, topic_path, audit_clean = (
+                    self._finalize()
+                )
+                fcntl.flock(finalization_lock, fcntl.LOCK_UN)
         state["completed"] = (
             not model_failed
             and not token_exhaustions
             and not failures
-            and audit_clean
+            and audit_clean is True
+            and not run_limit_reached
+            and work_remaining == 0
         )
         self._save_state(state)
         completed = bool(state["completed"])
@@ -740,12 +868,20 @@ class OntologyBuilder:
             (
                 "Ontology build completed"
                 if completed
-                else "Ontology build is incomplete and requires operator action"
+                else (
+                    "Worker checkpoint complete; invoke the same command to resume"
+                    if (run_limit_reached or work_deferred)
+                    and not model_failed
+                    and not token_exhaustions
+                    else "Ontology build is incomplete and requires operator action"
+                )
             ),
             proposal_count=len(set(proposals)),
             candidate_bundle_count=len(set(bundles)),
             failure_count=len(set(failures)),
             audit_clean=audit_clean,
+            run_limit_reached=run_limit_reached,
+            work_remaining=work_remaining,
         )
         return OntologyBuildReceipt(
             config_sha256=self.config_sha256,
@@ -763,17 +899,106 @@ class OntologyBuilder:
             token_limit_exhaustions=tuple(token_exhaustions),
             recommended_actions=tuple(
                 dict.fromkeys(
-                    action
-                    for item in token_exhaustions
-                    for action in item.recommendations
+                    [
+                        *(
+                            action
+                            for item in token_exhaustions
+                            for action in item.recommendations
+                        ),
+                        *(
+                            (
+                                "Run the same ontology-build command again to resume "
+                                "from immutable checkpoints.",
+                            )
+                            if run_limit_reached or work_deferred
+                            else ()
+                        ),
+                    ]
                 )
             ),
-            snapshot_path=str(snapshot_path),
-            projection_path=str(database_path),
-            topic_path=str(topic_path),
-            tainted_source_index_path=str(tainted_source_index_path),
+            snapshot_path=str(snapshot_path) if snapshot_path is not None else None,
+            projection_path=str(database_path) if database_path is not None else None,
+            topic_path=str(topic_path) if topic_path is not None else None,
+            tainted_source_index_path=(
+                str(tainted_source_index_path)
+                if tainted_source_index_path is not None
+                else None
+            ),
             audit_clean=audit_clean,
+            run_limit_reached=run_limit_reached,
+            resumable=(run_limit_reached or work_deferred)
+            and not model_failed
+            and not token_exhaustions,
+            work_remaining=work_remaining,
+            run_elapsed_seconds=self._run_elapsed_seconds(),
         )
+
+    def _run_elapsed_seconds(self) -> float:
+        if self._run_started_monotonic is None:
+            return 0.0
+        return round(time.monotonic() - self._run_started_monotonic, 3)
+
+    def _remaining_run_seconds(self) -> float:
+        return max(0.0, self.config.max_run_seconds - self._run_elapsed_seconds())
+
+    def _acquire_work_claim(self, source_version_id: str) -> str | None:
+        claim_root = self.root / "work-claims"
+        claim_root.mkdir(parents=True, exist_ok=True)
+        key = hashlib.sha256(source_version_id.encode()).hexdigest()
+        path = claim_root / f"{key}.json"
+        token = str(uuid4())
+        now = utc_now()
+        payload = {
+            "version": 1,
+            "source_version_id": source_version_id,
+            "token": token,
+            "pid": os.getpid(),
+            "hostname": socket.gethostname(),
+            "acquired_at": now.isoformat(),
+            "expires_at": datetime.fromtimestamp(
+                now.timestamp() + self.config.max_run_seconds + 60,
+                tz=now.tzinfo,
+            ).isoformat(),
+        }
+        rendered = json.dumps(payload, sort_keys=True).encode() + b"\n"
+        for _ in range(3):
+            try:
+                descriptor = os.open(
+                    path,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                )
+            except FileExistsError:
+                try:
+                    existing = json.loads(path.read_bytes())
+                    expires_at = datetime.fromisoformat(existing["expires_at"])
+                except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+                    return None
+                if expires_at >= utc_now():
+                    return None
+                stale = claim_root / f".{key}.stale.{uuid4()}.json"
+                try:
+                    os.replace(path, stale)
+                except FileNotFoundError:
+                    continue
+                continue
+            try:
+                os.write(descriptor, rendered)
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            return token
+        return None
+
+    def _release_work_claim(self, source_version_id: str, token: str) -> None:
+        key = hashlib.sha256(source_version_id.encode()).hexdigest()
+        path = self.root / "work-claims" / f"{key}.json"
+        try:
+            payload = json.loads(path.read_bytes())
+        except FileNotFoundError:
+            return
+        if payload.get("token") == token:
+            path.unlink(missing_ok=True)
 
     def _validate_inputs(self) -> None:
         for path in (
@@ -814,7 +1039,7 @@ class OntologyBuilder:
                     "use reasoning_effort=high"
                 )
         policy = ResearchPolicy.from_yaml(self.research_policy_path)
-        if not policy.provider("connector:mojeek").enabled:
+        if self.config.discovery_enabled and not policy.provider("connector:mojeek").enabled:
             raise ValueError("ontology build requires enabled Mojeek discovery")
 
     def _seed_paths(self) -> tuple[Path, ...]:
@@ -904,6 +1129,8 @@ class OntologyBuilder:
             )
 
     def _queries(self) -> tuple[str, ...]:
+        if not self.config.discovery_enabled:
+            return ()
         values = list(self.config.queries or (self.config.topic,))
         if self.config.include_gap_queries:
             gaps = sorted(
@@ -953,6 +1180,8 @@ class OntologyBuilder:
         self,
         snapshot: RepositorySnapshot,
         structural_derivation_id: str,
+        *,
+        timeout_seconds: float,
     ) -> ValidatedExtractionProposal:
         _, providers = load_provider_configs(self.providers_path)
         provider = providers[self.config.provider]
@@ -972,7 +1201,7 @@ class OntologyBuilder:
             self.config.provider,
             provider,
             gate=gate,
-            timeout=self.config.timeout_seconds,
+            timeout=timeout_seconds,
             parameters=self.config.model_parameters,
             connection_attempts=self.config.connection_attempts,
             connection_retry_seconds=self.config.connection_retry_seconds,
@@ -999,21 +1228,29 @@ class OntologyBuilder:
             self.store.put_record("usage-settlement", gate.last_settlement)
         return result.proposal
 
-    @staticmethod
-    def _extraction_question(repository: str) -> str:
+    def _extraction_question(self, repository: str) -> str:
+        criteria = (
+            "; ".join(self.config.scope_criteria)
+            if self.config.scope_criteria
+            else f"explicit relevance to {self.config.topic}"
+        )
+        facets = ", ".join(self.config.ontology_facets)
+        competency = (
+            " Competency questions: "
+            + "; ".join(self.config.competency_questions)
+            + "."
+            if self.config.competency_questions
+            else ""
+        )
         return (
-            f"Assess {repository} for the maintained ontology of open-source "
-            "research agents without presupposing that the repository is in scope. "
-            "The supplied source must explicitly support classification as one of: "
-            "(1) a research agent, (2) a framework or component explicitly intended "
-            "for research agents, (3) a benchmark or dataset explicitly evaluating "
-            "research agents, or (4) a curated catalog explicitly about research "
-            "agents. Repository names, search ranking, and this question are not "
-            "evidence. If none of those classifications is explicitly supported, "
+            f'Assess {repository} for the maintained ontology "{self.config.topic}" '
+            "without presupposing that the source is in scope. The supplied source "
+            f"must explicitly satisfy at least one scope criterion: {criteria}. "
+            "Source names, search ranking, configured topic text, and this question "
+            "are not evidence. If relevance is not explicitly supported, "
             "return empty concepts, claims, controversies, and gaps. If supported, "
-            "build reusable knowledge and extract only evidenced identity, scope, "
-            "architecture, retrieval, inputs, outputs, persistent state, local-model "
-            "support, licensing, security, evaluation, limitations, dissent, and gaps."
+            f"build reusable knowledge and extract only evidenced facets: {facets}."
+            f"{competency}"
         )
 
     def _model_heartbeat(
@@ -1023,6 +1260,7 @@ class OntologyBuilder:
         current: int,
         total: int,
         started: float,
+        timeout_seconds: float,
     ) -> None:
         while not stop.wait(30):
             elapsed = round(time.monotonic() - started, 1)
@@ -1034,7 +1272,7 @@ class OntologyBuilder:
                 total=total,
                 repository=snapshot.repository,
                 elapsed_seconds=elapsed,
-                timeout_seconds=self.config.timeout_seconds,
+                timeout_seconds=round(timeout_seconds, 3),
             )
 
     def _select_anchors(self, derivation_id: str) -> tuple[str, ...]:
@@ -1106,6 +1344,33 @@ class OntologyBuilder:
         return tuple(
             RepositorySnapshot.model_validate(value)
             for value in self.store.iter_records("repository-snapshot")
+        )
+
+    def _library_snapshots(
+        self,
+        snapshots: tuple[RepositorySnapshot, ...],
+    ) -> tuple[RepositorySnapshot, ...]:
+        snapshot_id = self.config.source_library_snapshot_id
+        if snapshot_id is None:
+            return snapshots
+        matches = [
+            value
+            for value in self.store.iter_records("source-library-snapshot")
+            if value.get("id") == snapshot_id
+        ]
+        if len(matches) != 1:
+            raise ValueError(
+                f"unknown or ambiguous source-library snapshot: {snapshot_id}"
+            )
+        original_ids = set(matches[0].get("source_version_ids", ()))
+        derived_ids = {
+            value["derived_source_version_id"]
+            for value in self.store.iter_records("text-derivation")
+            if value.get("original_source_version_id") in original_ids
+            and isinstance(value.get("derived_source_version_id"), str)
+        }
+        return tuple(
+            item for item in snapshots if item.source_version_id in derived_ids
         )
 
     def _rank_snapshots(
@@ -1185,23 +1450,13 @@ class OntologyBuilder:
         proposal: ValidatedExtractionProposal,
         request: ExtractionRequest,
         configured_model: str,
+        *,
+        expected_question: str | None = None,
     ) -> bool:
+        del configured_model
         return (
-            request.provider == self.config.provider
-            and request.model == configured_model
-            and request.max_output_tokens == self.config.max_output_tokens
-            and request.model_parameters == self.config.model_parameters
-            and request.debug_reasoning == self.config.debug_reasoning
-            and proposal.model == configured_model
-            and (
-                request.validator_version == proposal.validator_version
-                or (
-                    request.validator_version
-                    == "anchor-grounded-extraction-validator/1"
-                    and proposal.validator_version
-                    == "anchor-grounded-extraction-validator/2"
-                )
-            )
+            request.source_version_id == proposal.source_version_id
+            and (expected_question is None or request.question == expected_question)
             and proposal.validator_version
             in AnchorGroundedExtractionManager.compatible_proposal_versions
         )
@@ -1388,6 +1643,68 @@ class OntologyBuilder:
 
     def _save_state(self, state: dict[str, object]) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
-        temporary = self.state_path.with_suffix(f".{os.getpid()}.tmp")
-        temporary.write_bytes(json.dumps(state, indent=2, sort_keys=True).encode() + b"\n")
-        os.replace(temporary, self.state_path)
+        lock_path = self.root / "ontology-build-state.lock"
+        with lock_path.open("a+b") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            merged = dict(state)
+            if self.state_path.exists():
+                current = json.loads(self.state_path.read_bytes())
+                if (
+                    current.get("discovery_config_sha256")
+                    == state.get("discovery_config_sha256")
+                ):
+                    merged = self._merge_state(current, state)
+            temporary = self.state_path.with_suffix(f".{os.getpid()}.tmp")
+            temporary.write_bytes(
+                json.dumps(merged, indent=2, sort_keys=True).encode() + b"\n"
+            )
+            os.replace(temporary, self.state_path)
+            fcntl.flock(lock, fcntl.LOCK_UN)
+        state.clear()
+        state.update(merged)
+
+    @staticmethod
+    def _merge_state(
+        current: dict[str, object],
+        incoming: dict[str, object],
+    ) -> dict[str, object]:
+        merged = {**current, **incoming}
+        for field in (
+            "imported_bundles",
+            "queries_completed",
+            "proposals",
+            "candidate_bundles",
+            "skipped_tainted_sources",
+            "skipped_unlicensed_sources",
+        ):
+            merged[field] = sorted(
+                set(current.get(field, ())) | set(incoming.get(field, ()))
+            )
+        if current.get("config_sha256") == incoming.get("config_sha256"):
+            merged["failures"] = sorted(
+                set(current.get("failures", ()))
+                | set(incoming.get("failures", ()))
+            )
+            exhaustion_by_json = {
+                json.dumps(item, sort_keys=True): item
+                for item in (
+                    *current.get("token_limit_exhaustions", ()),
+                    *incoming.get("token_limit_exhaustions", ()),
+                )
+            }
+            merged["token_limit_exhaustions"] = [
+                exhaustion_by_json[key] for key in sorted(exhaustion_by_json)
+            ]
+        timestamps = {
+            **current.get("query_completed_at", {}),
+            **incoming.get("query_completed_at", {}),
+        }
+        for question in set(current.get("query_completed_at", {})) & set(
+            incoming.get("query_completed_at", {})
+        ):
+            timestamps[question] = max(
+                current["query_completed_at"][question],
+                incoming["query_completed_at"][question],
+            )
+        merged["query_completed_at"] = timestamps
+        return merged

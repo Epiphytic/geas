@@ -54,6 +54,8 @@ def test_shipped_build_config_keeps_serial_128k_capacity_without_coverage_caps()
     assert config.model_parallelism == 1
     assert config.max_output_tokens == 131_072
     assert config.timeout_seconds == 14_400
+    assert config.max_run_seconds == 1800
+    assert config.minimum_model_window_seconds == 300
     assert config.include_gap_queries
     assert config.max_queries is None
     assert config.max_sources is None
@@ -92,6 +94,20 @@ def test_general_ontology_default_is_64k() -> None:
         }
     )
     assert config.max_output_tokens == 65_536
+    assert config.max_run_seconds == 1800
+
+
+def test_ontology_worker_cannot_run_longer_than_thirty_minutes() -> None:
+    with pytest.raises(ValueError, match="less than or equal to 1800"):
+        OntologyBuildConfig.model_validate(
+            {
+                "version": 1,
+                "topic": "Test",
+                "topic_concept_id": "concept:test",
+                "output_directory": "ontology/test/generated",
+                "max_run_seconds": 1801,
+            }
+        )
 
 
 def test_max_reasoning_requires_384_kib_context() -> None:
@@ -152,7 +168,7 @@ def test_model_tuning_does_not_invalidate_discovery_checkpoint(tmp_path) -> None
     assert high.discovery_config_sha256 != changed_discovery.discovery_config_sha256
 
 
-def test_proposal_reuse_requires_model_and_validator_contract(tmp_path) -> None:
+def test_proposal_reuse_survives_model_and_effort_changes(tmp_path) -> None:
     builder = _builder(
         tmp_path,
         OntologyBuildConfig.model_validate(
@@ -165,6 +181,8 @@ def test_proposal_reuse_requires_model_and_validator_contract(tmp_path) -> None:
         ),
     )
     request = ExtractionRequest.model_construct(
+        source_version_id="source:test",
+        question="Original ontology scope",
         provider="deepseek_local",
         model="deepseek-v4-flash",
         max_output_tokens=65_536,
@@ -173,6 +191,7 @@ def test_proposal_reuse_requires_model_and_validator_contract(tmp_path) -> None:
         validator_version=AnchorGroundedExtractionManager.version,
     )
     proposal = ValidatedExtractionProposal.model_construct(
+        source_version_id="source:test",
         model="deepseek-v4-flash",
         validator_version=AnchorGroundedExtractionManager.version,
     )
@@ -206,23 +225,63 @@ def test_proposal_reuse_requires_model_and_validator_contract(tmp_path) -> None:
         ),
         "deepseek-v4-flash",
     )
-    assert not builder._proposal_is_compatible(
+    assert builder._proposal_is_compatible(
         proposal.model_copy(update={"model": "stale-model"}),
         request,
         "deepseek-v4-flash",
+    )
+    assert builder._proposal_is_compatible(
+        proposal,
+        request.model_copy(
+            update={
+                "provider": "frontier",
+                "model": "different-model",
+                "max_output_tokens": 8192,
+                "model_parameters": builder.config.model_parameters.model_copy(
+                    update={"reasoning_effort": "low"}
+                ),
+            }
+        ),
+        "different-model",
     )
     assert not builder._proposal_is_compatible(
         proposal.model_copy(update={"validator_version": "stale-contract"}),
         request,
         "deepseek-v4-flash",
     )
+    assert not builder._proposal_is_compatible(
+        proposal.model_copy(update={"source_version_id": "source:other"}),
+        request,
+        "deepseek-v4-flash",
+    )
+    assert not builder._proposal_is_compatible(
+        proposal,
+        request,
+        "deepseek-v4-flash",
+        expected_question="A changed ontology scope",
+    )
 
 
-def test_extraction_question_does_not_presuppose_repository_is_an_agent() -> None:
-    question = OntologyBuilder._extraction_question("Example/Repository")
+def test_extraction_question_does_not_presuppose_repository_is_an_agent(
+    tmp_path: Path,
+) -> None:
+    builder = _builder(
+        tmp_path,
+        OntologyBuildConfig.model_validate(
+            {
+                "version": 1,
+                "topic": "Research agents",
+                "topic_concept_id": "concept:research-agents",
+                "scope_criteria": ["a research agent", "a research-agent benchmark"],
+                "output_directory": "ontology/test/generated",
+            }
+        ),
+    )
+    question = builder._extraction_question("Example/Repository")
 
     assert "without presupposing" in question
-    assert "Repository names, search ranking, and this question are not evidence" in question
+    assert "Source names, search ranking" in question
+    assert "a research-agent benchmark" in question
     assert "return empty concepts, claims, controversies, and gaps" in question
 
 
@@ -257,6 +316,51 @@ def test_snapshot_ranking_keeps_only_latest_repository_revision(tmp_path) -> Non
     )
 
     assert builder._rank_snapshots((new, old)) == (new,)
+
+
+def test_ontology_view_can_select_an_immutable_source_library_snapshot(
+    tmp_path: Path,
+) -> None:
+    library_snapshot_id = "source-library-snapshot:sha256:" + "a" * 64
+    builder = _builder(
+        tmp_path,
+        OntologyBuildConfig.model_validate(
+            {
+                "version": 1,
+                "topic": "Network engineering",
+                "topic_concept_id": "concept:network-engineering",
+                "source_library_snapshot_id": library_snapshot_id,
+                "discovery_enabled": False,
+                "output_directory": "ontology/test/generated",
+            }
+        ),
+    )
+    builder.store.initialize()
+    builder.store.put_record(
+        "source-library-snapshot",
+        {
+            "id": library_snapshot_id,
+            "source_version_ids": ["source:original:included"],
+        },
+    )
+    builder.store.put_record(
+        "text-derivation",
+        {
+            "original_source_version_id": "source:original:included",
+            "derived_source_version_id": "source:derived:included",
+        },
+    )
+    included = RepositorySnapshot.model_construct(
+        id="repository-snapshot:included",
+        source_version_id="source:derived:included",
+    )
+    excluded = RepositorySnapshot.model_construct(
+        id="repository-snapshot:excluded",
+        source_version_id="source:derived:excluded",
+    )
+
+    assert builder._library_snapshots((included, excluded)) == (included,)
+    assert builder._queries() == ()
 
 
 def test_query_refresh_interval_is_deterministic(tmp_path) -> None:
@@ -378,6 +482,67 @@ def test_parallel_model_calls_are_rejected() -> None:
         OntologyBuildConfig.model_validate(value)
 
 
+def test_source_work_claims_prevent_duplicate_concurrent_extraction(
+    tmp_path: Path,
+) -> None:
+    builder = _builder(
+        tmp_path,
+        OntologyBuildConfig.model_validate(
+            {
+                "version": 1,
+                "topic": "Test",
+                "topic_concept_id": "concept:test",
+                "output_directory": "ontology/test/generated",
+            }
+        ),
+    )
+
+    first = builder._acquire_work_claim("source:test")
+    assert first is not None
+    assert builder._acquire_work_claim("source:test") is None
+    builder._release_work_claim("source:test", "not-the-owner")
+    assert builder._acquire_work_claim("source:test") is None
+    builder._release_work_claim("source:test", first)
+    second = builder._acquire_work_claim("source:test")
+    assert second is not None
+    builder._release_work_claim("source:test", second)
+
+
+def test_concurrent_worker_state_merge_preserves_distinct_completed_work() -> None:
+    base = {
+        "config_sha256": "a" * 64,
+        "discovery_config_sha256": "b" * 64,
+        "imported_bundles": [],
+        "queries_completed": [],
+        "query_completed_at": {},
+        "proposals": [],
+        "candidate_bundles": [],
+        "skipped_tainted_sources": [],
+        "skipped_unlicensed_sources": [],
+        "failures": [],
+        "token_limit_exhaustions": [],
+        "completed": False,
+    }
+    current = {
+        **base,
+        "queries_completed": ["query one"],
+        "query_completed_at": {"query one": "2026-08-04T10:00:00+00:00"},
+        "proposals": ["proposal:one"],
+    }
+    incoming = {
+        **base,
+        "queries_completed": ["query two"],
+        "query_completed_at": {"query two": "2026-08-04T10:01:00+00:00"},
+        "proposals": ["proposal:two"],
+    }
+
+    merged = OntologyBuilder._merge_state(current, incoming)
+
+    assert merged["queries_completed"] == ["query one", "query two"]
+    assert merged["proposals"] == ["proposal:one", "proposal:two"]
+    assert set(merged["query_completed_at"]) == {"query one", "query two"}
+
+
 def test_documented_check_command_is_executable(tmp_path) -> None:
     result = subprocess.run(
         (
@@ -480,6 +645,20 @@ def test_cli_rejects_incomplete_build_with_non_token_failures() -> None:
     )
 
     assert _ontology_build_exit_code(receipt) == 2
+
+
+def test_cli_treats_clean_worker_checkpoint_as_success(capsys) -> None:
+    receipt = OntologyBuildReceipt(
+        config_sha256="a" * 64,
+        checked_only=False,
+        completed=False,
+        run_limit_reached=True,
+        resumable=True,
+        work_remaining=4,
+    )
+
+    assert _ontology_build_exit_code(receipt) == 0
+    assert "4 source(s) remaining" in capsys.readouterr().err
 
 
 def test_tainted_source_index_excludes_hostile_payload_text(tmp_path) -> None:

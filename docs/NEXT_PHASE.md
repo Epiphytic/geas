@@ -338,6 +338,8 @@ that format without changing canonical records.
 - [x] Add identifier, reference, exact-resolution, and source-provenance tables.
 - [x] Add exact identifier traversal and topic-scoped citation views.
 - [x] Generate topic, controversy, provenance, threat, and gap pages.
+- [x] Add ontology-independent source-library snapshots, FTS5 search, and
+  bounded exact agent-context packages.
 - Add optional Semble indexing over generated pages.
 
 **Acceptance:** an independent agent answers the competency questions using only
@@ -380,6 +382,11 @@ improve coverage.
   evidence, and lossless rendering before accepting records.
 - [x] Keep repository approval and automatic-merge rules out of ontology
   semantics.
+- [x] Bound resumable ontology workers to 30 minutes, claim source work
+  atomically, and reuse validator-compatible proposals across model settings.
+- [x] Move topic scope, facets, and competency questions into ontology-local
+  configuration and allow repository ontology views over a source-library
+  snapshot.
 - [ ] Add conflict analysis against already accepted claims.
 - [ ] Connect reviewed gap records to bounded extraction tasks.
 

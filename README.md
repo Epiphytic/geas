@@ -7,6 +7,9 @@ regenerated report.
 
 To build or resume an ontology from one configuration, see the
 [executable ontology quick start](docs/QUICKSTART_ONTOLOGY.md).
+Reusable ontology-independent source collections and bounded agent context
+retrieval are documented in
+[source libraries](docs/SOURCE_LIBRARIES.md).
 
 This repository provides the deterministic control plane, offline acquisition,
 open scholarly discovery, and a persistent SQLite knowledge-query vertical
@@ -16,6 +19,8 @@ slice:
 - strict records for query plans, discovery, acquisition, access constraints,
   and coverage;
 - an immutable, content-addressed local store;
+- ontology-independent source-library manifests, snapshots, deterministic
+  search, and bounded exact agent-context packages;
 - a deterministic source-policy engine loaded from validated YAML;
 - fixed workflow transitions that models cannot authorize;
 - connector capability manifests and narrow discovery/acquisition contracts;
@@ -43,6 +48,8 @@ slice:
 - proposal-only local DeepSeek extraction grounded in operator-selected exact
   anchors, with deterministic schema, scope, hierarchy, and quote validation;
 - an executable maintained ontology of open-source research agents;
+- resumable ontology workers capped at 30 minutes per invocation, with
+  source-level work claims and cross-model proposal reuse;
 - a tool-free client for local DeepSeek and optional external providers;
 - a starter LinkML ontology and a maintained upstream intelligence registry;
 - tests for the principal prompt-injection security invariants.
