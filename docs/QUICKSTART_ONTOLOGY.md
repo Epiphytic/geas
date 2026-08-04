@@ -30,11 +30,11 @@ queries, searches Mojeek, resolves supported GitHub results through the
 official API at immutable commits, parses and threat-scans source text,
 selects anchors deterministically, and sends one tool-free extraction request
 at a time to the configured model. It validates every proposed quote against
-the source range before writing a candidate bundle. Finally it imports the
-review-only candidate, runs the deterministic audit, captures canonical truth,
-rebuilds SQLite, and exports an agent-readable topic view. Generated candidates
-are not imported into accepted knowledge before their patch, PR, or MR is
-approved through the repository workflow.
+the source range before writing a repository-namespaced candidate bundle. It
+then runs the deterministic audit, captures canonical truth, rebuilds SQLite,
+and exports an agent-readable topic view from the bundles already accepted in
+Git `HEAD`. Generated candidates are not imported into accepted knowledge
+before their patch, PR, or MR is approved through the repository workflow.
 
 The command checkpoints at
 `data/open-source-research-agents/ontology-build-state.json`. Re-running the
@@ -64,6 +64,10 @@ Review these outputs:
 - `ontology/open-source-research-agents/generated/*/bundle.yaml` contains
   reviewable ontology proposals and exact evidence ranges. Merging them through
   the repository's normal patch, PR, or MR workflow makes them canonical.
+- `ontology/open-source-research-agents/tainted-sources.yaml` is the
+  deterministic poisoned-source index. It contains immutable source identity,
+  threat classifications, detector identity, and evidence-fragment IDs, but
+  never copies the hostile payload or attempted instruction.
 - `data/open-source-research-agents/topic.md` is the complete agent-readable
   projection.
 - `data/open-source-research-agents/query.sqlite` is disposable and searchable.
@@ -84,6 +88,11 @@ the repository promotion workflow tracks/approves them. The configured
 `seed_bundle_globs` resolve files from `HEAD` only, so a post-merge rerun imports
 approved generated bundles while ignoring uncommitted candidates. SQLite is
 always a discardable projection and never writes back into the ontology.
+Consequently, promotion is an explicit two-pass workflow: run the builder to
+produce candidates, review and commit/merge those candidates, then run the same
+command again to import the now-canonical bundles and rebuild the final
+projection. The second pass reuses compatible extraction proposals and does not
+repeat those model calls.
 
 Search the completed ontology deterministically:
 
@@ -99,6 +108,11 @@ queries, seed bundles, and output directory, then use a fresh `--root`.
 Defaults deliberately keep model concurrency at one and output capacity at
 64K tokens. The maintained open-source-research-agents ontology explicitly
 uses 128K and approves discovery above the conservative 50-result threshold.
+Its 200-result/five-page Mojeek boundary comes from the connector manifest, not
+an ontology item cap. Repository acquisition is processed in bounded,
+resumable batches because each candidate requires several official GitHub API
+requests; additional queries and later gap-filling passes can continue
+expanding the ontology without a semantic source ceiling.
 Token ceilings are configured per ontology; the builder refuses a
 provider that cannot satisfy the requested ceiling. If a model exhausts the
 ceiling, the CLI marks the build incomplete, exits non-zero, and tells the
