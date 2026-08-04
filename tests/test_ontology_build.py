@@ -538,11 +538,22 @@ def test_tainted_source_index_excludes_hostile_payload_text(tmp_path) -> None:
         observed_at=datetime(2026, 8, 4, tzinfo=UTC),
     )
 
-    relative = builder._write_tainted_source_index((snapshot,))
+    clean_newer = snapshot.model_copy(
+        update={
+            "id": "repository-snapshot:clean-newer",
+            "commit_sha": "d" * 40,
+            "source_version_id": "source:clean-newer",
+            "source_content_sha256": "e" * 64,
+            "observed_at": datetime(2026, 8, 5, tzinfo=UTC),
+        }
+    )
+    relative = builder._write_tainted_source_index((clean_newer, snapshot))
     rendered = (tmp_path / relative).read_text()
     parsed = yaml.safe_load(rendered)
 
     assert parsed["entries"][0]["repository"] == "Example/Tainted"
+    assert parsed["entries"][0]["commit_sha"] == "a" * 40
+    assert len(parsed["entries"]) == 1
     assert parsed["entries"][0]["observations"][0]["detector_kind"] == (
         "deterministic_rule"
     )

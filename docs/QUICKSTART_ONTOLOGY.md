@@ -83,7 +83,9 @@ Review these outputs:
 - `ontology/open-source-research-agents/tainted-sources.yaml` is the
   deterministic poisoned-source index. It contains immutable source identity,
   threat classifications, detector identity, and evidence-fragment IDs, but
-  never copies the hostile payload or attempted instruction.
+  never copies the hostile payload or attempted instruction. Entries are
+  version-specific and remain in the index when a later repository revision is
+  clean.
 - `data/open-source-research-agents/topic.md` is the complete agent-readable
   projection.
 - `data/open-source-research-agents/query.sqlite` is disposable and searchable.

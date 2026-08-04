@@ -722,7 +722,7 @@ class OntologyBuilder:
         )
         self._save_state(state)
         tainted_source_index_path = self._write_tainted_source_index(
-            selected_snapshots
+            self._snapshots()
         )
         self.progress.event("finalize", "running", "Auditing and rebuilding projections")
         snapshot_path, database_path, topic_path, audit_clean = self._finalize()
@@ -1295,7 +1295,16 @@ class OntologyBuilder:
                 ),
                 default=None,
             ),
-            entries=tuple(sorted(entries, key=lambda item: item.repository.casefold())),
+            entries=tuple(
+                sorted(
+                    entries,
+                    key=lambda item: (
+                        item.repository.casefold(),
+                        item.commit_sha,
+                        item.source_version_id,
+                    ),
+                )
+            ),
         )
         relative = (
             self.config.tainted_source_index
