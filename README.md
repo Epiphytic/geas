@@ -250,6 +250,7 @@ demo_root=$(mktemp -d /tmp/research-agent-demo.XXXXXX)
 See [docs/CITATION_GRAPH.md](docs/CITATION_GRAPH.md),
 [docs/MAINTAINED_ONTOLOGIES.md](docs/MAINTAINED_ONTOLOGIES.md),
 [docs/MODEL_EXTRACTION.md](docs/MODEL_EXTRACTION.md),
+[docs/PROMOTIONS.md](docs/PROMOTIONS.md),
 [docs/PARSING.md](docs/PARSING.md) and
 [docs/STRUCTURAL_DERIVATIONS.md](docs/STRUCTURAL_DERIVATIONS.md).
 

@@ -396,7 +396,8 @@ evidence-selector, and model-assisted proposal work.
 
 ## 17. Model-proposal review and promotion
 
-**Status:** operator decision required; promotion is not implemented.
+**Status:** accepted — provider-neutral Git proposal; repository approval policy
+is out of scope.
 
 ### Context
 
@@ -405,19 +406,26 @@ exact-evidence extraction proposals. Deterministic validation proves structural
 integrity and evidence addressability, not truth. Every proposal is therefore
 fixed to `review_state: proposed` and `commit_authority: none_proposal_only`.
 
-### Options
+### Decision
 
-- Require an authenticated, single-proposal review receipt bound to the
-  proposal, source, evidence, ontology snapshot, and resulting record hashes.
-  This is the recommended initial CLI boundary because each accepted patch is
-  independently attributable and replay-resistant.
-- Accept a reviewed batch manifest containing several proposal IDs and one
-  common ontology snapshot. This is more efficient for curation but increases
-  review scope and partial-failure complexity.
-- Permit automatic promotion after deterministic validation. This removes the
-  human bottleneck but would confuse schema/evidence validity with factual
-  acceptance and is not recommended for the initial system.
+Each promotion is an ordinary, single-proposal Git change. It can be submitted
+as a Radicle patch, GitHub pull request, GitLab merge request, or another
+mechanism that transports Git commits. The provider is not an authority in the
+ontology:
 
-The choice also needs to establish whether a reviewer may edit a proposal
-during promotion or must reject it and submit a separately attributable
-replacement.
+- opening, approving, labelling, or otherwise changing a forge review object
+  never promotes knowledge;
+- the deterministic verifier reads the manifest bytes from the configured
+  canonical local Git branch, confirms the staging base is its ancestor, and
+  revalidates the immutable proposal, source, structural anchors, exact ranges,
+  hashes, and lossless accepted-record rendering;
+- semantic edits require a new attributable extraction proposal. A merge cannot
+  turn changed model content into accepted content merely by changing hashes;
+- only after verification may the deterministic importer materialize accepted
+  immutable records. The SQLite query database remains a disposable projection;
+- branch protection, delegate rules, required reviewers, CI, automatic merge,
+  and all other repository approval policy are explicitly out of scope. They
+  govern how a commit reaches the canonical branch, not ontology semantics.
+
+The first version deliberately promotes one proposal per manifest. Batching can
+be added later without changing the authority boundary.

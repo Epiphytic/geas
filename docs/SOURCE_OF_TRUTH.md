@@ -31,6 +31,14 @@ quarantined proposal. Its `review_state` is fixed to `proposed`, its commit
 authority is `none_proposal_only`, and SQLite proposal search cannot promote it
 into accepted knowledge.
 
+A version-controlled promotion manifest is the sole bridge from such a
+proposal to accepted records. It has authority only when its exact bytes are
+read from its declared canonical local Git branch and pass deterministic
+verification. GitHub pull requests, GitLab merge requests, Radicle patches,
+reviews, and repository automation are transport and governance layers; their
+API state is not read as ontology truth. See
+[`PROMOTIONS.md`](PROMOTIONS.md).
+
 ### Operational ledger exception
 
 “SQLite is disposable” applies to ontology/query projections. The separate

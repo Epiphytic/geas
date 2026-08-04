@@ -43,6 +43,7 @@ record_schema_paths:
   - src/research_agent/bundles.py
   - src/research_agent/audit.py
   - src/research_agent/extraction.py
+  - src/research_agent/promotion.py
   - src/research_agent/remote_acquisition.py
 
 # These roots are relative to the selected immutable store root.
