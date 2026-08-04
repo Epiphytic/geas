@@ -93,6 +93,8 @@ class OntologyBuildConfig(StrictModel):
     model_parameters: ModelParameters = Field(default_factory=ModelParameters)
     debug_reasoning: bool = True
     timeout_seconds: float = Field(default=3600.0, ge=1.0, le=86_400.0)
+    connection_attempts: int = Field(default=10, ge=1, le=20)
+    connection_retry_seconds: float = Field(default=2.0, ge=0.0, le=30.0)
     anchors_per_batch: int = Field(default=200, ge=1, le=200)
     max_batches_per_source: int | None = Field(default=None, ge=1, le=500)
     max_sources: int | None = Field(default=None, ge=1, le=10_000)
@@ -303,6 +305,8 @@ class OntologyBuilder:
                 "model_parameters",
                 "debug_reasoning",
                 "timeout_seconds",
+                "connection_attempts",
+                "connection_retry_seconds",
                 "anchors_per_batch",
                 "max_batches_per_source",
                 "max_sources",
@@ -939,6 +943,8 @@ class OntologyBuilder:
             gate=gate,
             timeout=self.config.timeout_seconds,
             parameters=self.config.model_parameters,
+            connection_attempts=self.config.connection_attempts,
+            connection_retry_seconds=self.config.connection_retry_seconds,
         )
         anchors = self._select_anchors(structural_derivation_id)
         result = AnchorGroundedExtractionManager(

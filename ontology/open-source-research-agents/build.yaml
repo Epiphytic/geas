@@ -24,6 +24,8 @@ model_parameters:
   seed: 0
 debug_reasoning: true
 timeout_seconds: 14400
+connection_attempts: 10
+connection_retry_seconds: 2
 model_parallelism: 1
 output_directory: ontology/open-source-research-agents/generated
 tainted_source_index: ontology/open-source-research-agents/tainted-sources.yaml

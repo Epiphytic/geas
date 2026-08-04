@@ -23,6 +23,7 @@ from research_agent.knowledge import (
     KnowledgeImporter,
     KnowledgePack,
 )
+from research_agent.models import SourceVersion
 from research_agent.parsing import ParsedDocumentManager
 from research_agent.planning import (
     ConceptVocabulary,
@@ -64,6 +65,46 @@ class _EuropePmcFixtureTransport:
 class _UnpaywallFixtureTransport:
     def request(self, doi: str) -> bytes:
         return Path("tests/fixtures/unpaywall/doi.json").read_bytes()
+
+
+def test_projection_deduplicates_content_identical_source_acquisitions(
+    tmp_path: Path,
+) -> None:
+    store = ImmutableStore(tmp_path / "data")
+    store.initialize()
+    official = SourceVersion.from_bytes(
+        source_uri="https://raw.githubusercontent.com/example/research/commit/README.md",
+        content=b"same immutable source",
+        media_type="text/markdown",
+        connector_id="connector:github-repository",
+        acquired_at=INSTANT,
+        license="MIT",
+    )
+    maintained = official.model_copy(
+        update={
+            "source_uri": "bundle:example-research/sources/readme.md",
+            "connector_id": "connector:maintained-bundle",
+        }
+    )
+    store.put_record("source-version", official)
+    store.put_record("source-version", maintained)
+
+    sources = SQLiteKnowledgeProjection(
+        store=store,
+        workspace_root=Path("."),
+    )._sources()
+
+    assert sources == (official,)
+
+    store.put_record(
+        "source-version",
+        official.model_copy(update={"content_sha256": "f" * 64}),
+    )
+    with pytest.raises(ValueError, match="conflicting canonical source"):
+        SQLiteKnowledgeProjection(
+            store=store,
+            workspace_root=Path("."),
+        )._sources()
 
 
 def _researched_store(tmp_path: Path) -> tuple[ImmutableStore, object]:

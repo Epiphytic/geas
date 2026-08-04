@@ -141,6 +141,8 @@ model_parameters:
   stop: []
 debug_reasoning: true
 timeout_seconds: 14400
+connection_attempts: 10        # retries connection refusal only
+connection_retry_seconds: 2
 ```
 
 The provider separately declares `context_window_tokens`. For DwarfStar,

@@ -61,6 +61,8 @@ def test_shipped_build_config_keeps_serial_128k_capacity_without_coverage_caps()
     assert config.approve_large_queries is True
     assert config.model_parameters.reasoning_effort == "high"
     assert config.debug_reasoning is True
+    assert config.connection_attempts == 10
+    assert config.connection_retry_seconds == 2
 
 
 def test_shipped_reasoning_decision_is_backed_by_recorded_metrics() -> None:
