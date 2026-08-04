@@ -63,6 +63,7 @@ def test_shipped_build_config_keeps_serial_128k_capacity_without_coverage_caps()
     assert config.debug_reasoning is True
     assert config.connection_attempts == 10
     assert config.connection_retry_seconds == 2
+    assert config.refresh_after_hours == 168
 
 
 def test_shipped_reasoning_decision_is_backed_by_recorded_metrics() -> None:
@@ -223,6 +224,65 @@ def test_extraction_question_does_not_presuppose_repository_is_an_agent() -> Non
     assert "without presupposing" in question
     assert "Repository names, search ranking, and this question are not evidence" in question
     assert "return empty concepts, claims, controversies, and gaps" in question
+
+
+def test_snapshot_ranking_keeps_only_latest_repository_revision(tmp_path) -> None:
+    builder = _builder(
+        tmp_path,
+        OntologyBuildConfig.model_validate(
+            {
+                "version": 1,
+                "topic": "Research agents",
+                "topic_concept_id": "concept:research-agents",
+                "output_directory": "ontology/test/generated",
+            }
+        ),
+    )
+    old = RepositorySnapshot.model_construct(
+        id="repository-snapshot:old",
+        repository="Example/Research",
+        canonical_locator="https://github.com/Example/Research",
+        commit_sha="a" * 40,
+        observed_at=datetime(2026, 8, 3, tzinfo=UTC),
+        description="Research agent",
+        archived=False,
+        fork=False,
+    )
+    new = old.model_copy(
+        update={
+            "id": "repository-snapshot:new",
+            "commit_sha": "b" * 40,
+            "observed_at": datetime(2026, 8, 4, tzinfo=UTC),
+        }
+    )
+
+    assert builder._rank_snapshots((new, old)) == (new,)
+
+
+def test_query_refresh_interval_is_deterministic(tmp_path) -> None:
+    builder = _builder(
+        tmp_path,
+        OntologyBuildConfig.model_validate(
+            {
+                "version": 1,
+                "topic": "Research agents",
+                "topic_concept_id": "concept:research-agents",
+                "output_directory": "ontology/test/generated",
+                "refresh_after_hours": 168,
+            }
+        ),
+    )
+    now = datetime(2026, 8, 4, tzinfo=UTC)
+
+    assert not builder._query_refresh_due(None, now=now)
+    assert not builder._query_refresh_due(
+        datetime(2026, 7, 29, tzinfo=UTC).isoformat(),
+        now=now,
+    )
+    assert builder._query_refresh_due(
+        datetime(2026, 7, 28, tzinfo=UTC).isoformat(),
+        now=now,
+    )
 
 
 def test_seed_globs_only_resolve_git_tracked_promoted_bundles(tmp_path) -> None:

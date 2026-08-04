@@ -84,6 +84,7 @@ class OntologyBuildConfig(StrictModel):
     seed_bundle_globs: tuple[str, ...] = ()
     queries: tuple[str, ...] = ()
     include_gap_queries: bool = True
+    refresh_after_hours: int | None = Field(default=168, ge=1, le=87_600)
     max_queries: int | None = Field(default=None, ge=1, le=10_000)
     result_limit: int = Field(default=30, ge=1, le=200)
     approve_large_queries: bool = False
@@ -286,6 +287,7 @@ class OntologyBuilder:
         budget_policy_path: Path,
         truth_policy_path: Path,
         vocabulary_path: Path,
+        force_refresh: bool = False,
     ) -> None:
         self.config = config
         self.root = root.resolve()
@@ -296,6 +298,7 @@ class OntologyBuilder:
         self.budget_policy_path = budget_policy_path
         self.truth_policy_path = truth_policy_path
         self.vocabulary_path = vocabulary_path
+        self.force_refresh = force_refresh
         self.store = ImmutableStore(self.root)
         self.config_sha256 = hashlib.sha256(canonical_json(config)).hexdigest()
         discovery_fields = config.model_dump(
@@ -307,6 +310,7 @@ class OntologyBuilder:
                 "timeout_seconds",
                 "connection_attempts",
                 "connection_retry_seconds",
+                "refresh_after_hours",
                 "anchors_per_batch",
                 "max_batches_per_source",
                 "max_sources",
@@ -378,11 +382,24 @@ class OntologyBuilder:
         snapshots = self._snapshots()
         acquired_by_source = {item.source_version_id: item for item in snapshots}
         known_locators = {item.canonical_locator.casefold() for item in snapshots}
+        refreshed_locators: set[str] = set()
         research_policy = ResearchPolicy.from_yaml(self.research_policy_path)
         provider_policy = research_policy.provider("connector:mojeek")
         connector = MojeekDiscoveryConnector()
         for index, question in enumerate(query_strings, start=1):
-            if question in state["queries_completed"]:
+            now = utc_now()
+            completed = question in state["queries_completed"]
+            completed_at = state["query_completed_at"].get(question)
+            refresh_due = completed and self._query_refresh_due(
+                completed_at,
+                now=now,
+            )
+            if completed and completed_at is None:
+                # Migrate legacy checkpoints without unexpectedly repeating
+                # external calls during an upgrade.
+                state["query_completed_at"][question] = now.isoformat()
+                self._save_state(state)
+            if completed and not self.force_refresh and not refresh_due:
                 self.progress.event(
                     "discovery",
                     "resumed",
@@ -392,6 +409,7 @@ class OntologyBuilder:
                     query=question,
                 )
                 continue
+            refreshing = completed and (self.force_refresh or refresh_due)
             self.progress.event(
                 "discovery",
                 "running",
@@ -407,20 +425,29 @@ class OntologyBuilder:
                 connector,
             )
             self.store.put_record("discovery-run", execution.discovery_run)
-            novel_hits = tuple(
+            eligible_hits = tuple(
                 hit
                 for hit in execution.hits
-                if hit.canonical_locator.casefold() not in known_locators
+                if hit.canonical_locator.casefold() not in refreshed_locators
+                and (
+                    refreshing
+                    or hit.canonical_locator.casefold() not in known_locators
+                )
+            )
+            refreshed_locators.update(
+                hit.canonical_locator.casefold() for hit in eligible_hits
             )
             receipt = GitHubDiscoveryAcquirer(store=self.store).acquire_hits(
-                novel_hits,
+                eligible_hits,
                 discovery_label=f"ontology-build:{self.config_sha256}:{question}",
                 limit=self.config.repository_limit_per_query,
             )
             for item in receipt.acquired:
                 known_locators.add(item.snapshot.canonical_locator.casefold())
                 acquired_by_source[item.snapshot.source_version_id] = item.snapshot
-            state["queries_completed"].append(question)
+            if question not in state["queries_completed"]:
+                state["queries_completed"].append(question)
+            state["query_completed_at"][question] = utc_now().isoformat()
             self._save_state(state)
             self.progress.event(
                 "discovery",
@@ -1085,6 +1112,20 @@ class OntologyBuilder:
         self,
         snapshots: tuple[RepositorySnapshot, ...],
     ) -> tuple[RepositorySnapshot, ...]:
+        latest_by_repository: dict[str, RepositorySnapshot] = {}
+        for item in snapshots:
+            key = item.canonical_locator.casefold()
+            existing = latest_by_repository.get(key)
+            if existing is None or (
+                item.observed_at,
+                item.commit_sha,
+                item.id,
+            ) > (
+                existing.observed_at,
+                existing.commit_sha,
+                existing.id,
+            ):
+                latest_by_repository[key] = item
         topic_terms = {
             item.casefold()
             for item in self._words.findall(
@@ -1104,7 +1145,20 @@ class OntologyBuilder:
             relevance -= 3 if item.fork else 0
             return (-relevance, item.repository.casefold(), item.commit_sha)
 
-        return tuple(sorted(snapshots, key=score))
+        return tuple(sorted(latest_by_repository.values(), key=score))
+
+    def _query_refresh_due(
+        self,
+        completed_at: str | None,
+        *,
+        now: datetime,
+    ) -> bool:
+        if completed_at is None or self.config.refresh_after_hours is None:
+            return False
+        age_seconds = (
+            now - datetime.fromisoformat(completed_at)
+        ).total_seconds()
+        return age_seconds >= self.config.refresh_after_hours * 3600
 
     def _validation_failure_counts(self) -> dict[str, int]:
         requests = {
@@ -1299,6 +1353,7 @@ class OntologyBuilder:
                 "discovery_config_sha256": self.discovery_config_sha256,
                 "imported_bundles": [],
                 "queries_completed": [],
+                "query_completed_at": {},
                 "proposals": [],
                 "candidate_bundles": [],
                 "skipped_tainted_sources": [],
@@ -1319,6 +1374,7 @@ class OntologyBuilder:
             value["token_limit_exhaustions"] = []
             value["completed"] = False
         value.setdefault("discovery_config_sha256", self.discovery_config_sha256)
+        value.setdefault("query_completed_at", {})
         return value
 
     def _save_state(self, state: dict[str, object]) -> None:

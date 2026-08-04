@@ -25,6 +25,20 @@ uv run research-agent --env-file .env ontology-build \
   --root data/open-source-research-agents
 ```
 
+To deliberately refresh completed searches and re-resolve already known
+repositories at their current official commits:
+
+```bash
+uv run research-agent --env-file .env ontology-build \
+  ontology/open-source-research-agents/build.yaml \
+  --root data/open-source-research-agents \
+  --refresh
+```
+
+Without the flag, `refresh_after_hours` controls scheduled refresh. Each known
+repository is refreshed at most once per run, and only its latest immutable
+snapshot is selected for extraction.
+
 That one command imports the seed ontology, turns its open gaps into search
 queries, searches Mojeek, resolves supported GitHub results through the
 official API at immutable commits, parses and threat-scans source text,

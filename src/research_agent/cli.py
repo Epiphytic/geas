@@ -346,6 +346,11 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="validate configuration and local dependencies without network or model calls",
     )
+    ontology_build.add_argument(
+        "--refresh",
+        action="store_true",
+        help="refresh completed discovery queries and known repository snapshots",
+    )
 
     crossref = subparsers.add_parser(
         "discover-crossref",
@@ -1044,6 +1049,7 @@ def main() -> None:
             budget_policy_path=args.budget_policy,
             truth_policy_path=args.truth_policy,
             vocabulary_path=args.vocabulary,
+            force_refresh=args.refresh,
         )
         receipt = builder.check() if args.check else builder.run()
         _json(receipt)
