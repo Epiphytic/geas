@@ -215,6 +215,8 @@ class TruthManager:
         if not ontology_paths:
             raise ValueError("truth policy did not resolve any canonical ontology files")
         for path in sorted(ontology_paths):
+            if self.policy.ontology_git_tracking == "required":
+                self._assert_matches_git_head(path)
             artifacts.append(self._file_artifact(path, ArtifactRole.ONTOLOGY, "workspace"))
         for relative in self.policy.operational_policy_paths:
             path = self.workspace_root / relative
@@ -267,6 +269,29 @@ class TruthManager:
             for item in result.stdout.split(b"\0")
             if item
         )
+
+    def _assert_matches_git_head(self, path: Path) -> None:
+        relative = path.relative_to(self.workspace_root).as_posix()
+        result = subprocess.run(
+            (
+                "git",
+                "-C",
+                str(self.workspace_root),
+                "cat-file",
+                "blob",
+                f"HEAD:{relative}",
+            ),
+            check=False,
+            capture_output=True,
+        )
+        if (
+            result.returncode != 0
+            or path.is_symlink()
+            or path.read_bytes() != result.stdout
+        ):
+            raise ValueError(
+                f"Git-tracked canonical ontology differs from HEAD: {relative}"
+            )
 
     def _file_artifact(
         self,

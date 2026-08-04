@@ -127,6 +127,12 @@ def test_required_git_tracking_excludes_unreviewed_ontology_candidates(
     assert "workspace:ontology/knowledge.yaml" in locators
     assert "workspace:ontology/generated/candidate.yaml" not in locators
 
+    (workspace / "ontology" / "knowledge.yaml").write_text(
+        "concepts:\n  - dirty-unreviewed-change\n"
+    )
+    with pytest.raises(ValueError, match="differs from HEAD"):
+        manager.capture(created_by="operator:test")
+
 
 def test_new_immutable_record_is_detected_as_added_truth(tmp_path: Path) -> None:
     workspace, store = _workspace(tmp_path)
