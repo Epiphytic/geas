@@ -341,8 +341,10 @@ class OntologyBuilder:
         unlicensed = list(state.get("skipped_unlicensed_sources", []))
 
         seed_paths = self._seed_paths()
-        for path in seed_paths:
-            self._assert_seed_matches_head(path)
+        truth_policy = TruthPolicy.from_yaml(self.truth_policy_path)
+        if truth_policy.ontology_git_tracking == "required":
+            for path in seed_paths:
+                self._assert_seed_matches_head(path)
         for index, path in enumerate(seed_paths, start=1):
             key = str(path)
             if key not in state["imported_bundles"]:
@@ -857,7 +859,11 @@ class OntologyBuilder:
                 f"canonical ontology path is absent from Git HEAD: {relative}"
             )
         path = self.workspace / relative
-        if path.is_symlink() or path.read_bytes() != result.stdout:
+        try:
+            differs = path.is_symlink() or path.read_bytes() != result.stdout
+        except OSError:
+            differs = True
+        if differs:
             raise ValueError(
                 f"canonical ontology path differs from Git HEAD: {relative}"
             )

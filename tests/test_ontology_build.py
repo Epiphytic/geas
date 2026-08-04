@@ -249,6 +249,11 @@ def test_seed_globs_only_resolve_git_tracked_promoted_bundles(tmp_path) -> None:
         builder._assert_path_matches_head(
             Path("ontology/topic/generated/tracked/bundle.yaml")
         )
+    tracked.unlink()
+    with pytest.raises(ValueError, match="differs from Git HEAD"):
+        builder._assert_path_matches_head(
+            Path("ontology/topic/generated/tracked/bundle.yaml")
+        )
     with pytest.raises(ValueError, match="absent from Git HEAD"):
         builder._assert_path_matches_head(
             Path("ontology/topic/generated/untracked/bundle.yaml")
