@@ -9,6 +9,7 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Literal
 from uuid import uuid4
@@ -51,7 +52,13 @@ from research_agent.model_policy import (
     ModelUseGate,
     ModelUsePolicy,
 )
-from research_agent.models import ModelParameters, StrictModel, canonical_json, utc_now
+from research_agent.models import (
+    ModelParameters,
+    StrictModel,
+    ThreatObservation,
+    canonical_json,
+    utc_now,
+)
 from research_agent.operator_policy import ResearchPolicy
 from research_agent.planning import (
     ConceptVocabulary,
@@ -91,10 +98,13 @@ class OntologyBuildConfig(StrictModel):
     max_sources: int | None = Field(default=None, ge=1, le=10_000)
     model_parallelism: int = Field(default=1, ge=1, le=1)
     output_directory: Path
+    tainted_source_index: Path | None = None
 
-    @field_validator("seed_bundles", "output_directory")
+    @field_validator("seed_bundles", "output_directory", "tainted_source_index")
     @classmethod
     def paths_are_relative(cls, value: object) -> object:
+        if value is None:
+            return value
         values = value if isinstance(value, tuple) else (value,)
         if any(Path(item).is_absolute() or ".." in Path(item).parts for item in values):
             raise ValueError("ontology build paths must be workspace-relative")
@@ -131,6 +141,37 @@ class TokenLimitExhaustion(StrictModel):
     recommendations: tuple[str, ...]
 
 
+class TaintedSourceObservation(StrictModel):
+    id: str
+    threat_type: str
+    status: str
+    severity: str
+    detected_at: datetime
+    detector_kind: str
+    detector_id: str
+    detector_version: str | None = None
+    evidence_fragment_ids: tuple[str, ...]
+
+
+class TaintedSourceEntry(StrictModel):
+    repository: str
+    canonical_locator: str
+    commit_sha: str
+    source_version_id: str
+    source_content_sha256: str
+    license: str | None = None
+    observed_at: datetime
+    observations: tuple[TaintedSourceObservation, ...]
+
+
+class TaintedSourceIndex(StrictModel):
+    version: Literal[1] = 1
+    topic: str
+    generated_by: str = "deterministic-tainted-source-index/1"
+    recorded_through: datetime | None = None
+    entries: tuple[TaintedSourceEntry, ...] = ()
+
+
 class OntologyBuildReceipt(StrictModel):
     version: Literal[1] = 1
     config_sha256: str
@@ -148,6 +189,7 @@ class OntologyBuildReceipt(StrictModel):
     snapshot_path: str | None = None
     projection_path: str | None = None
     topic_path: str | None = None
+    tainted_source_index_path: str | None = None
     audit_clean: bool | None = None
 
 
@@ -642,6 +684,9 @@ class OntologyBuilder:
             }
         )
         self._save_state(state)
+        tainted_source_index_path = self._write_tainted_source_index(
+            selected_snapshots
+        )
         self.progress.event("finalize", "running", "Auditing and rebuilding projections")
         snapshot_path, database_path, topic_path, audit_clean = self._finalize()
         state["completed"] = (
@@ -689,6 +734,7 @@ class OntologyBuilder:
             snapshot_path=str(snapshot_path),
             projection_path=str(database_path),
             topic_path=str(topic_path),
+            tainted_source_index_path=str(tainted_source_index_path),
             audit_clean=audit_clean,
         )
 
@@ -1032,6 +1078,86 @@ class OntologyBuilder:
             observed_output_tokens=error.output_tokens,
             recommendations=tuple(recommendations),
         )
+
+    def _write_tainted_source_index(
+        self,
+        snapshots: tuple[RepositorySnapshot, ...],
+    ) -> Path:
+        observations_by_source: dict[str, list[ThreatObservation]] = {}
+        for value in self.store.iter_records("threat-observation"):
+            observation = ThreatObservation.model_validate(value)
+            observations_by_source.setdefault(
+                observation.target.source_version, []
+            ).append(observation)
+
+        entries = []
+        for snapshot in snapshots:
+            observations = tuple(
+                sorted(
+                    observations_by_source.get(snapshot.source_version_id, ()),
+                    key=lambda item: item.id,
+                )
+            )
+            if not observations:
+                continue
+            entries.append(
+                TaintedSourceEntry(
+                    repository=snapshot.repository,
+                    canonical_locator=snapshot.canonical_locator,
+                    commit_sha=snapshot.commit_sha,
+                    source_version_id=snapshot.source_version_id,
+                    source_content_sha256=snapshot.source_content_sha256,
+                    license=snapshot.license,
+                    observed_at=snapshot.observed_at,
+                    observations=tuple(
+                        TaintedSourceObservation(
+                            id=item.id,
+                            threat_type=item.threat_type,
+                            status=item.status.value,
+                            severity=item.severity.value,
+                            detected_at=item.detected_at,
+                            detector_kind=item.detector.kind.value,
+                            detector_id=item.detector.id,
+                            detector_version=item.detector.version,
+                            evidence_fragment_ids=item.evidence,
+                        )
+                        for item in observations
+                    ),
+                )
+            )
+        index = TaintedSourceIndex(
+            topic=self.config.topic,
+            recorded_through=max(
+                (
+                    item.detected_at
+                    for entry in entries
+                    for item in entry.observations
+                ),
+                default=None,
+            ),
+            entries=tuple(sorted(entries, key=lambda item: item.repository.casefold())),
+        )
+        relative = (
+            self.config.tainted_source_index
+            or self.config.output_directory.parent / "tainted-sources.yaml"
+        )
+        unresolved = self.workspace / relative
+        if unresolved.is_symlink():
+            raise ValueError("tainted source index path cannot replace a symlink")
+        path = unresolved.resolve()
+        if not path.is_relative_to(self.workspace.resolve()):
+            raise ValueError("tainted source index path escapes the workspace")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(f".{os.getpid()}.tmp")
+        temporary.write_text(
+            yaml.safe_dump(
+                index.model_dump(mode="json", exclude_none=True),
+                allow_unicode=True,
+                sort_keys=False,
+            )
+        )
+        os.replace(temporary, path)
+        return path.relative_to(self.workspace.resolve())
 
     def _finalize(self) -> tuple[Path, Path, Path, bool]:
         audit = DeterministicKnowledgeAuditor().audit(self.store, as_of=utc_now())
