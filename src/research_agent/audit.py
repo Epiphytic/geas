@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime
 from enum import StrEnum
 
@@ -153,6 +154,50 @@ class DeterministicKnowledgeAuditor:
                     "Controversy does not contain deterministically distinct positions.",
                     "Add an opposing, questioning, or substantively different claim.",
                     controversy.claim_ids,
+                )
+
+        controversy_sets = tuple(
+            frozenset(item.claim_ids) for item in controversies
+        )
+        position_groups: dict[tuple[str, str, str], list[Claim]] = {}
+        for claim in claims.values():
+            if claim.review_state is not ReviewState.ACCEPTED:
+                continue
+            key = (
+                claim.subject,
+                claim.predicate,
+                json.dumps(claim.qualifiers, sort_keys=True, separators=(",", ":")),
+            )
+            position_groups.setdefault(key, []).append(claim)
+        for selected in position_groups.values():
+            conflicting_ids: set[str] = set()
+            for index, left in enumerate(selected):
+                for right in selected[index + 1 :]:
+                    pair = frozenset((left.id, right.id))
+                    if any(pair <= indexed for indexed in controversy_sets):
+                        continue
+                    same_object = (
+                        str(left.object).casefold() == str(right.object).casefold()
+                    )
+                    left_supports = left.stance in {"asserts", "reports"}
+                    right_supports = right.stance in {"asserts", "reports"}
+                    opposite_stance = same_object and left_supports != right_supports
+                    opposite_boolean = (
+                        isinstance(left.object, bool)
+                        and isinstance(right.object, bool)
+                        and left.object != right.object
+                    )
+                    if opposite_stance or opposite_boolean:
+                        conflicting_ids.update(pair)
+            if conflicting_ids:
+                ordered_ids = tuple(sorted(conflicting_ids))
+                add(
+                    "direct-opposing-claims-unindexed",
+                    AuditSeverity.WARNING,
+                    ordered_ids[0],
+                    "Directly opposing accepted claims are not indexed as a controversy.",
+                    "Review the positions and add or update a controversy record.",
+                    ordered_ids[1:],
                 )
 
         for gap in gaps:

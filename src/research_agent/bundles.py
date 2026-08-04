@@ -54,6 +54,16 @@ class BundleEvidence(StrictModel):
     exact: str = Field(min_length=1)
     prefix: str | None = None
     suffix: str | None = None
+    start: int | None = Field(default=None, ge=0)
+    end: int | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def range_is_complete(self) -> BundleEvidence:
+        if (self.start is None) != (self.end is None):
+            raise ValueError("bundle evidence start and end must be supplied together")
+        if self.start is not None and self.end is not None and self.end <= self.start:
+            raise ValueError("bundle evidence end must be greater than start")
+        return self
 
 
 class KnowledgeBundle(StrictModel):
@@ -216,6 +226,8 @@ class KnowledgeBundleImporter:
                     exact=item.exact,
                     prefix=item.prefix,
                     suffix=item.suffix,
+                    start=item.start,
+                    end=item.end,
                 )
                 for item in bundle.evidence
             ),

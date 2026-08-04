@@ -295,10 +295,7 @@ class SQLiteKnowledgeProjection:
             counts = self._insert(
                 connection,
                 concepts=concepts,
-                sources=(
-                    SourceVersion.model_validate(value)
-                    for value in self.store.iter_records("source-version")
-                ),
+                sources=self._sources(),
                 topic_sources=(
                     TopicSourceAssociation.model_validate(value)
                     for value in self.store.iter_records("topic-source")
@@ -377,12 +374,15 @@ class SQLiteKnowledgeProjection:
         return counts
 
     def _concepts(self) -> tuple[Concept, ...]:
-        records = {
-            item.id: item
-            for item in (
-                Concept.model_validate(value) for value in self.store.iter_records("concept")
-            )
-        }
+        records: dict[str, Concept] = {}
+        for value in self.store.iter_records("concept"):
+            item = Concept.model_validate(value)
+            existing = records.get(item.id)
+            if existing is not None and existing != item:
+                raise ValueError(
+                    f"conflicting canonical concept records share ID {item.id}"
+                )
+            records[item.id] = item
         vocabulary_path = self.workspace_root / "config/query-vocabulary.yaml"
         if vocabulary_path.exists():
             vocabulary = yaml.safe_load(vocabulary_path.read_text()).get("concepts", {})
@@ -398,6 +398,34 @@ class SQLiteKnowledgeProjection:
                         recorded_by="system:controlled-vocabulary",
                     )
         return tuple(records[key] for key in sorted(records))
+
+    def _sources(self) -> tuple[SourceVersion, ...]:
+        grouped: dict[str, list[SourceVersion]] = {}
+        for value in self.store.iter_records("source-version"):
+            item = SourceVersion.model_validate(value)
+            grouped.setdefault(item.id, []).append(item)
+        selected = []
+        for source_id, items in sorted(grouped.items()):
+            digests = {item.content_sha256 for item in items}
+            if len(digests) != 1:
+                raise ValueError(
+                    f"conflicting canonical source records share ID {source_id}"
+                )
+            selected.append(
+                min(
+                    items,
+                    key=lambda item: (
+                        item.connector_id == "connector:maintained-bundle",
+                        item.license is None,
+                        json.dumps(
+                            item.model_dump(mode="json"),
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                    ),
+                )
+            )
+        return tuple(selected)
 
     @staticmethod
     def _create_schema(connection: sqlite3.Connection) -> None:

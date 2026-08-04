@@ -1,0 +1,23 @@
+version: 1
+topic: State of available open-source research agents
+generated_by: deterministic-tainted-source-index/1
+recorded_through: '2026-08-04T18:25:41.482942Z'
+entries:
+- repository: zilliztech/deep-searcher
+  canonical_locator: https://github.com/zilliztech/deep-searcher
+  commit_sha: d89e37cdfbbef5e44ae6162ce9cc2c627a69b7e1
+  source_version_id: source:sha256:3b081c5d0ccaea802adb7fedef1cf5eea8e61861c9e2eb3c1a41683be1c31011
+  source_content_sha256: 3b081c5d0ccaea802adb7fedef1cf5eea8e61861c9e2eb3c1a41683be1c31011
+  license: Apache-2.0
+  observed_at: '2026-08-04T18:25:41.447891Z'
+  observations:
+  - id: threat-observation:sha256:f040122e7fe7c8f930d15d0f1d14aa1af59bb5ca10039a04b112b91d10c75142
+    threat_type: threat:indirect-prompt-injection:tool-command
+    status: suspected
+    severity: high
+    detected_at: '2026-08-04T18:25:41.482942Z'
+    detector_kind: deterministic_rule
+    detector_id: rule:inert-source-instruction
+    detector_version: deterministic-threat-scanner/1
+    evidence_fragment_ids:
+    - evidence-fragment:sha256:2ebb16089f199b5489563cd4030429cdfb1af080068cc1c95bcaacdc00598af3

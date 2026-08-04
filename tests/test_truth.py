@@ -1,4 +1,5 @@
 import sqlite3
+import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -83,6 +84,59 @@ def test_ontology_change_is_canonical_drift(tmp_path: Path) -> None:
     assert report.recommended_action == "create_snapshot_then_rebuild"
     assert report.items[0].kind is DriftKind.CHANGED
     assert report.items[0].locator == "workspace:ontology/knowledge.yaml"
+
+
+def test_required_git_tracking_excludes_unreviewed_ontology_candidates(
+    tmp_path: Path,
+) -> None:
+    workspace, store = _workspace(tmp_path)
+    subprocess.run(("git", "init", "-q", str(workspace)), check=True)
+    subprocess.run(
+        ("git", "-C", str(workspace), "add", "ontology/knowledge.yaml", "schema.py"),
+        check=True,
+    )
+    subprocess.run(
+        (
+            "git",
+            "-C",
+            str(workspace),
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "canonical fixture",
+        ),
+        check=True,
+    )
+    candidate = workspace / "ontology" / "generated" / "candidate.yaml"
+    candidate.parent.mkdir()
+    candidate.write_text("claims:\n  - unreviewed\n")
+    policy = _policy().model_copy(update={"ontology_git_tracking": "required"})
+    manager = TruthManager(
+        workspace_root=workspace,
+        store_root=store.root,
+        policy=policy,
+        clock=lambda: datetime(2026, 8, 2, 12, 0, tzinfo=UTC),
+    )
+
+    snapshot = manager.capture(created_by="operator:test")
+
+    locators = {item.locator for item in snapshot.artifacts}
+    assert "workspace:ontology/knowledge.yaml" in locators
+    assert "workspace:ontology/generated/candidate.yaml" not in locators
+
+    (workspace / "ontology" / "knowledge.yaml").write_text(
+        "concepts:\n  - dirty-unreviewed-change\n"
+    )
+    dirty_snapshot = manager.capture(created_by="operator:test")
+    assert dirty_snapshot.state_digest == snapshot.state_digest
+    assert manager.verify(snapshot).clean
+
+    (workspace / "ontology" / "knowledge.yaml").unlink()
+    missing_snapshot = manager.capture(created_by="operator:test")
+    assert missing_snapshot.state_digest == snapshot.state_digest
 
 
 def test_new_immutable_record_is_detected_as_added_truth(tmp_path: Path) -> None:
@@ -180,3 +234,14 @@ def test_policy_forbids_database_as_canonical_source() -> None:
                 "database_to_canonical": "allowed",
             }
         )
+
+
+def test_git_ontology_glob_matches_zero_or_many_directories() -> None:
+    pattern = "ontology/**/*.yaml"
+
+    assert TruthManager._glob_matches("ontology/knowledge.yaml", pattern)
+    assert TruthManager._glob_matches(
+        "ontology/topic/generated/project/bundle.yaml",
+        pattern,
+    )
+    assert not TruthManager._glob_matches("ontology/topic/source.md", pattern)

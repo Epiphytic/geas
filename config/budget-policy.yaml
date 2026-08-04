@@ -8,7 +8,7 @@ automatic_envelope:
   max_cost_microusd_per_month: 25000000
   max_calls_per_run: 10
   max_input_tokens_per_call: 32000
-  max_output_tokens_per_call: 8192
+  max_output_tokens_per_call: 131072
 
 # Operators may change treatment to excluded_from_cost for subscription or
 # enterprise-accounted services. Exclusions still consume call and token caps.
@@ -30,6 +30,24 @@ accounts:
     accounting_note: Z.AI API pay-as-you-go
     input_cost_microusd_per_million_tokens: 1400000
     output_cost_microusd_per_million_tokens: 4400000
+
+  - service: model
+    provider: codex_oneshot
+    model: gpt-5.6-sol
+    billing_basis: subscription_included
+    budget_treatment: excluded_from_cost
+    accounting_note: Codex CLI subscription; call and token limits still apply
+    input_cost_microusd_per_million_tokens: 0
+    output_cost_microusd_per_million_tokens: 0
+
+  - service: model
+    provider: claude_oneshot
+    model: opus
+    billing_basis: subscription_included
+    budget_treatment: excluded_from_cost
+    accounting_note: Claude Code subscription; call and token limits still apply
+    input_cost_microusd_per_million_tokens: 0
+    output_cost_microusd_per_million_tokens: 0
 
   - service: search
     provider: openalex

@@ -7,7 +7,13 @@ from research_agent.knowledge import (
     GapStatus,
     KnowledgeGap,
 )
-from research_agent.models import Claim, ReviewState, content_id
+from research_agent.models import (
+    Claim,
+    EvidenceFragment,
+    EvidenceSelector,
+    ReviewState,
+    content_id,
+)
 from research_agent.parsing import ParsedDocumentManager
 from research_agent.store import ImmutableStore
 
@@ -90,4 +96,61 @@ def test_audit_detects_tainted_evidence_stale_gaps_weak_dissent_and_retractions(
         "controversy-has-distinct-positions",
         "explicit-retraction-reference",
         "gap-freshness-deadline",
+    }
+
+
+def test_audit_flags_only_direct_unindexed_opposition(tmp_path) -> None:
+    store = ImmutableStore(tmp_path / "data")
+    evidence = EvidenceFragment(
+        id="evidence-fragment:test",
+        source_version="source:test",
+        selector=EvidenceSelector(type="external_reference"),
+        content_sha256="a" * 64,
+        created_at=INSTANT,
+    )
+    store.put_record("evidence-fragment", evidence)
+
+    def claim(key: str, object_value: bool, stance: str) -> Claim:
+        fields = {
+            "subject": "concept:agent",
+            "predicate": "ep:supports_local_models",
+            "object": object_value,
+            "qualifiers": {"version": "1"},
+            "stance": stance,
+            "epistemic_status": "observed",
+            "asserted_by": f"actor:{key}",
+            "evidence": (evidence.id,),
+            "recorded_at": INSTANT,
+            "review_state": ReviewState.ACCEPTED,
+        }
+        return Claim(id=content_id("claim", fields), **fields)
+
+    supports = claim("supports", True, "asserts")
+    denies = claim("denies", False, "asserts")
+    for item in (supports, denies):
+        store.put_record("claim", item)
+
+    unindexed = DeterministicKnowledgeAuditor().audit(store, as_of=INSTANT)
+    assert "direct-opposing-claims-unindexed" in {
+        item.rule_id for item in unindexed.findings
+    }
+
+    controversy_fields = {
+        "topic_concept_id": "concept:agent",
+        "question": "Are local models supported?",
+        "description": "Accepted sources report opposing boolean positions.",
+        "claim_ids": (supports.id, denies.id),
+        "recorded_at": INSTANT,
+        "recorded_by": "operator:test",
+    }
+    store.put_record(
+        "controversy",
+        Controversy(
+            id=content_id("controversy", controversy_fields),
+            **controversy_fields,
+        ),
+    )
+    indexed = DeterministicKnowledgeAuditor().audit(store, as_of=INSTANT)
+    assert "direct-opposing-claims-unindexed" not in {
+        item.rule_id for item in indexed.findings
     }

@@ -105,7 +105,7 @@ class GitPromotionManager:
         if not branch:
             raise PromotionError("promotion staging requires a named Git branch")
         accepted_by = f"vcs:{target_ref}"
-        pack = self._build_pack(
+        pack = self.build_pack(
             proposal,
             topic=topic,
             topic_concept_id=topic_concept_id,
@@ -254,7 +254,7 @@ class GitPromotionManager:
             raise PromotionError("manifest source hash does not match proposal")
         if manifest.structural_derivation_id != proposal.structural_derivation_id:
             raise PromotionError("manifest structural derivation does not match proposal")
-        expected_pack = self._build_pack(
+        expected_pack = self.build_pack(
             proposal,
             topic=manifest.pack.topic,
             topic_concept_id=manifest.pack.topic_concept_id,
@@ -312,7 +312,7 @@ class GitPromotionManager:
                 if hashlib.sha256(exact.encode()).hexdigest() != evidence.exact_sha256:
                     raise PromotionError("proposal evidence hash no longer matches source")
 
-    def _build_pack(
+    def build_pack(
         self,
         proposal: ValidatedExtractionProposal,
         *,
