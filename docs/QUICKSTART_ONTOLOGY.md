@@ -43,8 +43,10 @@ configuration fingerprint, so changing only model parameters, output capacity,
 timeouts, or extraction batching reuses acquired immutable sources while
 rerunning extraction under the new settings. A changed query, seed, or
 discovery limit requires a new runtime root. Proposals are reused only when
-their provider, output ceiling, model parameters, and reasoning-log setting
-match. A model failure stops further model
+their provider, model name, output ceiling, model parameters, reasoning-log
+setting, and extraction-validator contract version match. Prompt or output
+schema changes must bump that validator version, which deterministically
+invalidates stale proposals without repeating discovery. A model failure stops further model
 requests for that run—important for non-streaming local servers that may still
 be finishing a timed-out request—but deterministic finalization still runs.
 Human-readable stage progress and progress bars are written to stderr. A

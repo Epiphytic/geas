@@ -10,6 +10,11 @@ import yaml
 
 from research_agent.cli import _ontology_build_exit_code
 from research_agent.discovery_acquisition import RepositorySnapshot
+from research_agent.extraction import (
+    AnchorGroundedExtractionManager,
+    ExtractionRequest,
+    ValidatedExtractionProposal,
+)
 from research_agent.models import (
     Detector,
     DetectorKind,
@@ -142,6 +147,45 @@ def test_model_tuning_does_not_invalidate_discovery_checkpoint(tmp_path) -> None
     assert high.discovery_config_sha256 == maximum.discovery_config_sha256
     assert high.discovery_config_sha256 == changed_output.discovery_config_sha256
     assert high.discovery_config_sha256 != changed_discovery.discovery_config_sha256
+
+
+def test_proposal_reuse_requires_model_and_validator_contract(tmp_path) -> None:
+    builder = _builder(
+        tmp_path,
+        OntologyBuildConfig.model_validate(
+            {
+                "version": 1,
+                "topic": "Test",
+                "topic_concept_id": "concept:test",
+                "output_directory": "ontology/test/generated",
+            }
+        ),
+    )
+    request = ExtractionRequest.model_construct(
+        provider="deepseek_local",
+        model="deepseek-v4-flash",
+        max_output_tokens=65_536,
+        model_parameters=builder.config.model_parameters,
+        debug_reasoning=True,
+    )
+    proposal = ValidatedExtractionProposal.model_construct(
+        model="deepseek-v4-flash",
+        validator_version=AnchorGroundedExtractionManager.version,
+    )
+
+    assert builder._proposal_is_compatible(
+        proposal, request, "deepseek-v4-flash"
+    )
+    assert not builder._proposal_is_compatible(
+        proposal.model_copy(update={"model": "stale-model"}),
+        request,
+        "deepseek-v4-flash",
+    )
+    assert not builder._proposal_is_compatible(
+        proposal.model_copy(update={"validator_version": "stale-contract"}),
+        request,
+        "deepseek-v4-flash",
+    )
 
 
 def test_seed_globs_only_resolve_git_tracked_promoted_bundles(tmp_path) -> None:

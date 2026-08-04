@@ -430,16 +430,14 @@ class OntologyBuilder:
                 duration_seconds=round(time.monotonic() - started, 3),
             )
 
-        compatible_requests = {
-            item.id
+        _, provider_configs = load_provider_configs(self.providers_path)
+        configured_model = provider_configs[self.config.provider].model
+        extraction_requests = {
+            item.id: item
             for item in (
                 ExtractionRequest.model_validate(value)
                 for value in self.store.iter_records("extraction-request")
             )
-            if item.provider == self.config.provider
-            and item.max_output_tokens == self.config.max_output_tokens
-            and item.model_parameters == self.config.model_parameters
-            and item.debug_reasoning == self.config.debug_reasoning
         }
         existing_proposals = {
             item.source_version_id: item
@@ -447,7 +445,10 @@ class OntologyBuilder:
                 ValidatedExtractionProposal.model_validate(value)
                 for value in self.store.iter_records("extraction-proposal")
             )
-            if item.extraction_request_id in compatible_requests
+            if (
+                request := extraction_requests.get(item.extraction_request_id)
+            ) is not None
+            and self._proposal_is_compatible(item, request, configured_model)
         }
         model_failed = bool(token_exhaustions)
         selected_snapshots = self._rank_snapshots(tuple(acquired_by_source.values()))
@@ -1046,6 +1047,23 @@ class OntologyBuilder:
             if source_id is not None:
                 counts[source_id] = counts.get(source_id, 0) + 1
         return counts
+
+    def _proposal_is_compatible(
+        self,
+        proposal: ValidatedExtractionProposal,
+        request: ExtractionRequest,
+        configured_model: str,
+    ) -> bool:
+        return (
+            request.provider == self.config.provider
+            and request.model == configured_model
+            and request.max_output_tokens == self.config.max_output_tokens
+            and request.model_parameters == self.config.model_parameters
+            and request.debug_reasoning == self.config.debug_reasoning
+            and proposal.model == configured_model
+            and proposal.validator_version
+            == AnchorGroundedExtractionManager.version
+        )
 
     def _token_exhaustion(
         self,
