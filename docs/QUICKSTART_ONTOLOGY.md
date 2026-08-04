@@ -8,6 +8,21 @@ model endpoint, and a Mojeek key. From the repository root, create the ignored
 MOJEEK_API_KEY=replace-with-your-key
 ```
 
+Create a new ontology with complete, inspectable configuration files:
+
+```bash
+uv run research-agent ontology-init ontology/network-engineering \
+  --topic "Network engineering for selected repositories" \
+  --concept-id concept:network-engineering
+```
+
+This writes `build.yaml` and `library.yaml`. Every application default,
+including null and empty settings, model parameters, discovery limits, worker
+timing, retry behavior, extraction selection, output paths, and library
+selectors is written explicitly. The files can be edited before the first run;
+the CLI does not silently rely on omitted values. Existing files fail closed
+unless `--force` is supplied.
+
 Validate the complete configuration without making network or model calls:
 
 ```bash
@@ -25,13 +40,29 @@ uv run research-agent --env-file .env ontology-build \
   --root data/open-source-research-agents
 ```
 
-Each invocation is a bounded worker. `max_run_seconds` is at most 1,800 seconds;
-when useful work remains, a clean worker checkpoint exits successfully and the
-same command resumes from immutable records. A source work claim prevents two
-workers sharing a runtime root from issuing the same extraction request.
+Each invocation is a bounded worker. `max_run_seconds` defaults to 1,800 seconds
+and is explicitly configurable in each ontology; when useful work remains, a
+clean worker checkpoint exits successfully and the same command resumes from
+immutable records. A source work claim prevents two workers sharing a runtime
+root from issuing the same extraction request.
 Validated proposals remain reusable when a later worker changes model,
 provider, output ceiling, or reasoning effort. Pass `--reextract` only to
 deliberately reconsider completed sources.
+
+For high-reasoning assembly over a source library, an ontology can say:
+
+```yaml
+provider: codex_oneshot
+max_output_tokens: 131072
+model_parameters:
+  thinking: true
+  reasoning_effort: xhigh
+```
+
+`claude_oneshot` is the equivalent Claude Code route. The corresponding CLI
+must be installed and authenticated. These are tool-isolated proposal
+generators; the research agent still owns retrieval, grounding validation,
+checkpointing, and persistence.
 
 To deliberately refresh completed searches and re-resolve already known
 repositories at their current official commits:
@@ -156,7 +187,7 @@ All generation parameters are ontology-local:
 max_output_tokens: 131072
 model_parameters:
   thinking: true
-reasoning_effort: high  # use max only with >=393216 context tokens
+  reasoning_effort: high  # use max only with >=393216 context tokens
   temperature: 0
   top_p: null
   top_k: null
@@ -167,6 +198,8 @@ debug_reasoning: true
 timeout_seconds: 14400
 max_run_seconds: 1800          # hard per-worker ceiling
 minimum_model_window_seconds: 300
+finalization_reserve_seconds: 120
+work_claim_grace_seconds: 60
 connection_attempts: 10        # retries connection refusal only
 connection_retry_seconds: 2
 ```

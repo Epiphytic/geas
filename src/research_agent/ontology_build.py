@@ -29,6 +29,7 @@ from research_agent.candidate_bundles import (
     CandidateLicenseError,
 )
 from research_agent.connectors import MojeekDiscoveryConnector
+from research_agent.deposits import ModelRoute
 from research_agent.discovery import (
     CompilerIdentity,
     ConnectorCapability,
@@ -117,8 +118,10 @@ class OntologyBuildConfig(StrictModel):
     model_parameters: ModelParameters = Field(default_factory=ModelParameters)
     debug_reasoning: bool = True
     timeout_seconds: float = Field(default=3600.0, ge=1.0, le=86_400.0)
-    max_run_seconds: float = Field(default=1800.0, ge=60.0, le=1800.0)
-    minimum_model_window_seconds: float = Field(default=300.0, ge=30.0, le=1500.0)
+    max_run_seconds: float = Field(default=1800.0, gt=0.0)
+    minimum_model_window_seconds: float = Field(default=300.0, gt=0.0)
+    finalization_reserve_seconds: float = Field(default=120.0, ge=0.0)
+    work_claim_grace_seconds: float = Field(default=60.0, ge=0.0)
     connection_attempts: int = Field(default=10, ge=1, le=20)
     connection_retry_seconds: float = Field(default=2.0, ge=0.0, le=30.0)
     anchors_per_batch: int = Field(default=200, ge=1, le=200)
@@ -155,11 +158,28 @@ class OntologyBuildConfig(StrictModel):
             raise ValueError(
                 "minimum_model_window_seconds must leave time inside max_run_seconds"
             )
+        if self.finalization_reserve_seconds >= self.max_run_seconds:
+            raise ValueError(
+                "finalization_reserve_seconds must be less than max_run_seconds"
+            )
         return self
 
     @classmethod
     def from_yaml(cls, path: Path) -> OntologyBuildConfig:
         return cls.model_validate(yaml.safe_load(path.read_text()))
+
+    def explicit_yaml(self) -> str:
+        header = (
+            "# Complete ontology worker configuration.\n"
+            "# Every default is explicit; edit values here rather than relying on\n"
+            "# application defaults. Connector and provider capabilities are still\n"
+            "# validated when the worker starts.\n"
+        )
+        return header + yaml.safe_dump(
+            self.model_dump(mode="json", exclude_none=False),
+            sort_keys=False,
+            allow_unicode=True,
+        )
 
 
 class TokenLimitExhaustion(StrictModel):
@@ -286,7 +306,6 @@ class OntologyBuilder:
     """Own the deterministic, resumable ontology-building control loop."""
 
     version = "ontology-builder/1"
-    _finalization_reserve_seconds = 120.0
     _words = re.compile(r"[a-z0-9][a-z0-9_.+-]{1,}", re.IGNORECASE)
     _anchor_terms = frozenset(
         {
@@ -432,7 +451,10 @@ class OntologyBuilder:
         connector = MojeekDiscoveryConnector()
         run_limit_reached = False
         for index, question in enumerate(query_strings, start=1):
-            if self._remaining_run_seconds() <= self._finalization_reserve_seconds:
+            if (
+                self._remaining_run_seconds()
+                <= self.config.finalization_reserve_seconds
+            ):
                 run_limit_reached = True
                 break
             now = utc_now()
@@ -652,7 +674,7 @@ class OntologyBuilder:
                         max(
                             1.0,
                             self._remaining_run_seconds()
-                            - self._finalization_reserve_seconds,
+                            - self.config.finalization_reserve_seconds,
                         ),
                     )
                     self.progress.event(
@@ -956,7 +978,9 @@ class OntologyBuilder:
             "hostname": socket.gethostname(),
             "acquired_at": now.isoformat(),
             "expires_at": datetime.fromtimestamp(
-                now.timestamp() + self.config.max_run_seconds + 60,
+                now.timestamp()
+                + self.config.max_run_seconds
+                + self.config.work_claim_grace_seconds,
                 tz=now.tzinfo,
             ).isoformat(),
         }
@@ -1191,6 +1215,11 @@ class OntologyBuilder:
                 operation=ModelOperation.ONTOLOGY_EXTRACTION,
                 data_class=DataClass.PUBLIC,
                 input_kind=InputKind.SOURCE_CONTENT,
+                model_route=(
+                    ModelRoute.EXTERNAL_ALLOWED
+                    if provider.external
+                    else ModelRoute.LOCAL_PREFERRED
+                ),
                 run_id=f"run:ontology-build:{uuid4()}",
             ),
             budget_policy=BudgetPolicy.from_yaml(self.budget_policy_path),

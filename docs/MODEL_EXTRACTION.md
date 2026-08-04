@@ -14,6 +14,27 @@ The operator supplies:
 - the existing concept IDs that claims may use;
 - provider, data-class, route, token, approval, and budget inputs.
 
+## High-reasoning one-shot providers
+
+`codex_oneshot` and `claude_oneshot` let an ontology select a bounded coding
+agent for assembly while discovery, source selection, validation, and
+persistence stay deterministic. Configure the provider and reasoning effort in
+the ontology's `build.yaml`.
+
+The subprocess starts in an empty temporary directory and receives only the
+trusted extraction instruction plus already-selected untrusted anchors on
+stdin. Codex runs ephemeral with user configuration and repository rules
+ignored, read-only sandboxing, web search disabled, a deny-all `PreToolUse`
+hook, strict output schema, and typed JSONL event auditing. Claude Code runs in
+safe mode with no session persistence, an empty strict MCP configuration, and
+an empty tool list. A typed command, file-change, MCP, tool-call, or web-search
+Codex event fails closed.
+
+Coding-agent output has proposal authority only. The normal envelope,
+allowed-concept, exact-excerpt, anchor-containment, evidence-hash, and semantic
+validators still run before a proposal enters the immutable store. The
+subprocess cannot promote or write ontology truth.
+
 Document, page, and section containers are rejected. At most 200 leaf anchors
 and 200,000 source characters enter one call. Source text is JSON-labelled as
 `untrusted_source_anchors`; no tools are offered to the model.

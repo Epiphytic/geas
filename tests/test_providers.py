@@ -1,7 +1,9 @@
 import io
 import json
+import subprocess
 import urllib.error
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from pydantic import ValidationError
@@ -13,6 +15,194 @@ from research_agent.providers import (
     ModelOutputTruncatedError,
     load_provider_configs,
 )
+
+
+class _Gate:
+    def __init__(self) -> None:
+        self.authorized = False
+        self.settled = False
+
+    def authorize(self, **_kwargs) -> None:
+        self.authorized = True
+
+    def settle(self, **_kwargs) -> None:
+        self.settled = True
+
+
+def _oneshot_config(kind: str) -> ProviderConfig:
+    return ProviderConfig(
+        kind=kind,
+        base_url=(
+            "https://chatgpt.com/codex-cli"
+            if kind == "codex_oneshot"
+            else "https://api.anthropic.com/claude-code"
+        ),
+        model="fixture",
+        external=True,
+        max_output_tokens=4096,
+    )
+
+
+def test_codex_oneshot_is_ephemeral_schema_bound_and_tool_denied(monkeypatch, tmp_path) -> None:
+    captured = {}
+
+    def run(command, **kwargs):
+        captured.update(command=command, kwargs=kwargs)
+        output_path = Path(command[command.index("--output-last-message") + 1])
+        output_path.write_text('{"version":1}')
+        return SimpleNamespace(
+            returncode=0,
+            stdout=(
+                '{"type":"thread.started","thread_id":"t"}\n'
+                '{"type":"turn.completed","usage":{"output_tokens":7}}\n'
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr("subprocess.run", run)
+    gate = _Gate()
+    client = ModelClient(
+        "codex",
+        _oneshot_config("codex_oneshot"),
+        gate=gate,
+        parameters=ModelParameters(reasoning_effort="xhigh"),
+    )
+    user = json.dumps(
+        {
+            "output_schema": {
+                "type": "object",
+                "properties": {"version": {"type": "integer"}},
+                "required": ["version"],
+            }
+        }
+    )
+
+    assert client.complete_json(system="trusted", user=user) == {"version": 1}
+    command = captured["command"]
+    assert command[:3] == ["codex", "exec", "-"]
+    assert "--ephemeral" in command
+    assert "--ignore-user-config" in command
+    assert "--ignore-rules" in command
+    assert command[command.index("--sandbox") : command.index("--sandbox") + 2] == [
+        "--sandbox",
+        "read-only",
+    ]
+    assert any("hooks.PreToolUse=" in item for item in command)
+    assert 'web_search="disabled"' in command
+    assert captured["kwargs"]["input"].startswith("trusted")
+    assert gate.authorized and gate.settled
+    assert client.last_output_tokens == 7
+
+
+def test_oneshot_schema_normalization_requires_all_nested_properties() -> None:
+    schema = ModelClient._strict_output_schema(
+        {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "child": {
+                    "type": "object",
+                    "properties": {"optional": {"type": ["string", "null"]}},
+                },
+                "mapping": {
+                    "type": "object",
+                    "additionalProperties": {"type": "string"},
+                },
+            },
+            "required": ["name"],
+        }
+    )
+
+    assert schema["required"] == ["name", "child", "mapping"]
+    assert schema["additionalProperties"] is False
+    assert schema["properties"]["child"]["required"] == ["optional"]
+    assert schema["properties"]["child"]["additionalProperties"] is False
+    assert schema["properties"]["mapping"]["properties"] == {}
+    assert schema["properties"]["mapping"]["required"] == []
+
+
+def test_codex_oneshot_rejects_audited_tool_attempt(monkeypatch) -> None:
+    def run(command, **_kwargs):
+        output_path = Path(command[command.index("--output-last-message") + 1])
+        output_path.write_text('{"version":1}')
+        return SimpleNamespace(
+            returncode=0,
+            stdout=(
+                '{"type":"item.started","item":{"type":"command_execution","command":"pwd"}}\n'
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr("subprocess.run", run)
+    client = ModelClient(
+        "codex",
+        _oneshot_config("codex_oneshot"),
+        gate=_Gate(),
+    )
+    with pytest.raises(Exception, match="forbidden one-shot action"):
+        client.complete_json(system="trusted", user="{}")
+
+
+def test_codex_audit_does_not_confuse_text_about_tools_with_tool_events() -> None:
+    client = ModelClient(
+        "codex",
+        _oneshot_config("codex_oneshot"),
+        gate=_Gate(),
+    )
+    client._audit_codex_events(
+        '{"type":"item.completed","item":{"type":"agent_message",'
+        '"text":"I made no tool_call or web_search."}}\n'
+    )
+
+
+def test_oneshot_timeout_fails_closed(monkeypatch) -> None:
+    def run(command, **_kwargs):
+        raise subprocess.TimeoutExpired(command, timeout=12)
+
+    monkeypatch.setattr("subprocess.run", run)
+    client = ModelClient(
+        "codex",
+        _oneshot_config("codex_oneshot"),
+        gate=_Gate(),
+        timeout=12,
+    )
+    with pytest.raises(Exception, match="exceeded 12 seconds"):
+        client.complete_json(system="trusted", user="{}")
+
+
+def test_claude_oneshot_disables_tools_and_reads_structured_output(monkeypatch) -> None:
+    captured = {}
+
+    def run(command, **kwargs):
+        captured.update(command=command, kwargs=kwargs)
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "is_error": False,
+                    "structured_output": {"version": 1},
+                    "usage": {"output_tokens": 9},
+                }
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr("subprocess.run", run)
+    client = ModelClient(
+        "claude",
+        _oneshot_config("claude_oneshot"),
+        gate=_Gate(),
+    )
+    assert client.complete_json(system="trusted", user="{}") == {"version": 1}
+    assert "--tools=" in captured["command"]
+    assert "--safe-mode" in captured["command"]
+    assert captured["command"][
+        captured["command"].index("--permission-mode") : captured["command"].index(
+            "--permission-mode"
+        )
+        + 2
+    ] == ["--permission-mode", "dontAsk"]
+    assert client.last_output_tokens == 9
 
 
 def test_local_deepseek_is_default() -> None:
@@ -111,9 +301,7 @@ def test_model_client_never_salvages_nested_json_from_truncated_outer_object(
             "choices": [
                 {
                     "message": {
-                        "content": (
-                            '{"version":1,"claims":[{"key":"nested","subject":"x"}]'
-                        )
+                        "content": ('{"version":1,"claims":[{"key":"nested","subject":"x"}]')
                     },
                     "finish_reason": "stop",
                 }

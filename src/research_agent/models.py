@@ -223,7 +223,7 @@ class PolicyDecision(StrictModel):
 
 
 class ProviderConfig(StrictModel):
-    kind: Literal["openai_compatible"]
+    kind: Literal["openai_compatible", "codex_oneshot", "claude_oneshot"]
     base_url: HttpUrl
     model: str
     api_key_env: str = ""
@@ -233,6 +233,8 @@ class ProviderConfig(StrictModel):
 
     @model_validator(mode="after")
     def endpoint_matches_trust_boundary(self) -> ProviderConfig:
+        if self.kind != "openai_compatible" and not self.external:
+            raise ValueError("one-shot CLI providers must be external")
         host = self.base_url.host
         if self.external:
             if self.base_url.scheme != "https":

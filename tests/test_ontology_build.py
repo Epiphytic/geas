@@ -18,6 +18,7 @@ from research_agent.extraction import (
 from research_agent.models import (
     Detector,
     DetectorKind,
+    ModelParameters,
     ThreatObservation,
     ThreatSeverity,
     ThreatStatus,
@@ -56,12 +57,15 @@ def test_shipped_build_config_keeps_serial_128k_capacity_without_coverage_caps()
     assert config.timeout_seconds == 14_400
     assert config.max_run_seconds == 1800
     assert config.minimum_model_window_seconds == 300
+    assert config.finalization_reserve_seconds == 120
+    assert config.work_claim_grace_seconds == 60
     assert config.include_gap_queries
     assert config.max_queries is None
     assert config.max_sources is None
     assert config.max_batches_per_source is None
     assert config.approve_large_queries is True
-    assert config.model_parameters.reasoning_effort == "high"
+    assert config.provider == "codex_oneshot"
+    assert config.model_parameters.reasoning_effort == "xhigh"
     assert config.debug_reasoning is True
     assert config.connection_attempts == 10
     assert config.connection_retry_seconds == 2
@@ -74,7 +78,11 @@ def test_shipped_reasoning_decision_is_backed_by_recorded_metrics() -> None:
             "ontology/open-source-research-agents/model-evaluation.yaml"
         ).read_text()
     )
-    assert evaluation["decision"]["reasoning_effort"] == "high"
+    assert evaluation["decision"]["provider"] == "codex_oneshot"
+    assert evaluation["decision"]["reasoning_effort"] == "xhigh"
+    assert evaluation["codex_oneshot_xhigh"]["claims"] > evaluation["high"]["claims"]
+    assert evaluation["codex_oneshot_xhigh"]["concepts"] > evaluation["high"]["concepts"]
+    assert evaluation["codex_oneshot_xhigh"]["gaps"] > evaluation["high"]["gaps"]
     assert evaluation["high"]["claims"] > evaluation["max"]["claims"]
     assert (
         evaluation["high"]["distinct_predicates"]
@@ -97,17 +105,24 @@ def test_general_ontology_default_is_64k() -> None:
     assert config.max_run_seconds == 1800
 
 
-def test_ontology_worker_cannot_run_longer_than_thirty_minutes() -> None:
-    with pytest.raises(ValueError, match="less than or equal to 1800"):
-        OntologyBuildConfig.model_validate(
-            {
-                "version": 1,
-                "topic": "Test",
-                "topic_concept_id": "concept:test",
-                "output_directory": "ontology/test/generated",
-                "max_run_seconds": 1801,
-            }
-        )
+def test_ontology_worker_duration_and_reserves_are_configurable() -> None:
+    config = OntologyBuildConfig.model_validate(
+        {
+            "version": 1,
+            "topic": "Test",
+            "topic_concept_id": "concept:test",
+            "output_directory": "ontology/test/generated",
+            "max_run_seconds": 3600,
+            "minimum_model_window_seconds": 120,
+            "finalization_reserve_seconds": 30,
+            "work_claim_grace_seconds": 15,
+        }
+    )
+
+    assert config.max_run_seconds == 3600
+    assert config.minimum_model_window_seconds == 120
+    assert config.finalization_reserve_seconds == 30
+    assert config.work_claim_grace_seconds == 15
 
 
 def test_max_reasoning_requires_384_kib_context() -> None:
@@ -564,6 +579,55 @@ def test_documented_check_command_is_executable(tmp_path) -> None:
 
     assert '"checked_only": true' in result.stdout
     assert '"completed": false' in result.stdout
+
+
+def test_ontology_init_writes_every_default_explicitly(tmp_path: Path) -> None:
+    relative = Path("ontology") / f"test-explicit-{tmp_path.name}"
+    result = subprocess.run(
+        (
+            "uv",
+            "run",
+            "research-agent",
+            "ontology-init",
+            str(relative),
+            "--topic",
+            "Test explicit ontology",
+            "--concept-id",
+            "concept:test-explicit",
+        ),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    try:
+        receipt = json.loads(result.stdout)
+        build_path = Path(receipt["build_config"])
+        library_path = Path(receipt["library_config"])
+        build = yaml.safe_load(build_path.read_text())
+        library = yaml.safe_load(library_path.read_text())
+
+        assert set(build) == set(OntologyBuildConfig.model_fields)
+        assert set(build["model_parameters"]) == set(ModelParameters.model_fields)
+        assert build["max_run_seconds"] == 1800
+        assert build["finalization_reserve_seconds"] == 120
+        assert build["max_queries"] is None
+        assert build["max_sources"] is None
+        assert library["include_all_parsed_sources"] is True
+        assert set(library) == {
+            "version",
+            "id",
+            "title",
+            "description",
+            "repositories",
+            "source_version_ids",
+            "source_uri_prefixes",
+            "connector_ids",
+            "include_all_parsed_sources",
+        }
+    finally:
+        for path in (relative / "build.yaml", relative / "library.yaml"):
+            path.unlink(missing_ok=True)
+        relative.rmdir()
 
 
 def test_reasoning_evaluation_runner_has_valid_shell_syntax() -> None:

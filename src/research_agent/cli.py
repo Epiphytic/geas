@@ -223,6 +223,16 @@ def _build_parser() -> argparse.ArgumentParser:
     init = subparsers.add_parser("store-init", help="initialize an immutable store")
     init.add_argument("--root", type=Path, default=Path("data"))
 
+    ontology_init = subparsers.add_parser(
+        "ontology-init",
+        help="create complete explicit ontology and source-library configuration files",
+    )
+    ontology_init.add_argument("directory", type=Path)
+    ontology_init.add_argument("--topic", required=True)
+    ontology_init.add_argument("--concept-id", required=True)
+    ontology_init.add_argument("--provider", default="deepseek_local")
+    ontology_init.add_argument("--force", action="store_true")
+
     source = subparsers.add_parser("source-add", help="archive a local source file")
     source.add_argument("path", type=Path)
     source.add_argument("--root", type=Path, default=Path("data"))
@@ -791,6 +801,7 @@ def main() -> None:
                 "default": default,
                 "providers": {
                     name: {
+                        "kind": config.kind,
                         "base_url": str(config.base_url),
                         "model": config.model,
                         "external": config.external,
@@ -870,6 +881,49 @@ def main() -> None:
         store = ImmutableStore(args.root)
         store.initialize()
         _json({"root": str(store.root), "initialized": True})
+        return
+
+    if args.command == "ontology-init":
+        directory = args.directory
+        if directory.is_absolute() or ".." in directory.parts:
+            raise ValueError("ontology directory must be workspace-relative")
+        build_path = directory / "build.yaml"
+        library_path = directory / "library.yaml"
+        existing = tuple(path for path in (build_path, library_path) if path.exists())
+        if existing and not args.force:
+            raise ValueError(
+                "ontology configuration already exists; pass --force to replace: "
+                + ", ".join(str(path) for path in existing)
+            )
+        config = OntologyBuildConfig(
+            version=1,
+            topic=args.topic,
+            topic_concept_id=args.concept_id,
+            provider=args.provider,
+            output_directory=directory / "generated",
+        )
+        library = SourceLibraryManifest(
+            version=1,
+            id=f"library:{args.concept_id.removeprefix('concept:')}",
+            title=f"{args.topic} source library",
+            description=(
+                "Reusable immutable sources for this ontology. Replace the default "
+                "selection with explicit repositories, source IDs, URI prefixes, "
+                "or connectors as the collection becomes defined."
+            ),
+            include_all_parsed_sources=True,
+        )
+        directory.mkdir(parents=True, exist_ok=True)
+        build_path.write_text(config.explicit_yaml())
+        library_path.write_text(library.explicit_yaml())
+        _json(
+            {
+                "directory": str(directory),
+                "build_config": str(build_path),
+                "library_config": str(library_path),
+                "defaults_explicit": True,
+            }
+        )
         return
 
     if args.command == "source-add":

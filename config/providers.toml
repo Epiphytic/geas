@@ -23,3 +23,21 @@ model = "glm-5.2"
 api_key_env = "ZAI_API_KEY"
 external = true
 max_output_tokens = 8192
+
+[providers.codex_oneshot]
+kind = "codex_oneshot"
+base_url = "https://chatgpt.com/codex-cli"
+model = "gpt-5.6-sol"
+api_key_env = ""
+external = true
+max_output_tokens = 131072
+context_window_tokens = 524288
+
+[providers.claude_oneshot]
+kind = "claude_oneshot"
+base_url = "https://api.anthropic.com/claude-code"
+model = "opus"
+api_key_env = ""
+external = true
+max_output_tokens = 131072
+context_window_tokens = 200000

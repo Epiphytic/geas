@@ -102,10 +102,11 @@ bundles.
 
 ## Bounded resumable workers
 
-`ontology-build` is a resumable worker. `max_run_seconds` cannot exceed 1,800
-seconds. A clean time-budget checkpoint exits successfully, reports remaining
-work, and can be resumed with the same command. Completed immutable discovery,
-source parsing, proposals, and candidates are retained.
+`ontology-build` is a resumable worker. `max_run_seconds` defaults to 1,800
+seconds and is explicitly configurable per ontology. A clean time-budget
+checkpoint exits successfully, reports remaining work, and can be resumed with
+the same command. Completed immutable discovery, source parsing, proposals, and
+candidates are retained.
 
 Validator-compatible proposals for the same immutable source are reused even if
 the next worker selects another provider, model, token ceiling, or reasoning

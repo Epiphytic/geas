@@ -63,6 +63,17 @@ class SourceLibraryManifest(StrictModel):
     def from_yaml(cls, path: Path) -> SourceLibraryManifest:
         return cls.model_validate(yaml.safe_load(path.read_text()))
 
+    def explicit_yaml(self) -> str:
+        header = (
+            "# Complete source-library selection configuration.\n"
+            "# Selectors are an inclusive union and are all explicit.\n"
+        )
+        return header + yaml.safe_dump(
+            self.model_dump(mode="json", exclude_none=False),
+            sort_keys=False,
+            allow_unicode=True,
+        )
+
 
 class SourceLibrarySnapshot(StrictModel):
     version: Literal[1] = 1

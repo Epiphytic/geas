@@ -18,7 +18,7 @@ def _policy() -> BudgetPolicy:
     return BudgetPolicy.from_yaml(Path("config/budget-policy.yaml"))
 
 
-def test_conservative_envelope_matches_operator_decision() -> None:
+def test_automatic_envelope_supports_bounded_128k_oneshots() -> None:
     envelope = _policy().automatic_envelope
 
     assert envelope.max_cost_microusd_per_call == 250_000
@@ -27,7 +27,7 @@ def test_conservative_envelope_matches_operator_decision() -> None:
     assert envelope.max_cost_microusd_per_month == 25_000_000
     assert envelope.max_calls_per_run == 10
     assert envelope.max_input_tokens_per_call == 32_000
-    assert envelope.max_output_tokens_per_call == 8_192
+    assert envelope.max_output_tokens_per_call == 131_072
 
 
 def test_unknown_accounting_fails_closed(tmp_path: Path) -> None:

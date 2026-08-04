@@ -32,27 +32,39 @@ seed_bundles:
   - ontology/open-source-research-agents/bundle.yaml
 seed_bundle_globs:
   - ontology/open-source-research-agents/generated/*/bundle.yaml
+source_library_snapshot_id: null
+discovery_enabled: true
 queries:
   - open source deep research agent GitHub
   - open source research agent retrieval citations benchmark GitHub
 include_gap_queries: true
 refresh_after_hours: 168
+max_queries: null
 result_limit: 200
 approve_large_queries: true
 repository_limit_per_query: 100
-provider: deepseek_local
+provider: codex_oneshot
 max_output_tokens: 131072
 model_parameters:
   thinking: true
-  reasoning_effort: high
+  reasoning_effort: xhigh
   temperature: 0
+  top_p: null
+  top_k: null
+  min_p: null
   seed: 0
+  stop: []
 debug_reasoning: true
 timeout_seconds: 14400
 max_run_seconds: 1800
 minimum_model_window_seconds: 300
+finalization_reserve_seconds: 120
+work_claim_grace_seconds: 60
 connection_attempts: 10
 connection_retry_seconds: 2
+anchors_per_batch: 200
+max_batches_per_source: null
+max_sources: null
 model_parallelism: 1
 output_directory: ontology/open-source-research-agents/generated
 tainted_source_index: ontology/open-source-research-agents/tainted-sources.yaml

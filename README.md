@@ -50,7 +50,8 @@ slice:
 - an executable maintained ontology of open-source research agents;
 - resumable ontology workers capped at 30 minutes per invocation, with
   source-level work claims and cross-model proposal reuse;
-- a tool-free client for local DeepSeek and optional external providers;
+- tool-free clients for local DeepSeek, external APIs, and bounded Codex or
+  Claude Code one-shot ontology assembly;
 - a starter LinkML ontology and a maintained upstream intelligence registry;
 - tests for the principal prompt-injection security invariants.
 
@@ -103,10 +104,15 @@ http://127.0.0.1:8000/v1
 model: deepseek-v4-flash
 ```
 
-[`config/providers.toml`](config/providers.toml) also defines opt-in OpenAI and
-Z.AI providers. External calls require `OPENAI_API_KEY` or `ZAI_API_KEY`; no key
-is needed for the local endpoint. Provider credentials are read only from
-environment variables and must never be committed.
+[`config/providers.toml`](config/providers.toml) also defines opt-in OpenAI,
+Z.AI, Codex CLI, and Claude Code providers. API providers require their named
+environment key. CLI one-shots reuse their own authenticated subscription and
+are accounted as subscription-included calls.
+
+Use `codex_oneshot` or `claude_oneshot` when ontology assembly needs a stronger
+reasoning tier than the local extraction model. They receive only selected
+source anchors and return proposal JSON; discovery and ontology writes remain
+outside the coding agent.
 
 ## Quick start
 
