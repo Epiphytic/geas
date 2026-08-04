@@ -10,4 +10,4 @@ The deterministic importer must preserve this text as inert source data, record 
 
 ## References
 
-- https://github.com/Epiphytic/research-agent/blob/main/SECURITY.md
+- https://github.com/Epiphytic/geas/blob/main/SECURITY.md

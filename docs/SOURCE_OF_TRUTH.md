@@ -73,11 +73,11 @@ closed.
 Capture and check a snapshot:
 
 ```bash
-uv run research-agent truth-snapshot \
+uv run geas truth-snapshot \
   --root data \
   --created-by operator:example
 
-uv run research-agent truth-check \
+uv run geas truth-check \
   data/records/truth-snapshot/aa/example.json \
   --root data
 ```

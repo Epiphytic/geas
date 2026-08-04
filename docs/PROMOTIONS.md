@@ -40,7 +40,7 @@ automatic merge are intentionally outside this application.
 Start on a topic branch after creating an extraction proposal:
 
 ```bash
-uv run research-agent promotion-stage \
+uv run geas promotion-stage \
   extraction-proposal:sha256:... \
   --topic "Open source research agents" \
   --topic-concept-id concept:open-source-research-agents \
@@ -55,11 +55,11 @@ Commit the manifest and submit the branch through the desired review mechanism.
 After the exact change reaches the local canonical branch:
 
 ```bash
-uv run research-agent promotion-verify \
+uv run geas promotion-verify \
   ontology/promotions/example.json \
   --root data
 
-uv run research-agent promotion-apply \
+uv run geas promotion-apply \
   ontology/promotions/example.json \
   --root data
 ```

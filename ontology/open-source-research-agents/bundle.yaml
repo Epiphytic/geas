@@ -10,7 +10,7 @@ sources:
     acquired_at: 2026-08-03T15:00:00Z
     original_locator: https://github.com/assafelovic/gpt-researcher
     title: GPT Researcher source card
-    authors: [Epiphytic research-agent maintainers]
+    authors: [Geas maintainers]
     publisher: Epiphytic
     media_type: text/markdown
     license: Apache-2.0
@@ -23,7 +23,7 @@ sources:
     acquired_at: 2026-08-03T15:00:00Z
     original_locator: https://github.com/stanford-oval/storm
     title: STORM and Co-STORM source card
-    authors: [Epiphytic research-agent maintainers]
+    authors: [Geas maintainers]
     publisher: Epiphytic
     media_type: text/markdown
     license: Apache-2.0
@@ -36,7 +36,7 @@ sources:
     acquired_at: 2026-08-03T15:00:00Z
     original_locator: https://github.com/langchain-ai/open_deep_research
     title: LangChain Open Deep Research source card
-    authors: [Epiphytic research-agent maintainers]
+    authors: [Geas maintainers]
     publisher: Epiphytic
     media_type: text/markdown
     license: Apache-2.0
@@ -49,7 +49,7 @@ sources:
     acquired_at: 2026-08-03T15:00:00Z
     original_locator: https://github.com/Future-House/paper-qa
     title: PaperQA2 source card
-    authors: [Epiphytic research-agent maintainers]
+    authors: [Geas maintainers]
     publisher: Epiphytic
     media_type: text/markdown
     license: Apache-2.0
@@ -62,7 +62,7 @@ sources:
     acquired_at: 2026-08-03T15:00:00Z
     original_locator: https://github.com/bytedance/deer-flow
     title: DeerFlow source card
-    authors: [Epiphytic research-agent maintainers]
+    authors: [Geas maintainers]
     publisher: Epiphytic
     media_type: text/markdown
     license: Apache-2.0
@@ -75,7 +75,7 @@ sources:
     acquired_at: 2026-08-03T15:00:00Z
     original_locator: https://github.com/SkyworkAI/DeepResearchAgent
     title: Skywork DeepResearchAgent source card
-    authors: [Epiphytic research-agent maintainers]
+    authors: [Geas maintainers]
     publisher: Epiphytic
     media_type: text/markdown
     license: Apache-2.0
@@ -88,7 +88,7 @@ sources:
     acquired_at: 2026-08-03T15:00:00Z
     original_locator: https://github.com/TIGER-AI-Lab/OpenResearcher
     title: OpenResearcher source card
-    authors: [Epiphytic research-agent maintainers]
+    authors: [Geas maintainers]
     publisher: Epiphytic
     media_type: text/markdown
     license: Apache-2.0
@@ -96,12 +96,12 @@ sources:
     rights_basis: Original project-authored summary
     provenance_note: Curated from the official repository, default tree, and pinned commit.
   - key: epiphytic
-    path: sources/epiphytic-research-agent.md
-    expected_sha256: de3e838de7b28b15c7936e64bbb40af2ffc319f3879a1c33c573399a3f473857
+    path: sources/geas.md
+    expected_sha256: 92315bc814e02c25652904eaface548109da18b36c9fa4029cdfee71f492140e
     acquired_at: 2026-08-03T15:00:00Z
-    original_locator: https://github.com/Epiphytic/research-agent
-    title: Epiphytic research-agent source card
-    authors: [Epiphytic research-agent maintainers]
+    original_locator: https://github.com/Epiphytic/geas
+    title: Geas source card
+    authors: [Geas maintainers]
     publisher: Epiphytic
     media_type: text/markdown
     license: Apache-2.0
@@ -110,11 +110,11 @@ sources:
     provenance_note: Curated from this repository's README, security model, and implementation.
   - key: poison-fixture
     path: sources/poisoned-source-fixture.md
-    expected_sha256: b6a264621bdf0976bba7c51d038ee30c77aeff6e641a8b3b6392d667d50d5dec
+    expected_sha256: 16d502e0abe431458c45a997372162180be59c7f55734292f782bce37d2a3cb1
     acquired_at: 2026-08-03T15:00:00Z
     original_locator: urn:epiphytic:fixture:poisoned-source
     title: Synthetic poisoned-source fixture
-    authors: [Epiphytic research-agent maintainers]
+    authors: [Geas maintainers]
     publisher: Epiphytic
     media_type: text/markdown
     license: Apache-2.0
@@ -203,7 +203,7 @@ concepts:
     recorded_at: 2026-08-03T16:00:00Z
     recorded_by: operator:epiphytic
   - id: project:epiphytic-research-agent
-    label: Epiphytic research-agent
+    label: Geas
     description: Persistent ontology-backed research control plane in this repository.
     broader: [concept:persistent-research-knowledge, concept:deterministic-research-control]
     recorded_at: 2026-08-03T16:00:00Z
@@ -323,7 +323,7 @@ evidence:
     exact: GitHub did not identify a repository license and no top-level license file was present in the inspected default-branch tree, so the software license is recorded as unknown.
   - key: ep-graph
     source_key: epiphytic
-    exact: Epiphytic research-agent treats a versioned graph of concepts, claims, exact evidence, disagreements, knowledge gaps, and source-threat observations as its durable product.
+    exact: Geas treats a versioned graph of concepts, claims, exact evidence, disagreements, knowledge gaps, and source-threat observations as its durable product.
   - key: ep-canonical
     source_key: epiphytic
     exact: Canonical ontology and policy remain inspectable text, while immutable content-addressed records and blobs preserve research history.
@@ -645,7 +645,7 @@ claims:
     object: versioned claim, evidence, dissent, gap, and threat graph
     stance: asserts
     epistemic_status: observed
-    asserted_by: github:Epiphytic/research-agent
+    asserted_by: github:Epiphytic/geas
     evidence_keys: [ep-graph]
   - key: ep-canonical
     subject: project:epiphytic-research-agent
@@ -653,7 +653,7 @@ claims:
     object: inspectable ontology text and immutable content-addressed history
     stance: asserts
     epistemic_status: observed
-    asserted_by: github:Epiphytic/research-agent
+    asserted_by: github:Epiphytic/geas
     evidence_keys: [ep-canonical]
   - key: ep-query
     subject: project:epiphytic-research-agent
@@ -661,7 +661,7 @@ claims:
     object: deterministic SQLite graph, FTS, temporal, citation, and provenance queries
     stance: asserts
     epistemic_status: observed
-    asserted_by: github:Epiphytic/research-agent
+    asserted_by: github:Epiphytic/geas
     evidence_keys: [ep-query]
   - key: ep-security
     subject: project:epiphytic-research-agent
@@ -669,7 +669,7 @@ claims:
     object: deterministic controls with source and model text treated as inert data
     stance: asserts
     epistemic_status: observed
-    asserted_by: github:Epiphytic/research-agent
+    asserted_by: github:Epiphytic/geas
     evidence_keys: [ep-security]
   - key: ep-model
     subject: project:epiphytic-research-agent
@@ -677,7 +677,7 @@ claims:
     object: local DeepSeek preferred with no direct ontology-write authority
     stance: asserts
     epistemic_status: observed
-    asserted_by: github:Epiphytic/research-agent
+    asserted_by: github:Epiphytic/geas
     evidence_keys: [ep-model]
   - key: ep-license
     subject: project:epiphytic-research-agent
@@ -686,7 +686,7 @@ claims:
     qualifiers: {starter_ontology_license: CC0}
     stance: reports
     epistemic_status: observed
-    asserted_by: github:Epiphytic/research-agent
+    asserted_by: github:Epiphytic/geas
     evidence_keys: [ep-license]
 
 controversies:

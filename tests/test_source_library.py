@@ -115,7 +115,7 @@ def test_documented_source_library_cli_is_executable(tmp_path: Path) -> None:
         (
             "uv",
             "run",
-            "research-agent",
+            "geas",
             "library-build",
             str(manifest),
             "--root",
@@ -131,7 +131,7 @@ def test_documented_source_library_cli_is_executable(tmp_path: Path) -> None:
         (
             "uv",
             "run",
-            "research-agent",
+            "geas",
             "library-context",
             "route selection",
             "--database",

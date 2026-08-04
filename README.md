@@ -1,15 +1,54 @@
-# Persistent research knowledge system
+# Geas
 
-An early implementation of an agent-maintained, ontology-backed research
-knowledge base. Its durable product is a versioned graph of claims, evidence,
-concepts, disagreements, and source-threat observations—not a periodically
-regenerated report.
+Geas builds and maintains inspectable research knowledge: immutable source
+libraries, evidence-linked ontologies, explicit disagreements and gaps, and
+deterministic search indexes. Its durable product is reusable knowledge, not a
+one-time report.
 
-To build or resume an ontology from one configuration, see the
-[executable ontology quick start](docs/QUICKSTART_ONTOLOGY.md).
-Reusable ontology-independent source collections and bounded agent context
-retrieval are documented in
-[source libraries](docs/SOURCE_LIBRARIES.md).
+The project is developed at
+[`Epiphytic/geas`](https://github.com/Epiphytic/geas). Its CLI is `geas`.
+
+## Common use cases
+
+| You want to… | Use… | Result |
+|---|---|---|
+| Research a topic into durable, reusable knowledge | `ontology-init`, then `ontology-build` | A resumable source library, reviewable ontology proposals, a deterministic SQLite projection, and an agent-readable topic view |
+| Give an agent precise context without conventional RAG | `library-query`, `library-context`, or `knowledge-query` | Bounded exact text fragments or evidence-linked claims, with source identities and truncation made explicit |
+| Search a corpus before deciding on an ontology | `parse-document` and `library-build` | An ontology-independent, immutable, searchable source library |
+| Keep an existing topic current | rerun `ontology-build`, optionally with `--refresh` | New source versions and proposals without discarding completed discovery, acquisition, or extraction work |
+| Preserve competing conclusions | maintained controversies plus `topic-show` | Dissent stored as first-class positions linked to claims and evidence |
+| Track hostile or unreliable inputs | deterministic scanning, source policy, and `knowledge-audit` | Version-specific threat observations and a maintained tainted-source index |
+| Research selected local repositories or documents | `research-local`, `source-add`, or `deposit-add` | Content-addressed sources with provenance, parsed structure, and exact anchors |
+| Discover scholarly material and acquire eligible open access copies | Crossref, OpenAlex, Europe PMC, and Unpaywall commands | Normalized discovery metadata, license-aware resolution, and immutable parsed documents |
+| Review and promote model-generated knowledge through Git | `promotion-stage`, `promotion-verify`, and `promotion-apply` | A patch/PR/MR workflow in which models propose but cannot publish canonical truth |
+| Detect ontology/database drift | `truth-snapshot`, `truth-check`, and `projection-check` | A reproducible authority boundary between Git/immutable records and disposable SQLite indexes |
+
+Start with the [use-case guide](docs/USE_CASES.md) to choose a workflow, or use
+the [executable ontology quick start](docs/QUICKSTART_ONTOLOGY.md) to build a
+topic immediately. The [documentation index](docs/README.md) maps operational,
+security, model, provenance, and architecture guides.
+
+### What Geas is not
+
+Geas is not a chat UI, a report generator, or an embedding database. Reports
+can be projected from a snapshot, but canonical knowledge remains a versioned
+graph of concepts, claims, exact evidence, provenance, disagreements, gaps, and
+source-threat observations. Natural-language retrieval is compiled into
+inspectable full-text, graph, temporal, provenance, and contradiction queries;
+embeddings are not authoritative.
+
+### Current boundary
+
+The strongest end-to-end path today is a local, single-user CLI that discovers
+web and scholarly sources, resolves supported GitHub repositories, preserves
+local and open-access documents, builds resumable ontology proposals, and
+projects accepted knowledge into SQLite. Arbitrary repository-tree acquisition
+and bounded traversal of links found inside repositories are not yet a complete
+first-class workflow; known repositories already acquired into the store can be
+selected by a source-library manifest. See
+[source libraries](docs/SOURCE_LIBRARIES.md#manifest-selectors).
+
+## Capabilities
 
 This repository provides the deterministic control plane, offline acquisition,
 open scholarly discovery, and a persistent SQLite knowledge-query vertical
@@ -122,22 +161,40 @@ Python 3.12 and `uv` are recommended:
 uv sync --extra dev
 uv run pytest
 uv run ruff check .
-uv run research-agent providers
-uv run research-agent model-smoke
-uv run research-agent projection-benchmark --tier smoke
+uv run geas providers
+uv run geas model-smoke
+uv run geas projection-benchmark --tier smoke
 ```
+
+Create a configured ontology and validate it without network or model calls:
+
+```bash
+uv run geas ontology-init ontology/example \
+  --topic "Example topic" \
+  --concept-id concept:example
+
+uv run geas --env-file .env ontology-build \
+  ontology/example/build.yaml \
+  --root data/example \
+  --check
+```
+
+Edit the explicit `build.yaml` and `library.yaml`, then rerun the second command
+without `--check` to build or resume. See
+[the ontology quick start](docs/QUICKSTART_ONTOLOGY.md) for credentials,
+checkpointing, candidate review, promotion, and final projection.
 
 Create an immutable store and archive a source:
 
 ```bash
-uv run research-agent store-init --root data
-uv run research-agent source-add README.md --root data
+uv run geas store-init --root data
+uv run geas source-add README.md --root data
 ```
 
 Run the offline research slice over one or more operator-selected directories:
 
 ```bash
-uv run research-agent research-local \
+uv run geas research-local \
   "How should prompt injection be handled?" \
   --corpus docs \
   --concept concept:prompt-injection \
@@ -157,7 +214,7 @@ Evaluate deterministic policy against zero or more threat-observation JSON
 records:
 
 ```bash
-uv run research-agent policy-check \
+uv run geas policy-check \
   --workflow-id workflow:example \
   --source-version source:sha256:example \
   --stage extraction
@@ -170,7 +227,7 @@ Run bounded Mojeek discovery using `MOJEEK_API_KEY` from the ignored `.env`
 file:
 
 ```bash
-uv run research-agent discover-mojeek \
+uv run geas discover-mojeek \
   "ontology-backed research agents" \
   --result-limit 10
 ```
@@ -184,7 +241,7 @@ Run authenticated OpenAlex discovery using `OPENALEX_API_KEY` from the same
 ignored file:
 
 ```bash
-uv run research-agent --env-file .env discover-openalex \
+uv run geas --env-file .env discover-openalex \
   "community water fluoridation neurodevelopment" \
   --concept concept:community-water-fluoridation \
   --term "community water fluoridation" \
@@ -201,7 +258,7 @@ are never placed in the knowledge store.
 Run Europe PMC lite bibliographic discovery without credentials:
 
 ```bash
-uv run research-agent discover-europe-pmc \
+uv run geas discover-europe-pmc \
   "community water fluoridation neurodevelopment" \
   --concept concept:community-water-fluoridation \
   --term "community water fluoridation" \
@@ -217,7 +274,7 @@ Resolve known DOIs to license-attributed OA manifestations with the project
 contact from the ignored `.env` file:
 
 ```bash
-uv run research-agent resolve-unpaywall \
+uv run geas resolve-unpaywall \
   10.1002/14651858.CD010856.pub3 \
   --root data
 ```
@@ -231,7 +288,7 @@ noncommercial, and no-derivatives terms require operator review.
 Preserve and parse an operator-selected document:
 
 ```bash
-uv run research-agent parse-document paper.pdf \
+uv run geas parse-document paper.pdf \
   --license CC-BY-4.0 \
   --root data
 ```
@@ -239,7 +296,7 @@ uv run research-agent parse-document paper.pdf \
 Acquire a previously resolved, deterministically licensed manifestation:
 
 ```bash
-uv run research-agent acquire-open-access \
+uv run geas acquire-open-access \
   10.1289/ehp.1104912 \
   --root data
 ```
@@ -251,7 +308,7 @@ searched with `knowledge-query --kind anchor`. Citation identifiers and
 relations are also generated automatically. Traverse one identifier exactly:
 
 ```bash
-uv run research-agent identifier-show \
+uv run geas identifier-show \
   doi 10.18653/v1/2024.naacl-long.347 \
   --database data/query.sqlite
 ```
@@ -259,7 +316,7 @@ uv run research-agent identifier-show \
 Build and exercise the maintained open-source research-agent ontology:
 
 ```bash
-demo_root=$(mktemp -d /tmp/research-agent-demo.XXXXXX)
+demo_root=$(mktemp -d /tmp/geas-demo.XXXXXX)
 ./ontology/open-source-research-agents/demo.sh "$demo_root"
 ```
 
@@ -274,11 +331,11 @@ Capture canonical state and detect later ontology, record, blob, or SQLite
 projection drift:
 
 ```bash
-uv run research-agent truth-snapshot \
+uv run geas truth-snapshot \
   --root data \
   --created-by operator:example
 
-uv run research-agent projection-check \
+uv run geas projection-check \
   data/records/truth-snapshot/aa/snapshot.json \
   data/query.sqlite \
   --root data
@@ -298,7 +355,7 @@ requires measured evidence against [the workload contract](docs/WORKLOAD_TARGET.
 Archive a user-provided source with explicit provenance:
 
 ```bash
-uv run research-agent deposit-add paper.pdf \
+uv run geas deposit-add paper.pdf \
   --deposited-by user:researcher \
   --method browser_save \
   --original-locator https://publisher.example/paper \
@@ -349,9 +406,9 @@ terms. See [docs/LICENSING.md](docs/LICENSING.md).
 
 ```text
 config/        trusted provider, vocabulary, and deterministic policy configuration
-docs/          intelligence-source research
+docs/          operator guides, architecture, policy, and research notes
 intelligence/  machine-readable upstream source registry
-ontology/      starter persistent-knowledge schema
+ontology/      maintained ontologies, source cards, and candidate bundles
 src/           models, planning, connectors, store, policy, workflow, providers, CLI
 tests/         security-invariant and behavior tests
 ```

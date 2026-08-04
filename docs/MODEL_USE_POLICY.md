@@ -45,7 +45,7 @@ Additional fail-closed rules apply:
 Local query compilation remains automatic:
 
 ```bash
-uv run research-agent research-local "Map this topic" \
+uv run geas research-local "Map this topic" \
   --corpus corpus \
   --compiler-provider deepseek_local
 ```
@@ -54,7 +54,7 @@ An external compiler within the automatic envelope requires a trusted
 classification:
 
 ```bash
-uv run research-agent research-local "Map this topic" \
+uv run geas research-local "Map this topic" \
   --corpus corpus \
   --compiler-provider openai \
   --compiler-data-class authorized_workspace

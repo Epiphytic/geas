@@ -120,7 +120,7 @@ deterministic model gate.
 First search or inspect structural anchors, then select exact leaf IDs:
 
 ```bash
-uv run research-agent propose-extraction \
+uv run geas propose-extraction \
   structural-derivation:sha256:... \
   --anchor structural-anchor:sha256:... \
   --anchor structural-anchor:sha256:... \
@@ -137,7 +137,7 @@ Validated proposals are searchable but remain visibly quarantined from
 accepted knowledge:
 
 ```bash
-uv run research-agent knowledge-query \
+uv run geas knowledge-query \
   "persistent ontology proposal" \
   --kind proposal \
   --database data/query.sqlite
@@ -148,7 +148,7 @@ anchor set, question, sampling parameters, and output ceiling. Then compare
 the two proposal IDs without another model call:
 
 ```bash
-uv run research-agent compare-extractions \
+uv run geas compare-extractions \
   extraction-proposal:sha256:HIGH... \
   extraction-proposal:sha256:MAX... \
   --root data
@@ -170,7 +170,7 @@ changing ontology state or granting either proposal commit authority.
 Inspect one small concept subtree without loading a whole proposal:
 
 ```bash
-uv run research-agent proposal-slice \
+uv run geas proposal-slice \
   extraction-proposal:sha256:... \
   concept:model-provider-support \
   --root data

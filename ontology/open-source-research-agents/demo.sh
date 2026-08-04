@@ -3,7 +3,7 @@ set -euo pipefail
 
 workspace_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 bundle_path="$workspace_root/ontology/open-source-research-agents/bundle.yaml"
-demo_root=${1:-$(mktemp -d /tmp/research-agent-open-source-agents.XXXXXX)}
+demo_root=${1:-$(mktemp -d /tmp/geas-open-source-agents.XXXXXX)}
 
 if [[ -e "$demo_root/records" || -e "$demo_root/blobs" || -e "$demo_root/query.sqlite" ]]; then
   echo "demo root already contains canonical or projected state: $demo_root" >&2
@@ -13,46 +13,46 @@ mkdir -p "$demo_root"
 
 cd "$workspace_root"
 
-uv run research-agent bundle-import \
+uv run geas bundle-import \
   "$bundle_path" \
   --root "$demo_root" \
   --imported-by operator:demo \
   > "$demo_root/import.json"
 
-uv run research-agent knowledge-audit \
+uv run geas knowledge-audit \
   --root "$demo_root" \
   --as-of 2026-08-03T16:00:00+00:00 \
   --fail-on-error \
   > "$demo_root/audit.json"
 
-uv run research-agent truth-snapshot \
+uv run geas truth-snapshot \
   --root "$demo_root" \
   --workspace "$workspace_root" \
   --created-by operator:demo \
   > "$demo_root/snapshot-envelope.json"
 jq '.snapshot' "$demo_root/snapshot-envelope.json" > "$demo_root/snapshot.json"
 
-uv run research-agent projection-build \
+uv run geas projection-build \
   "$demo_root/snapshot.json" \
   "$demo_root/query.sqlite" \
   --root "$demo_root" \
   --workspace "$workspace_root" \
   > "$demo_root/projection.json"
 
-uv run research-agent knowledge-query \
+uv run geas knowledge-query \
   "persistent ontology exact evidence and deterministic retrieval" \
   --database "$demo_root/query.sqlite" \
   --limit 20 \
   > "$demo_root/query-persistent-knowledge.json"
 
-uv run research-agent knowledge-query \
+uv run geas knowledge-query \
   "prompt injection poisoned source threat" \
   --database "$demo_root/query.sqlite" \
   --kind threat \
   --limit 20 \
   > "$demo_root/query-threats.json"
 
-uv run research-agent knowledge-query \
+uv run geas knowledge-query \
   "STORM hierarchical mind map references" \
   --database "$demo_root/query.sqlite" \
   --kind claim \
@@ -60,13 +60,13 @@ uv run research-agent knowledge-query \
   --limit 20 \
   > "$demo_root/query-storm.json"
 
-uv run research-agent topic-export \
+uv run geas topic-export \
   concept:open-source-research-agents \
   "$demo_root/topic.md" \
   --database "$demo_root/query.sqlite" \
   > "$demo_root/topic-export.json"
 
-uv run research-agent projection-check \
+uv run geas projection-check \
   "$demo_root/snapshot.json" \
   "$demo_root/query.sqlite" \
   --root "$demo_root" \

@@ -3,8 +3,8 @@
 The benchmark is reproducible from the CLI:
 
 ```bash
-uv run research-agent projection-benchmark --tier smoke
-uv run research-agent projection-benchmark --tier standard
+uv run geas projection-benchmark --tier smoke
+uv run geas projection-benchmark --tier standard
 ```
 
 It measures the complete local path: content-addressed canonical writes, truth

@@ -71,7 +71,7 @@ typed derivation without changing existing anchors.
 records. Existing text can be reprocessed idempotently:
 
 ```bash
-uv run research-agent derive-structure \
+uv run geas derive-structure \
   text-derivation:sha256:<digest> \
   --root data
 ```
@@ -82,7 +82,7 @@ and parent graph. It indexes leaf-block text and heading/section labels under
 query kind `anchor`; document and page containers are not duplicated into FTS:
 
 ```bash
-uv run research-agent knowledge-query \
+uv run geas knowledge-query \
   "population evidence uncertainty" \
   --kind anchor \
   --database data/query.sqlite

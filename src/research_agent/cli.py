@@ -154,7 +154,7 @@ def _local_approval_principal(root: Path) -> AuthenticatedPrincipal:
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="research-agent")
+    parser = argparse.ArgumentParser(prog="geas")
     parser.add_argument(
         "--providers",
         type=Path,
