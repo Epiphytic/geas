@@ -20,7 +20,11 @@ from research_agent.approvals import ApprovalRegistry
 from research_agent.audit import DeterministicKnowledgeAuditor
 from research_agent.budget import BudgetPolicy, UsageLedger
 from research_agent.bundles import KnowledgeBundleImporter
-from research_agent.candidate_bundles import CandidateBundleError, CandidateBundleWriter
+from research_agent.candidate_bundles import (
+    CandidateBundleError,
+    CandidateBundleWriter,
+    CandidateLicenseError,
+)
 from research_agent.connectors import MojeekDiscoveryConnector
 from research_agent.discovery import (
     CompilerIdentity,
@@ -576,7 +580,7 @@ class OntologyBuilder:
                     topic_concept_id=self.config.topic_concept_id,
                     output_root=self.config.output_directory,
                 )
-            except CandidateBundleError:
+            except CandidateLicenseError:
                 unlicensed.append(snapshot.repository)
                 self.progress.event(
                     "bundle",
@@ -586,6 +590,20 @@ class OntologyBuilder:
                     total=len(selected_snapshots),
                     repository=snapshot.repository,
                     license=snapshot.license or "unknown",
+                )
+                continue
+            except CandidateBundleError as error:
+                failures.append(
+                    f"{snapshot.repository}:candidate-bundle:{type(error).__name__}"
+                )
+                self.progress.event(
+                    "bundle",
+                    "failed",
+                    f"Rejected invalid candidate bundle for {snapshot.repository}",
+                    current=index,
+                    total=len(selected_snapshots),
+                    repository=snapshot.repository,
+                    error_type=type(error).__name__,
                 )
                 continue
             relative_text = relative.as_posix()

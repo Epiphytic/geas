@@ -19,6 +19,10 @@ class CandidateBundleError(ValueError):
     pass
 
 
+class CandidateLicenseError(CandidateBundleError):
+    pass
+
+
 class CandidateBundleWriter:
     """Render validated proposals and immutable source bytes for Git review."""
 
@@ -54,7 +58,9 @@ class CandidateBundleWriter:
         if proposal.source_version_id != snapshot.source_version_id:
             raise CandidateBundleError("proposal and repository snapshot source differ")
         if snapshot.license not in self.permissive_licenses:
-            raise CandidateBundleError("source license is not a known redistributable license")
+            raise CandidateLicenseError(
+                "source license is not a known redistributable license"
+            )
         manager = GitPromotionManager(store=self.store, repository=self.workspace)
         try:
             pack = manager.build_pack(

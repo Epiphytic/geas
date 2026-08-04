@@ -6,7 +6,10 @@ from pathlib import Path
 import pytest
 
 from research_agent.bundles import KnowledgeBundle, KnowledgeBundleImporter
-from research_agent.candidate_bundles import CandidateBundleError, CandidateBundleWriter
+from research_agent.candidate_bundles import (
+    CandidateBundleWriter,
+    CandidateLicenseError,
+)
 from research_agent.discovery_acquisition import RepositorySnapshot
 from research_agent.extraction import AnchorGroundedExtractionManager
 from research_agent.parsing import ParsedDocumentManager
@@ -209,7 +212,7 @@ def test_candidate_bundle_namespaces_same_model_id_per_repository(tmp_path) -> N
 
 def test_candidate_bundle_rejects_unknown_license(tmp_path) -> None:
     workspace, store, proposal, snapshot = _fixture(tmp_path)
-    with pytest.raises(CandidateBundleError, match="license"):
+    with pytest.raises(CandidateLicenseError, match="license"):
         CandidateBundleWriter(store=store, workspace=workspace).write(
             proposal,
             snapshot.model_copy(update={"license": None}),
