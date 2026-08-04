@@ -953,12 +953,7 @@ class OntologyBuilder:
             provider=self.config.provider,
             model=provider.model,
         ).propose(
-            question=(
-                f"Build reusable ontology knowledge about {snapshot.repository} as an "
-                "open-source research agent. Extract only supported identity, scope, "
-                "architecture, retrieval, inputs, outputs, persistent state, local-model "
-                "support, licensing, security, evaluation, limitations, dissent, and gaps."
-            ),
+            question=self._extraction_question(snapshot.repository),
             structural_derivation_id=structural_derivation_id,
             anchor_ids=anchors,
             allowed_concept_ids=(self.config.topic_concept_id,),
@@ -972,6 +967,23 @@ class OntologyBuilder:
         if gate.last_settlement is not None:
             self.store.put_record("usage-settlement", gate.last_settlement)
         return result.proposal
+
+    @staticmethod
+    def _extraction_question(repository: str) -> str:
+        return (
+            f"Assess {repository} for the maintained ontology of open-source "
+            "research agents without presupposing that the repository is in scope. "
+            "The supplied source must explicitly support classification as one of: "
+            "(1) a research agent, (2) a framework or component explicitly intended "
+            "for research agents, (3) a benchmark or dataset explicitly evaluating "
+            "research agents, or (4) a curated catalog explicitly about research "
+            "agents. Repository names, search ranking, and this question are not "
+            "evidence. If none of those classifications is explicitly supported, "
+            "return empty concepts, claims, controversies, and gaps. If supported, "
+            "build reusable knowledge and extract only evidenced identity, scope, "
+            "architecture, retrieval, inputs, outputs, persistent state, local-model "
+            "support, licensing, security, evaluation, limitations, dissent, and gaps."
+        )
 
     def _model_heartbeat(
         self,

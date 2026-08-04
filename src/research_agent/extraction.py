@@ -470,10 +470,11 @@ class ReasoningDebugLogger:
 
 
 class AnchorGroundedExtractionManager:
-    version = "anchor-grounded-extraction-validator/2"
+    version = "anchor-grounded-extraction-validator/3"
     compatible_proposal_versions = frozenset(
         {
             "anchor-grounded-extraction-validator/1",
+            "anchor-grounded-extraction-validator/2",
             version,
         }
     )

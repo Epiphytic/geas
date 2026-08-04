@@ -193,7 +193,11 @@ def test_proposal_reuse_requires_model_and_validator_contract(tmp_path) -> None:
         "deepseek-v4-flash",
     )
     assert builder._proposal_is_compatible(
-        proposal,
+        proposal.model_copy(
+            update={
+                "validator_version": "anchor-grounded-extraction-validator/2"
+            }
+        ),
         request.model_copy(
             update={
                 "validator_version": "anchor-grounded-extraction-validator/1"
@@ -211,6 +215,14 @@ def test_proposal_reuse_requires_model_and_validator_contract(tmp_path) -> None:
         request,
         "deepseek-v4-flash",
     )
+
+
+def test_extraction_question_does_not_presuppose_repository_is_an_agent() -> None:
+    question = OntologyBuilder._extraction_question("Example/Repository")
+
+    assert "without presupposing" in question
+    assert "Repository names, search ranking, and this question are not evidence" in question
+    assert "return empty concepts, claims, controversies, and gaps" in question
 
 
 def test_seed_globs_only_resolve_git_tracked_promoted_bundles(tmp_path) -> None:
