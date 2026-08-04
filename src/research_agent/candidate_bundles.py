@@ -9,6 +9,7 @@ import yaml
 from research_agent.bundles import BundleEvidence, BundleSource, KnowledgeBundle
 from research_agent.discovery_acquisition import RepositorySnapshot
 from research_agent.extraction import ValidatedExtractionProposal
+from research_agent.knowledge import KnowledgePack
 from research_agent.models import canonical_json
 from research_agent.promotion import GitPromotionManager, PromotionError
 from research_agent.store import ImmutableStore
@@ -21,7 +22,7 @@ class CandidateBundleError(ValueError):
 class CandidateBundleWriter:
     """Render validated proposals and immutable source bytes for Git review."""
 
-    version = "candidate-bundle-writer/1"
+    version = "candidate-bundle-writer/2"
     permissive_licenses = frozenset(
         {
             "0BSD",
@@ -64,6 +65,7 @@ class CandidateBundleWriter:
             )
         except PromotionError as error:
             raise CandidateBundleError(str(error)) from error
+        pack = self._namespace_proposed_concepts(pack, proposal, snapshot)
         slug = re.sub(r"[^a-z0-9]+", "-", snapshot.repository.casefold()).strip("-")
         relative_root = output_root / slug
         self._confined(relative_root)
@@ -133,6 +135,65 @@ class CandidateBundleWriter:
         if canonical_json(KnowledgeBundle.from_yaml(bundle_path)) != canonical_json(bundle):
             raise CandidateBundleError("rendered candidate bundle failed round-trip validation")
         return bundle_path.relative_to(self.workspace)
+
+    @staticmethod
+    def _namespace_proposed_concepts(
+        pack: KnowledgePack,
+        proposal: ValidatedExtractionProposal,
+        snapshot: RepositorySnapshot,
+    ) -> KnowledgePack:
+        """Make model-created IDs deterministic and collision-free across repositories."""
+
+        repository_namespace = snapshot.repository.casefold().replace("/", ":")
+        proposed_ids = {item.id for item in proposal.concepts}
+        remap = {
+            concept_id: f"concept:{repository_namespace}:{concept_id.removeprefix('concept:')}"
+            for concept_id in proposed_ids
+        }
+
+        def mapped(value: str) -> str:
+            return remap.get(value, value)
+
+        concepts = tuple(
+            item.model_copy(
+                update={
+                    "id": mapped(item.id),
+                    "broader": tuple(mapped(parent) for parent in item.broader),
+                }
+            )
+            for item in pack.concepts
+        )
+        claims = tuple(
+            item.model_copy(
+                update={
+                    "subject": mapped(item.subject),
+                    "object": mapped(item.object)
+                    if isinstance(item.object, str)
+                    else item.object,
+                    "qualifiers": {
+                        key: mapped(value) if isinstance(value, str) else value
+                        for key, value in item.qualifiers.items()
+                    },
+                }
+            )
+            for item in pack.claims
+        )
+        controversies = tuple(
+            item.model_copy(update={"topic_concept_id": mapped(item.topic_concept_id)})
+            for item in pack.controversies
+        )
+        gaps = tuple(
+            item.model_copy(update={"topic_concept_id": mapped(item.topic_concept_id)})
+            for item in pack.gaps
+        )
+        return pack.model_copy(
+            update={
+                "concepts": concepts,
+                "claims": claims,
+                "controversies": controversies,
+                "gaps": gaps,
+            }
+        )
 
     def _confined(self, relative: Path) -> Path:
         if relative.is_absolute() or ".." in relative.parts:

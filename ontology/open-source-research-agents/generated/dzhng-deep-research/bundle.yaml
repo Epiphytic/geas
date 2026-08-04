@@ -1,0 +1,643 @@
+version: 1
+topic: State of available open-source research agents
+topic_concept_id: concept:open-source-research-agents
+recorded_at: '2026-08-04T18:26:46.073536Z'
+sources:
+- key: dzhng-deep-research-e157f80f5866
+  path: sources/dzhng-deep-research-e157f80f5866.md
+  expected_sha256: e157f80f58668649c2d0b528dbad422de671d52a551cf2160156be685c7947fd
+  acquired_at: '2026-08-04T18:25:35.445054Z'
+  original_locator: https://github.com/dzhng/deep-research/tree/1f8f3e285bbc23e80b98a66a64effab9069f3ad4/README.md
+  title: dzhng/deep-research README at 1f8f3e285bbc
+  authors: []
+  publisher: GitHub
+  media_type: text/markdown
+  license: MIT
+  usage_conditions:
+  - Redistributed under SPDX license MIT.
+  rights_basis: 'SPDX license reported by the official repository API: MIT'
+  provenance_note: Resolved through the official GitHub API, pinned to immutable commit
+    1f8f3e285bbc23e80b98a66a64effab9069f3ad4, and verified against Git blob 78d7dcaad5524e630b5c106f46bf4782a56b7ce5.
+concepts:
+- id: concept:dzhng:deep-research:concurrent-processing
+  label: Concurrent Processing
+  description: Handles multiple searches and result processing in parallel for efficiency.
+  broader:
+  - concept:dzhng:deep-research:dzhng-deep-research
+  synonyms: []
+  recorded_at: '2026-08-04T18:26:46.073536Z'
+  recorded_by: extraction-proposal:extraction-proposal:sha256:b2ca61219baf375cf76ce0555d9139f594f734a5afefe72798b9ce4db1b11e71
+  review_state: accepted
+- id: concept:dzhng:deep-research:custom-endpoint-support
+  label: Custom Endpoint Support
+  description: Allows using other OpenAI compatible APIs by setting OPENAI_ENDPOINT
+    and CUSTOM_MODEL environment variables.
+  broader:
+  - concept:dzhng:deep-research:dzhng-deep-research
+  synonyms: []
+  recorded_at: '2026-08-04T18:26:46.073536Z'
+  recorded_by: extraction-proposal:extraction-proposal:sha256:b2ca61219baf375cf76ce0555d9139f594f734a5afefe72798b9ce4db1b11e71
+  review_state: accepted
+- id: concept:dzhng:deep-research:deepseek-r1-support
+  label: DeepSeek R1 Support
+  description: Supports DeepSeek R1 model via Fireworks API, automatically switches
+    from o3-mini when Fireworks key is detected.
+  broader:
+  - concept:dzhng:deep-research:dzhng-deep-research
+  synonyms: []
+  recorded_at: '2026-08-04T18:26:46.073536Z'
+  recorded_by: extraction-proposal:extraction-proposal:sha256:b2ca61219baf375cf76ce0555d9139f594f734a5afefe72798b9ce4db1b11e71
+  review_state: accepted
+- id: concept:dzhng:deep-research:depth-breadth-control
+  label: Depth & Breadth Control
+  description: Configurable parameters to control how wide (breadth) and deep (depth)
+    the research goes.
+  broader:
+  - concept:dzhng:deep-research:dzhng-deep-research
+  synonyms: []
+  recorded_at: '2026-08-04T18:26:46.073536Z'
+  recorded_by: extraction-proposal:extraction-proposal:sha256:b2ca61219baf375cf76ce0555d9139f594f734a5afefe72798b9ce4db1b11e71
+  review_state: accepted
+- id: concept:dzhng:deep-research:docker-deployment
+  label: Docker Deployment
+  description: Supports deployment via Docker with docker build and docker compose.
+  broader:
+  - concept:dzhng:deep-research:dzhng-deep-research
+  synonyms: []
+  recorded_at: '2026-08-04T18:26:46.073536Z'
+  recorded_by: extraction-proposal:extraction-proposal:sha256:b2ca61219baf375cf76ce0555d9139f594f734a5afefe72798b9ce4db1b11e71
+  review_state: accepted
+- id: concept:dzhng:deep-research:dzhng-deep-research
+  label: dzhng/deep-research
+  description: An AI-powered research assistant that performs iterative, deep research
+    on any topic by combining search engines, web scraping, and large language models.
+  broader:
+  - concept:open-source-research-agents
+  synonyms:
+  - Open Deep Research
+  recorded_at: '2026-08-04T18:26:46.073536Z'
+  recorded_by: extraction-proposal:extraction-proposal:sha256:b2ca61219baf375cf76ce0555d9139f594f734a5afefe72798b9ce4db1b11e71
+  review_state: accepted
+- id: concept:dzhng:deep-research:iterative-research
+  label: Iterative Research
+  description: Performs deep research by iteratively generating search queries, processing
+    results, and diving deeper based on findings.
+  broader:
+  - concept:dzhng:deep-research:dzhng-deep-research
+  synonyms: []
+  recorded_at: '2026-08-04T18:26:46.073536Z'
+  recorded_by: extraction-proposal:extraction-proposal:sha256:b2ca61219baf375cf76ce0555d9139f594f734a5afefe72798b9ce4db1b11e71
+  review_state: accepted
+- id: concept:dzhng:deep-research:local-model-support
+  label: Local Model Support
+  description: Supports local LLMs by setting OPENAI_ENDPOINT and OPENAI_MODEL environment
+    variables.
+  broader:
+  - concept:dzhng:deep-research:dzhng-deep-research
+  synonyms: []
+  recorded_at: '2026-08-04T18:26:46.073536Z'
+  recorded_by: extraction-proposal:extraction-proposal:sha256:b2ca61219baf375cf76ce0555d9139f594f734a5afefe72798b9ce4db1b11e71
+  review_state: accepted
+- id: concept:dzhng:deep-research:markdown-report
+  label: Markdown Report
+  description: Produces detailed markdown reports with findings and sources.
+  broader:
+  - concept:dzhng:deep-research:dzhng-deep-research
+  synonyms: []
+  recorded_at: '2026-08-04T18:26:46.073536Z'
+  recorded_by: extraction-proposal:extraction-proposal:sha256:b2ca61219baf375cf76ce0555d9139f594f734a5afefe72798b9ce4db1b11e71
+  review_state: accepted
+- id: concept:dzhng:deep-research:mit-license
+  label: MIT License
+  description: MIT License - feel free to use and modify as needed.
+  broader:
+  - concept:dzhng:deep-research:dzhng-deep-research
+  synonyms: []
+  recorded_at: '2026-08-04T18:26:46.073536Z'
+  recorded_by: extraction-proposal:extraction-proposal:sha256:b2ca61219baf375cf76ce0555d9139f594f734a5afefe72798b9ce4db1b11e71
+  review_state: accepted
+- id: concept:open-source-research-agents
+  label: Open-source research agents
+  description: Open-source systems that plan, retrieve, synthesize, or maintain research
+    knowledge.
+  broader: []
+  synonyms:
+  - open deep research
+  - research automation
+  recorded_at: '2026-08-03T16:00:00Z'
+  recorded_by: operator:epiphytic
+  review_state: accepted
+- id: concept:dzhng:deep-research:serp-query-generation
+  label: SERP Query Generation
+  description: Uses LLMs to generate targeted search queries based on research goals
+    and previous findings.
+  broader:
+  - concept:dzhng:deep-research:dzhng-deep-research
+  synonyms: []
+  recorded_at: '2026-08-04T18:26:46.073536Z'
+  recorded_by: extraction-proposal:extraction-proposal:sha256:b2ca61219baf375cf76ce0555d9139f594f734a5afefe72798b9ce4db1b11e71
+  review_state: accepted
+evidence:
+- key: identity-description-evidence-1
+  source_key: dzhng-deep-research-e157f80f5866
+  exact: An AI-powered research assistant that performs iterative, deep research on
+    any topic by combining search engines, web scraping, and large language models.
+  start: 22
+  end: 176
+- key: goal-simplicity-evidence-1
+  source_key: dzhng-deep-research-e157f80f5866
+  exact: The goal of this repo is to provide the simplest implementation of a deep
+    research agent - e.g. an agent that can refine its research direction over time
+    and deep dive into a topic. Goal is to keep the repo size at <500 LoC so it is
+    easy to understand and build on top of.
+  start: 178
+  end: 450
+- key: creator-duet-evidence-1
+  source_key: dzhng-deep-research-e157f80f5866
+  exact: If you like this project, please consider starring it and giving me a follow
+    on [X/Twitter](https://x.com/dzhng). This project is created by [Duet](https://duet.so).
+  start: 452
+  end: 617
+- key: feature-iterative-research-evidence-1
+  source_key: dzhng-deep-research-e157f80f5866
+  exact: '- **Iterative Research**: Performs deep research by iteratively generating
+    search queries, processing results, and diving deeper based on findings'
+  start: 1756
+  end: 1902
+- key: feature-query-generation-evidence-1
+  source_key: dzhng-deep-research-e157f80f5866
+  exact: '- **Intelligent Query Generation**: Uses LLMs to generate targeted search
+    queries based on research goals and previous findings'
+  start: 1903
+  end: 2030
+- key: feature-depth-breadth-evidence-1
+  source_key: dzhng-deep-research-e157f80f5866
+  exact: '- **Depth & Breadth Control**: Configurable parameters to control how wide
+    (breadth) and deep (depth) the research goes'
+  start: 2031
+  end: 2150
+- key: feature-smart-followup-evidence-1
+  source_key: dzhng-deep-research-e157f80f5866
+  exact: '- **Smart Follow-up**: Generates follow-up questions to better understand
+    research needs'
+  start: 2151
+  end: 2239
+- key: feature-comprehensive-reports-evidence-1
+  source_key: dzhng-deep-research-e157f80f5866
+  exact: '- **Comprehensive Reports**: Produces detailed markdown reports with findings
+    and sources'
+  start: 2240
+  end: 2329
+- key: feature-concurrent-processing-evidence-1
+  source_key: dzhng-deep-research-e157f80f5866
+  exact: '- **Concurrent Processing**: Handles multiple searches and result processing
+    in parallel for efficiency'
+  start: 2330
+  end: 2433
+- key: requirement-nodejs-evidence-1
+  source_key: dzhng-deep-research-e157f80f5866
+  exact: '- Node.js environment'
+  start: 2452
+  end: 2473
+- key: requirement-firecrawl-evidence-1
+  source_key: dzhng-deep-research-e157f80f5866
+  exact: '  - Firecrawl API (for web search and content extraction)'
+  start: 2490
+  end: 2547
+- key: requirement-openai-evidence-1
+  source_key: dzhng-deep-research-e157f80f5866
+  exact: '  - OpenAI API (for o3 mini model)'
+  start: 2548
+  end: 2582
+- key: local-model-config-evidence-1
+  source_key: dzhng-deep-research-e157f80f5866
+  exact: 'To use local LLM, comment out `OPENAI_KEY` and instead uncomment `OPENAI_ENDPOINT`
+    and `OPENAI_MODEL`:'
+  start: 2936
+  end: 3038
+- key: local-model-config-evidence-2
+  source_key: dzhng-deep-research-e157f80f5866
+  exact: '- Set `OPENAI_ENDPOINT` to the address of your local server (eg."http://localhost:1234/v1")'
+  start: 3040
+  end: 3131
+- key: local-model-config-evidence-3
+  source_key: dzhng-deep-research-e157f80f5866
+  exact: '- Set `OPENAI_MODEL` to the name of the model loaded in your local server.'
+  start: 3132
+  end: 3206
+- key: deepseek-r1-config-evidence-1
+  source_key: dzhng-deep-research-e157f80f5866
+  exact: 'Deep research performs great on R1! We use [Fireworks](http://fireworks.ai)
+    as the main provider for the R1 model. To use R1, simply set a Fireworks API key:'
+  start: 4484
+  end: 4641
+- key: deepseek-r1-config-evidence-2
+  source_key: dzhng-deep-research-e157f80f5866
+  exact: The system will automatically switch over to use R1 instead of `o3-mini`
+    when the key is detected.
+  start: 4680
+  end: 4778
+- key: custom-endpoint-config-evidence-1
+  source_key: dzhng-deep-research-e157f80f5866
+  exact: There are 2 other optional env vars that lets you tweak the endpoint (for
+    other OpenAI compatible APIs like OpenRouter or Gemini) as well as the model string.
+  start: 4813
+  end: 4971
+- key: custom-endpoint-config-evidence-2
+  source_key: dzhng-deep-research-e157f80f5866
+  exact: 'OPENAI_ENDPOINT="custom_endpoint"
+
+    CUSTOM_MODEL="custom_model"
+
+    '
+  start: 4981
+  end: 5043
+- key: docker-deployment-evidence-1
+  source_key: dzhng-deep-research-e157f80f5866
+  exact: '### Docker'
+  start: 3208
+  end: 3218
+- key: docker-deployment-evidence-2
+  source_key: dzhng-deep-research-e157f80f5866
+  exact: 1. Clone the repository
+  start: 3220
+  end: 3243
+- key: docker-deployment-evidence-3
+  source_key: dzhng-deep-research-e157f80f5866
+  exact: 2. Rename `.env.example` to `.env.local` and set your API keys
+  start: 3244
+  end: 3306
+- key: docker-deployment-evidence-4
+  source_key: dzhng-deep-research-e157f80f5866
+  exact: 3. Run `docker build -f Dockerfile`
+  start: 3308
+  end: 3343
+- key: docker-deployment-evidence-5
+  source_key: dzhng-deep-research-e157f80f5866
+  exact: '4. Run the Docker image:'
+  start: 3345
+  end: 3369
+- key: docker-deployment-evidence-6
+  source_key: dzhng-deep-research-e157f80f5866
+  exact: 'docker compose up -d
+
+    '
+  start: 3379
+  end: 3400
+- key: docker-deployment-evidence-7
+  source_key: dzhng-deep-research-e157f80f5866
+  exact: '5. Execute `npm run docker` in the docker service:'
+  start: 3405
+  end: 3455
+- key: docker-deployment-evidence-8
+  source_key: dzhng-deep-research-e157f80f5866
+  exact: 'docker exec -it deep-research npm run docker
+
+    '
+  start: 3465
+  end: 3510
+- key: concurrency-config-evidence-1
+  source_key: dzhng-deep-research-e157f80f5866
+  exact: If you have a paid version of Firecrawl or a local version, feel free to
+    increase the `ConcurrencyLimit` by setting the `CONCURRENCY_LIMIT` environment
+    variable so it runs faster.
+  start: 4149
+  end: 4328
+- key: output-report-evidence-1
+  source_key: dzhng-deep-research-e157f80f5866
+  exact: The final report will be saved as `report.md` or `answer.md` in your working
+    directory, depending on which modes you selected.
+  start: 4004
+  end: 4130
+- key: license-mit-evidence-1
+  source_key: dzhng-deep-research-e157f80f5866
+  exact: MIT License - feel free to use and modify as needed.
+  start: 5918
+  end: 5970
+- key: architecture-flow-evidence-1
+  source_key: dzhng-deep-research-e157f80f5866
+  exact: "```mermaid\nflowchart TB\n    subgraph Input\n        Q[User Query]\n  \
+    \      B[Breadth Parameter]\n        D[Depth Parameter]\n    end"
+  start: 636
+  end: 764
+- key: architecture-flow-evidence-2
+  source_key: dzhng-deep-research-e157f80f5866
+  exact: "    DR[Deep Research] -->\n    SQ[SERP Queries] -->\n    PR[Process Results]"
+  start: 766
+  end: 840
+- key: architecture-flow-evidence-3
+  source_key: dzhng-deep-research-e157f80f5866
+  exact: "    subgraph Results[Results]\n        direction TB\n        NL((Learnings))\n\
+    \        ND((Directions))\n    end"
+  start: 842
+  end: 949
+- key: architecture-flow-evidence-4
+  source_key: dzhng-deep-research-e157f80f5866
+  exact: "    PR --> NL\n    PR --> ND"
+  start: 951
+  end: 978
+- key: architecture-flow-evidence-5
+  source_key: dzhng-deep-research-e157f80f5866
+  exact: '    DP{depth > 0?}'
+  start: 980
+  end: 998
+- key: architecture-flow-evidence-6
+  source_key: dzhng-deep-research-e157f80f5866
+  exact: "    RD[\"Next Direction:\n    - Prior Goals\n    - New Questions\n    -\
+    \ Learnings\"]"
+  start: 1000
+  end: 1079
+- key: architecture-flow-evidence-7
+  source_key: dzhng-deep-research-e157f80f5866
+  exact: '    MR[Markdown Report]'
+  start: 1081
+  end: 1104
+- key: architecture-flow-evidence-8
+  source_key: dzhng-deep-research-e157f80f5866
+  exact: "    %% Main Flow\n    Q & B & D --> DR"
+  start: 1106
+  end: 1143
+- key: architecture-flow-evidence-9
+  source_key: dzhng-deep-research-e157f80f5866
+  exact: "    %% Results to Decision\n    NL & ND --> DP"
+  start: 1145
+  end: 1190
+- key: architecture-flow-evidence-10
+  source_key: dzhng-deep-research-e157f80f5866
+  exact: "    %% Circular Flow\n    DP -->|Yes| RD\n    RD -->|New Context| DR"
+  start: 1192
+  end: 1258
+- key: architecture-flow-evidence-11
+  source_key: dzhng-deep-research-e157f80f5866
+  exact: "    %% Final Output\n    DP -->|No| MR"
+  start: 1260
+  end: 1297
+claims:
+- key: identity-description
+  subject: concept:dzhng:deep-research:dzhng-deep-research
+  predicate: ep:description
+  object: An AI-powered research assistant that performs iterative, deep research
+    on any topic by combining search engines, web scraping, and large language models.
+  qualifiers: {}
+  stance: asserts
+  epistemic_status: observed
+  asserted_by: model:deepseek_local:deepseek-v4-flash
+  evidence_keys:
+  - identity-description-evidence-1
+- key: goal-simplicity
+  subject: concept:dzhng:deep-research:dzhng-deep-research
+  predicate: ep:goal
+  object: simplest implementation of a deep research agent with <500 LoC
+  qualifiers: {}
+  stance: asserts
+  epistemic_status: observed
+  asserted_by: model:deepseek_local:deepseek-v4-flash
+  evidence_keys:
+  - goal-simplicity-evidence-1
+- key: creator-duet
+  subject: concept:dzhng:deep-research:dzhng-deep-research
+  predicate: ep:creator
+  object: Duet
+  qualifiers: {}
+  stance: asserts
+  epistemic_status: observed
+  asserted_by: model:deepseek_local:deepseek-v4-flash
+  evidence_keys:
+  - creator-duet-evidence-1
+- key: feature-iterative-research
+  subject: concept:dzhng:deep-research:dzhng-deep-research
+  predicate: ep:has_feature
+  object: concept:dzhng:deep-research:iterative-research
+  qualifiers: {}
+  stance: asserts
+  epistemic_status: observed
+  asserted_by: model:deepseek_local:deepseek-v4-flash
+  evidence_keys:
+  - feature-iterative-research-evidence-1
+- key: feature-query-generation
+  subject: concept:dzhng:deep-research:dzhng-deep-research
+  predicate: ep:has_feature
+  object: concept:dzhng:deep-research:serp-query-generation
+  qualifiers: {}
+  stance: asserts
+  epistemic_status: observed
+  asserted_by: model:deepseek_local:deepseek-v4-flash
+  evidence_keys:
+  - feature-query-generation-evidence-1
+- key: feature-depth-breadth
+  subject: concept:dzhng:deep-research:dzhng-deep-research
+  predicate: ep:has_feature
+  object: concept:dzhng:deep-research:depth-breadth-control
+  qualifiers: {}
+  stance: asserts
+  epistemic_status: observed
+  asserted_by: model:deepseek_local:deepseek-v4-flash
+  evidence_keys:
+  - feature-depth-breadth-evidence-1
+- key: feature-smart-followup
+  subject: concept:dzhng:deep-research:dzhng-deep-research
+  predicate: ep:has_feature
+  object: Generates follow-up questions to better understand research needs
+  qualifiers: {}
+  stance: asserts
+  epistemic_status: observed
+  asserted_by: model:deepseek_local:deepseek-v4-flash
+  evidence_keys:
+  - feature-smart-followup-evidence-1
+- key: feature-comprehensive-reports
+  subject: concept:dzhng:deep-research:dzhng-deep-research
+  predicate: ep:has_feature
+  object: concept:dzhng:deep-research:markdown-report
+  qualifiers: {}
+  stance: asserts
+  epistemic_status: observed
+  asserted_by: model:deepseek_local:deepseek-v4-flash
+  evidence_keys:
+  - feature-comprehensive-reports-evidence-1
+- key: feature-concurrent-processing
+  subject: concept:dzhng:deep-research:dzhng-deep-research
+  predicate: ep:has_feature
+  object: concept:dzhng:deep-research:concurrent-processing
+  qualifiers: {}
+  stance: asserts
+  epistemic_status: observed
+  asserted_by: model:deepseek_local:deepseek-v4-flash
+  evidence_keys:
+  - feature-concurrent-processing-evidence-1
+- key: requirement-nodejs
+  subject: concept:dzhng:deep-research:dzhng-deep-research
+  predicate: ep:requires_environment
+  object: Node.js
+  qualifiers: {}
+  stance: asserts
+  epistemic_status: observed
+  asserted_by: model:deepseek_local:deepseek-v4-flash
+  evidence_keys:
+  - requirement-nodejs-evidence-1
+- key: requirement-firecrawl
+  subject: concept:dzhng:deep-research:dzhng-deep-research
+  predicate: ep:requires_api_key
+  object: Firecrawl API
+  qualifiers: {}
+  stance: asserts
+  epistemic_status: observed
+  asserted_by: model:deepseek_local:deepseek-v4-flash
+  evidence_keys:
+  - requirement-firecrawl-evidence-1
+- key: requirement-openai
+  subject: concept:dzhng:deep-research:dzhng-deep-research
+  predicate: ep:requires_api_key
+  object: OpenAI API (for o3 mini model)
+  qualifiers: {}
+  stance: asserts
+  epistemic_status: observed
+  asserted_by: model:deepseek_local:deepseek-v4-flash
+  evidence_keys:
+  - requirement-openai-evidence-1
+- key: local-model-config
+  subject: concept:dzhng:deep-research:local-model-support
+  predicate: ep:configuration
+  object: OPENAI_ENDPOINT and OPENAI_MODEL env vars
+  qualifiers: {}
+  stance: asserts
+  epistemic_status: observed
+  asserted_by: model:deepseek_local:deepseek-v4-flash
+  evidence_keys:
+  - local-model-config-evidence-1
+  - local-model-config-evidence-2
+  - local-model-config-evidence-3
+- key: deepseek-r1-config
+  subject: concept:dzhng:deep-research:deepseek-r1-support
+  predicate: ep:supported_via
+  object: Fireworks API
+  qualifiers: {}
+  stance: asserts
+  epistemic_status: observed
+  asserted_by: model:deepseek_local:deepseek-v4-flash
+  evidence_keys:
+  - deepseek-r1-config-evidence-1
+  - deepseek-r1-config-evidence-2
+- key: custom-endpoint-config
+  subject: concept:dzhng:deep-research:custom-endpoint-support
+  predicate: ep:configuration
+  object: OPENAI_ENDPOINT and CUSTOM_MODEL env vars
+  qualifiers: {}
+  stance: asserts
+  epistemic_status: observed
+  asserted_by: model:deepseek_local:deepseek-v4-flash
+  evidence_keys:
+  - custom-endpoint-config-evidence-1
+  - custom-endpoint-config-evidence-2
+- key: docker-deployment
+  subject: concept:dzhng:deep-research:docker-deployment
+  predicate: ep:deployment_method
+  object: Docker
+  qualifiers: {}
+  stance: asserts
+  epistemic_status: observed
+  asserted_by: model:deepseek_local:deepseek-v4-flash
+  evidence_keys:
+  - docker-deployment-evidence-1
+  - docker-deployment-evidence-2
+  - docker-deployment-evidence-3
+  - docker-deployment-evidence-4
+  - docker-deployment-evidence-5
+  - docker-deployment-evidence-6
+  - docker-deployment-evidence-7
+  - docker-deployment-evidence-8
+- key: concurrency-config
+  subject: concept:dzhng:deep-research:concurrent-processing
+  predicate: ep:configurable
+  object: CONCURRENCY_LIMIT env var
+  qualifiers: {}
+  stance: asserts
+  epistemic_status: observed
+  asserted_by: model:deepseek_local:deepseek-v4-flash
+  evidence_keys:
+  - concurrency-config-evidence-1
+- key: output-report
+  subject: concept:dzhng:deep-research:markdown-report
+  predicate: ep:output_format
+  object: markdown
+  qualifiers: {}
+  stance: asserts
+  epistemic_status: observed
+  asserted_by: model:deepseek_local:deepseek-v4-flash
+  evidence_keys:
+  - output-report-evidence-1
+- key: license-mit
+  subject: concept:dzhng:deep-research:mit-license
+  predicate: ep:license_type
+  object: MIT
+  qualifiers: {}
+  stance: asserts
+  epistemic_status: observed
+  asserted_by: model:deepseek_local:deepseek-v4-flash
+  evidence_keys:
+  - license-mit-evidence-1
+- key: architecture-flow
+  subject: concept:dzhng:deep-research:dzhng-deep-research
+  predicate: ep:architecture_step
+  object: 'Inputs (query, breadth, depth) -> Deep Research -> SERP Queries -> Process
+    Results -> Learnings and Directions -> Depth Check -> if depth>0: Next Direction
+    (Prior Goals, New Questions, Learnings) -> recursive; else Markdown Report'
+  qualifiers: {}
+  stance: asserts
+  epistemic_status: observed
+  asserted_by: model:deepseek_local:deepseek-v4-flash
+  evidence_keys:
+  - architecture-flow-evidence-1
+  - architecture-flow-evidence-2
+  - architecture-flow-evidence-3
+  - architecture-flow-evidence-4
+  - architecture-flow-evidence-5
+  - architecture-flow-evidence-6
+  - architecture-flow-evidence-7
+  - architecture-flow-evidence-8
+  - architecture-flow-evidence-9
+  - architecture-flow-evidence-10
+  - architecture-flow-evidence-11
+controversies: []
+gaps:
+- topic_concept_id: concept:open-source-research-agents
+  question: What security measures are implemented?
+  kind: missing_source_class
+  rationale: The README does not mention any security measures, authentication, or
+    data protection.
+  related_claim_keys: []
+  searched_query_plan_ids: []
+  priority: 50
+  status: open
+- topic_concept_id: concept:open-source-research-agents
+  question: How is the system evaluated for accuracy or performance?
+  kind: insufficient_evidence
+  rationale: No evaluation benchmarks, metrics, or testing procedures are documented.
+  related_claim_keys: []
+  searched_query_plan_ids: []
+  priority: 50
+  status: open
+- topic_concept_id: concept:open-source-research-agents
+  question: What are the limitations beyond rate limits?
+  kind: insufficient_evidence
+  rationale: Only rate limits for free Firecrawl are mentioned; no other limitations
+    such as supported languages, maximum query length, or error handling are documented.
+  related_claim_keys: []
+  searched_query_plan_ids: []
+  priority: 50
+  status: open
+- topic_concept_id: concept:open-source-research-agents
+  question: Is there any persistent state beyond the generated report?
+  kind: unknown
+  rationale: The README does not mention any database, caching, or state storage mechanism.
+  related_claim_keys: []
+  searched_query_plan_ids: []
+  priority: 30
+  status: open
+- topic_concept_id: concept:open-source-research-agents
+  question: What are the cost implications of using external APIs?
+  kind: missing_source_class
+  rationale: No cost information or pricing details are provided.
+  related_claim_keys: []
+  searched_query_plan_ids: []
+  priority: 40
+  status: open

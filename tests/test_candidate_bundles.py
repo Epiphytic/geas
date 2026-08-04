@@ -23,11 +23,19 @@ class _Client:
     def complete_json(self, **_kwargs):
         return {
             "version": 1,
-            "concepts": [],
+            "concepts": [
+                {
+                    "key": "search-capability",
+                    "id": "concept:search-capability",
+                    "label": "Search capability",
+                    "description": "The project's source-search capability.",
+                    "broader": ["concept:research-agents"],
+                }
+            ],
             "claims": [
                 {
                     "key": "searches",
-                    "subject": "concept:research-agents",
+                    "subject": "concept:search-capability",
                     "predicate": "ep:capability",
                     "object": "searches sources",
                     "stance": "asserts",
@@ -138,10 +146,65 @@ def test_candidate_bundle_is_deterministic_ranged_and_reimportable(tmp_path) -> 
     assert (workspace / second).read_bytes() == first_bytes
     assert bundle.evidence[0].start is not None
     assert bundle.evidence[0].end is not None
+    assert {item.id for item in bundle.concepts} == {
+        "concept:example:research:search-capability",
+        "concept:research-agents",
+    }
+    assert bundle.claims[0].subject == "concept:example:research:search-capability"
     imported = KnowledgeBundleImporter(
         store=ImmutableStore(tmp_path / "reimported")
     ).import_bundle(workspace / second, imported_by="vcs:test")
     assert imported.knowledge_receipt.claim_ids
+
+
+def test_candidate_bundle_namespaces_same_model_id_per_repository(tmp_path) -> None:
+    workspace, store, proposal, snapshot = _fixture(tmp_path)
+    writer = CandidateBundleWriter(store=store, workspace=workspace)
+    first = KnowledgeBundle.from_yaml(
+        workspace
+        / writer.write(
+            proposal,
+            snapshot,
+            topic="Research agents",
+            topic_concept_id="concept:research-agents",
+            output_root=Path("ontology/generated"),
+        )
+    )
+    second = KnowledgeBundle.from_yaml(
+        workspace
+        / writer.write(
+            proposal,
+            snapshot.model_copy(
+                update={
+                    "repository": "Other/Research",
+                    "canonical_locator": "https://github.com/Other/Research",
+                    "api_locator": "https://api.github.com/repos/Other/Research",
+                }
+            ),
+            topic="Research agents",
+            topic_concept_id="concept:research-agents",
+            output_root=Path("ontology/generated"),
+        )
+    )
+
+    first_proposed = {item.id for item in first.concepts} - {"concept:research-agents"}
+    second_proposed = {item.id for item in second.concepts} - {"concept:research-agents"}
+    assert first_proposed == {"concept:example:research:search-capability"}
+    assert second_proposed == {"concept:other:research:search-capability"}
+    assert first_proposed.isdisjoint(second_proposed)
+
+    merged_store = ImmutableStore(tmp_path / "merged")
+    importer = KnowledgeBundleImporter(store=merged_store)
+    importer.import_bundle(
+        workspace / "ontology/generated/example-research/bundle.yaml",
+        imported_by="vcs:test",
+    )
+    importer.import_bundle(
+        workspace / "ontology/generated/other-research/bundle.yaml",
+        imported_by="vcs:test",
+    )
+    concept_ids = [item["id"] for item in merged_store.iter_records("concept")]
+    assert len(concept_ids) == len(set(concept_ids))
 
 
 def test_candidate_bundle_rejects_unknown_license(tmp_path) -> None:
