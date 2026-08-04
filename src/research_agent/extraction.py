@@ -184,6 +184,15 @@ class ExtractionAttemptFailure(StrictModel):
     stage: Literal["model_call", "output_validation"]
     error_type: str
     validation_issues: tuple[str, ...] = ()
+    validation_reason: Literal[
+        "claim_evidence_anchor_not_selected",
+        "claim_evidence_exact_not_unique",
+        "claim_subject_not_allowed",
+        "concept_hierarchy_cycle",
+        "concept_redefines_existing",
+        "concept_unknown_broader",
+        "other_extraction_validation",
+    ] | None = None
     finish_reason: str | None = None
     provider_output_tokens: int | None = Field(default=None, ge=0)
     source_content_retained: Literal[True] = True
@@ -799,6 +808,7 @@ class AnchorGroundedExtractionManager:
                 if isinstance(error, ValidationError)
                 else ()
             ),
+            "validation_reason": self._validation_reason(error),
             "finish_reason": getattr(error, "finish_reason", None),
             "provider_output_tokens": getattr(error, "output_tokens", None),
             "source_content_retained": True,
@@ -810,6 +820,30 @@ class AnchorGroundedExtractionManager:
                 id=content_id("extraction-attempt-failure", fields),
                 **fields,
             ),
+        )
+
+    @staticmethod
+    def _validation_reason(error: Exception) -> str | None:
+        if not isinstance(error, ExtractionError):
+            return None
+        message = str(error)
+        reasons = (
+            ("proposal redefines existing concept IDs", "concept_redefines_existing"),
+            ("proposed concept has unknown broader IDs", "concept_unknown_broader"),
+            ("proposed concept hierarchy contains a cycle", "concept_hierarchy_cycle"),
+            ("claim subject is not allowed", "claim_subject_not_allowed"),
+            (
+                "claim cites an anchor outside the trusted selection",
+                "claim_evidence_anchor_not_selected",
+            ),
+            (
+                "proposed exact evidence must occur once",
+                "claim_evidence_exact_not_unique",
+            ),
+        )
+        return next(
+            (reason for prefix, reason in reasons if message.startswith(prefix)),
+            "other_extraction_validation",
         )
 
     def _validate_output(

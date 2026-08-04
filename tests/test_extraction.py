@@ -208,6 +208,9 @@ def test_extraction_rejects_fabricated_quote_and_unselected_anchor(tmp_path) -> 
             anchor_ids=[item["id"] for item in paragraphs],
             allowed_concept_ids=["concept:research-system"],
         )
+    failure = next(store.iter_records("extraction-attempt-failure"))
+    assert failure["validation_reason"] == "claim_evidence_exact_not_unique"
+    assert "fabricated" not in str(failure)
 
     output = _valid_output(paragraphs)
     with pytest.raises(ExtractionError, match="outside the trusted selection"):
