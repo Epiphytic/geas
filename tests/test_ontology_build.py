@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
@@ -628,6 +629,56 @@ def test_ontology_init_writes_every_default_explicitly(tmp_path: Path) -> None:
         for path in (relative / "build.yaml", relative / "library.yaml"):
             path.unlink(missing_ok=True)
         relative.rmdir()
+
+
+def test_ontology_init_defaults_to_shared_user_config_and_build_resolves_name(
+    tmp_path: Path,
+) -> None:
+    config_home = tmp_path / "geas-config"
+    environment = {**os.environ, "GEAS_CONFIG_HOME": str(config_home)}
+    initialized = subprocess.run(
+        (
+            "uv",
+            "run",
+            "geas",
+            "ontology-init",
+            "--topic",
+            "Shared routing ontology",
+            "--concept-id",
+            "concept:shared-routing",
+            "--no-pull",
+        ),
+        check=True,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+    receipt = json.loads(initialized.stdout)
+    expected = config_home / "ontologies" / "shared-routing"
+
+    assert receipt["directory"] == str(expected)
+    assert receipt["location"] == "user_config"
+    assert receipt["ontology_name"] == "shared-routing"
+    build = yaml.safe_load((expected / "build.yaml").read_text())
+    assert build["output_directory"] == "data/ontologies/shared-routing/generated"
+
+    checked = subprocess.run(
+        (
+            "uv",
+            "run",
+            "geas",
+            "ontology-build",
+            "shared-routing",
+            "--root",
+            str(tmp_path / "runtime"),
+            "--check",
+        ),
+        check=True,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+    assert json.loads(checked.stdout)["checked_only"] is True
 
 
 def test_reasoning_evaluation_runner_has_valid_shell_syntax() -> None:

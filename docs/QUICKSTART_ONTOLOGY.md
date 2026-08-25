@@ -6,12 +6,23 @@ For source-only search or integration with another agent, start with
 [source libraries](SOURCE_LIBRARIES.md) instead.
 
 The autonomous builder needs Python 3.12+, `uv`, Git, a running configured
-model endpoint, and a Mojeek key. From the repository root, create the ignored
-`.env` file:
+model endpoint, and a Mojeek key. Initialize the per-user configuration:
+
+```bash
+uv run geas config-init
+```
+
+Then put the key in the deny-by-default secret location:
 
 ```dotenv
+# ~/.config/geas/secrets/common.env on Linux without XDG_CONFIG_HOME
 MOJEEK_API_KEY=replace-with-your-key
 ```
+
+The exact OS-specific locations, named team profiles, YAML/JSON secret sources,
+and optional private Git synchronization are documented in
+[User configuration](USER_CONFIG.md). `--env-file .env` remains available as
+an explicit legacy override.
 
 The project and its installed CLI are both named Geas; invoke the CLI as
 `geas`.
@@ -19,12 +30,15 @@ The project and its installed CLI are both named Geas; invoke the CLI as
 Create a new ontology with complete, inspectable configuration files:
 
 ```bash
-uv run geas ontology-init ontology/network-engineering \
+uv run geas ontology-init \
   --topic "Network engineering for selected repositories" \
   --concept-id concept:network-engineering
 ```
 
-This writes `build.yaml` and `library.yaml`. Every application default,
+This writes `build.yaml` and `library.yaml` beneath the selected profile's
+OS-standard ontology directory. The ontology can subsequently be addressed as
+`network-engineering`. Passing an explicit directory instead keeps the
+repository-local workflow used by the maintained example. Every application default,
 including null and empty settings, model parameters, discovery limits, worker
 timing, retry behavior, extraction selection, output paths, and library
 selectors is written explicitly. The files can be edited before the first run;

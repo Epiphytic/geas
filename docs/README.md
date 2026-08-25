@@ -4,8 +4,14 @@ Choose the shortest path that matches the work:
 
 - [Common use cases](USE_CASES.md) explains which Geas workflow to use and what
   is implemented today.
+- [Build and use Geas end to end](GETTING_STARTED.md) covers installation,
+  API/LLM setup, repository material, ontologies, agent retrieval, and
+  project-specific expert exports.
 - [Ontology quick start](QUICKSTART_ONTOLOGY.md) is the executable path from a
   new configuration to a resumable ontology build.
+- [User configuration, shared ontologies, and Git sync](USER_CONFIG.md) covers
+  OS-standard locations, team profiles, modular secrets, private Git, and
+  Obsidian-style export.
 - [Source libraries](SOURCE_LIBRARIES.md) covers ontology-independent source
   collections, exact search, and bounded agent context.
 - [Knowledge workflow](KNOWLEDGE_WORKFLOW.md) covers acquisition, import,

@@ -248,7 +248,7 @@ class KnowledgeImportReceipt(StrictModel):
 class DeterministicThreatScanner:
     """Find inert source-text instructions without interpreting or executing them."""
 
-    version = "deterministic-threat-scanner/1"
+    version = "deterministic-threat-scanner/2"
     patterns = (
         (
             "threat:indirect-prompt-injection:instruction-override",
@@ -290,7 +290,16 @@ class DeterministicThreatScanner:
         for threat_type, severity, pattern in self.patterns:
             for match in pattern.finditer(text):
                 exact = match.group(0)
-                selector = EvidenceSelector(type="text_quote", exact=exact)
+                # Exact text alone is not a unique selector when the same hostile
+                # phrase occurs more than once in one immutable source version.
+                # Preserve the character range so every observation remains
+                # independently attributable and receives a distinct content ID.
+                selector = EvidenceSelector(
+                    type="text_quote",
+                    exact=exact,
+                    start=match.start(),
+                    end=match.end(),
+                )
                 fragment_fields = {
                     "source_version": source_id,
                     "selector": selector,

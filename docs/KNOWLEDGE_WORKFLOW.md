@@ -237,6 +237,12 @@ uv run geas topic-export \
 The generated page is a projection, not a report of record and not canonical.
 It explicitly marks source/evidence content as untrusted data.
 
+Add `--format obsidian` and provide a directory output to generate a
+deterministic cross-linked Markdown vault with typed concept, claim, source,
+controversy, gap, threat, and reference notes. The vault is a disposable
+projection, never canonical ontology input; a differing existing vault requires
+`--force` for atomic replacement. See [user configuration](USER_CONFIG.md).
+
 Run a model-free maintenance audit with an explicit time:
 
 ```bash

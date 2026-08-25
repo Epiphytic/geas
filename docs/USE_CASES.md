@@ -19,17 +19,16 @@ Use this when the goal is a maintained understanding rather than a final
 report.
 
 ```bash
-uv run geas ontology-init ontology/example \
+uv run geas config-init
+uv run geas ontology-init \
   --topic "Example topic" \
   --concept-id concept:example
 
-uv run geas --env-file .env ontology-build \
-  ontology/example/build.yaml \
+uv run geas ontology-build example \
   --root data/example \
   --check
 
-uv run geas --env-file .env ontology-build \
-  ontology/example/build.yaml \
+uv run geas ontology-build example \
   --root data/example
 ```
 
@@ -37,6 +36,11 @@ uv run geas --env-file .env ontology-build \
 facets, competency questions, model settings, budgets, and time limits before
 the first live run. Each build invocation checkpoints its work and can resume
 with another configured model or reasoning effort.
+
+User-created ontologies default to the selected OS-standard Geas profile; see
+[user configuration](USER_CONFIG.md) for team profiles, modular secrets, Git
+sync, and Obsidian export. Explicit paths remain available for maintained
+repository ontologies.
 
 The durable outputs are immutable source records, a source library, validated
 model proposals, reviewable ontology bundle candidates, and structured JSONL

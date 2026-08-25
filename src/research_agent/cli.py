@@ -77,13 +77,20 @@ from research_agent.models import (
     ThreatObservation,
     ThreatTarget,
 )
+from research_agent.onboarding import build_setup_guide, render_setup_guide_markdown
 from research_agent.ontology_build import (
     OntologyBuildConfig,
     OntologyBuilder,
     OntologyBuildReceipt,
 )
+from research_agent.ontology_sync import OntologyRepositoryManager
 from research_agent.operator_policy import ResearchPolicy
 from research_agent.parsing import ParsedDocumentManager
+from research_agent.paths import (
+    resolve_ontology_build_config,
+    resolve_profile_ontology_config,
+    shared_ontology_directory,
+)
 from research_agent.planning import (
     ConceptVocabulary,
     ModelQueryCompiler,
@@ -100,12 +107,18 @@ from research_agent.projection import (
 from research_agent.promotion import GitPromotionManager
 from research_agent.providers import ModelClient, load_provider_configs
 from research_agent.remote_acquisition import LicenseGatedAcquirer
-from research_agent.render import render_topic_markdown
+from research_agent.render import (
+    render_agent_instructions,
+    render_topic_markdown,
+    render_topic_obsidian,
+    write_obsidian_vault,
+)
 from research_agent.research import DiscoveryExecutor, OfflineResearchRunner
-from research_agent.secrets import load_env_file
+from research_agent.secrets import load_env_file, load_secret_sources
 from research_agent.store import ImmutableStore
 from research_agent.structure import AnchorKind, StructuralAnchor, StructuralDocumentManager
 from research_agent.truth import SQLiteProjectionGuard, TruthManager, TruthPolicy, TruthSnapshot
+from research_agent.user_config import GeasUserConfig, UserConfigManager
 from research_agent.workflow import ActorKind, WorkflowEngine, WorkflowState
 from research_agent.workload import WorkloadPolicy
 
@@ -153,6 +166,46 @@ def _local_approval_principal(root: Path) -> AuthenticatedPrincipal:
     )
 
 
+def _user_config_manager(args: argparse.Namespace) -> UserConfigManager:
+    return UserConfigManager(args.geas_config)
+
+
+def _profile_ontology_root(
+    args: argparse.Namespace,
+    *,
+    pull_before_read: bool = False,
+) -> Path | None:
+    manager = _user_config_manager(args)
+    if not manager.path.exists():
+        return None
+    _name, profile = manager.profile(args.geas_profile)
+    root = manager.ontology_root(profile)
+    if (
+        pull_before_read
+        and profile.ontology_git is not None
+        and profile.ontology_git.pull_before_update
+    ):
+        OntologyRepositoryManager(checkout=root, config=profile.ontology_git).pull()
+    return root
+
+
+def _load_allowed_secrets(
+    args: argparse.Namespace,
+    *,
+    allowed_names: frozenset[str],
+) -> frozenset[str]:
+    if args.env_file is not None:
+        return load_env_file(args.env_file, allowed_names=allowed_names)
+    manager = _user_config_manager(args)
+    if manager.path.exists():
+        _name, profile = manager.profile(args.geas_profile)
+        return load_secret_sources(
+            manager.secret_paths(profile),
+            allowed_names=allowed_names,
+        )
+    return load_env_file(Path(".env"), allowed_names=allowed_names)
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="geas")
     parser.add_argument(
@@ -176,8 +229,18 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--env-file",
         type=Path,
-        default=Path(".env"),
-        help="ignored secret environment file",
+        default=None,
+        help="explicit legacy dotenv file; otherwise use selected Geas profile sources",
+    )
+    parser.add_argument(
+        "--geas-config",
+        type=Path,
+        default=None,
+        help="per-user Geas config.yaml path",
+    )
+    parser.add_argument(
+        "--geas-profile",
+        help="named Geas profile for ontology location, Git sync, and secret sources",
     )
     parser.add_argument(
         "--truth-policy",
@@ -213,6 +276,29 @@ def _build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser("providers", help="list configured providers without secrets")
 
+    setup_guide = subparsers.add_parser(
+        "setup-guide",
+        help="show a project build and end-to-end Geas setup walkthrough",
+    )
+    setup_guide.add_argument(
+        "--format",
+        choices=("json", "markdown"),
+        default="json",
+    )
+
+    subparsers.add_parser(
+        "config-init",
+        help="create the per-user Geas profile and modular-secret scaffold",
+    )
+
+    ontology_sync = subparsers.add_parser(
+        "ontology-sync",
+        help="pull or safely commit and push the selected profile's ontology repository",
+    )
+    ontology_sync.add_argument("--pull", action="store_true")
+    ontology_sync.add_argument("--push", action="store_true")
+    ontology_sync.add_argument("--message", default="geas: update ontologies")
+
     smoke = subparsers.add_parser("model-smoke", help="run a tool-free model smoke test")
     smoke.add_argument("--provider")
     smoke.add_argument("--root", type=Path, default=Path("data"))
@@ -227,11 +313,31 @@ def _build_parser() -> argparse.ArgumentParser:
         "ontology-init",
         help="create complete explicit ontology and source-library configuration files",
     )
-    ontology_init.add_argument("directory", type=Path)
+    ontology_init.add_argument(
+        "directory",
+        type=Path,
+        nargs="?",
+        help=(
+            "explicit workspace-relative directory; omit to use the per-user "
+            "Geas ontology directory"
+        ),
+    )
     ontology_init.add_argument("--topic", required=True)
     ontology_init.add_argument("--concept-id", required=True)
     ontology_init.add_argument("--provider", default="deepseek_local")
     ontology_init.add_argument("--force", action="store_true")
+    ontology_init.add_argument(
+        "--pull",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="override profile pull_before_update for this update",
+    )
+    ontology_init.add_argument(
+        "--push",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="override profile push_on_update for this update",
+    )
 
     source = subparsers.add_parser("source-add", help="archive a local source file")
     source.add_argument("path", type=Path)
@@ -358,7 +464,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "ontology-build",
         help="autonomously build, resume, audit, and project an ontology from one config",
     )
-    ontology_build.add_argument("config", type=Path)
+    ontology_build.add_argument(
+        "config",
+        type=Path,
+        help="build.yaml path or ontology name from the per-user Geas config directory",
+    )
     ontology_build.add_argument("--root", type=Path, default=Path("data/ontology-build"))
     ontology_build.add_argument("--workspace", type=Path, default=Path("."))
     ontology_build.add_argument(
@@ -648,7 +758,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "library-build",
         help="build a reusable, ontology-independent source-library snapshot and index",
     )
-    library_build.add_argument("manifest", type=Path)
+    library_build.add_argument(
+        "manifest",
+        type=Path,
+        help="library.yaml path or ontology name from the selected Geas profile",
+    )
     library_build.add_argument("--root", type=Path, default=Path("data"))
     library_build.add_argument(
         "--database",
@@ -751,6 +865,21 @@ def _build_parser() -> argparse.ArgumentParser:
     topic_export.add_argument("output", type=Path)
     topic_export.add_argument("--database", type=Path, default=Path("data/query.sqlite"))
     topic_export.add_argument("--as-of", type=datetime.fromisoformat)
+    topic_export.add_argument(
+        "--format",
+        choices=("markdown", "obsidian", "agent-instructions"),
+        default="markdown",
+        help="topic page, cross-linked Obsidian vault, or project agent handoff",
+    )
+    topic_export.add_argument(
+        "--force",
+        action="store_true",
+        help="replace a differing Obsidian export directory atomically",
+    )
+    topic_export.add_argument(
+        "--vault-link",
+        help="relative link to a companion Obsidian export for agent instructions",
+    )
 
     benchmark = subparsers.add_parser(
         "projection-benchmark",
@@ -794,6 +923,76 @@ def _build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = _build_parser().parse_args()
 
+    if args.command == "setup-guide":
+        manager = _user_config_manager(args)
+        user_config = manager.load() if manager.path.exists() else GeasUserConfig.default()
+        profile_name, profile = user_config.profile(args.geas_profile)
+        default_provider, providers = load_provider_configs(args.providers)
+        guide = build_setup_guide(
+            manager=manager,
+            profile_name=profile_name,
+            profile=profile,
+            default_provider=default_provider,
+            providers=providers,
+            research_policy=ResearchPolicy.from_yaml(args.research_policy),
+        )
+        if args.format == "markdown":
+            print(render_setup_guide_markdown(guide), end="")
+        else:
+            _json(guide)
+        return
+
+    if args.command == "config-init":
+        manager = _user_config_manager(args)
+        config = manager.load_or_create()
+        profile_name, profile = config.profile(args.geas_profile)
+        _json(
+            {
+                "config": str(manager.path),
+                "config_root": str(manager.root),
+                "created_or_validated": True,
+                "default_profile": config.default_profile,
+                "profiles": tuple(sorted(config.profiles)),
+                "selected_profile": profile_name,
+                "ontology_directory": str(manager.ontology_root(profile)),
+                "ontology_repository": (
+                    profile.ontology_git.url if profile.ontology_git is not None else None
+                ),
+                "secret_sources": tuple(
+                    {
+                        "path": str(path),
+                        "format": format,
+                    }
+                    for path, format in manager.secret_paths(profile)
+                ),
+            }
+        )
+        return
+
+    if args.command == "ontology-sync":
+        manager = _user_config_manager(args)
+        profile_name, profile = manager.profile(args.geas_profile)
+        if profile.ontology_git is None:
+            raise ValueError(f"Geas profile {profile_name!r} has no ontology_git config")
+        repository = OntologyRepositoryManager(
+            checkout=manager.ontology_root(profile),
+            config=profile.ontology_git,
+        )
+        pull_requested = args.pull or not args.push
+        result: dict[str, object] = {
+            "profile": profile_name,
+            "config": str(manager.path),
+        }
+        if pull_requested:
+            result["pull"] = repository.pull()
+        if args.push:
+            result["push"] = repository.push(
+                relative_paths=(Path("."),),
+                message=args.message,
+            )
+        _json(result)
+        return
+
     if args.command == "providers":
         default, providers = load_provider_configs(args.providers)
         _json(
@@ -818,6 +1017,11 @@ def main() -> None:
     if args.command == "model-smoke":
         default, providers = load_provider_configs(args.providers)
         name = args.provider or default
+        if providers[name].api_key_env:
+            _load_allowed_secrets(
+                args,
+                allowed_names=frozenset({providers[name].api_key_env}),
+            )
         gate = ModelUseGate(
             ModelUsePolicy.from_yaml(args.model_policy),
             ModelUseContext(
@@ -884,9 +1088,53 @@ def main() -> None:
         return
 
     if args.command == "ontology-init":
-        directory = args.directory
-        if directory.is_absolute() or ".." in directory.parts:
-            raise ValueError("ontology directory must be workspace-relative")
+        shared_default = args.directory is None
+        manager = _user_config_manager(args)
+        profile_name = None
+        repository = None
+        pull_receipt = None
+        push_receipt = None
+        if shared_default:
+            user_config = manager.load_or_create()
+            profile_name, profile = user_config.profile(args.geas_profile)
+            ontology_root = manager.ontology_root(profile)
+            ontology_name = shared_ontology_directory(
+                args.concept_id,
+                config_home=manager.root,
+            ).name
+            directory = ontology_root / ontology_name
+            pull_requested = bool(args.pull)
+            if args.pull is None and profile.ontology_git is not None:
+                pull_requested = (
+                    profile.ontology_git.pull_before_update
+                    or not (ontology_root / ".git").is_dir()
+                )
+            push_requested = (
+                profile.ontology_git.push_on_update
+                if args.push is None and profile.ontology_git is not None
+                else bool(args.push)
+            )
+            if (pull_requested or push_requested) and profile.ontology_git is None:
+                raise ValueError(
+                    f"Geas profile {profile_name!r} has no ontology_git config"
+                )
+            if profile.ontology_git is not None:
+                repository = OntologyRepositoryManager(
+                    checkout=ontology_root,
+                    config=profile.ontology_git,
+                )
+            if pull_requested and repository is not None:
+                pull_receipt = repository.pull()
+        else:
+            directory = args.directory
+            ontology_name = directory.name
+            push_requested = False
+            if args.pull is not None or args.push is not None:
+                raise ValueError(
+                    "--pull and --push apply only to the default profile ontology location"
+                )
+        if not shared_default and (directory.is_absolute() or ".." in directory.parts):
+            raise ValueError("explicit ontology directory must be workspace-relative")
         build_path = directory / "build.yaml"
         library_path = directory / "library.yaml"
         existing = tuple(path for path in (build_path, library_path) if path.exists())
@@ -900,7 +1148,11 @@ def main() -> None:
             topic=args.topic,
             topic_concept_id=args.concept_id,
             provider=args.provider,
-            output_directory=directory / "generated",
+            output_directory=(
+                Path("data") / "ontologies" / ontology_name / "generated"
+                if shared_default
+                else directory / "generated"
+            ),
         )
         library = SourceLibraryManifest(
             version=1,
@@ -916,12 +1168,22 @@ def main() -> None:
         directory.mkdir(parents=True, exist_ok=True)
         build_path.write_text(config.explicit_yaml())
         library_path.write_text(library.explicit_yaml())
+        if push_requested and repository is not None:
+            push_receipt = repository.push(
+                relative_paths=(Path(ontology_name),),
+                message=f"geas: update ontology {ontology_name}",
+            )
         _json(
             {
                 "directory": str(directory),
                 "build_config": str(build_path),
                 "library_config": str(library_path),
                 "defaults_explicit": True,
+                "location": "user_config" if shared_default else "explicit_workspace",
+                "ontology_name": ontology_name,
+                "profile": profile_name,
+                "pull": pull_receipt,
+                "push": push_receipt,
             }
         )
         return
@@ -1073,8 +1335,8 @@ def main() -> None:
         provider_policy = research_policy.provider("connector:mojeek")
         if not provider_policy.enabled:
             raise ValueError("Mojeek is disabled by the research policy")
-        load_env_file(
-            args.env_file,
+        _load_allowed_secrets(
+            args,
             allowed_names=frozenset({provider_policy.credential_env}),
         )
         connector = MojeekDiscoveryConnector()
@@ -1149,15 +1411,25 @@ def main() -> None:
         return
 
     if args.command == "ontology-build":
-        config = OntologyBuildConfig.from_yaml(args.config)
+        ontology_root = _profile_ontology_root(args, pull_before_read=True)
+        config_path = (
+            resolve_profile_ontology_config(
+                args.config,
+                filename="build.yaml",
+                ontology_root=ontology_root,
+            )
+            if ontology_root is not None
+            else resolve_ontology_build_config(args.config)
+        )
+        config = OntologyBuildConfig.from_yaml(config_path)
         research_policy = ResearchPolicy.from_yaml(args.research_policy)
         _, providers = load_provider_configs(args.providers)
         credential_names = {
             research_policy.provider("connector:mojeek").credential_env,
             providers[config.provider].api_key_env,
         }
-        load_env_file(
-            args.env_file,
+        _load_allowed_secrets(
+            args,
             allowed_names=frozenset(item for item in credential_names if item),
         )
         builder = OntologyBuilder(
@@ -1251,8 +1523,8 @@ def main() -> None:
         provider_policy = research_policy.domain_index("connector:openalex")
         if not provider_policy.enabled:
             raise ValueError("OpenAlex is disabled by the research policy")
-        load_env_file(
-            args.env_file,
+        _load_allowed_secrets(
+            args,
             allowed_names=frozenset({provider_policy.credential_env}),
         )
         run_id = args.run_id or f"openalex:{uuid4()}"
@@ -1412,8 +1684,8 @@ def main() -> None:
         normalized_dois = tuple(dict.fromkeys(normalize_doi(item) for item in args.doi))
         if len(normalized_dois) > provider_policy.max_requests_per_run:
             raise ValueError("Unpaywall DOI count exceeds the provider run limit")
-        load_env_file(
-            args.env_file,
+        _load_allowed_secrets(
+            args,
             allowed_names=frozenset({provider_policy.credential_env}),
         )
         resolver = UnpaywallResolver()
@@ -1527,8 +1799,8 @@ def main() -> None:
         if not 1.0 <= args.timeout <= 86_400.0:
             raise ValueError("model timeout must be between 1 and 86400 seconds")
         if config.api_key_env:
-            load_env_file(
-                args.env_file,
+            _load_allowed_secrets(
+                args,
                 allowed_names=frozenset({config.api_key_env}),
             )
         gate = ModelUseGate(
@@ -1838,9 +2110,19 @@ def main() -> None:
         return
 
     if args.command == "library-build":
+        ontology_root = _profile_ontology_root(args, pull_before_read=True)
+        manifest_path = (
+            resolve_profile_ontology_config(
+                args.manifest,
+                filename="library.yaml",
+                ontology_root=ontology_root,
+            )
+            if ontology_root is not None
+            else args.manifest
+        )
         _json(
             SourceLibraryBuilder(store=ImmutableStore(args.root)).build(
-                SourceLibraryManifest.from_yaml(args.manifest),
+                SourceLibraryManifest.from_yaml(manifest_path),
                 args.database,
             )
         )
@@ -1941,21 +2223,43 @@ def main() -> None:
         return
 
     if args.command == "topic-export":
+        if args.vault_link and args.format != "agent-instructions":
+            raise ValueError("--vault-link requires --format agent-instructions")
         topic = KnowledgeQueryEngine(args.database).topic(
             args.concept_id,
             as_of=args.as_of,
         )
-        rendered = render_topic_markdown(topic)
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        args.output.write_text(rendered)
-        _json(
-            {
-                "output": str(args.output.resolve()),
-                "bytes": len(rendered.encode()),
-                "snapshot_id": topic.projection_snapshot_id,
-                "topic_concept_id": topic.topic_concept_id,
-            }
-        )
+        if args.format == "obsidian":
+            receipt = write_obsidian_vault(
+                render_topic_obsidian(topic),
+                args.output,
+                force=args.force,
+            )
+            _json(
+                {
+                    **receipt,
+                    "format": "obsidian",
+                    "snapshot_id": topic.projection_snapshot_id,
+                    "topic_concept_id": topic.topic_concept_id,
+                }
+            )
+        else:
+            rendered = (
+                render_agent_instructions(topic, vault_link=args.vault_link)
+                if args.format == "agent-instructions"
+                else render_topic_markdown(topic)
+            )
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            args.output.write_text(rendered)
+            _json(
+                {
+                    "output": str(args.output.resolve()),
+                    "bytes": len(rendered.encode()),
+                    "format": args.format,
+                    "snapshot_id": topic.projection_snapshot_id,
+                    "topic_concept_id": topic.topic_concept_id,
+                }
+            )
         return
 
     if args.command == "projection-benchmark":

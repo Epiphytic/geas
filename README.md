@@ -24,6 +24,10 @@ The project is developed at
 | Detect ontology/database drift | `truth-snapshot`, `truth-check`, and `projection-check` | A reproducible authority boundary between Git/immutable records and disposable SQLite indexes |
 
 Start with the [use-case guide](docs/USE_CASES.md) to choose a workflow, or use
+the [end-to-end getting-started guide](docs/GETTING_STARTED.md) for building,
+provider setup, repository ingestion, agent use, and expert exports. You can
+also print a path-aware walkthrough with
+`uv run geas setup-guide --format markdown`. Use
 the [executable ontology quick start](docs/QUICKSTART_ONTOLOGY.md) to build a
 topic immediately. The [documentation index](docs/README.md) maps operational,
 security, model, provenance, and architecture guides.
@@ -74,6 +78,9 @@ slice:
 - atomic SQLite projection builds with FTS5, hierarchy, provenance, dissent,
   gap, threat, and valid-time queries;
 - deterministic JSON and Markdown topic views;
+- deterministic cross-linked Obsidian-style Markdown vault projections;
+- OS-standard per-user ontology profiles with modular secrets and optional
+  private Git synchronization;
 - format-neutral original preservation with versioned text derivations for
   text, JSON, HTML, XML, OpenDocument/OpenXML office files, and PDF;
 - immutable document/page/section/heading/block anchors with exact offsets,
@@ -162,6 +169,7 @@ uv sync --extra dev
 uv run pytest
 uv run ruff check .
 uv run geas providers
+uv run geas setup-guide --format markdown
 uv run geas model-smoke
 uv run geas projection-benchmark --tier smoke
 ```
@@ -169,18 +177,21 @@ uv run geas projection-benchmark --tier smoke
 Create a configured ontology and validate it without network or model calls:
 
 ```bash
-uv run geas ontology-init ontology/example \
+uv run geas config-init
+uv run geas ontology-init \
   --topic "Example topic" \
   --concept-id concept:example
 
-uv run geas --env-file .env ontology-build \
-  ontology/example/build.yaml \
+uv run geas ontology-build example \
   --root data/example \
   --check
 ```
 
-Edit the explicit `build.yaml` and `library.yaml`, then rerun the second command
-without `--check` to build or resume. See
+This writes the ontology configuration in the OS-standard per-user Geas
+directory. Edit its explicit `build.yaml` and `library.yaml`, then rerun the
+second command without `--check` to build or resume. Explicit workspace paths
+remain supported. See [user configuration and Git sync](docs/USER_CONFIG.md)
+and
 [the ontology quick start](docs/QUICKSTART_ONTOLOGY.md) for credentials,
 checkpointing, candidate review, promotion, and final projection.
 
