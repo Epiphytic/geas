@@ -341,23 +341,27 @@ def install_snapshot(
     files: Mapping[Path, bytes], target: Path, *, force: bool = False
 ) -> SkillExportReceipt:
     """Atomically install a complete, manifest-verified snapshot at one exact target."""
-    destination = target.expanduser()
+    destination = _absolute_path(target)
     _reject_symlink_ancestry(destination.parent)
+    manifest = _validate_snapshot_files(files)
+    existing: SkillManifest | None = None
+    if destination.exists() or destination.is_symlink():
+        try:
+            existing = validate_snapshot(destination)
+        except ValueError:
+            if not force:
+                raise ValueError("skill snapshot target is unmanaged or modified") from None
+        if existing is not None and existing == manifest:
+            return SkillExportReceipt(path=destination, manifest=manifest, unchanged=True)
+
     destination.parent.mkdir(parents=True, exist_ok=True)
     _reject_symlink_ancestry(destination.parent)
     candidate = Path(tempfile.mkdtemp(prefix=f".{destination.name}.", dir=destination.parent))
     try:
         _write_snapshot_candidate(files, candidate)
-        manifest = validate_snapshot(candidate)
+        if validate_snapshot(candidate) != manifest:
+            raise ValueError("skill snapshot candidate does not match its validated files")
         if destination.exists() or destination.is_symlink():
-            try:
-                existing = validate_snapshot(destination)
-            except ValueError:
-                if not force:
-                    raise ValueError("skill snapshot target is unmanaged or modified") from None
-                existing = None
-            if existing is not None and existing == manifest:
-                return SkillExportReceipt(path=destination, manifest=manifest, unchanged=True)
             _replace_snapshot(candidate, destination)
         else:
             os.replace(candidate, destination)
@@ -380,7 +384,7 @@ def export_skill(
     """Install a managed snapshot in user configuration or a Git worktree."""
     manifest = _manifest_from_files(files)
     if repository is None:
-        target = config_root.expanduser() / "skills" / manifest.skill.name
+        target = config_root.expanduser().resolve(strict=False) / "skills" / manifest.skill.name
         receipt = install_snapshot(files, target, force=force)
         if not link:
             return receipt
@@ -433,7 +437,12 @@ def unlink_skill(path: Path, *, home: Path, force: bool = False) -> SkillRemoval
             skill_name=manifest.skill.name,
             detections=detect_agents(home=home, which=lambda _executable: "detached"),
         )
-    removed = _remove_exact_links(targets, snapshot=snapshot)
+    removed = _remove_exact_links(
+        targets,
+        snapshot=snapshot,
+        root=home if repository is None else repository,
+        relative=repository is not None,
+    )
     return SkillRemovalReceipt(
         path=snapshot,
         removed_paths=removed,
@@ -461,6 +470,24 @@ def _write_snapshot_candidate(files: Mapping[Path, bytes], candidate: Path) -> N
         destination = candidate / normalized
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_bytes(content)
+
+
+def _validate_snapshot_files(files: Mapping[Path, bytes]) -> SkillManifest:
+    """Validate a complete portable snapshot mapping without creating staging files."""
+    manifest = _manifest_from_files(files)
+    actual: list[SkillFile] = []
+    for path, content in files.items():
+        if not isinstance(path, Path) or not isinstance(content, bytes):
+            raise ValueError("skill snapshot files must map paths to bytes")
+        value = path.as_posix()
+        if value == _MANIFEST_NAME:
+            continue
+        normalized = _normalized_path(value)
+        actual.append(SkillFile(path=normalized, sha256=hashlib.sha256(content).hexdigest()))
+    inventory = tuple(sorted(actual, key=lambda item: item.path.encode("utf-8")))
+    if manifest.files != inventory:
+        raise ValueError("skill snapshot files do not match manifest inventory")
+    return manifest
 
 
 def _manifest_from_files(files: Mapping[Path, bytes]) -> SkillManifest:
@@ -585,22 +612,26 @@ def _install_links(
     receipts: list[LinkReceipt] = []
     for destination in targets:
         _confined_link_parent(destination.parent, root)
-        if destination.is_symlink() and _link_points_to(destination, snapshot):
+        expected_target = _expected_link_target(destination, snapshot=snapshot, relative=relative)
+        if destination.is_symlink() and _link_points_to(destination, expected_target):
             receipts.append(LinkReceipt(path=destination, target=snapshot, unchanged=True))
             continue
         if destination.exists() or destination.is_symlink():
             if not force:
                 raise ValueError(f"skill link conflict at {destination}")
             _remove_exact_target(destination)
-        raw_target: Path | str = (
-            Path(os.path.relpath(snapshot, start=destination.parent)) if relative else snapshot
-        )
-        destination.symlink_to(raw_target, target_is_directory=True)
+        destination.symlink_to(expected_target, target_is_directory=True)
         receipts.append(LinkReceipt(path=destination, target=snapshot, unchanged=False))
     return tuple(sorted(receipts, key=lambda item: os.fspath(item.path)))
 
 
-def _confined_link_parent(parent: Path, root: Path) -> None:
+def _expected_link_target(destination: Path, *, snapshot: Path, relative: bool) -> Path:
+    if relative:
+        return Path(os.path.relpath(snapshot, start=destination.parent))
+    return snapshot
+
+
+def _confined_link_parent(parent: Path, root: Path, *, create: bool = True) -> None:
     root_resolved = root.expanduser().resolve(strict=False)
     lexical_parent = parent.expanduser()
     if not lexical_parent.is_absolute():
@@ -619,20 +650,21 @@ def _confined_link_parent(parent: Path, root: Path) -> None:
         parent_resolved.relative_to(root_resolved)
     except ValueError as error:
         raise ValueError("skill link path escapes its managed root") from error
-    parent_resolved.mkdir(parents=True, exist_ok=True)
+    if create:
+        parent_resolved.mkdir(parents=True, exist_ok=True)
     _reject_symlink_ancestry(parent_resolved)
 
 
-def _link_points_to(link: Path, snapshot: Path) -> bool:
+def _link_points_to(link: Path, expected_target: Path) -> bool:
+    """Require the managed link's direct target spelling, without resolving it."""
     try:
-        raw_target = link.readlink()
-        return (link.parent / raw_target).resolve(strict=False) == snapshot.resolve(strict=False)
+        return link.readlink() == expected_target
     except OSError:
         return False
 
 
 def _snapshot_directory(path: Path) -> Path:
-    supplied = path.expanduser()
+    supplied = _absolute_path(path)
     _reject_symlink_ancestry(supplied)
     if supplied.name == _MANIFEST_NAME:
         return supplied.parent
@@ -651,10 +683,18 @@ def _containing_worktree(snapshot: Path) -> Path | None:
     return worktree
 
 
-def _remove_exact_links(targets: tuple[Path, ...], *, snapshot: Path) -> tuple[Path, ...]:
+def _remove_exact_links(
+    targets: tuple[Path, ...],
+    *,
+    snapshot: Path,
+    root: Path,
+    relative: bool,
+) -> tuple[Path, ...]:
     removed: list[Path] = []
     for target in targets:
-        if target.is_symlink() and _link_points_to(target, snapshot):
+        _confined_link_parent(target.parent, root, create=False)
+        expected_target = _expected_link_target(target, snapshot=snapshot, relative=relative)
+        if target.is_symlink() and _link_points_to(target, expected_target):
             target.unlink()
             removed.append(target)
     return tuple(sorted(removed, key=os.fspath))
@@ -677,3 +717,8 @@ def _remove_exact_target(path: Path) -> None:
 
 def _regeneration_command(manifest: SkillManifest) -> str:
     return f"geas skill-export {manifest.ontology.name} --name {manifest.skill.name}"
+
+
+def _absolute_path(path: Path) -> Path:
+    """Return an absolute lexical path without following a possible target symlink."""
+    return Path(os.path.abspath(os.fspath(path.expanduser())))

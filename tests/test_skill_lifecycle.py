@@ -503,3 +503,200 @@ def test_remove_repository_snapshot_leaves_git_deletions_without_committing(
     assert after == before
     assert " D .agents/skills/test-skill/SKILL.md" in status
     assert not (repository / ".claude" / "skills" / "test-skill").exists()
+
+
+def test_unlink_rejects_symlinked_user_agent_parent_without_touching_outside(
+    tmp_path: Path,
+) -> None:
+    """Catches unlink following a user adapter parent into an outside directory."""
+    from research_agent.agent_skills import unlink_skill
+
+    home = tmp_path / "home"
+    home.mkdir()
+    receipt = export_skill(
+        _files(),
+        config_root=tmp_path / "config",
+        home=home,
+        repository=None,
+        link=True,
+        force=False,
+        which=_which("codex"),
+    )
+    outside = tmp_path / "outside"
+    outside_link = outside / "skills" / "test-skill"
+    outside_link.parent.mkdir(parents=True)
+    outside_link.symlink_to(receipt.path, target_is_directory=True)
+    shutil.rmtree(home / ".agents")
+    (home / ".agents").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="symbolic"):
+        unlink_skill(receipt.path, home=home)
+
+    assert outside_link.is_symlink()
+    assert receipt.path.is_dir()
+
+
+def test_unlink_rejects_symlinked_repository_agent_parent_without_touching_outside(
+    tmp_path: Path,
+) -> None:
+    """Catches unlink following a repository adapter parent into an outside directory."""
+    from research_agent.agent_skills import unlink_skill
+
+    repository = _git_repository(tmp_path / "repo")
+    home = tmp_path / "home"
+    home.mkdir()
+    receipt = export_skill(
+        _files(),
+        config_root=tmp_path / "config",
+        home=home,
+        repository=repository,
+        link=False,
+        force=False,
+        which=_which("claude"),
+    )
+    outside = tmp_path / "outside"
+    outside_link = outside / "skills" / "test-skill"
+    outside_link.parent.mkdir(parents=True)
+    outside_link.symlink_to(receipt.path, target_is_directory=True)
+    shutil.rmtree(repository / ".claude")
+    (repository / ".claude").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="symbolic"):
+        unlink_skill(receipt.path, home=home)
+
+    assert outside_link.is_symlink()
+    assert receipt.path.is_dir()
+
+
+def test_unlink_preserves_escaping_symlink_chain_that_only_resolves_to_snapshot(
+    tmp_path: Path,
+) -> None:
+    """Catches unlink treating a chained or escaping link as a direct managed link."""
+    from research_agent.agent_skills import unlink_skill
+
+    home = tmp_path / "home"
+    home.mkdir()
+    receipt = export_skill(
+        _files(),
+        config_root=tmp_path / "config",
+        home=home,
+        repository=None,
+        link=True,
+        force=False,
+        which=_which("codex"),
+    )
+    link = home / ".agents" / "skills" / "test-skill"
+    redirect = tmp_path / "outside" / "redirect"
+    redirect.parent.mkdir()
+    redirect.symlink_to(receipt.path, target_is_directory=True)
+    link.unlink()
+    link.symlink_to(redirect, target_is_directory=True)
+
+    detached = unlink_skill(receipt.path, home=home)
+
+    assert detached.removed_paths == ()
+    assert link.is_symlink()
+    assert redirect.is_symlink()
+    assert receipt.path.is_dir()
+
+
+def test_identical_install_does_not_stage_a_directory_before_comparing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches idempotent install staging files before it knows replacement is unnecessary."""
+    import research_agent.agent_skills as skills
+    from research_agent.agent_skills import install_snapshot
+
+    target = tmp_path / "skills" / "test-skill"
+    install_snapshot(_files(), target)
+
+    def fail_staging(*_args: object, **_kwargs: object) -> str:
+        raise AssertionError("identical install must not create a staging directory")
+
+    monkeypatch.setattr(skills.tempfile, "mkdtemp", fail_staging)
+    receipt = install_snapshot(_files(), target)
+
+    assert receipt.unchanged is True
+
+
+def test_export_resolves_relative_config_root_before_creating_user_link(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches a relative config root producing a relative, broken user-level link target."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.chdir(tmp_path)
+
+    receipt = export_skill(
+        _files(),
+        config_root=Path("config"),
+        home=home,
+        repository=None,
+        link=True,
+        force=False,
+        which=_which("codex"),
+    )
+    link = home / ".agents" / "skills" / "test-skill"
+
+    assert receipt.path.is_absolute()
+    assert Path(link.readlink()).is_absolute()
+    assert link.resolve() == receipt.path
+
+
+def test_remove_rejects_symlinked_agent_parent_without_touching_outside(tmp_path: Path) -> None:
+    """Catches removal following an adapter parent symlink before deleting the snapshot."""
+    from research_agent.agent_skills import remove_skill
+
+    home = tmp_path / "home"
+    home.mkdir()
+    receipt = export_skill(
+        _files(),
+        config_root=tmp_path / "config",
+        home=home,
+        repository=None,
+        link=True,
+        force=False,
+        which=_which("codex"),
+    )
+    outside = tmp_path / "outside"
+    outside_link = outside / "skills" / "test-skill"
+    outside_link.parent.mkdir(parents=True)
+    outside_link.symlink_to(receipt.path, target_is_directory=True)
+    shutil.rmtree(home / ".agents")
+    (home / ".agents").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="symbolic"):
+        remove_skill(receipt.path, home=home)
+
+    assert outside_link.is_symlink()
+    assert receipt.path.is_dir()
+
+
+def test_remove_preserves_escaping_symlink_chain(tmp_path: Path) -> None:
+    """Catches removal unlinking a chain that only resolves to the managed snapshot."""
+    from research_agent.agent_skills import remove_skill
+
+    home = tmp_path / "home"
+    home.mkdir()
+    receipt = export_skill(
+        _files(),
+        config_root=tmp_path / "config",
+        home=home,
+        repository=None,
+        link=True,
+        force=False,
+        which=_which("codex"),
+    )
+    link = home / ".agents" / "skills" / "test-skill"
+    redirect = tmp_path / "outside" / "redirect"
+    redirect.parent.mkdir()
+    redirect.symlink_to(receipt.path, target_is_directory=True)
+    link.unlink()
+    link.symlink_to(redirect, target_is_directory=True)
+
+    removed = remove_skill(receipt.path, home=home)
+
+    assert removed.removed_paths == ()
+    assert link.is_symlink()
+    assert redirect.is_symlink()
+    assert not receipt.path.exists()
