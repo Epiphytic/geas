@@ -27,6 +27,7 @@ SHA256 = "b" * 64
 def _manifest(*, files: tuple[SkillFile, ...] | None = None) -> SkillManifest:
     inventory = files or (SkillFile(path="SKILL.md", sha256=SHA256),)
     return SkillManifest(
+        format_version=1,
         skill=SkillIdentity(name="test-skill"),
         ontology=OntologyIdentity(
             name="test-ontology",
@@ -58,6 +59,43 @@ def test_manifest_round_trip_is_canonical_and_has_one_trailing_newline() -> None
     decoded = json.loads(encoded)
     assert list(decoded) == sorted(decoded)
     assert SkillManifest.model_validate(decoded) == manifest
+
+
+def test_manifest_requires_format_version_and_safe_ontology_identity() -> None:
+    """Catches manifests that silently default versions or embed unsafe identity text."""
+    payload = _manifest().model_dump(mode="json")
+    payload.pop("format_version")
+
+    with pytest.raises(ValidationError, match="format_version"):
+        SkillManifest.model_validate(payload)
+    with pytest.raises(ValidationError, match="name"):
+        OntologyIdentity(
+            name="Test ontology",
+            repository_url="https://example.test/ontology.git",
+            branch="main",
+            commit=COMMIT,
+        )
+    with pytest.raises(ValidationError, match="repository_url"):
+        OntologyIdentity(
+            name="test-ontology",
+            repository_url="file:///private/ontology.git",
+            branch="main",
+            commit=COMMIT,
+        )
+    with pytest.raises(ValidationError, match="repository_url"):
+        OntologyIdentity(
+            name="test-ontology",
+            repository_url="https://localhost/ontology.git",
+            branch="main",
+            commit=COMMIT,
+        )
+    with pytest.raises(ValidationError, match="branch"):
+        OntologyIdentity(
+            name="test-ontology",
+            repository_url="https://example.test/ontology.git",
+            branch="../outside",
+            commit=COMMIT,
+        )
 
 
 @pytest.mark.parametrize(
@@ -129,12 +167,36 @@ def test_validate_snapshot_rejects_symbolic_linked_root_or_file(tmp_path: Path) 
     (target / "geas-skill.json").write_bytes(canonical_manifest_bytes(manifest))
     linked_root = tmp_path / "linked-root"
     linked_root.symlink_to(target, target_is_directory=True)
-    with pytest.raises(ValueError, match="non-symlink"):
+    with pytest.raises(ValueError, match="symbolic"):
         validate_snapshot(linked_root)
 
     (target / "linked.md").symlink_to(target / "SKILL.md")
     with pytest.raises(ValueError, match="symbolic"):
         validate_snapshot(target)
+
+
+def test_validate_snapshot_rejects_symlinked_parent_and_noncanonical_manifest(
+    tmp_path: Path,
+) -> None:
+    """Catches validation that resolves an indirect root or accepts equivalent JSON."""
+    parent = tmp_path / "parent"
+    snapshot = parent / "skill"
+    snapshot.mkdir(parents=True)
+    (snapshot / "SKILL.md").write_text("skill\n")
+    manifest = _manifest(
+        files=(SkillFile(path="SKILL.md", sha256=hashlib.sha256(b"skill\n").hexdigest()),)
+    )
+    (snapshot / "geas-skill.json").write_bytes(canonical_manifest_bytes(manifest))
+    linked_parent = tmp_path / "linked-parent"
+    linked_parent.symlink_to(parent, target_is_directory=True)
+    with pytest.raises(ValueError, match="symbolic"):
+        validate_snapshot(linked_parent / "skill")
+
+    (snapshot / "geas-skill.json").write_text(
+        json.dumps(manifest.model_dump(mode="json"), indent=2) + "\n"
+    )
+    with pytest.raises(ValueError, match="canonical"):
+        validate_snapshot(snapshot)
 
 
 def _topic(*, reverse: bool = False) -> TopicView:
@@ -149,7 +211,7 @@ def _topic(*, reverse: bool = False) -> TopicView:
         {
             "id": "concept:child",
             "label": "Child",
-            "description": "Child concept",
+            "description": "Child concept\n# hostile concept heading",
             "broader": "concept:root",
             "synonyms": "child term",
         },
@@ -204,13 +266,19 @@ def _topic(*, reverse: bool = False) -> TopicView:
             "source_id": "source:one",
             "source_uri": "https://original.example.test/one",
             "exact_text": "Exact evidence one.",
+            "selector_type": "text_quote",
+            "selector_prefix": "Before evidence.",
+            "selector_suffix": "After evidence.",
+            "selector_start": 7,
+            "selector_end": 26,
+            "selector_pointer": "/claims/0",
         },
     )
     controversies = (
         {
             "id": "controversy:one",
             "question": "Which claim?",
-            "description": "Competing claims",
+            "description": "Competing claims\n# hostile controversy heading",
             "status": "open",
             "claim_ids": "claim:one,claim:two",
         },
@@ -219,7 +287,7 @@ def _topic(*, reverse: bool = False) -> TopicView:
         {
             "id": "gap:one",
             "question": "What is missing?",
-            "rationale": "Missing evidence",
+            "rationale": "Missing evidence\n# hostile gap heading",
             "topic_concept_id": "concept:root",
             "kind": "evidence",
             "status": "open",
@@ -280,7 +348,7 @@ def test_render_ontology_skill_is_deterministic_and_bounded_to_one_hop_reference
     first = render_ontology_skill(
         _topic(),
         skill_name="test-skill",
-        ontology_name="Test ontology",
+        ontology_name="test-ontology",
         repository_url="https://example.test/ontology.git",
         branch="main",
         ontology_commit=COMMIT,
@@ -290,7 +358,7 @@ def test_render_ontology_skill_is_deterministic_and_bounded_to_one_hop_reference
     reversed_input = render_ontology_skill(
         _topic(reverse=True),
         skill_name="test-skill",
-        ontology_name="Test ontology",
+        ontology_name="test-ontology",
         repository_url="https://example.test/ontology.git",
         branch="main",
         ontology_commit=COMMIT,
@@ -318,8 +386,25 @@ def test_render_ontology_skill_is_deterministic_and_bounded_to_one_hop_reference
         "claim:one",
         "evidence:one",
         "citation:one",
+        "Selector type: `text_quote`",
+        "Selector prefix (untrusted data):",
+        "Selector suffix (untrusted data):",
+        "Selector range: `7..26`",
+        "Selector pointer (untrusted data):",
+        "Untrusted concept description",
+        "Untrusted controversy description",
+        "Untrusted gap rationale",
     ):
         assert expected in rendered
+    for selector in ("Before evidence.", "After evidence.", "/claims/0"):
+        assert f"\n        {selector}" in rendered
+    for hostile in (
+        "# hostile concept heading",
+        "# hostile controversy heading",
+        "# hostile gap heading",
+    ):
+        assert f"\n    {hostile}" in rendered
+        assert f"\n{hostile}" not in rendered
     for forbidden in ("FULL-DOCUMENT-SENTINEL", "/tmp/", "generated_at:", "username:", "hostname:"):
         assert forbidden not in rendered
     assert all(value.endswith(b"\n") and not value.endswith(b"\n\n") for value in first.values())

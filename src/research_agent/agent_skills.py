@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
+import os
 import re
 from pathlib import Path, PurePosixPath
 from typing import Literal
+from urllib.parse import urlsplit
 
 from pydantic import Field, field_validator, model_validator
 
@@ -15,12 +18,49 @@ from research_agent.models import StrictModel
 _GIT_ID = re.compile(r"^[0-9a-f]{40}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _SKILL_NAME = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+_BRANCH_NAME = re.compile(r"^(?![-/])(?!.*(?://|\.\.|@\{|\.$))[A-Za-z0-9][A-Za-z0-9._/-]*$")
 _MANIFEST_NAME = "geas-skill.json"
 
 
 def _validated_name(value: str, field_name: str) -> str:
     if not _SKILL_NAME.fullmatch(value):
         raise ValueError(f"{field_name} must be lowercase hyphenated ASCII")
+    return value
+
+
+def _contains_control(value: str) -> bool:
+    return any(ord(character) < 32 or ord(character) == 127 for character in value)
+
+
+def _validated_repository_url(value: str) -> str:
+    parsed = urlsplit(value)
+    hostname = parsed.hostname
+    host_is_private = False
+    if hostname:
+        try:
+            address = ipaddress.ip_address(hostname)
+        except ValueError:
+            host_is_private = hostname.casefold() == "localhost" or hostname.casefold().endswith(
+                ".localhost"
+            )
+        else:
+            host_is_private = not address.is_global
+    if (
+        _contains_control(value)
+        or parsed.scheme != "https"
+        or not hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.fragment
+        or host_is_private
+    ):
+        raise ValueError("repository_url must be a public HTTPS URL without credentials")
+    return value
+
+
+def _validated_branch(value: str) -> str:
+    if _contains_control(value) or not _BRANCH_NAME.fullmatch(value):
+        raise ValueError("branch must be a safe Git branch name")
     return value
 
 
@@ -55,12 +95,20 @@ class OntologyIdentity(StrictModel):
     branch: str
     commit: str
 
-    @field_validator("name", "repository_url", "branch")
+    @field_validator("name")
     @classmethod
-    def nonempty(cls, value: str) -> str:
-        if not value:
-            raise ValueError("must not be empty")
-        return value
+    def valid_name(cls, value: str) -> str:
+        return _validated_name(value, "name")
+
+    @field_validator("repository_url")
+    @classmethod
+    def valid_repository_url(cls, value: str) -> str:
+        return _validated_repository_url(value)
+
+    @field_validator("branch")
+    @classmethod
+    def valid_branch(cls, value: str) -> str:
+        return _validated_branch(value)
 
     @field_validator("commit")
     @classmethod
@@ -129,7 +177,7 @@ def snapshot_digest(files: tuple[SkillFile, ...]) -> str:
 
 
 class SkillManifest(StrictModel):
-    format_version: Literal[1] = 1
+    format_version: Literal[1]
     skill: SkillIdentity
     ontology: OntologyIdentity
     geas: GeasIdentity
@@ -165,15 +213,19 @@ def canonical_manifest_bytes(manifest: SkillManifest) -> bytes:
 def validate_snapshot(directory: Path) -> SkillManifest:
     """Validate every regular file in a portable skill snapshot against its manifest."""
     root = directory.expanduser()
+    _reject_symlink_ancestry(root)
     if root.is_symlink() or not root.is_dir():
         raise ValueError("skill snapshot root must be a non-symlink directory")
     manifest_path = root / _MANIFEST_NAME
     if manifest_path.is_symlink() or not manifest_path.is_file():
         raise ValueError("skill snapshot manifest must be a regular file")
     try:
-        manifest = SkillManifest.model_validate_json(manifest_path.read_bytes())
+        manifest_bytes = manifest_path.read_bytes()
+        manifest = SkillManifest.model_validate_json(manifest_bytes)
     except Exception as error:
         raise ValueError("skill snapshot manifest is invalid") from error
+    if manifest_bytes != canonical_manifest_bytes(manifest):
+        raise ValueError("skill snapshot manifest must use canonical JSON encoding")
 
     actual: list[SkillFile] = []
     for path in root.rglob("*"):
@@ -198,3 +250,14 @@ def validate_snapshot(directory: Path) -> SkillManifest:
     if manifest.files != actual_inventory:
         raise ValueError("skill snapshot file hash does not match manifest")
     return manifest
+
+
+def _reject_symlink_ancestry(path: Path) -> None:
+    """Reject each lexical component before filesystem resolution can follow it."""
+    supplied = path if path.is_absolute() else Path.cwd() / path
+    supplied = Path(os.fspath(supplied))
+    current = Path(supplied.anchor)
+    for part in supplied.parts[1:]:
+        current /= part
+        if current.is_symlink():
+            raise ValueError("skill snapshot path must not traverse symbolic links")

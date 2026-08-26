@@ -438,6 +438,19 @@ def test_projection_supports_lexical_hierarchy_dissent_gaps_and_provenance(
     assert len(topic.descendant_concept_ids) == 4
     assert len(topic.sources) == 5
     assert len({item["id"] for item in topic.claims}) == 7
+    selector = topic.claims[0]
+    assert {
+        "selector_type",
+        "selector_prefix",
+        "selector_suffix",
+        "selector_start",
+        "selector_end",
+        "selector_pointer",
+    } <= set(selector)
+    assert selector["selector_type"] == "text_quote"
+    assert selector["selector_start"] is None
+    assert selector["selector_end"] is None
+    assert selector["selector_pointer"] is None
     assert len(topic.controversies) == 2
     assert len(topic.gaps) == 3
     assert topic.gaps[0]["priority"] == 90

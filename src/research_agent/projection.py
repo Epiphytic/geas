@@ -560,6 +560,9 @@ class SQLiteKnowledgeProjection:
                 exact_text TEXT,
                 prefix_text TEXT,
                 suffix_text TEXT,
+                selector_start INTEGER,
+                selector_end INTEGER,
+                selector_pointer TEXT,
                 content_sha256 TEXT NOT NULL,
                 created_at TEXT NOT NULL
             );
@@ -1014,7 +1017,7 @@ class SQLiteKnowledgeProjection:
         for item in fragments:
             counts["evidence_fragments"] += 1
             connection.execute(
-                "INSERT INTO evidence_fragment VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO evidence_fragment VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     item.id,
                     item.source_version,
@@ -1022,6 +1025,9 @@ class SQLiteKnowledgeProjection:
                     item.selector.exact,
                     item.selector.prefix,
                     item.selector.suffix,
+                    item.selector.start,
+                    item.selector.end,
+                    item.selector.pointer,
                     item.content_sha256,
                     item.created_at.isoformat(),
                 ),
@@ -1952,6 +1958,9 @@ class KnowledgeQueryEngine:
                 connection,
                 f"""
                 SELECT c.*, ef.id AS evidence_id, ef.exact_text,
+                       ef.selector_type, ef.prefix_text AS selector_prefix,
+                       ef.suffix_text AS selector_suffix, ef.selector_start,
+                       ef.selector_end, ef.selector_pointer,
                        s.id AS source_id, s.source_uri, s.acquired_at, s.license
                 FROM claim c
                 JOIN claim_evidence ce ON ce.claim_id = c.id

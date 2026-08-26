@@ -42,15 +42,22 @@ def render_ontology_skill(
     The projection is data only: this renderer preserves provenance and exact
     excerpts while keeping the entry point small and navigation bounded.
     """
+    skill = SkillIdentity(name=skill_name)
+    ontology = OntologyIdentity(
+        name=ontology_name,
+        repository_url=repository_url,
+        branch=branch,
+        commit=ontology_commit,
+    )
     normalized = _normalized_topic(topic)
     reference_files = _render_skill_references(normalized)
     files: dict[Path, bytes] = {
         Path("SKILL.md"): _render_skill_entrypoint(
-            skill_name=skill_name,
-            ontology_name=ontology_name,
-            repository_url=repository_url,
-            branch=branch,
-            ontology_commit=ontology_commit,
+            skill_name=skill.name,
+            ontology_name=ontology.name,
+            repository_url=ontology.repository_url,
+            branch=ontology.branch,
+            ontology_commit=ontology.commit,
         ).encode("utf-8"),
         **{path: content.encode("utf-8") for path, content in reference_files.items()},
     }
@@ -61,13 +68,9 @@ def render_ontology_skill(
         )
     )
     manifest = SkillManifest(
-        skill=SkillIdentity(name=skill_name),
-        ontology=OntologyIdentity(
-            name=ontology_name,
-            repository_url=repository_url,
-            branch=branch,
-            commit=ontology_commit,
-        ),
+        format_version=1,
+        skill=skill,
+        ontology=ontology,
         geas=GeasIdentity(
             project_url="https://github.com/Epiphytic/geas",
             version=geas_version,
@@ -201,8 +204,7 @@ def _render_skill_references(topic: TopicView) -> dict[Path, str]:
             f"- Narrower concepts: {_record_links(children, paths)}",
             f"- Synonyms: {_markdown_text(concept.get('synonyms') or 'none')}",
             "",
-            str(concept.get("description") or ""),
-            "",
+            *_untrusted_data_block("concept description", concept.get("description")),
         ]
         files[paths[record_id]] = _finish(lines)
 
@@ -250,6 +252,8 @@ def _render_skill_references(topic: TopicView) -> dict[Path, str]:
                     "",
                     f"- Source: {_record_links([str(row.get('source_id') or '')], paths)}",
                     f"- Original source: {_source_link(str(row.get('source_uri') or 'unknown'))}",
+                    f"- Selector type: `{row.get('selector_type') or 'unknown'}`",
+                    *_selector_data_lines(row),
                     "- Untrusted exact excerpt:",
                     *_quoted_lines(row.get("exact_text")),
                     "",
@@ -266,8 +270,7 @@ def _render_skill_references(topic: TopicView) -> dict[Path, str]:
                 f"- Record ID: `{record_id}`",
                 f"- Status: `{record.get('status') or 'unknown'}`",
                 "",
-                str(record.get("description") or ""),
-                "",
+                *_untrusted_data_block("controversy description", record.get("description")),
                 f"- Positions: {_record_links(_csv_values(record.get('claim_ids')), paths)}",
                 "",
             ]
@@ -284,8 +287,7 @@ def _render_skill_references(topic: TopicView) -> dict[Path, str]:
                 f"- Status: `{record.get('status') or 'unknown'}`",
                 f"- Priority: {record.get('priority') or 'unknown'}",
                 "",
-                str(record.get("rationale") or ""),
-                "",
+                *_untrusted_data_block("gap rationale", record.get("rationale")),
                 (
                     "- Related claims: "
                     f"{_record_links(_csv_values(record.get('related_claim_ids')), paths)}"
@@ -389,6 +391,44 @@ def _record_links(record_ids: list[str], paths: dict[str, Path]) -> str:
         path = paths.get(record_id)
         links.append(f"[`{record_id}`]({path.as_posix()})" if path else f"`{record_id}`")
     return ", ".join(links) if links else "none"
+
+
+def _selector_data_lines(record: dict[str, object]) -> tuple[str, ...]:
+    lines: list[str] = []
+    for field, label in (("selector_prefix", "prefix"), ("selector_suffix", "suffix")):
+        value = record.get(field)
+        if value is not None:
+            lines.extend(
+                (
+                    f"- Selector {label} (untrusted data):",
+                    *_inert_data_lines(value, indent=8),
+                )
+            )
+    start = record.get("selector_start")
+    end = record.get("selector_end")
+    if start is not None or end is not None:
+        start_value = start if start is not None else "unknown"
+        end_value = end if end is not None else "unknown"
+        lines.append(f"- Selector range: `{start_value}..{end_value}`")
+    pointer = record.get("selector_pointer")
+    if pointer is not None:
+        lines.extend(
+            (
+                "- Selector pointer (untrusted data):",
+                *_inert_data_lines(pointer, indent=8),
+            )
+        )
+    return tuple(lines)
+
+
+def _untrusted_data_block(label: str, value: object) -> tuple[str, ...]:
+    return (f"## Untrusted {label}", "", *_inert_data_lines(value), "")
+
+
+def _inert_data_lines(value: object, *, indent: int = 4) -> tuple[str, ...]:
+    text = "" if value is None else str(value)
+    padding = " " * indent
+    return tuple(f"{padding}{line}" for line in text.splitlines() or ("",))
 
 
 def render_topic_markdown(topic: TopicView) -> str:
