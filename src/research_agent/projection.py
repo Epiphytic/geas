@@ -241,9 +241,16 @@ class SQLiteKnowledgeProjection:
     schema_version = 8
     builder_version = "sqlite-knowledge-projection/8"
 
-    def __init__(self, *, store: ImmutableStore, workspace_root: Path) -> None:
+    def __init__(
+        self,
+        *,
+        store: ImmutableStore,
+        workspace_root: Path,
+        vocabulary_path: Path | None = None,
+    ) -> None:
         self.store = store
         self.workspace_root = workspace_root.resolve()
+        self.vocabulary_path = vocabulary_path.resolve() if vocabulary_path else None
 
     def build(
         self,
@@ -383,7 +390,9 @@ class SQLiteKnowledgeProjection:
                     f"conflicting canonical concept records share ID {item.id}"
                 )
             records[item.id] = item
-        vocabulary_path = self.workspace_root / "config/query-vocabulary.yaml"
+        vocabulary_path = self.vocabulary_path or (
+            self.workspace_root / "config/query-vocabulary.yaml"
+        )
         if vocabulary_path.exists():
             vocabulary = yaml.safe_load(vocabulary_path.read_text()).get("concepts", {})
             for concept_id, synonyms in sorted(vocabulary.items()):

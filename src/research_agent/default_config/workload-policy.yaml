@@ -1,0 +1,25 @@
+version: 1
+deployment_target: local_single_user_cli
+
+concurrency:
+  canonical_writers: 1
+  research_workers: 4
+  query_readers: 4
+  writes_are_serialized: true
+
+benchmark_tiers:
+  - name: smoke
+    claims: 10000
+  - name: standard
+    claims: 100000
+  - name: scale
+    claims: 1000000
+
+priorities:
+  - inspectability
+  - deterministic_rebuilds
+  - crash_recovery
+  - portability
+  - local_query_latency
+
+backend_migration_requires_measurement: true

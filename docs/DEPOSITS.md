@@ -19,7 +19,9 @@ Consequences:
 
 ## User-controlled defaults
 
-`config/deposit-policy.yaml` supplies editable defaults for:
+The managed `deposit-policy.yaml` in the user configuration root supplies
+editable defaults (with `config/deposit-policy.yaml` as its packaged template)
+for:
 
 - workspace scope label;
 - whether content should be indexed;

@@ -83,6 +83,7 @@ from research_agent.ontology_build import (
     OntologyBuilder,
     OntologyBuildReceipt,
 )
+from research_agent.ontology_catalog import inventory_ontologies
 from research_agent.ontology_sync import OntologyRepositoryManager
 from research_agent.operator_policy import ResearchPolicy
 from research_agent.parsing import ParsedDocumentManager
@@ -118,7 +119,11 @@ from research_agent.secrets import load_env_file, load_secret_sources
 from research_agent.store import ImmutableStore
 from research_agent.structure import AnchorKind, StructuralAnchor, StructuralDocumentManager
 from research_agent.truth import SQLiteProjectionGuard, TruthManager, TruthPolicy, TruthSnapshot
-from research_agent.user_config import GeasUserConfig, UserConfigManager
+from research_agent.user_config import (
+    GeasUserConfig,
+    UserConfigManager,
+    default_config_path,
+)
 from research_agent.workflow import ActorKind, WorkflowEngine, WorkflowState
 from research_agent.workload import WorkloadPolicy
 
@@ -206,24 +211,49 @@ def _load_allowed_secrets(
     return load_env_file(Path(".env"), allowed_names=allowed_names)
 
 
+def _resolve_cli_config_paths(args: argparse.Namespace) -> None:
+    manager = _user_config_manager(args)
+    fields = {
+        "providers": "providers.toml",
+        "policy": "source-policy.yaml",
+        "research_policy": "research-policy.yaml",
+        "truth_policy": "truth-policy.yaml",
+        "deposit_policy": "deposit-policy.yaml",
+        "model_policy": "model-policy.yaml",
+        "budget_policy": "budget-policy.yaml",
+        "workload_policy": "workload-policy.yaml",
+        "vocabulary": "query-vocabulary.yaml",
+        "query_vocabulary": "query-vocabulary.yaml",
+    }
+    for field, filename in fields.items():
+        if not hasattr(args, field) or getattr(args, field) is not None:
+            continue
+        user_path = manager.policy_path(filename)
+        setattr(
+            args,
+            field,
+            user_path if user_path.is_file() else default_config_path(filename),
+        )
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="geas")
     parser.add_argument(
         "--providers",
         type=Path,
-        default=Path("config/providers.toml"),
+        default=None,
         help="provider configuration path",
     )
     parser.add_argument(
         "--policy",
         type=Path,
-        default=Path("config/source-policy.yaml"),
+        default=None,
         help="deterministic source policy path",
     )
     parser.add_argument(
         "--research-policy",
         type=Path,
-        default=Path("config/research-policy.yaml"),
+        default=None,
         help="connector priority, storage, and cost policy path",
     )
     parser.add_argument(
@@ -245,32 +275,38 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--truth-policy",
         type=Path,
-        default=Path("config/truth-policy.yaml"),
+        default=None,
         help="canonical-source and projection reconciliation policy",
     )
     parser.add_argument(
         "--deposit-policy",
         type=Path,
-        default=Path("config/deposit-policy.yaml"),
+        default=None,
         help="user-deposit defaults and authorization-boundary policy",
     )
     parser.add_argument(
         "--model-policy",
         type=Path,
-        default=Path("config/model-policy.yaml"),
+        default=None,
         help="deterministic local and external model-use policy",
     )
     parser.add_argument(
         "--budget-policy",
         type=Path,
-        default=Path("config/budget-policy.yaml"),
+        default=None,
         help="automatic external-use envelope and accounting treatment",
     )
     parser.add_argument(
         "--workload-policy",
         type=Path,
-        default=Path("config/workload-policy.yaml"),
+        default=None,
         help="local deployment workload and benchmark tiers",
+    )
+    parser.add_argument(
+        "--query-vocabulary",
+        type=Path,
+        default=None,
+        help="controlled query vocabulary used by knowledge projections",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -286,9 +322,14 @@ def _build_parser() -> argparse.ArgumentParser:
         default="json",
     )
 
-    subparsers.add_parser(
+    config_init = subparsers.add_parser(
         "config-init",
         help="create the per-user Geas profile and modular-secret scaffold",
+    )
+    config_init.add_argument(
+        "--update-defaults",
+        action="store_true",
+        help="update unchanged managed defaults and preserve modified files as-is",
     )
 
     ontology_sync = subparsers.add_parser(
@@ -298,6 +339,17 @@ def _build_parser() -> argparse.ArgumentParser:
     ontology_sync.add_argument("--pull", action="store_true")
     ontology_sync.add_argument("--push", action="store_true")
     ontology_sync.add_argument("--message", default="geas: update ontologies")
+
+    ontology_list = subparsers.add_parser(
+        "ontology-list",
+        help="list ontologies in the selected profile or a provided directory",
+    )
+    ontology_list.add_argument(
+        "directory",
+        type=Path,
+        nargs="?",
+        help="ontology root to inspect; omit for the selected Geas profile",
+    )
 
     smoke = subparsers.add_parser("model-smoke", help="run a tool-free model smoke test")
     smoke.add_argument("--provider")
@@ -413,7 +465,7 @@ def _build_parser() -> argparse.ArgumentParser:
     offline.add_argument(
         "--vocabulary",
         type=Path,
-        default=Path("config/query-vocabulary.yaml"),
+        default=None,
     )
     offline.add_argument("--result-limit", type=int, default=50)
     offline.add_argument("--approve-budget", action="store_true")
@@ -444,7 +496,7 @@ def _build_parser() -> argparse.ArgumentParser:
     mojeek.add_argument(
         "--vocabulary",
         type=Path,
-        default=Path("config/query-vocabulary.yaml"),
+        default=None,
     )
     mojeek.add_argument("--result-limit", type=int, default=10)
     mojeek.add_argument("--approve-budget", action="store_true")
@@ -474,7 +526,7 @@ def _build_parser() -> argparse.ArgumentParser:
     ontology_build.add_argument(
         "--vocabulary",
         type=Path,
-        default=Path("config/query-vocabulary.yaml"),
+        default=None,
     )
     ontology_build.add_argument(
         "--check",
@@ -503,7 +555,7 @@ def _build_parser() -> argparse.ArgumentParser:
     crossref.add_argument(
         "--vocabulary",
         type=Path,
-        default=Path("config/query-vocabulary.yaml"),
+        default=None,
     )
     crossref.add_argument("--result-limit", type=int, default=20)
     crossref.add_argument("--approve-budget", action="store_true")
@@ -519,7 +571,7 @@ def _build_parser() -> argparse.ArgumentParser:
     europe_pmc.add_argument(
         "--vocabulary",
         type=Path,
-        default=Path("config/query-vocabulary.yaml"),
+        default=None,
     )
     europe_pmc.add_argument("--result-limit", type=int, default=20)
     europe_pmc.add_argument("--approve-budget", action="store_true")
@@ -535,7 +587,7 @@ def _build_parser() -> argparse.ArgumentParser:
     openalex.add_argument(
         "--vocabulary",
         type=Path,
-        default=Path("config/query-vocabulary.yaml"),
+        default=None,
     )
     openalex.add_argument("--result-limit", type=int, default=20)
     openalex.add_argument("--approve-budget", action="store_true")
@@ -922,6 +974,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = _build_parser().parse_args()
+    _resolve_cli_config_paths(args)
 
     if args.command == "setup-guide":
         manager = _user_config_manager(args)
@@ -944,7 +997,7 @@ def main() -> None:
 
     if args.command == "config-init":
         manager = _user_config_manager(args)
-        config = manager.load_or_create()
+        config = manager.load_or_create(update_defaults=args.update_defaults)
         profile_name, profile = config.profile(args.geas_profile)
         _json(
             {
@@ -965,6 +1018,7 @@ def main() -> None:
                     }
                     for path, format in manager.secret_paths(profile)
                 ),
+                "managed_defaults": manager.last_defaults_receipt,
             }
         )
         return
@@ -991,6 +1045,27 @@ def main() -> None:
                 message=args.message,
             )
         _json(result)
+        return
+
+    if args.command == "ontology-list":
+        manager = _user_config_manager(args)
+        profile_name = None
+        if args.directory is None:
+            user_config = manager.load() if manager.path.exists() else GeasUserConfig.default()
+            profile_name, profile = user_config.profile(args.geas_profile)
+            root = manager.ontology_root(profile)
+            location = "selected_profile"
+        else:
+            root = args.directory
+            location = "provided_directory"
+        inventory = inventory_ontologies(root)
+        _json(
+            {
+                **inventory.model_dump(mode="json"),
+                "location": location,
+                "profile": profile_name,
+            }
+        )
         return
 
     if args.command == "providers":
@@ -2163,6 +2238,7 @@ def main() -> None:
         result = SQLiteKnowledgeProjection(
             store=store,
             workspace_root=args.workspace,
+            vocabulary_path=args.query_vocabulary,
         ).build(
             args.database,
             snapshot=snapshot,

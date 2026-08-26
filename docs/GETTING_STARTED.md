@@ -41,11 +41,10 @@ uv tool install .
 geas --help
 ```
 
-Repository-relative trusted policy files are required by the current CLI
-defaults. When invoking an installed CLI from elsewhere, pass explicit global
-paths such as `--providers`, `--research-policy`, `--model-policy`, and
-`--budget-policy`, or run it from a deployment checkout containing those
-files.
+Run `geas config-init` after installation. It copies packaged provider and
+policy templates into the OS-standard user configuration root, and subsequent
+CLI invocations resolve those live files from any working directory. Global
+path options remain available for deliberate one-command overrides.
 
 ## 2. Initialize user configuration
 
@@ -56,10 +55,13 @@ locations:
 uv run geas config-init
 ```
 
-On Linux this normally creates `~/.config/geas/config.yaml`,
-`~/.config/geas/ontologies/`, and `~/.config/geas/secrets/`. XDG, macOS,
-Windows, overrides, team profiles, and Git synchronization are described in
-[User configuration](USER_CONFIG.md).
+On Linux this normally creates `~/.config/geas/config.yaml`, every live
+provider and policy file, `~/.config/geas/ontologies/`, and
+`~/.config/geas/secrets/`. XDG, macOS, Windows, overrides, team profiles, safe
+default upgrades, and Git synchronization are described in
+[User configuration](USER_CONFIG.md). Checked-in `config/` files are packaged
+templates and maintained-demo inputs; normal CLI defaults resolve the user
+copies.
 
 Inspect the generated walkthrough with its resolved paths:
 
@@ -112,11 +114,11 @@ secret mappings and per-team sources are also supported.
 
 To add or change an LLM, update all of these boundaries together:
 
-1. `config/providers.toml` fixes the client kind, endpoint, model, credential
+1. `~/.config/geas/providers.toml` fixes the client kind, endpoint, model, credential
    name, external/local classification, and capacities.
-2. `config/model-policy.yaml` authorizes the exact provider, endpoint, model,
+2. `~/.config/geas/model-policy.yaml` authorizes the exact provider, endpoint, model,
    operation, and data classes.
-3. `config/budget-policy.yaml` limits calls and token/cost exposure.
+3. `~/.config/geas/budget-policy.yaml` limits calls and token/cost exposure.
 4. The ontology's `build.yaml` selects the provider, output limit, and model
    parameters.
 
@@ -213,6 +215,14 @@ uv run geas ontology-sync --push --message "geas: update example ontology"
 
 Profile settings can enable pull-before-update and push-on-update for
 `ontology-init`. Generated proposals never gain automatic promotion authority.
+
+List ontologies from the selected profile or another direct-child ontology
+root:
+
+```bash
+uv run geas ontology-list
+uv run geas ontology-list /srv/shared/geas-ontologies
+```
 
 ## 6. Use Geas with agents
 

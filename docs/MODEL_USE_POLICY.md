@@ -21,10 +21,11 @@ credentials.
 
 ## Current external policy
 
-`config/model-policy.yaml` allowlists OpenAI and z.ai endpoints, models,
+The managed `model-policy.yaml` (installed from
+`config/model-policy.yaml`) allowlists OpenAI and z.ai endpoints, models,
 operations, and data classes. This allowlist is necessary but not sufficient
 for an automatic external call. A transactional reservation must also pass
-`config/budget-policy.yaml`.
+the managed `budget-policy.yaml` installed from `config/budget-policy.yaml`.
 
 Additional fail-closed rules apply:
 

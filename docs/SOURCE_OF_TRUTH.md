@@ -52,7 +52,8 @@ request. Agents and model processes receive no direct database-write authority;
 only the deterministic budget component may reserve or settle usage.
 
 The exact canonical paths and reconciliation actions are declared in
-`config/truth-policy.yaml`. A policy change is itself detected as canonical
+the managed `truth-policy.yaml`; `config/truth-policy.yaml` is its tracked
+packaged template and maintained-workspace input. A policy change is itself detected as canonical
 drift.
 
 ## Truth snapshots

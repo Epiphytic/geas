@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import os
 import re
 from pathlib import Path
 from typing import Literal
+from uuid import uuid4
 
 import yaml
 from pydantic import Field, field_validator, model_validator
@@ -11,7 +15,37 @@ from research_agent.models import StrictModel
 from research_agent.paths import geas_config_home
 
 DEFAULT_ONTOLOGY_REPOSITORY = "https://github.com/liamhelmer-bel/ontologies.git"
+DEFAULT_CONFIG_FILENAMES = (
+    "providers.toml",
+    "source-policy.yaml",
+    "research-policy.yaml",
+    "truth-policy.yaml",
+    "deposit-policy.yaml",
+    "model-policy.yaml",
+    "budget-policy.yaml",
+    "workload-policy.yaml",
+    "query-vocabulary.yaml",
+)
 _PROFILE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+
+
+class ManagedDefaultFile(StrictModel):
+    installed_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    template_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class ManagedDefaultsState(StrictModel):
+    version: Literal[1] = 1
+    files: dict[str, ManagedDefaultFile] = Field(default_factory=dict)
+
+
+class DefaultConfigReceipt(StrictModel):
+    root: str
+    installed: tuple[str, ...] = ()
+    updated: tuple[str, ...] = ()
+    unchanged: tuple[str, ...] = ()
+    preserved: tuple[str, ...] = ()
+    review_candidates: tuple[str, ...] = ()
 
 
 class SecretSource(StrictModel):
@@ -114,13 +148,14 @@ class UserConfigManager:
     def __init__(self, path: Path | None = None) -> None:
         self.path = (path or geas_config_home() / "config.yaml").expanduser().resolve()
         self.root = self.path.parent
+        self.last_defaults_receipt: DefaultConfigReceipt | None = None
 
     def load(self) -> GeasUserConfig:
         if not self.path.is_file():
             raise ValueError(f"Geas user config does not exist: {self.path}")
         return GeasUserConfig.from_yaml(self.path)
 
-    def load_or_create(self) -> GeasUserConfig:
+    def load_or_create(self, *, update_defaults: bool = False) -> GeasUserConfig:
         if self.path.exists():
             config = self.load()
         else:
@@ -128,7 +163,115 @@ class UserConfigManager:
             config = GeasUserConfig.default()
             self.path.write_text(config.explicit_yaml())
         self._ensure_secret_scaffold()
+        self.last_defaults_receipt = self.install_defaults(update=update_defaults)
         return config
+
+    def install_defaults(self, *, update: bool = False) -> DefaultConfigReceipt:
+        """Install packaged policy defaults without overwriting operator changes."""
+        self.root.mkdir(parents=True, exist_ok=True)
+        state_path = self.root / "defaults-state.json"
+        if state_path.is_symlink():
+            raise ValueError("managed-default state cannot be a symbolic link")
+        state = self._load_defaults_state(state_path)
+        installed: list[str] = []
+        updated: list[str] = []
+        unchanged: list[str] = []
+        preserved: list[str] = []
+        candidates: list[str] = []
+        next_files = dict(state.files)
+
+        for filename in DEFAULT_CONFIG_FILENAMES:
+            template = default_config_path(filename).read_bytes()
+            template_hash = _sha256(template)
+            destination = self.policy_path(filename)
+            if destination.is_symlink():
+                raise ValueError(f"managed config cannot be a symbolic link: {destination}")
+            previous = state.files.get(filename)
+            if not destination.exists():
+                _atomic_write(destination, template)
+                installed.append(filename)
+                next_files[filename] = ManagedDefaultFile(
+                    installed_sha256=template_hash,
+                    template_sha256=template_hash,
+                )
+                continue
+            if not destination.is_file():
+                raise ValueError(f"managed config must be a regular file: {destination}")
+
+            current_hash = _sha256(destination.read_bytes())
+            if current_hash == template_hash:
+                unchanged.append(filename)
+                next_files[filename] = ManagedDefaultFile(
+                    installed_sha256=template_hash,
+                    template_sha256=template_hash,
+                )
+                self._remove_candidate(destination)
+                continue
+            if (
+                previous is not None
+                and previous.installed_sha256 is not None
+                and current_hash == previous.installed_sha256
+                and update
+            ):
+                _atomic_write(destination, template)
+                updated.append(filename)
+                next_files[filename] = ManagedDefaultFile(
+                    installed_sha256=template_hash,
+                    template_sha256=template_hash,
+                )
+                self._remove_candidate(destination)
+                continue
+
+            preserved.append(filename)
+            candidate = destination.with_name(f"{destination.name}.new")
+            if candidate.is_symlink():
+                raise ValueError(f"managed config candidate cannot be a symlink: {candidate}")
+            if not candidate.exists() or candidate.read_bytes() != template:
+                _atomic_write(candidate, template)
+            candidates.append(candidate.name)
+            next_files[filename] = ManagedDefaultFile(
+                installed_sha256=(
+                    previous.installed_sha256 if previous is not None else None
+                ),
+                template_sha256=template_hash,
+            )
+
+        next_state = ManagedDefaultsState(files=next_files)
+        _atomic_write(
+            state_path,
+            json.dumps(next_state.model_dump(mode="json"), indent=2, sort_keys=True).encode()
+            + b"\n",
+        )
+        return DefaultConfigReceipt(
+            root=str(self.root),
+            installed=tuple(installed),
+            updated=tuple(updated),
+            unchanged=tuple(unchanged),
+            preserved=tuple(preserved),
+            review_candidates=tuple(candidates),
+        )
+
+    def policy_path(self, filename: str) -> Path:
+        if filename not in DEFAULT_CONFIG_FILENAMES:
+            raise ValueError(f"unknown managed Geas config file: {filename}")
+        return self._confined(Path(filename))
+
+    @staticmethod
+    def _load_defaults_state(path: Path) -> ManagedDefaultsState:
+        if not path.exists():
+            return ManagedDefaultsState()
+        try:
+            return ManagedDefaultsState.model_validate_json(path.read_text())
+        except ValueError as error:
+            raise ValueError(f"invalid managed-default state: {path}") from error
+
+    @staticmethod
+    def _remove_candidate(destination: Path) -> None:
+        candidate = destination.with_name(f"{destination.name}.new")
+        if candidate.is_symlink():
+            raise ValueError(f"managed config candidate cannot be a symlink: {candidate}")
+        if candidate.exists():
+            candidate.unlink()
 
     def _ensure_secret_scaffold(self) -> None:
         secrets = self.root / "secrets"
@@ -161,3 +304,26 @@ class UserConfigManager:
         if not resolved.is_relative_to(self.root):
             raise ValueError("Geas profile path escapes the user config directory")
         return resolved
+
+
+def default_config_path(filename: str) -> Path:
+    if filename not in DEFAULT_CONFIG_FILENAMES:
+        raise ValueError(f"unknown packaged Geas config file: {filename}")
+    path = Path(__file__).parent / "default_config" / filename
+    if not path.is_file():
+        raise ValueError(f"packaged Geas config is missing: {filename}")
+    return path
+
+
+def _sha256(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def _atomic_write(path: Path, value: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp-{uuid4().hex}")
+    try:
+        temporary.write_bytes(value)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)

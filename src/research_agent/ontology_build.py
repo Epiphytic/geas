@@ -1628,7 +1628,11 @@ class OntologyBuilder:
             + b"\n"
         )
         database_path = self.root / "query.sqlite"
-        SQLiteKnowledgeProjection(store=self.store, workspace_root=self.workspace).build(
+        SQLiteKnowledgeProjection(
+            store=self.store,
+            workspace_root=self.workspace,
+            vocabulary_path=self.vocabulary_path,
+        ).build(
             database_path,
             snapshot=snapshot,
             truth_manager=truth_manager,

@@ -135,8 +135,9 @@ queued -> fetched -> quarantined -> extracted -> validated
 ```
 
 Models cannot transition it. Confirmed or suspected hostile-source observations
-cause deterministic quarantine or denial according to
-[`config/source-policy.yaml`](config/source-policy.yaml). See
+cause deterministic quarantine or denial according to the managed
+`source-policy.yaml` under the user configuration root. Its packaged template
+is [`config/source-policy.yaml`](config/source-policy.yaml). See
 [SECURITY.md](SECURITY.md) for implemented guarantees and remaining deployment
 work.
 
@@ -150,10 +151,11 @@ http://127.0.0.1:8000/v1
 model: deepseek-v4-flash
 ```
 
-[`config/providers.toml`](config/providers.toml) also defines opt-in OpenAI,
-Z.AI, Codex CLI, and Claude Code providers. API providers require their named
-environment key. CLI one-shots reuse their own authenticated subscription and
-are accounted as subscription-included calls.
+The managed `providers.toml` under the user configuration root defines model
+routes. Its packaged template, [`config/providers.toml`](config/providers.toml),
+includes opt-in OpenAI, Z.AI, Codex CLI, and Claude Code providers. API
+providers require their named environment key. CLI one-shots reuse their own
+authenticated subscription and are accounted as subscription-included calls.
 
 Use `codex_oneshot` or `claude_oneshot` when ontology assembly needs a stronger
 reasoning tier than the local extraction model. They receive only selected
@@ -234,8 +236,8 @@ uv run geas policy-check \
 Global options such as `--policy` and `--providers` go before the subcommand.
 The `data/` directory is intentionally ignored by Git.
 
-Run bounded Mojeek discovery using `MOJEEK_API_KEY` from the ignored `.env`
-file:
+Run bounded Mojeek discovery using `MOJEEK_API_KEY` from the selected profile's
+managed secret source:
 
 ```bash
 uv run geas discover-mojeek \
@@ -249,7 +251,7 @@ confirms that the Mojeek subscription has storage rights. Search hits and
 snippets are never evidence.
 
 Run authenticated OpenAlex discovery using `OPENALEX_API_KEY` from the same
-ignored file:
+managed secret source:
 
 ```bash
 uv run geas --env-file .env discover-openalex \
@@ -282,7 +284,7 @@ text, and raw responses are excluded and require a separate license-aware
 acquisition path.
 
 Resolve known DOIs to license-attributed OA manifestations with the project
-contact from the ignored `.env` file:
+contact from the managed secret source:
 
 ```bash
 uv run geas resolve-unpaywall \

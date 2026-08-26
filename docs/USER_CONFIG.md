@@ -22,6 +22,42 @@ The default locations are:
 `GEAS_CONFIG_HOME` overrides the root on every OS. `--geas-config` selects a
 specific `config.yaml`, useful for a completely separate deployment.
 
+## Managed provider and policy configuration
+
+`config-init` installs every live provider, policy, workload, truth, deposit,
+and query-vocabulary file beside `config.yaml`:
+
+```text
+config.yaml
+providers.toml
+source-policy.yaml
+research-policy.yaml
+truth-policy.yaml
+deposit-policy.yaml
+model-policy.yaml
+budget-policy.yaml
+workload-policy.yaml
+query-vocabulary.yaml
+defaults-state.json
+```
+
+The CLI resolves these files from the directory containing the selected
+`config.yaml`. Global path options remain available for one-command overrides.
+The source repository's `config/` directory and packaged copies are
+installation templates, not the live defaults after initialization.
+
+Geas records template and installed hashes in `defaults-state.json`. To adopt
+new packaged defaults after upgrading:
+
+```bash
+geas config-init --update-defaults
+```
+
+Files still matching the previously installed bytes are updated atomically.
+Operator-modified files are never overwritten; Geas preserves them and writes
+a sibling `.new` candidate for review. After manually adopting or merging a
+candidate, rerun `config-init --update-defaults` to reconcile the state.
+
 ## Ontology location and named profiles
 
 `config.yaml` is explicit, versioned configuration. Its default profile points
@@ -59,6 +95,10 @@ uv run geas ontology-build model-routing-for-ai-red-blue-teaming \
 Passing a directory to `ontology-init` preserves the explicit workspace-local
 workflow. `ontology-build` and `library-build` accept either an explicit path
 or an ontology name from the selected profile.
+
+List available ontologies with `geas ontology-list`. Pass a directory to
+inventory another direct-child ontology root, for example
+`geas ontology-list /srv/team/ontologies`.
 
 Add profiles for different teams or security domains. Each can select its own
 ontology directory, secret sources, and Git repository. Select one with the

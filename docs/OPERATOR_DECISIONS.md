@@ -36,7 +36,8 @@ approved raw-response retention period.
 
 ### Implementation
 
-- Credential: `MOJEEK_API_KEY`, loaded from the ignored `.env` file without
+- Credential: `MOJEEK_API_KEY`, loaded from the selected profile's ignored
+  modular secret source without
   shell evaluation.
 - API destination: fixed to `https://api.mojeek.com/search`.
 - API keys are never included in connector manifests, query plans, audit
@@ -252,7 +253,8 @@ all-match FTS query 1.07 seconds median with 241 MiB peak RSS. See
 ### Decision
 
 - Use OpenAlex after Crossref in the domain-index priority order.
-- Load `OPENALEX_API_KEY` only from the ignored environment file.
+- Load `OPENALEX_API_KEY` only from the selected profile's ignored modular
+  secret source.
 - Persist normalized OpenAlex metadata under CC0, but retain no raw response
   body and do not infer rights for linked documents.
 - Treat search calls as metered and counted even when OpenAlex's daily free

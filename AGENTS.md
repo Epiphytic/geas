@@ -277,25 +277,29 @@ charged.
 
 ## Trusted configuration
 
-Configuration is versioned because it changes system behavior:
+Live operator configuration is installed in the OS-standard Geas user config
+root (`~/.config/geas` on Linux without an XDG override). Checked-in `config/`
+files and `src/research_agent/default_config/` are synchronized packaged
+templates and maintained-demo inputs, not the normal live CLI defaults after
+`config-init`. Configuration is versioned because it changes system behavior:
 
-- `config/providers.toml`: provider kind, fixed endpoint, model, key variable,
+- `providers.toml` (template `config/providers.toml`): provider kind, fixed endpoint, model, key variable,
   external/local status, output capacity, and context capacity.
-- `config/model-policy.yaml`: which external provider/model/operation/data
+- `model-policy.yaml` (template `config/model-policy.yaml`): which external provider/model/operation/data
   combinations are allowed.
-- `config/budget-policy.yaml`: automatic envelopes, account treatment, and hard
+- `budget-policy.yaml` (template `config/budget-policy.yaml`): automatic envelopes, account treatment, and hard
   usage caps.
-- `config/research-policy.yaml`: connector order, credential names, retention,
+- `research-policy.yaml` (template `config/research-policy.yaml`): connector order, credential names, retention,
   storage rights, and request/cost limits.
-- `config/source-policy.yaml`: deterministic action by threat status, severity,
+- `source-policy.yaml` (template `config/source-policy.yaml`): deterministic action by threat status, severity,
   and workflow stage.
-- `config/deposit-policy.yaml`: provenance and handling defaults for user
+- `deposit-policy.yaml` (template `config/deposit-policy.yaml`): provenance and handling defaults for user
   deposits.
-- `config/query-vocabulary.yaml`: allowed query concepts, connectors, fields,
+- `query-vocabulary.yaml` (template `config/query-vocabulary.yaml`): allowed query concepts, connectors, fields,
   and synonyms.
-- `config/truth-policy.yaml`: canonical ontology/policy/schema inventory and
+- `truth-policy.yaml` (template `config/truth-policy.yaml`): canonical ontology/policy/schema inventory and
   required drift action.
-- `config/workload-policy.yaml`: deployment concurrency and benchmark tiers.
+- `workload-policy.yaml` (template `config/workload-policy.yaml`): deployment concurrency and benchmark tiers.
 
 When adding a provider or connector, update its implementation, trusted config,
 CLI composition, documentation, and tests together. A config entry alone is not

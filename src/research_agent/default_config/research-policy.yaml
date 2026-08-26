@@ -1,0 +1,87 @@
+version: 4
+
+# Discovery rankings and snippets identify candidates; they never support claims.
+general_search_results_are_evidence: false
+
+# Acquisition tries structured and openly accessible representations before
+# bounded public-web fetching or user-assisted deposits.
+open_source_acquisition_order:
+  - official_api
+  - domain_index
+  - open_repository
+  - publisher_open_access
+  - feed_or_sitemap
+  - common_crawl
+  - allowlisted_public_web
+  - user_deposit
+
+domain_index_providers:
+  - connector_id: connector:crossref
+    enabled: true
+    priority: 1
+    credential_env: ""
+    metadata_license: Crossref public metadata; publisher abstracts excluded
+    persist_normalized_metadata: true
+    raw_response_retention_days: 0
+    max_requests_per_run: 20
+    cost_accounting: none
+
+  - connector_id: connector:openalex
+    enabled: true
+    priority: 2
+    credential_env: OPENALEX_API_KEY
+    metadata_license: CC0-1.0
+    persist_normalized_metadata: true
+    raw_response_retention_days: 0
+    max_requests_per_run: 10
+    # Calls are reserved transactionally before network access and settled from
+    # the API-reported cost. The allowance is a hard provider-specific ceiling.
+    cost_accounting: provider_reported_only
+    daily_free_allowance_usd: 1.0
+
+  - connector_id: connector:europe-pmc
+    enabled: true
+    priority: 3
+    credential_env: ""
+    metadata_license: unknown; lite bibliographic metadata only
+    persist_normalized_metadata: true
+    raw_response_retention_days: 0
+    max_requests_per_run: 20
+    cost_accounting: none
+
+  - connector_id: connector:unpaywall
+    enabled: true
+    priority: 4
+    credential_env: UNPAYWALL_EMAIL
+    metadata_license: unknown; location-level licenses retained separately
+    persist_normalized_metadata: true
+    raw_response_retention_days: 0
+    max_requests_per_run: 50
+    cost_accounting: none
+
+general_search_providers:
+  - connector_id: connector:mojeek
+    enabled: true
+    priority: 1
+    credential_env: MOJEEK_API_KEY
+    # Change to confirmed only after verifying that the account has Business
+    # storage rights. Other plans permit only one-hour caching.
+    storage_rights: unconfirmed
+    persist_normalized_results: false
+    raw_response_retention_days: 0
+    # Per-run requests are enforced now. Monthly accounting becomes enforceable
+    # when the persistent usage ledger is added before scheduled searches.
+    max_requests_per_run: 50
+    max_requests_per_month: 5000
+    monthly_cost_ceiling_usd: 25
+
+  - connector_id: connector:brave-search
+    enabled: false
+    priority: 2
+    credential_env: BRAVE_API_KEY
+    storage_rights: unconfirmed
+    persist_normalized_results: false
+    raw_response_retention_days: 0
+    max_requests_per_run: 50
+    max_requests_per_month: 5000
+    monthly_cost_ceiling_usd: 25

@@ -1,0 +1,58 @@
+version: 1
+currency: USD
+
+automatic_envelope:
+  max_cost_microusd_per_call: 250000
+  max_cost_microusd_per_run: 2000000
+  max_cost_microusd_per_day: 5000000
+  max_cost_microusd_per_month: 25000000
+  max_calls_per_run: 10
+  max_input_tokens_per_call: 32000
+  max_output_tokens_per_call: 131072
+
+# Operators may change treatment to excluded_from_cost for subscription or
+# enterprise-accounted services. Exclusions still consume call and token caps.
+accounts:
+  - service: model
+    provider: openai
+    model: gpt-5.2
+    billing_basis: metered
+    budget_treatment: counted
+    accounting_note: OpenAI API pay-as-you-go
+    input_cost_microusd_per_million_tokens: 1750000
+    output_cost_microusd_per_million_tokens: 14000000
+
+  - service: model
+    provider: zai
+    model: glm-5.2
+    billing_basis: metered
+    budget_treatment: counted
+    accounting_note: Z.AI API pay-as-you-go
+    input_cost_microusd_per_million_tokens: 1400000
+    output_cost_microusd_per_million_tokens: 4400000
+
+  - service: model
+    provider: codex_oneshot
+    model: gpt-5.6-sol
+    billing_basis: subscription_included
+    budget_treatment: excluded_from_cost
+    accounting_note: Codex CLI subscription; call and token limits still apply
+    input_cost_microusd_per_million_tokens: 0
+    output_cost_microusd_per_million_tokens: 0
+
+  - service: model
+    provider: claude_oneshot
+    model: opus
+    billing_basis: subscription_included
+    budget_treatment: excluded_from_cost
+    accounting_note: Claude Code subscription; call and token limits still apply
+    input_cost_microusd_per_million_tokens: 0
+    output_cost_microusd_per_million_tokens: 0
+
+  - service: search
+    provider: openalex
+    model:
+    billing_basis: metered
+    budget_treatment: counted
+    accounting_note: OpenAlex API usage; free daily credit does not disable accounting
+    unit_cost_microusd: 1000
