@@ -1134,6 +1134,13 @@ def main() -> None:
     if args.command == "config-init":
         manager = _user_config_manager(args)
         config = manager.load_or_create(update_defaults=args.update_defaults)
+        print("Ensuring packaged Geas agent skill is installed.", file=sys.stderr)
+        skills = manager.install_builtin_skill()
+        if skills.conflicts:
+            print(
+                "Preserved unmanaged Geas agent-skill conflicts.",
+                file=sys.stderr,
+            )
         profile_name, profile = config.profile(args.geas_profile)
         _json(
             {
@@ -1155,6 +1162,7 @@ def main() -> None:
                     for path, format in manager.secret_paths(profile)
                 ),
                 "managed_defaults": manager.last_defaults_receipt,
+                "skills": skills,
             }
         )
         return

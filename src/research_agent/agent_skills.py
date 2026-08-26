@@ -12,6 +12,8 @@ import subprocess
 import tempfile
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
+from importlib.metadata import PackageNotFoundError, version
+from importlib.resources import files as package_files
 from pathlib import Path, PurePosixPath
 from typing import Literal
 from urllib.parse import urlsplit
@@ -25,6 +27,8 @@ _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _SKILL_NAME = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 _BRANCH_NAME = re.compile(r"^(?![-/])(?!.*(?://|\.\.|@\{|\.$))[A-Za-z0-9][A-Za-z0-9._/-]*$")
 _MANIFEST_NAME = "geas-skill.json"
+_BUILTIN_SKILL_NAME = "geas"
+_GEAS_PROJECT_URL = "https://github.com/Epiphytic/geas"
 
 
 @dataclass(frozen=True)
@@ -72,6 +76,32 @@ class SkillRemovalReceipt:
     removed_paths: tuple[Path, ...]
     removed_snapshot: bool
     regeneration_command: str
+
+
+class BuiltinSkillReceipt(StrictModel):
+    """Sorted, non-sensitive results from installing the packaged Geas skill."""
+
+    installed: tuple[Path, ...] = ()
+    updated: tuple[Path, ...] = ()
+    unchanged: tuple[Path, ...] = ()
+    linked: tuple[Path, ...] = ()
+    skipped: tuple[Path, ...] = ()
+    conflicts: tuple[Path, ...] = ()
+
+    @model_validator(mode="after")
+    def sorted_paths(self) -> BuiltinSkillReceipt:
+        for name in (
+            "installed",
+            "updated",
+            "unchanged",
+            "linked",
+            "skipped",
+            "conflicts",
+        ):
+            paths = getattr(self, name)
+            if paths != tuple(sorted(paths, key=os.fspath)):
+                raise ValueError(f"{name} paths must be sorted")
+        return self
 
 
 _AGENT_ADAPTERS: tuple[AgentAdapter, ...] = (
@@ -417,6 +447,66 @@ def export_skill(
     )
 
 
+def install_builtin_geas_skill(
+    *,
+    config_root: Path,
+    home: Path,
+    which: Callable[[str], str | None],
+) -> BuiltinSkillReceipt:
+    """Install the packaged generic skill and repair only exact managed links."""
+    files = _builtin_skill_snapshot_files()
+    root = _absolute_path(config_root)
+    snapshot = root / "skills" / _BUILTIN_SKILL_NAME
+    existed = snapshot.exists() or snapshot.is_symlink()
+    installed: list[Path] = []
+    updated: list[Path] = []
+    unchanged: list[Path] = []
+    linked: list[Path] = []
+    skipped: list[Path] = []
+    conflicts: list[Path] = []
+
+    try:
+        snapshot_receipt = install_snapshot(files, snapshot)
+    except ValueError:
+        conflicts.append(snapshot)
+        return _builtin_receipt(conflicts=conflicts)
+
+    if snapshot_receipt.unchanged:
+        unchanged.append(snapshot)
+    elif existed:
+        updated.append(snapshot)
+    else:
+        installed.append(snapshot)
+
+    detections = detect_agents(home=home, which=which)
+    for destination in _user_link_targets(
+        _BUILTIN_SKILL_NAME, home=home, detections=detections
+    ):
+        try:
+            (link_receipt,) = _install_links(
+                (destination,),
+                snapshot=snapshot,
+                root=home,
+                relative=False,
+                force=False,
+            )
+        except ValueError:
+            conflicts.append(destination)
+            continue
+        if link_receipt.unchanged:
+            skipped.append(destination)
+        else:
+            linked.append(destination)
+    return _builtin_receipt(
+        installed=installed,
+        updated=updated,
+        unchanged=unchanged,
+        linked=linked,
+        skipped=skipped,
+        conflicts=conflicts,
+    )
+
+
 def unlink_skill(path: Path, *, home: Path, force: bool = False) -> SkillRemovalReceipt:
     """Remove only exact managed agent links, leaving the snapshot untouched."""
     snapshot = _snapshot_directory(path)
@@ -488,6 +578,90 @@ def _validate_snapshot_files(files: Mapping[Path, bytes]) -> SkillManifest:
     if manifest.files != inventory:
         raise ValueError("skill snapshot files do not match manifest inventory")
     return manifest
+
+
+def _builtin_skill_snapshot_files() -> dict[Path, bytes]:
+    source_files = _builtin_skill_source_files()
+    inventory = tuple(
+        sorted(
+            (
+                SkillFile(
+                    path=path.as_posix(),
+                    sha256=hashlib.sha256(content).hexdigest(),
+                )
+                for path, content in source_files.items()
+            ),
+            key=lambda item: item.path.encode("utf-8"),
+        )
+    )
+    manifest = SkillManifest(
+        format_version=1,
+        skill=SkillIdentity(name=_BUILTIN_SKILL_NAME),
+        # The generic skill is not ontology knowledge.  These schema-required
+        # identifiers describe its fixed Geas project locator only.
+        ontology=OntologyIdentity(
+            name="geas",
+            repository_url=f"{_GEAS_PROJECT_URL}.git",
+            branch="main",
+            commit="0" * 40,
+        ),
+        geas=GeasIdentity(
+            project_url=_GEAS_PROJECT_URL,
+            version=_installed_geas_version(),
+        ),
+        projection=ProjectionIdentity(
+            snapshot_id="builtin:geas",
+            topic_concept_id="builtin:geas",
+        ),
+        files=inventory,
+        snapshot_sha256=snapshot_digest(inventory),
+    )
+    return {**source_files, Path(_MANIFEST_NAME): canonical_manifest_bytes(manifest)}
+
+
+def _builtin_skill_source_files() -> dict[Path, bytes]:
+    """Read only regular, non-symlinked files from the packaged generic skill."""
+    root = Path(package_files("research_agent").joinpath("builtin_skills", "geas"))
+    if root.is_symlink() or not root.is_dir():
+        raise ValueError("packaged Geas skill directory is missing or unsafe")
+    result: dict[Path, bytes] = {}
+    for source in sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix()):
+        if source.is_symlink():
+            raise ValueError("packaged Geas skill must not contain symbolic links")
+        if source.is_dir():
+            continue
+        if not source.is_file():
+            raise ValueError("packaged Geas skill must contain regular files only")
+        result[source.relative_to(root)] = source.read_bytes()
+    if Path("SKILL.md") not in result:
+        raise ValueError("packaged Geas skill is missing SKILL.md")
+    return result
+
+
+def _installed_geas_version() -> str:
+    try:
+        return version("geas")
+    except PackageNotFoundError:
+        return "0.1.0"
+
+
+def _builtin_receipt(
+    *,
+    installed: Iterable[Path] = (),
+    updated: Iterable[Path] = (),
+    unchanged: Iterable[Path] = (),
+    linked: Iterable[Path] = (),
+    skipped: Iterable[Path] = (),
+    conflicts: Iterable[Path] = (),
+) -> BuiltinSkillReceipt:
+    return BuiltinSkillReceipt(
+        installed=tuple(sorted(installed, key=os.fspath)),
+        updated=tuple(sorted(updated, key=os.fspath)),
+        unchanged=tuple(sorted(unchanged, key=os.fspath)),
+        linked=tuple(sorted(linked, key=os.fspath)),
+        skipped=tuple(sorted(skipped, key=os.fspath)),
+        conflicts=tuple(sorted(conflicts, key=os.fspath)),
+    )
 
 
 def _manifest_from_files(files: Mapping[Path, bytes]) -> SkillManifest:
