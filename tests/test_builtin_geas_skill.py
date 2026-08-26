@@ -1,13 +1,53 @@
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Callable
 from pathlib import Path
 
-from research_agent.agent_skills import install_builtin_geas_skill, validate_snapshot
+import pytest
+
+from research_agent.agent_skills import (
+    GeasIdentity,
+    OntologyIdentity,
+    ProjectionIdentity,
+    SkillFile,
+    SkillIdentity,
+    SkillManifest,
+    canonical_manifest_bytes,
+    install_builtin_geas_skill,
+    install_snapshot,
+    snapshot_digest,
+    validate_snapshot,
+)
 
 
 def _which(*available: str) -> Callable[[str], str | None]:
     return lambda executable: f"/controlled/{executable}" if executable in available else None
+
+
+def _alternative_builtin_files() -> dict[Path, bytes]:
+    body = b"operator-owned generic skill\n"
+    inventory = (SkillFile(path="SKILL.md", sha256=hashlib.sha256(body).hexdigest()),)
+    manifest = SkillManifest(
+        format_version=1,
+        skill=SkillIdentity(name="geas"),
+        ontology=OntologyIdentity(
+            name="operator-ontology",
+            repository_url="https://example.test/operator.git",
+            branch="main",
+            commit="a" * 40,
+        ),
+        geas=GeasIdentity(project_url="https://example.test/geas", version="1.0.0"),
+        projection=ProjectionIdentity(
+            snapshot_id="operator:snapshot", topic_concept_id="concept:operator"
+        ),
+        files=inventory,
+        snapshot_sha256=snapshot_digest(inventory),
+    )
+    return {
+        Path("SKILL.md"): body,
+        Path("geas-skill.json"): canonical_manifest_bytes(manifest),
+    }
 
 
 def test_builtin_skill_installs_a_valid_snapshot_and_deduplicated_agent_links(
@@ -72,6 +112,72 @@ def test_builtin_skill_is_idempotent_updates_managed_content_and_preserves_confl
     )
     assert conflicted.conflicts == (snapshot,)
     assert (snapshot / "SKILL.md").read_text() == "operator skill\n"
+
+
+def test_builtin_skill_preserves_a_valid_snapshot_without_builtin_ownership(
+    tmp_path: Path,
+) -> None:
+    """Catches adopting any valid geas snapshot as a managed packaged skill."""
+    home = tmp_path / "home"
+    home.mkdir()
+    config_root = tmp_path / "config"
+    snapshot = config_root / "skills" / "geas"
+    install_snapshot(_alternative_builtin_files(), snapshot)
+    before = {
+        path.relative_to(snapshot): path.read_bytes()
+        for path in snapshot.rglob("*")
+        if path.is_file()
+    }
+
+    receipt = install_builtin_geas_skill(
+        config_root=config_root, home=home, which=_which("codex")
+    )
+
+    after = {
+        path.relative_to(snapshot): path.read_bytes()
+        for path in snapshot.rglob("*")
+        if path.is_file()
+    }
+    assert receipt.conflicts == (snapshot,)
+    assert after == before
+    assert not (config_root / "state" / "builtin-skills" / "geas.json").exists()
+
+
+@pytest.mark.parametrize("contents", ("not JSON\n", '{"unexpected": true}\n'))
+def test_builtin_skill_rejects_malformed_ownership_state(
+    tmp_path: Path,
+    contents: str,
+) -> None:
+    """Catches treating tampered ownership state as authority to replace a skill."""
+    home = tmp_path / "home"
+    home.mkdir()
+    config_root = tmp_path / "config"
+    first = install_builtin_geas_skill(
+        config_root=config_root, home=home, which=_which("codex")
+    )
+    snapshot = first.installed[0]
+    state = config_root / "state" / "builtin-skills" / "geas.json"
+    state.write_text(contents)
+
+    with pytest.raises(ValueError, match="builtin skill state"):
+        install_builtin_geas_skill(config_root=config_root, home=home, which=_which("codex"))
+    assert validate_snapshot(snapshot).skill.name == "geas"
+
+
+def test_builtin_skill_rejects_symlinked_ownership_state(tmp_path: Path) -> None:
+    """Catches following a state symlink outside the config root."""
+    home = tmp_path / "home"
+    home.mkdir()
+    config_root = tmp_path / "config"
+    install_builtin_geas_skill(config_root=config_root, home=home, which=_which("codex"))
+    state = config_root / "state" / "builtin-skills" / "geas.json"
+    state.unlink()
+    external = tmp_path / "external-state.json"
+    external.write_text("{}\n")
+    state.symlink_to(external)
+
+    with pytest.raises(ValueError, match="builtin skill state"):
+        install_builtin_geas_skill(config_root=config_root, home=home, which=_which("codex"))
 
 
 def test_packaged_skill_routes_retrieval_lifecycle_and_security_to_one_hop_references() -> None:

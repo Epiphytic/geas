@@ -104,6 +104,15 @@ class BuiltinSkillReceipt(StrictModel):
         return self
 
 
+class BuiltinSkillState(StrictModel):
+    """Local ownership evidence for the generic packaged skill snapshot."""
+
+    version: Literal[1]
+    skill_name: Literal["geas"]
+    snapshot_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
 _AGENT_ADAPTERS: tuple[AgentAdapter, ...] = (
     AgentAdapter(name="codex", executable="codex", parent=Path(".agents") / "skills"),
     AgentAdapter(name="claude", executable="claude", parent=Path(".claude") / "skills"),
@@ -457,6 +466,8 @@ def install_builtin_geas_skill(
     files = _builtin_skill_snapshot_files()
     root = _absolute_path(config_root)
     snapshot = root / "skills" / _BUILTIN_SKILL_NAME
+    state_path = _builtin_skill_state_path(root)
+    state = _load_builtin_skill_state(state_path)
     existed = snapshot.exists() or snapshot.is_symlink()
     installed: list[Path] = []
     updated: list[Path] = []
@@ -465,11 +476,25 @@ def install_builtin_geas_skill(
     skipped: list[Path] = []
     conflicts: list[Path] = []
 
+    if existed:
+        if state is None:
+            return _builtin_receipt(conflicts=(snapshot,))
+        try:
+            existing_manifest = validate_snapshot(snapshot)
+        except ValueError:
+            return _builtin_receipt(conflicts=(snapshot,))
+        if not _builtin_state_matches_manifest(state, existing_manifest):
+            return _builtin_receipt(conflicts=(snapshot,))
+
     try:
         snapshot_receipt = install_snapshot(files, snapshot)
     except ValueError:
         conflicts.append(snapshot)
         return _builtin_receipt(conflicts=conflicts)
+    _write_builtin_skill_state(
+        state_path,
+        _builtin_skill_state_from_manifest(snapshot_receipt.manifest),
+    )
 
     if snapshot_receipt.unchanged:
         unchanged.append(snapshot)
@@ -617,6 +642,74 @@ def _builtin_skill_snapshot_files() -> dict[Path, bytes]:
         snapshot_sha256=snapshot_digest(inventory),
     )
     return {**source_files, Path(_MANIFEST_NAME): canonical_manifest_bytes(manifest)}
+
+
+def _builtin_skill_state_path(config_root: Path) -> Path:
+    return config_root / "state" / "builtin-skills" / f"{_BUILTIN_SKILL_NAME}.json"
+
+
+def _load_builtin_skill_state(path: Path) -> BuiltinSkillState | None:
+    _reject_symlink_ancestry(path.parent)
+    if path.is_symlink():
+        raise ValueError("builtin skill state must not be a symbolic link")
+    if not path.exists():
+        return None
+    if not path.is_file():
+        raise ValueError("builtin skill state must be a regular file")
+    try:
+        return BuiltinSkillState.model_validate_json(path.read_bytes())
+    except Exception as error:
+        raise ValueError("builtin skill state is invalid") from error
+
+
+def _write_builtin_skill_state(path: Path, state: BuiltinSkillState) -> None:
+    _reject_symlink_ancestry(path.parent)
+    if path.is_symlink():
+        raise ValueError("builtin skill state must not be a symbolic link")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _reject_symlink_ancestry(path.parent)
+    payload = (
+        json.dumps(
+            state.model_dump(mode="json"),
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        + b"\n"
+    )
+    with tempfile.NamedTemporaryFile(
+        mode="wb",
+        prefix=f".{path.name}.",
+        dir=path.parent,
+        delete=False,
+    ) as candidate:
+        candidate.write(payload)
+        candidate_path = Path(candidate.name)
+    try:
+        if path.is_symlink():
+            raise ValueError("builtin skill state must not be a symbolic link")
+        os.replace(candidate_path, path)
+    finally:
+        candidate_path.unlink(missing_ok=True)
+
+
+def _builtin_skill_state_from_manifest(manifest: SkillManifest) -> BuiltinSkillState:
+    return BuiltinSkillState(
+        version=1,
+        skill_name=_BUILTIN_SKILL_NAME,
+        snapshot_sha256=manifest.snapshot_sha256,
+        manifest_sha256=hashlib.sha256(canonical_manifest_bytes(manifest)).hexdigest(),
+    )
+
+
+def _builtin_state_matches_manifest(
+    state: BuiltinSkillState, manifest: SkillManifest
+) -> bool:
+    return (
+        manifest.skill.name == _BUILTIN_SKILL_NAME
+        and state.snapshot_sha256 == manifest.snapshot_sha256
+        and state.manifest_sha256
+        == hashlib.sha256(canonical_manifest_bytes(manifest)).hexdigest()
+    )
 
 
 def _builtin_skill_source_files() -> dict[Path, bytes]:
