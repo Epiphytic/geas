@@ -1,5 +1,6 @@
 import os
 import subprocess
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -105,3 +106,45 @@ def test_git_sync_rejects_secret_content_and_unrelated_staging(
     _git("add", "unrelated.md", cwd=manager.checkout)
     with pytest.raises(OntologySyncError, match="previously staged"):
         manager.push(relative_paths=(Path("routing"),), message="must fail")
+
+
+def test_freshness_check_fetches_at_most_once_per_window(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("GIT_AUTHOR_NAME", "Geas Test")
+    monkeypatch.setenv("GIT_AUTHOR_EMAIL", "geas-test@example.invalid")
+    monkeypatch.setenv("GIT_COMMITTER_NAME", "Geas Test")
+    monkeypatch.setenv("GIT_COMMITTER_EMAIL", "geas-test@example.invalid")
+    remote = tmp_path / "remote.git"
+    remote.mkdir()
+    _git("init", "--bare", "--initial-branch=main", cwd=remote)
+    first = _manager(remote, tmp_path / "first")
+    state = tmp_path / "state" / "freshness.json"
+    start = datetime(2026, 8, 26, 12, 0, tzinfo=UTC)
+
+    initial = first.freshen(state_path=state, clock=lambda: start)
+    assert initial.checked is True
+    ontology = first.checkout / "routing"
+    ontology.mkdir()
+    (ontology / "build.yaml").write_text("version: 1\n")
+    first.push(relative_paths=(Path("routing"),), message="initial ontology")
+
+    second = _manager(remote, tmp_path / "second")
+    second.pull()
+    (second.checkout / "routing" / "library.yaml").write_text("version: 1\n")
+    second.push(relative_paths=(Path("routing"),), message="remote update")
+
+    cached = first.freshen(
+        state_path=state,
+        clock=lambda: start + timedelta(minutes=59),
+    )
+    assert cached.checked is False
+    assert not (first.checkout / "routing" / "library.yaml").exists()
+
+    refreshed = first.freshen(
+        state_path=state,
+        clock=lambda: start + timedelta(hours=1),
+    )
+    assert refreshed.checked is True
+    assert (first.checkout / "routing" / "library.yaml").is_file()

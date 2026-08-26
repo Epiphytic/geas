@@ -215,6 +215,11 @@ uv run geas ontology-sync --push --message "geas: update example ontology"
 
 Profile settings can enable pull-before-update and push-on-update for
 `ontology-init`. Generated proposals never gain automatic promotion authority.
+Named ontology commands perform a freshness check by default and cache a
+successful remote check for one hour. This avoids a Git fetch on every command.
+Global and per-ontology overrides, plus conditional SQLite/generated-content
+publication and lazy hydration, are documented in
+[portable ontology artifacts](PORTABLE_ONTOLOGY_ARTIFACTS.md).
 
 List ontologies from the selected profile or another direct-child ontology
 root:

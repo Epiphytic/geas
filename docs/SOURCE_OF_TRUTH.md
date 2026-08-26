@@ -20,6 +20,14 @@ The system has one-way authority:
 Later layers cannot silently modify earlier layers. In particular, SQLite is
 never reconciled back into ontology files or immutable records.
 
+An ontology Git repository may contain an `artifacts.yaml` manifest pointing
+to content-addressed private release assets. This is a distribution and cache
+mechanism only. The manifest records input revisions, hashes, sizes, and an
+explicit storage-rights basis; it does not make SQLite or generated Markdown
+canonical. Hydration verifies the remote digest, local SHA-256, SQLite
+integrity, and embedded projection metadata. Drift is still repaired by
+discarding or rebuilding the projection, never by promoting its rows.
+
 Maintained bundle YAML and Markdown source cards under `ontology/` are
 canonical workspace inputs. Bundle imports create immutable source,
 provenance, structural, citation, claim, controversy, gap, threat, and receipt

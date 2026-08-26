@@ -78,6 +78,14 @@ from research_agent.structure import AnchorKind, StructuralAnchor
 from research_agent.truth import TruthManager, TruthPolicy
 
 
+class OntologySyncOverride(StrictModel):
+    """Per-ontology overrides for repository freshness and artifact hydration."""
+
+    check_before_use: bool | None = None
+    max_age_seconds: int | None = Field(default=None, ge=60, le=604_800)
+    hydrate_artifacts_before_use: bool | None = None
+
+
 class OntologyBuildConfig(StrictModel):
     version: Literal[1]
     topic: str = Field(min_length=1)
@@ -105,6 +113,7 @@ class OntologyBuildConfig(StrictModel):
         default=None,
         pattern=r"^source-library-snapshot:sha256:[0-9a-f]{64}$",
     )
+    repository_sync: OntologySyncOverride = Field(default_factory=OntologySyncOverride)
     discovery_enabled: bool = True
     queries: tuple[str, ...] = ()
     include_gap_queries: bool = True

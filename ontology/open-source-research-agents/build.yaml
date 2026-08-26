@@ -33,6 +33,10 @@ seed_bundles:
 seed_bundle_globs:
   - ontology/open-source-research-agents/generated/*/bundle.yaml
 source_library_snapshot_id: null
+repository_sync:
+  check_before_use: null
+  max_age_seconds: null
+  hydrate_artifacts_before_use: null
 discovery_enabled: true
 queries:
   - open source deep research agent GitHub

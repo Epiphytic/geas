@@ -32,8 +32,9 @@ def test_setup_guide_lists_paths_credentials_and_end_to_end_steps(tmp_path: Path
         "UNPAYWALL_EMAIL",
         "ZAI_API_KEY",
     }
-    assert len(guide.steps) == 9
+    assert len(guide.steps) == 10
     assert "ontology-build project-expertise" in markdown
+    assert "ontology-artifact-publish project-expertise" in markdown
     assert "--format agent-instructions" in markdown
     assert "secret-value" not in markdown
 

@@ -79,6 +79,12 @@ class OntologyGitConfig(StrictModel):
         return value
 
 
+class OntologyFreshnessConfig(StrictModel):
+    check_before_use: bool = True
+    max_age_seconds: int = Field(default=3600, ge=60, le=604_800)
+    hydrate_artifacts_before_use: bool = False
+
+
 class GeasProfile(StrictModel):
     ontology_directory: Path = Path("ontologies")
     secret_sources: tuple[SecretSource, ...] = (
@@ -97,6 +103,9 @@ class GeasProfile(StrictModel):
 class GeasUserConfig(StrictModel):
     version: Literal[1] = 1
     default_profile: str = "default"
+    ontology_freshness: OntologyFreshnessConfig = Field(
+        default_factory=OntologyFreshnessConfig
+    )
     profiles: dict[str, GeasProfile]
 
     @field_validator("default_profile")

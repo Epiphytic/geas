@@ -167,6 +167,27 @@ def build_setup_guide(
         ),
         SetupStep(
             number=9,
+            title="Publish portable ontology artifacts",
+            purpose=(
+                "Upload only changed database and generated-content revisions, then "
+                "commit their verified manifest."
+            ),
+            commands=(
+                "uv run geas ontology-artifact-publish project-expertise "
+                "--source-library data/project-expertise/library.sqlite "
+                "--knowledge-projection data/project-expertise/query.sqlite "
+                "--generated-content /path/to/project/docs/geas-expert "
+                "--published-by operator:example "
+                "--storage-rights-basis \"authorized private storage\"",
+                "uv run geas ontology-artifact-sync project-expertise",
+            ),
+            notes=(
+                "Named ontology use checks Git at most once per configured freshness window.",
+                "Release assets are rebuildable caches; Git ontology files remain canonical.",
+            ),
+        ),
+        SetupStep(
+            number=10,
             title="Export project expert knowledge",
             purpose="Create a linked vault and a project instruction handoff.",
             commands=(

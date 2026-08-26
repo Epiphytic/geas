@@ -33,6 +33,11 @@ def test_user_config_initializes_explicit_profile_and_secret_scaffold(
     assert manager.last_defaults_receipt is not None
     assert manager.last_defaults_receipt.installed == DEFAULT_CONFIG_FILENAMES
     serialized = yaml.safe_load(manager.path.read_text())
+    assert serialized["ontology_freshness"] == {
+        "check_before_use": True,
+        "max_age_seconds": 3600,
+        "hydrate_artifacts_before_use": False,
+    }
     assert serialized["profiles"]["default"]["ontology_git"] == {
         "url": DEFAULT_ONTOLOGY_REPOSITORY,
         "branch": "main",

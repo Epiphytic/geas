@@ -66,6 +66,10 @@ at the private shared repository `liamhelmer-bel/ontologies`:
 ```yaml
 version: 1
 default_profile: default
+ontology_freshness:
+  check_before_use: true
+  max_age_seconds: 3600
+  hydrate_artifacts_before_use: false
 profiles:
   default:
     ontology_directory: ontologies
@@ -156,7 +160,8 @@ commits and pushes without placing credentials in the repository URL.
 
 The checkout receives a conservative `.gitignore` that excludes `.env` files,
 private-key formats, credential- and secret-named paths, SQLite databases,
-runtime `data/`, model logs, reasoning logs, and checkpoints. These controls
+runtime `data/`, hydrated `.geas-artifacts/`, model logs, reasoning logs, and
+checkpoints. These controls
 reduce accidental disclosure; they are not a substitute for repository access
 controls, forge secret scanning, or credential rotation after an exposure.
 
@@ -169,6 +174,13 @@ The command-line `--pull`/`--no-pull` and `--push`/`--no-push` flags override
 those settings for one invocation. Model proposals never acquire automatic
 promotion authority: use the normal review and promotion workflow before
 treating generated knowledge as canonical.
+
+By default, named ontology use also performs a freshness-throttled Git check.
+The successful check time is cached outside Git, so repeated uses within one
+hour do not contact the remote. Configure `ontology_freshness` globally or the
+nullable `repository_sync` fields in an ontology's `build.yaml`. See
+[portable ontology artifacts](PORTABLE_ONTOLOGY_ARTIFACTS.md) for conditional
+database publication and lazy hydration.
 
 ## Obsidian-style Markdown export
 

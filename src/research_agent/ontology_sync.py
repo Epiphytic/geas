@@ -1,11 +1,25 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
+from collections.abc import Callable
+from contextlib import contextmanager
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import Literal
+from uuid import uuid4
 
+from pydantic import Field
+
+from research_agent.models import StrictModel, utc_now
 from research_agent.user_config import OntologyGitConfig
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
 
 DEFAULT_ONTOLOGY_GITIGNORE = """# Geas runtime and credential material
 .env
@@ -20,6 +34,7 @@ DEFAULT_ONTOLOGY_GITIGNORE = """# Geas runtime and credential material
 *credentials*
 *secret*
 data/
+.geas-artifacts/
 model-prompts.jsonl
 model-reasoning-debug.jsonl
 ontology-build.log.jsonl
@@ -43,6 +58,27 @@ _SENSITIVE_CONTENT = (
 
 class OntologySyncError(RuntimeError):
     pass
+
+
+class OntologyFreshnessState(StrictModel):
+    version: Literal[1] = 1
+    repository: str
+    branch: str
+    checked_at: datetime
+    remote_commit: str | None = None
+    local_commit: str | None = None
+
+
+class OntologyFreshnessReceipt(StrictModel):
+    state: str
+    checked: bool
+    fresh: bool
+    checked_at: datetime
+    next_check_at: datetime
+    max_age_seconds: int = Field(ge=60)
+    local_commit: str | None = None
+    remote_commit: str | None = None
+    pull: dict[str, object] | None = None
 
 
 class OntologyRepositoryManager:
@@ -87,11 +123,88 @@ class OntologyRepositoryManager:
             "commit": self._head(),
         }
 
+    def freshen(
+        self,
+        *,
+        state_path: Path,
+        max_age_seconds: int = 3600,
+        force: bool = False,
+        clock: Callable[[], datetime] = utc_now,
+    ) -> OntologyFreshnessReceipt:
+        """Check and fast-forward at most once per freshness window.
+
+        The state is operational cache metadata only. It never changes ontology
+        authority and is written outside the ontology checkout by callers.
+        """
+        if not 60 <= max_age_seconds <= 604_800:
+            raise OntologySyncError(
+                "ontology freshness max_age_seconds must be between 60 and 604800"
+            )
+        state_path = state_path.expanduser()
+        if state_path.is_symlink():
+            raise OntologySyncError("ontology freshness state cannot be a symbolic link")
+        state_path = state_path.resolve()
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = state_path.with_suffix(f"{state_path.suffix}.lock")
+        if lock_path.is_symlink():
+            raise OntologySyncError("ontology freshness lock cannot be a symbolic link")
+        with _exclusive_file_lock(lock_path):
+            now = clock()
+            if now.tzinfo is None:
+                raise OntologySyncError("ontology freshness clock must be timezone-aware")
+            now = now.astimezone(UTC)
+            state = self._load_freshness_state(state_path)
+            if not force and self._state_is_fresh(
+                state,
+                now=now,
+                max_age_seconds=max_age_seconds,
+            ):
+                assert state is not None
+                return OntologyFreshnessReceipt(
+                    state=str(state_path),
+                    checked=False,
+                    fresh=True,
+                    checked_at=state.checked_at,
+                    next_check_at=datetime.fromtimestamp(
+                        state.checked_at.timestamp() + max_age_seconds,
+                        tz=UTC,
+                    ),
+                    max_age_seconds=max_age_seconds,
+                    local_commit=self._head() if self.checkout.exists() else None,
+                    remote_commit=state.remote_commit,
+                )
+            pull = self.pull()
+            remote_commit = self._remote_head()
+            local_commit = self._head()
+            next_state = OntologyFreshnessState(
+                repository=self.config.url,
+                branch=self.config.branch,
+                checked_at=now,
+                remote_commit=remote_commit,
+                local_commit=local_commit,
+            )
+            self._write_freshness_state(state_path, next_state)
+            return OntologyFreshnessReceipt(
+                state=str(state_path),
+                checked=True,
+                fresh=True,
+                checked_at=now,
+                next_check_at=datetime.fromtimestamp(
+                    now.timestamp() + max_age_seconds,
+                    tz=UTC,
+                ),
+                max_age_seconds=max_age_seconds,
+                local_commit=local_commit,
+                remote_commit=remote_commit,
+                pull=pull,
+            )
+
     def push(
         self,
         *,
         relative_paths: tuple[Path, ...] = (),
         message: str = "geas: update ontologies",
+        freshness_state_path: Path | None = None,
     ) -> dict[str, object]:
         self._ensure_checkout()
         self._assert_remote()
@@ -137,6 +250,8 @@ class OntologyRepositoryManager:
                     self.config.branch,
                 )
             )
+            if freshness_state_path is not None:
+                self._record_successful_push(freshness_state_path)
         return {
             "checkout": str(self.checkout),
             "repository": self.config.url,
@@ -203,6 +318,76 @@ class OntologyRepositoryManager:
     def _head(self) -> str | None:
         result = self._run(("git", "rev-parse", "--verify", "HEAD"), check=False)
         return result.stdout.strip() if result.returncode == 0 else None
+
+    def _remote_head(self) -> str | None:
+        result = self._run(
+            ("git", "rev-parse", "--verify", f"{self.config.remote}/{self.config.branch}"),
+            check=False,
+        )
+        return result.stdout.strip() if result.returncode == 0 else None
+
+    def _load_freshness_state(self, path: Path) -> OntologyFreshnessState | None:
+        if not path.exists():
+            return None
+        if not path.is_file():
+            raise OntologySyncError("ontology freshness state must be a regular file")
+        try:
+            return OntologyFreshnessState.model_validate_json(path.read_text())
+        except ValueError as error:
+            raise OntologySyncError(f"invalid ontology freshness state: {path}") from error
+
+    def _record_successful_push(self, state_path: Path) -> None:
+        expanded = state_path.expanduser()
+        if expanded.is_symlink():
+            raise OntologySyncError("ontology freshness state cannot be a symbolic link")
+        path = expanded.resolve()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = path.with_suffix(f"{path.suffix}.lock")
+        if lock_path.is_symlink():
+            raise OntologySyncError("ontology freshness lock cannot be a symbolic link")
+        with _exclusive_file_lock(lock_path):
+            now = utc_now().astimezone(UTC)
+            head = self._head()
+            self._write_freshness_state(
+                path,
+                OntologyFreshnessState(
+                    repository=self.config.url,
+                    branch=self.config.branch,
+                    checked_at=now,
+                    remote_commit=head,
+                    local_commit=head,
+                ),
+            )
+
+    def _state_is_fresh(
+        self,
+        state: OntologyFreshnessState | None,
+        *,
+        now: datetime,
+        max_age_seconds: int,
+    ) -> bool:
+        if state is None:
+            return False
+        if not (self.checkout / ".git").is_dir():
+            return False
+        if (
+            _normalized_url(state.repository) != _normalized_url(self.config.url)
+            or state.branch != self.config.branch
+        ):
+            return False
+        age = now.timestamp() - state.checked_at.timestamp()
+        return 0 <= age < max_age_seconds
+
+    @staticmethod
+    def _write_freshness_state(path: Path, state: OntologyFreshnessState) -> None:
+        temporary = path.with_name(f".{path.name}.tmp-{uuid4().hex}")
+        try:
+            temporary.write_text(
+                json.dumps(state.model_dump(mode="json"), indent=2, sort_keys=True) + "\n"
+            )
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
 
     def _status(self, *, ignore_generated_gitignore: bool = False) -> tuple[str, ...]:
         lines = tuple(
@@ -273,3 +458,24 @@ class OntologyRepositoryManager:
 
 def _normalized_url(value: str) -> str:
     return value.rstrip("/").removesuffix(".git")
+
+
+@contextmanager
+def _exclusive_file_lock(path: Path):
+    with path.open("a+b") as lock:
+        if os.name == "nt":
+            if lock.seek(0, os.SEEK_END) == 0:
+                lock.write(b"\0")
+                lock.flush()
+            lock.seek(0)
+            msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if os.name == "nt":
+                lock.seek(0)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(lock, fcntl.LOCK_UN)

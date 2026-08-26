@@ -197,6 +197,27 @@ and
 [the ontology quick start](docs/QUICKSTART_ONTOLOGY.md) for credentials,
 checkpointing, candidate review, promotion, and final projection.
 
+Named ontology use checks the configured Git repository for updates by default,
+but records a successful check for one hour so repeated commands do not contact
+the remote. Publish changed, rebuildable databases and generated content as
+verified private release assets, then hydrate them lazily on another machine:
+
+```bash
+uv run geas ontology-artifact-publish example \
+  --source-library data/example/library.sqlite \
+  --knowledge-projection data/example/query.sqlite \
+  --generated-content data/example/obsidian \
+  --published-by operator:example \
+  --storage-rights-basis "authorized private storage"
+
+uv run geas ontology-artifact-sync example
+```
+
+Only artifact roles whose embedded input revision changed are uploaded. See
+[portable ontology artifacts](docs/PORTABLE_ONTOLOGY_ARTIFACTS.md) for global
+and per-ontology freshness settings, lazy paths, rights checks, and the
+non-canonical cache boundary.
+
 Create an immutable store and archive a source:
 
 ```bash

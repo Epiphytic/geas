@@ -78,6 +78,11 @@ from research_agent.models import (
     ThreatTarget,
 )
 from research_agent.onboarding import build_setup_guide, render_setup_guide_markdown
+from research_agent.ontology_artifacts import (
+    ArtifactRole,
+    GitHubReleaseArtifactStore,
+    OntologyArtifactManager,
+)
 from research_agent.ontology_build import (
     OntologyBuildConfig,
     OntologyBuilder,
@@ -179,19 +184,111 @@ def _profile_ontology_root(
     args: argparse.Namespace,
     *,
     pull_before_read: bool = False,
+    ontology: Path | None = None,
 ) -> Path | None:
     manager = _user_config_manager(args)
     if not manager.path.exists():
         return None
-    _name, profile = manager.profile(args.geas_profile)
+    user_config = manager.load()
+    profile_name, profile = user_config.profile(args.geas_profile)
     root = manager.ontology_root(profile)
-    if (
-        pull_before_read
-        and profile.ontology_git is not None
-        and profile.ontology_git.pull_before_update
-    ):
-        OntologyRepositoryManager(checkout=root, config=profile.ontology_git).pull()
+    ontology_name = (
+        ontology.name
+        if ontology is not None
+        and not ontology.is_absolute()
+        and len(ontology.parts) == 1
+        else None
+    )
+    freshness = user_config.ontology_freshness
+    check_before_use = freshness.check_before_use
+    max_age_seconds = freshness.max_age_seconds
+    hydrate = freshness.hydrate_artifacts_before_use
+    local_build = root / ontology_name / "build.yaml" if ontology_name else None
+    if local_build is not None and local_build.is_file() and not local_build.is_symlink():
+        try:
+            override = OntologyBuildConfig.from_yaml(local_build).repository_sync
+        except (OSError, ValueError):
+            override = None
+        if override is not None:
+            if override.check_before_use is not None:
+                check_before_use = override.check_before_use
+            if override.max_age_seconds is not None:
+                max_age_seconds = override.max_age_seconds
+            if override.hydrate_artifacts_before_use is not None:
+                hydrate = override.hydrate_artifacts_before_use
+    repository = None
+    if pull_before_read and profile.ontology_git is not None:
+        repository = OntologyRepositoryManager(
+            checkout=root,
+            config=profile.ontology_git,
+        )
+        if (
+            check_before_use
+            or profile.ontology_git.pull_before_update
+            or not (root / ".git").is_dir()
+        ):
+            repository.freshen(
+                state_path=(
+                    manager.root / "state" / "ontology-sync" / f"{profile_name}.json"
+                ),
+                max_age_seconds=max_age_seconds,
+                force=profile.ontology_git.pull_before_update,
+            )
+    if hydrate and ontology_name is not None:
+        artifact_manager = OntologyArtifactManager(root / ontology_name)
+        if artifact_manager.manifest_path.is_file():
+            if profile.ontology_git is None:
+                raise ValueError(
+                    f"Geas profile {profile_name!r} has no ontology_git artifact source"
+                )
+            artifact_manager.hydrate(
+                store=GitHubReleaseArtifactStore(
+                    profile.ontology_git.url,
+                    branch=profile.ontology_git.branch,
+                )
+            )
     return root
+
+
+def _resolve_portable_database(
+    args: argparse.Namespace,
+    value: Path,
+    *,
+    role: ArtifactRole,
+) -> Path:
+    """Resolve a named ontology to one lazily hydrated portable database."""
+    if value.exists() or value.is_absolute() or len(value.parts) != 1:
+        return value
+    manager = _user_config_manager(args)
+    if not manager.path.exists():
+        return value
+    profile_name, profile = manager.profile(args.geas_profile)
+    if profile.ontology_git is None:
+        return value
+    root = _profile_ontology_root(
+        args,
+        pull_before_read=True,
+        ontology=value,
+    )
+    if root is None:
+        return value
+    ontology_directory = root / value.name
+    artifact_manager = OntologyArtifactManager(ontology_directory)
+    if not artifact_manager.manifest_path.is_file():
+        return value
+    receipt = artifact_manager.hydrate(
+        store=GitHubReleaseArtifactStore(
+            profile.ontology_git.url,
+            branch=profile.ontology_git.branch,
+        ),
+        roles=(role,),
+    )
+    if len(receipt.hydrated) != 1:
+        raise ValueError(
+            f"portable database role {role.value!r} is unavailable for profile "
+            f"{profile_name!r}"
+        )
+    return Path(receipt.hydrated[0].path)
 
 
 def _load_allowed_secrets(
@@ -339,6 +436,38 @@ def _build_parser() -> argparse.ArgumentParser:
     ontology_sync.add_argument("--pull", action="store_true")
     ontology_sync.add_argument("--push", action="store_true")
     ontology_sync.add_argument("--message", default="geas: update ontologies")
+
+    artifact_publish = subparsers.add_parser(
+        "ontology-artifact-publish",
+        help=(
+            "publish changed SQLite and generated ontology artifacts as "
+            "content-addressed GitHub release assets"
+        ),
+    )
+    artifact_publish.add_argument("ontology")
+    artifact_publish.add_argument("--source-library", type=Path)
+    artifact_publish.add_argument("--knowledge-projection", type=Path)
+    artifact_publish.add_argument("--generated-content", type=Path)
+    artifact_publish.add_argument("--published-by", required=True)
+    artifact_publish.add_argument("--storage-rights-basis", required=True)
+    artifact_publish.add_argument(
+        "--message",
+        default=None,
+        help="Git commit message for the updated artifact manifest",
+    )
+
+    artifact_sync = subparsers.add_parser(
+        "ontology-artifact-sync",
+        help="lazily download and verify stale artifacts for one ontology",
+    )
+    artifact_sync.add_argument("ontology")
+    artifact_sync.add_argument(
+        "--role",
+        type=ArtifactRole,
+        choices=list(ArtifactRole),
+        action="append",
+        default=[],
+    )
 
     ontology_list = subparsers.add_parser(
         "ontology-list",
@@ -1025,7 +1154,8 @@ def main() -> None:
 
     if args.command == "ontology-sync":
         manager = _user_config_manager(args)
-        profile_name, profile = manager.profile(args.geas_profile)
+        user_config = manager.load_or_create()
+        profile_name, profile = user_config.profile(args.geas_profile)
         if profile.ontology_git is None:
             raise ValueError(f"Geas profile {profile_name!r} has no ontology_git config")
         repository = OntologyRepositoryManager(
@@ -1037,23 +1167,108 @@ def main() -> None:
             "profile": profile_name,
             "config": str(manager.path),
         }
+        state_path = manager.root / "state" / "ontology-sync" / f"{profile_name}.json"
         if pull_requested:
-            result["pull"] = repository.pull()
+            result["pull"] = repository.freshen(
+                state_path=state_path,
+                max_age_seconds=user_config.ontology_freshness.max_age_seconds,
+                force=args.pull or profile.ontology_git.pull_before_update,
+            )
         if args.push:
+            if not pull_requested:
+                result["preflight"] = repository.freshen(
+                    state_path=state_path,
+                    max_age_seconds=user_config.ontology_freshness.max_age_seconds,
+                    force=profile.ontology_git.pull_before_update,
+                )
             result["push"] = repository.push(
                 relative_paths=(Path("."),),
                 message=args.message,
+                freshness_state_path=state_path,
             )
         _json(result)
+        return
+
+    if args.command in {"ontology-artifact-publish", "ontology-artifact-sync"}:
+        manager = _user_config_manager(args)
+        profile_name, profile = manager.profile(args.geas_profile)
+        if profile.ontology_git is None:
+            raise ValueError(f"Geas profile {profile_name!r} has no ontology_git config")
+        ontology_value = Path(args.ontology)
+        if (
+            ontology_value.is_absolute()
+            or len(ontology_value.parts) != 1
+            or ontology_value.name.startswith(".")
+        ):
+            raise ValueError("ontology artifact commands require one configured ontology name")
+        ontology_root = _profile_ontology_root(
+            args,
+            pull_before_read=True,
+            ontology=ontology_value,
+        )
+        assert ontology_root is not None
+        ontology_directory = ontology_root / ontology_value.name
+        if not ontology_directory.is_dir() or ontology_directory.is_symlink():
+            raise ValueError(f"configured ontology does not exist: {ontology_value.name}")
+        artifact_manager = OntologyArtifactManager(ontology_directory)
+        artifact_store = GitHubReleaseArtifactStore(
+            profile.ontology_git.url,
+            branch=profile.ontology_git.branch,
+        )
+        if args.command == "ontology-artifact-sync":
+            _json(
+                {
+                    "profile": profile_name,
+                    "artifact_sync": artifact_manager.hydrate(
+                        store=artifact_store,
+                        roles=tuple(args.role),
+                    ),
+                }
+            )
+            return
+        publication = artifact_manager.publish(
+            store=artifact_store,
+            published_by=args.published_by,
+            storage_rights_basis=args.storage_rights_basis,
+            source_library=args.source_library,
+            knowledge_projection=args.knowledge_projection,
+            generated_content=args.generated_content,
+        )
+        repository = OntologyRepositoryManager(
+            checkout=ontology_root,
+            config=profile.ontology_git,
+        )
+        push = repository.push(
+            relative_paths=(Path(ontology_value.name),),
+            message=(
+                args.message
+                or f"geas: publish artifacts for {ontology_value.name}"
+            ),
+            freshness_state_path=(
+                manager.root / "state" / "ontology-sync" / f"{profile_name}.json"
+            ),
+        )
+        _json(
+            {
+                "profile": profile_name,
+                "publication": publication,
+                "push": push,
+            }
+        )
         return
 
     if args.command == "ontology-list":
         manager = _user_config_manager(args)
         profile_name = None
         if args.directory is None:
-            user_config = manager.load() if manager.path.exists() else GeasUserConfig.default()
-            profile_name, profile = user_config.profile(args.geas_profile)
-            root = manager.ontology_root(profile)
+            if manager.path.exists():
+                profile_name, _profile = manager.profile(args.geas_profile)
+                root = _profile_ontology_root(args, pull_before_read=True)
+                assert root is not None
+            else:
+                user_config = GeasUserConfig.default()
+                profile_name, profile = user_config.profile(args.geas_profile)
+                root = manager.ontology_root(profile)
             location = "selected_profile"
         else:
             root = args.directory
@@ -1181,7 +1396,8 @@ def main() -> None:
             pull_requested = bool(args.pull)
             if args.pull is None and profile.ontology_git is not None:
                 pull_requested = (
-                    profile.ontology_git.pull_before_update
+                    user_config.ontology_freshness.check_before_use
+                    or profile.ontology_git.pull_before_update
                     or not (ontology_root / ".git").is_dir()
                 )
             push_requested = (
@@ -1199,7 +1415,13 @@ def main() -> None:
                     config=profile.ontology_git,
                 )
             if pull_requested and repository is not None:
-                pull_receipt = repository.pull()
+                pull_receipt = repository.freshen(
+                    state_path=(
+                        manager.root / "state" / "ontology-sync" / f"{profile_name}.json"
+                    ),
+                    max_age_seconds=user_config.ontology_freshness.max_age_seconds,
+                    force=bool(args.pull) or profile.ontology_git.pull_before_update,
+                )
         else:
             directory = args.directory
             ontology_name = directory.name
@@ -1247,6 +1469,9 @@ def main() -> None:
             push_receipt = repository.push(
                 relative_paths=(Path(ontology_name),),
                 message=f"geas: update ontology {ontology_name}",
+                freshness_state_path=(
+                    manager.root / "state" / "ontology-sync" / f"{profile_name}.json"
+                ),
             )
         _json(
             {
@@ -1486,7 +1711,11 @@ def main() -> None:
         return
 
     if args.command == "ontology-build":
-        ontology_root = _profile_ontology_root(args, pull_before_read=True)
+        ontology_root = _profile_ontology_root(
+            args,
+            pull_before_read=not args.check,
+            ontology=args.config,
+        )
         config_path = (
             resolve_profile_ontology_config(
                 args.config,
@@ -2185,7 +2414,11 @@ def main() -> None:
         return
 
     if args.command == "library-build":
-        ontology_root = _profile_ontology_root(args, pull_before_read=True)
+        ontology_root = _profile_ontology_root(
+            args,
+            pull_before_read=True,
+            ontology=args.manifest,
+        )
         manifest_path = (
             resolve_profile_ontology_config(
                 args.manifest,
@@ -2204,8 +2437,13 @@ def main() -> None:
         return
 
     if args.command == "library-query":
+        database = _resolve_portable_database(
+            args,
+            args.database,
+            role=ArtifactRole.SOURCE_LIBRARY,
+        )
         _json(
-            SourceLibraryQueryEngine(args.database).query(
+            SourceLibraryQueryEngine(database).query(
                 args.question,
                 limit=args.limit,
             )
@@ -2213,12 +2451,22 @@ def main() -> None:
         return
 
     if args.command == "library-show":
-        _json(SourceLibraryQueryEngine(args.database).describe())
+        database = _resolve_portable_database(
+            args,
+            args.database,
+            role=ArtifactRole.SOURCE_LIBRARY,
+        )
+        _json(SourceLibraryQueryEngine(database).describe())
         return
 
     if args.command == "library-context":
+        database = _resolve_portable_database(
+            args,
+            args.database,
+            role=ArtifactRole.SOURCE_LIBRARY,
+        )
         _json(
-            SourceLibraryQueryEngine(args.database).context(
+            SourceLibraryQueryEngine(database).context(
                 args.question,
                 limit=args.limit,
                 max_characters=args.max_characters,
@@ -2249,8 +2497,13 @@ def main() -> None:
 
     if args.command == "knowledge-query":
         kinds = tuple(args.kind) if args.kind else tuple(QueryRecordType)
+        database = _resolve_portable_database(
+            args,
+            args.database,
+            role=ArtifactRole.KNOWLEDGE_PROJECTION,
+        )
         _json(
-            KnowledgeQueryEngine(args.database).query(
+            KnowledgeQueryEngine(database).query(
                 args.question,
                 record_types=kinds,
                 limit=args.limit,
@@ -2281,8 +2534,13 @@ def main() -> None:
         return
 
     if args.command == "identifier-show":
+        database = _resolve_portable_database(
+            args,
+            args.database,
+            role=ArtifactRole.KNOWLEDGE_PROJECTION,
+        )
         _json(
-            KnowledgeQueryEngine(args.database).identifier(
+            KnowledgeQueryEngine(database).identifier(
                 args.kind,
                 args.value,
             )
@@ -2290,8 +2548,13 @@ def main() -> None:
         return
 
     if args.command == "topic-show":
+        database = _resolve_portable_database(
+            args,
+            args.database,
+            role=ArtifactRole.KNOWLEDGE_PROJECTION,
+        )
         _json(
-            KnowledgeQueryEngine(args.database).topic(
+            KnowledgeQueryEngine(database).topic(
                 args.concept_id,
                 as_of=args.as_of,
             )
@@ -2301,7 +2564,12 @@ def main() -> None:
     if args.command == "topic-export":
         if args.vault_link and args.format != "agent-instructions":
             raise ValueError("--vault-link requires --format agent-instructions")
-        topic = KnowledgeQueryEngine(args.database).topic(
+        database = _resolve_portable_database(
+            args,
+            args.database,
+            role=ArtifactRole.KNOWLEDGE_PROJECTION,
+        )
+        topic = KnowledgeQueryEngine(database).topic(
             args.concept_id,
             as_of=args.as_of,
         )

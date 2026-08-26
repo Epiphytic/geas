@@ -71,6 +71,9 @@ def test_shipped_build_config_keeps_serial_128k_capacity_without_coverage_caps()
     assert config.connection_attempts == 10
     assert config.connection_retry_seconds == 2
     assert config.refresh_after_hours == 168
+    assert config.repository_sync.check_before_use is None
+    assert config.repository_sync.max_age_seconds is None
+    assert config.repository_sync.hydrate_artifacts_before_use is None
 
 
 def test_shipped_reasoning_decision_is_backed_by_recorded_metrics() -> None:

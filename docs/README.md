@@ -12,6 +12,9 @@ Choose the shortest path that matches the work:
 - [User configuration, shared ontologies, and Git sync](USER_CONFIG.md) covers
   OS-standard locations, team profiles, modular secrets, private Git, and
   Obsidian-style export.
+- [Portable ontology artifacts](PORTABLE_ONTOLOGY_ARTIFACTS.md) covers
+  freshness-throttled pulls, content-addressed SQLite and generated-content
+  release assets, lazy hydration, and storage-rights checks.
 - [Source libraries](SOURCE_LIBRARIES.md) covers ontology-independent source
   collections, exact search, and bounded agent context.
 - [Knowledge workflow](KNOWLEDGE_WORKFLOW.md) covers acquisition, import,
