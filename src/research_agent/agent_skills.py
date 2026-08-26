@@ -486,6 +486,7 @@ def install_builtin_geas_skill(
         if not _builtin_state_matches_manifest(state, existing_manifest):
             return _builtin_receipt(conflicts=(snapshot,))
 
+    _prepare_builtin_skill_state_parent(state_path)
     try:
         snapshot_receipt = install_snapshot(files, snapshot)
     except ValueError:
@@ -649,7 +650,7 @@ def _builtin_skill_state_path(config_root: Path) -> Path:
 
 
 def _load_builtin_skill_state(path: Path) -> BuiltinSkillState | None:
-    _reject_symlink_ancestry(path.parent)
+    _prepare_builtin_skill_state_parent(path, create=False)
     if path.is_symlink():
         raise ValueError("builtin skill state must not be a symbolic link")
     if not path.exists():
@@ -663,11 +664,9 @@ def _load_builtin_skill_state(path: Path) -> BuiltinSkillState | None:
 
 
 def _write_builtin_skill_state(path: Path, state: BuiltinSkillState) -> None:
-    _reject_symlink_ancestry(path.parent)
+    _prepare_builtin_skill_state_parent(path)
     if path.is_symlink():
         raise ValueError("builtin skill state must not be a symbolic link")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    _reject_symlink_ancestry(path.parent)
     payload = (
         json.dumps(
             state.model_dump(mode="json"),
@@ -690,6 +689,29 @@ def _write_builtin_skill_state(path: Path, state: BuiltinSkillState) -> None:
         os.replace(candidate_path, path)
     finally:
         candidate_path.unlink(missing_ok=True)
+
+
+def _prepare_builtin_skill_state_parent(path: Path, *, create: bool = True) -> None:
+    """Reject unsafe state ancestors and create the required state directory first."""
+    state_root = path.parent.parent
+    try:
+        _reject_symlink_ancestry(path.parent)
+    except ValueError as error:
+        raise ValueError("builtin skill state path must not traverse symbolic links") from error
+    for directory in (state_root, path.parent):
+        if directory.is_symlink():
+            raise ValueError("builtin skill state path must not traverse symbolic links")
+        if directory.exists() and not directory.is_dir():
+            raise ValueError("builtin skill state parent must be a directory")
+    if not create:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        _reject_symlink_ancestry(path.parent)
+    except ValueError as error:
+        raise ValueError("builtin skill state path must not traverse symbolic links") from error
+    if not path.parent.is_dir() or path.parent.is_symlink():
+        raise ValueError("builtin skill state parent must be a non-symlink directory")
 
 
 def _builtin_skill_state_from_manifest(manifest: SkillManifest) -> BuiltinSkillState:

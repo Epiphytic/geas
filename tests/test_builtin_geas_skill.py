@@ -180,6 +180,46 @@ def test_builtin_skill_rejects_symlinked_ownership_state(tmp_path: Path) -> None
         install_builtin_geas_skill(config_root=config_root, home=home, which=_which("codex"))
 
 
+@pytest.mark.parametrize(
+    ("relative", "kind"),
+    (
+        (Path("state"), "file"),
+        (Path("state"), "symlink"),
+        (Path("state") / "builtin-skills", "file"),
+        (Path("state") / "builtin-skills", "symlink"),
+    ),
+)
+def test_builtin_skill_validates_ownership_state_ancestors_before_snapshot_install(
+    tmp_path: Path,
+    relative: Path,
+    kind: str,
+) -> None:
+    """Catches a state-path failure that leaves an unowned snapshot behind."""
+    home = tmp_path / "home"
+    home.mkdir()
+    config_root = tmp_path / "config"
+    obstacle = config_root / relative
+    obstacle.parent.mkdir(parents=True)
+    unrelated = tmp_path / "unrelated"
+    unrelated.write_text("preserve me\n")
+    if kind == "file":
+        obstacle.write_text("operator-owned obstacle\n")
+    else:
+        external = tmp_path / f"external-{relative.name}"
+        external.mkdir()
+        obstacle.symlink_to(external, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="builtin skill state"):
+        install_builtin_geas_skill(config_root=config_root, home=home, which=_which("codex"))
+
+    assert not (config_root / "skills" / "geas").exists()
+    assert unrelated.read_text() == "preserve me\n"
+    if kind == "file":
+        assert obstacle.read_text() == "operator-owned obstacle\n"
+    else:
+        assert obstacle.is_symlink()
+
+
 def test_packaged_skill_routes_retrieval_lifecycle_and_security_to_one_hop_references() -> None:
     """Catches the retrieval and source-instruction gaps observed in the no-skill baseline."""
     package = Path(__file__).parents[1] / "src" / "research_agent" / "builtin_skills" / "geas"
