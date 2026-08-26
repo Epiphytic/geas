@@ -456,6 +456,8 @@ def test_projection_supports_lexical_hierarchy_dissent_gaps_and_provenance(
     assert topic.gaps[0]["priority"] == 90
     assert len(topic.threats) == 3
     assert all(item["source_uri"].startswith("file:") for item in topic.claims)
+    assert build.schema_version == 9
+    assert build.builder_version == "sqlite-knowledge-projection/10"
     assert build.counts["claims"] == 7
     assert build.counts["topic_source_associations"] == 5
     assert build.counts["threat_observations"] == 3

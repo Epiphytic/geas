@@ -238,8 +238,8 @@ class DeterministicQueryCompiler:
 
 
 class SQLiteKnowledgeProjection:
-    schema_version = 8
-    builder_version = "sqlite-knowledge-projection/9"
+    schema_version = 9
+    builder_version = "sqlite-knowledge-projection/10"
 
     def __init__(
         self,

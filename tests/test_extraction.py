@@ -181,7 +181,7 @@ def test_model_extraction_is_exact_grounded_reproducible_and_proposal_only(
         "persistent knowledge graph proposal",
         record_types=(QueryRecordType.PROPOSAL,),
     )
-    assert build.schema_version == 8
+    assert build.schema_version == 9
     assert build.counts["extraction_proposals"] == 1
     assert len(result.hits) == 1
     assert result.hits[0].proposal_provider == "deepseek_local"
