@@ -94,9 +94,7 @@ def test_git_sync_rejects_secret_content_and_unrelated_staging(
 
     ontology = manager.checkout / "routing"
     ontology.mkdir()
-    (ontology / "public.yaml").write_text(
-        "OPENAI_API_KEY: sk-abcdefghijklmnopqrstuvwxyz\n"
-    )
+    (ontology / "public.yaml").write_text("OPENAI_API_KEY: sk-abcdefghijklmnopqrstuvwxyz\n")
     with pytest.raises(OntologySyncError, match="possible credential"):
         manager.push(relative_paths=(Path("routing"),), message="must fail")
 
@@ -148,3 +146,66 @@ def test_freshness_check_fetches_at_most_once_per_window(
     )
     assert refreshed.checked is True
     assert (first.checkout / "routing" / "library.yaml").is_file()
+
+
+def test_pull_rejects_existing_checkout_on_wrong_profile_branch(tmp_path: Path) -> None:
+    remote = tmp_path / "remote.git"
+    remote.mkdir()
+    _git("init", "--bare", "--initial-branch=main", cwd=remote)
+    seed = _manager(remote, tmp_path / "seed")
+    seed.pull()
+    (seed.checkout / "ontology.yaml").write_text("version: 1\n")
+    seed.push(relative_paths=(Path("ontology.yaml"),), message="seed")
+    checkout = _manager(remote, tmp_path / "checkout")
+    checkout.pull()
+    before = _git("rev-parse", "HEAD", cwd=checkout.checkout).stdout.strip()
+    _git("switch", "-c", "other", cwd=checkout.checkout)
+
+    with pytest.raises(OntologySyncError, match="branch"):
+        checkout.pull()
+
+    assert _git("rev-parse", "HEAD", cwd=checkout.checkout).stdout.strip() == before
+    assert _git("branch", "--show-current", cwd=checkout.checkout).stdout.strip() == "other"
+
+
+def test_pull_binds_merge_to_exact_remote_head_despite_custom_refspec(
+    tmp_path: Path,
+) -> None:
+    remote = tmp_path / "remote.git"
+    remote.mkdir()
+    _git("init", "--bare", "--initial-branch=main", cwd=remote)
+    seed = _manager(remote, tmp_path / "seed")
+    seed.pull()
+    (seed.checkout / "ontology.yaml").write_text("version: 1\n")
+    seed.push(relative_paths=(Path("ontology.yaml"),), message="seed")
+
+    local = _manager(remote, tmp_path / "local")
+    local.pull()
+    old = _git("rev-parse", "HEAD", cwd=local.checkout).stdout.strip()
+    upstream = _manager(remote, tmp_path / "upstream")
+    upstream.pull()
+    (upstream.checkout / "legitimate.yaml").write_text("trusted: true\n")
+    upstream.push(relative_paths=(Path("legitimate.yaml"),), message="legitimate")
+    legitimate = _git("rev-parse", "HEAD", cwd=upstream.checkout).stdout.strip()
+
+    _git("switch", "-c", "forged", cwd=local.checkout)
+    (local.checkout / "malicious.yaml").write_text("trusted: false\n")
+    _git("add", "malicious.yaml", cwd=local.checkout)
+    _git("commit", "-m", "forged tracking descendant", cwd=local.checkout)
+    forged = _git("rev-parse", "HEAD", cwd=local.checkout).stdout.strip()
+    _git("switch", "main", cwd=local.checkout)
+    _git("update-ref", "refs/remotes/origin/main", forged, cwd=local.checkout)
+    _git(
+        "config",
+        "remote.origin.fetch",
+        "+refs/heads/evil:refs/remotes/origin/main",
+        cwd=local.checkout,
+    )
+
+    receipt = local.pull()
+
+    assert receipt["old_commit"] == old
+    assert receipt["new_commit"] == legitimate
+    assert _git("rev-parse", "HEAD", cwd=local.checkout).stdout.strip() == legitimate
+    assert (local.checkout / "legitimate.yaml").is_file()
+    assert not (local.checkout / "malicious.yaml").exists()

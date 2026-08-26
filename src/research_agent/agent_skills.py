@@ -59,6 +59,15 @@ class LinkReceipt:
 
 
 @dataclass(frozen=True)
+class _LinkPlan:
+    destination: Path
+    expected_target: Path
+    signature: tuple[object, ...]
+    unchanged: bool
+    backup: Path
+
+
+@dataclass(frozen=True)
 class SkillExportReceipt:
     """The result of installing a portable snapshot and optional agent links."""
 
@@ -361,9 +370,7 @@ def _reject_symlink_ancestry(path: Path) -> None:
             raise ValueError("skill snapshot path must not traverse symbolic links")
 
 
-def detect_agents(
-    *, home: Path, which: Callable[[str], str | None]
-) -> tuple[AgentDetection, ...]:
+def detect_agents(*, home: Path, which: Callable[[str], str | None]) -> tuple[AgentDetection, ...]:
     """Probe supported agents in portable fixed order, without changing the filesystem."""
     root = home.expanduser().resolve(strict=False)
     return tuple(
@@ -436,9 +443,10 @@ def export_skill(
         target = _repository_snapshot_path(worktree, manifest.skill.name)
         receipt = install_snapshot(files, target, force=force)
         targets = _repository_link_targets(
-            worktree, snapshot=target, skill_name=manifest.skill.name, detections=detect_agents(
-                home=home, which=which
-            )
+            worktree,
+            snapshot=target,
+            skill_name=manifest.skill.name,
+            detections=detect_agents(home=home, which=which),
         )
         relative = True
     links = _install_links(
@@ -505,9 +513,7 @@ def install_builtin_geas_skill(
         installed.append(snapshot)
 
     detections = detect_agents(home=home, which=which)
-    for destination in _user_link_targets(
-        _BUILTIN_SKILL_NAME, home=home, detections=detections
-    ):
+    for destination in _user_link_targets(_BUILTIN_SKILL_NAME, home=home, detections=detections):
         try:
             (link_receipt,) = _install_links(
                 (destination,),
@@ -553,7 +559,7 @@ def refresh_skill(
 ) -> SkillExportReceipt:
     """Atomically replace one exact managed snapshot and repair its known links."""
     snapshot, existing = resolve_skill_snapshot(path, force=force)
-    candidate = _manifest_from_files(files)
+    candidate = _validate_snapshot_files(files)
     if candidate.skill.name != existing.skill.name:
         raise ValueError("skill update cannot change the managed skill name")
     repository = _containing_worktree(snapshot)
@@ -563,7 +569,7 @@ def refresh_skill(
         repository=repository,
         config_root=config_root,
     )
-    receipt = install_snapshot(files, snapshot, force=force)
+    snapshot_signature = _snapshot_signature(snapshot)
     detections = detect_agents(home=home, which=which)
     if repository is None:
         targets = _user_link_targets(candidate.skill.name, home=home, detections=detections)
@@ -578,12 +584,20 @@ def refresh_skill(
         )
         root = repository
         relative = True
-    links = _install_links(
+    plans = _plan_links(
         targets,
         snapshot=snapshot,
         root=root,
         relative=relative,
         force=force,
+    )
+    receipt, links = _replace_snapshot_and_links(
+        files,
+        snapshot=snapshot,
+        manifest=candidate,
+        snapshot_signature=snapshot_signature,
+        plans=plans,
+        root=root,
     )
     return SkillExportReceipt(
         path=receipt.path,
@@ -820,14 +834,11 @@ def _builtin_skill_state_from_manifest(manifest: SkillManifest) -> BuiltinSkillS
     )
 
 
-def _builtin_state_matches_manifest(
-    state: BuiltinSkillState, manifest: SkillManifest
-) -> bool:
+def _builtin_state_matches_manifest(state: BuiltinSkillState, manifest: SkillManifest) -> bool:
     return (
         manifest.skill.name == _BUILTIN_SKILL_NAME
         and state.snapshot_sha256 == manifest.snapshot_sha256
-        and state.manifest_sha256
-        == hashlib.sha256(canonical_manifest_bytes(manifest)).hexdigest()
+        and state.manifest_sha256 == hashlib.sha256(canonical_manifest_bytes(manifest)).hexdigest()
     )
 
 
@@ -1009,6 +1020,144 @@ def _install_links(
         destination.symlink_to(expected_target, target_is_directory=True)
         receipts.append(LinkReceipt(path=destination, target=snapshot, unchanged=False))
     return tuple(sorted(receipts, key=lambda item: os.fspath(item.path)))
+
+
+def _plan_links(
+    targets: tuple[Path, ...],
+    *,
+    snapshot: Path,
+    root: Path,
+    relative: bool,
+    force: bool,
+) -> tuple[_LinkPlan, ...]:
+    plans: list[_LinkPlan] = []
+    for destination in targets:
+        _confined_link_parent(destination.parent, root, create=False)
+        expected = _expected_link_target(destination, snapshot=snapshot, relative=relative)
+        unchanged = destination.is_symlink() and _link_points_to(destination, expected)
+        exists = destination.exists() or destination.is_symlink()
+        if exists and not unchanged and not force:
+            raise ValueError(f"skill link conflict at {destination}")
+        backup = destination.with_name(f".{destination.name}.geas-backup")
+        if not unchanged and (backup.exists() or backup.is_symlink()):
+            raise ValueError(f"skill link backup conflict at {backup}")
+        plans.append(
+            _LinkPlan(
+                destination=destination,
+                expected_target=expected,
+                signature=_path_signature(destination),
+                unchanged=unchanged,
+                backup=backup,
+            )
+        )
+    return tuple(plans)
+
+
+def _replace_snapshot_and_links(
+    files: Mapping[Path, bytes],
+    *,
+    snapshot: Path,
+    manifest: SkillManifest,
+    snapshot_signature: str,
+    plans: tuple[_LinkPlan, ...],
+    root: Path,
+) -> tuple[SkillExportReceipt, tuple[LinkReceipt, ...]]:
+    """Commit one snapshot/link plan or restore every exact prior target."""
+    try:
+        snapshot_unchanged = validate_snapshot(snapshot) == manifest
+    except ValueError:
+        snapshot_unchanged = False
+    snapshot_backup = snapshot.with_name(f".{snapshot.name}.geas-backup")
+    if not snapshot_unchanged and (snapshot_backup.exists() or snapshot_backup.is_symlink()):
+        raise ValueError("skill snapshot backup target already exists")
+
+    candidate: Path | None = None
+    if not snapshot_unchanged:
+        candidate = Path(tempfile.mkdtemp(prefix=f".{snapshot.name}.", dir=snapshot.parent))
+        _write_snapshot_candidate(files, candidate)
+        if validate_snapshot(candidate) != manifest:
+            shutil.rmtree(candidate)
+            raise ValueError("skill snapshot candidate does not match its validated files")
+
+    changed_links: list[_LinkPlan] = []
+    receipts: list[LinkReceipt] = []
+    snapshot_moved = False
+    try:
+        if _snapshot_signature(snapshot) != snapshot_signature:
+            raise ValueError("skill snapshot changed during update")
+        if candidate is not None:
+            os.replace(snapshot, snapshot_backup)
+            snapshot_moved = True
+            os.replace(candidate, snapshot)
+            candidate = None
+        for plan in plans:
+            _confined_link_parent(plan.destination.parent, root)
+            if _path_signature(plan.destination) != plan.signature:
+                raise ValueError(f"skill link changed during update at {plan.destination}")
+            if plan.unchanged:
+                receipts.append(LinkReceipt(path=plan.destination, target=snapshot, unchanged=True))
+                continue
+            if plan.destination.exists() or plan.destination.is_symlink():
+                os.replace(plan.destination, plan.backup)
+            changed_links.append(plan)
+            plan.destination.symlink_to(plan.expected_target, target_is_directory=True)
+            receipts.append(LinkReceipt(path=plan.destination, target=snapshot, unchanged=False))
+    except Exception:
+        for plan in reversed(changed_links):
+            if plan.destination.exists() or plan.destination.is_symlink():
+                _remove_exact_target(plan.destination)
+            if plan.backup.exists() or plan.backup.is_symlink():
+                os.replace(plan.backup, plan.destination)
+        if snapshot_moved:
+            if snapshot.exists() or snapshot.is_symlink():
+                _remove_exact_target(snapshot)
+            os.replace(snapshot_backup, snapshot)
+        raise
+    finally:
+        if candidate is not None and candidate.exists():
+            shutil.rmtree(candidate)
+
+    for plan in changed_links:
+        if plan.backup.exists() or plan.backup.is_symlink():
+            _remove_exact_target(plan.backup)
+    if snapshot_moved:
+        _remove_exact_target(snapshot_backup)
+    return (
+        SkillExportReceipt(
+            path=snapshot,
+            manifest=manifest,
+            unchanged=snapshot_unchanged,
+        ),
+        tuple(sorted(receipts, key=lambda item: os.fspath(item.path))),
+    )
+
+
+def _path_signature(path: Path) -> tuple[object, ...]:
+    if path.is_symlink():
+        stat = path.lstat()
+        return ("symlink", stat.st_dev, stat.st_ino, os.readlink(path))
+    if path.exists():
+        stat = path.stat()
+        kind = "directory" if path.is_dir() else "file" if path.is_file() else "other"
+        return (kind, stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+    return ("absent",)
+
+
+def _snapshot_signature(snapshot: Path) -> str:
+    digest = hashlib.sha256()
+    for path in sorted(snapshot.rglob("*"), key=lambda item: item.relative_to(snapshot).as_posix()):
+        if path.is_symlink() or (not path.is_dir() and not path.is_file()):
+            raise ValueError("skill snapshot changed during update")
+        relative = path.relative_to(snapshot).as_posix().encode()
+        digest.update(len(relative).to_bytes(8, "big"))
+        digest.update(relative)
+        if path.is_file():
+            content = path.read_bytes()
+            digest.update(len(content).to_bytes(8, "big"))
+            digest.update(content)
+        else:
+            digest.update(b"directory")
+    return digest.hexdigest()
 
 
 def _expected_link_target(destination: Path, *, snapshot: Path, relative: bool) -> Path:

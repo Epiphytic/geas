@@ -54,6 +54,7 @@ _SENSITIVE_CONTENT = (
         rb"\s*['\"]?[^\s'\"]{12,}"
     ),
 )
+_GIT_ID = re.compile(r"^[0-9a-f]{40}$")
 
 
 class OntologySyncError(RuntimeError):
@@ -89,38 +90,64 @@ class OntologyRepositoryManager:
     def pull(self) -> dict[str, object]:
         cloned = self._ensure_checkout()
         self._assert_remote()
+        old_commit = self._head()
+        if old_commit is not None and not cloned:
+            self._assert_profile_branch()
         if self._status(ignore_generated_gitignore=True):
             raise OntologySyncError(
                 "ontology checkout has local changes; commit/push or restore them before pull"
             )
-        remote_branch = f"{self.config.remote}/{self.config.branch}"
-        exists = self._run(
-            (
-                "git",
-                "ls-remote",
-                "--exit-code",
-                "--heads",
-                self.config.remote,
-                self.config.branch,
-            ),
-            check=False,
-        ).returncode == 0
+        fetched_ref = self._fetched_ref()
+        exists = (
+            self._run(
+                (
+                    "git",
+                    "ls-remote",
+                    "--exit-code",
+                    "--heads",
+                    self.config.remote,
+                    self.config.branch,
+                ),
+                check=False,
+            ).returncode
+            == 0
+        )
         if exists:
-            self._run(("git", "fetch", self.config.remote, self.config.branch))
+            self._run(
+                (
+                    "git",
+                    "fetch",
+                    "--no-tags",
+                    self.config.remote,
+                    f"+refs/heads/{self.config.branch}:{fetched_ref}",
+                )
+            )
+            fetched_commit = self._run(
+                ("git", "rev-parse", "--verify", f"{fetched_ref}^{{commit}}")
+            ).stdout.strip()
+            if not _GIT_ID.fullmatch(fetched_commit):
+                raise OntologySyncError("fetched ontology branch is not a full Git object ID")
             if self._has_head():
-                self._run(("git", "merge", "--ff-only", remote_branch))
+                current = self._run(("git", "branch", "--show-current")).stdout.strip()
+                if cloned and current != self.config.branch:
+                    self._run(("git", "checkout", "-B", self.config.branch, fetched_commit))
+                else:
+                    self._run(("git", "merge", "--ff-only", fetched_commit))
             else:
-                self._run(("git", "checkout", "-B", self.config.branch, remote_branch))
+                self._run(("git", "checkout", "-B", self.config.branch, fetched_commit))
         else:
             self._set_unborn_branch()
         self.ensure_gitignore()
+        new_commit = self._head()
         return {
             "checkout": str(self.checkout),
             "repository": self.config.url,
             "branch": self.config.branch,
             "cloned": cloned,
             "pulled": exists,
-            "commit": self._head(),
+            "old_commit": old_commit,
+            "new_commit": new_commit,
+            "commit": new_commit,
         }
 
     def freshen(
@@ -217,14 +244,10 @@ class OntologyRepositoryManager:
         self._run(("git", "add", "-A", "--", *(item.as_posix() for item in targets)))
         all_staged = tuple(
             Path(line)
-            for line in self._run(
-                ("git", "diff", "--cached", "--name-only")
-            ).stdout.splitlines()
+            for line in self._run(("git", "diff", "--cached", "--name-only")).stdout.splitlines()
             if line
         )
-        unexpected = tuple(
-            path for path in all_staged if not self._within_targets(path, targets)
-        )
+        unexpected = tuple(path for path in all_staged if not self._within_targets(path, targets))
         if unexpected:
             names = ", ".join(path.as_posix() for path in unexpected)
             raise OntologySyncError(f"refusing to include previously staged paths: {names}")
@@ -236,9 +259,7 @@ class OntologyRepositoryManager:
             if line
         )
         self._scan_staged(scanned)
-        changed = bool(
-            self._run(("git", "diff", "--cached", "--quiet"), check=False).returncode
-        )
+        changed = bool(self._run(("git", "diff", "--cached", "--quiet"), check=False).returncode)
         if changed:
             self._run(("git", "commit", "-m", message))
             self._run(
@@ -304,11 +325,7 @@ class OntologyRepositoryManager:
 
     def _set_unborn_branch(self) -> None:
         if self._has_head():
-            current = self._run(("git", "branch", "--show-current")).stdout.strip()
-            if current != self.config.branch:
-                raise OntologySyncError(
-                    f"ontology checkout is on {current!r}, expected {self.config.branch!r}"
-                )
+            self._assert_profile_branch()
             return
         self._run(("git", "symbolic-ref", "HEAD", f"refs/heads/{self.config.branch}"))
 
@@ -321,10 +338,20 @@ class OntologyRepositoryManager:
 
     def _remote_head(self) -> str | None:
         result = self._run(
-            ("git", "rev-parse", "--verify", f"{self.config.remote}/{self.config.branch}"),
+            ("git", "rev-parse", "--verify", f"{self._fetched_ref()}^{{commit}}"),
             check=False,
         )
         return result.stdout.strip() if result.returncode == 0 else None
+
+    def _assert_profile_branch(self) -> None:
+        current = self._run(("git", "branch", "--show-current")).stdout.strip()
+        if current != self.config.branch:
+            raise OntologySyncError(
+                f"ontology checkout is on branch {current!r}, expected {self.config.branch!r}"
+            )
+
+    def _fetched_ref(self) -> str:
+        return f"refs/geas-sync/{self.config.branch}"
 
     def _load_freshness_state(self, path: Path) -> OntologyFreshnessState | None:
         if not path.exists():
@@ -391,9 +418,7 @@ class OntologyRepositoryManager:
 
     def _status(self, *, ignore_generated_gitignore: bool = False) -> tuple[str, ...]:
         lines = tuple(
-            line
-            for line in self._run(("git", "status", "--porcelain")).stdout.splitlines()
-            if line
+            line for line in self._run(("git", "status", "--porcelain")).stdout.splitlines() if line
         )
         if ignore_generated_gitignore:
             return tuple(line for line in lines if line != "?? .gitignore")
@@ -450,9 +475,7 @@ class OntologyRepositoryManager:
         )
         if check and completed.returncode != 0:
             detail = completed.stderr.strip()[-2000:]
-            raise OntologySyncError(
-                f"Git command failed ({command[0]} {command[1]}): {detail}"
-            )
+            raise OntologySyncError(f"Git command failed ({command[0]} {command[1]}): {detail}")
         return completed
 
 
