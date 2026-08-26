@@ -111,6 +111,12 @@ then runs the deterministic audit, captures canonical truth, rebuilds SQLite,
 and exports an agent-readable topic view from the bundles already accepted in
 Git `HEAD`. Generated candidates are not imported into accepted knowledge
 before their patch, PR, or MR is approved through the repository workflow.
+With the packaged `acceptance.mode: auto`, a profile with `ontology_git` uses
+`refs/heads/main` as the default acceptance boundary. The merging actor may be
+human or automation; Geas does not impose HITL. A working-tree file, open PR or
+MR, and unmerged Radicle patch remain proposals. `ontology-init` records a
+trusted root-topic timestamp and actor so first-run model concepts can safely
+refer to the topic without granting the model acceptance authority.
 
 The command checkpoints at
 `data/open-source-research-agents/ontology-build-state.json`. Re-running the

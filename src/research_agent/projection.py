@@ -239,7 +239,7 @@ class DeterministicQueryCompiler:
 
 class SQLiteKnowledgeProjection:
     schema_version = 8
-    builder_version = "sqlite-knowledge-projection/8"
+    builder_version = "sqlite-knowledge-projection/9"
 
     def __init__(
         self,
@@ -311,10 +311,7 @@ class SQLiteKnowledgeProjection:
                     SourceMetadata.model_validate(value)
                     for value in self.store.iter_records("source-metadata")
                 ),
-                fragments=(
-                    EvidenceFragment.model_validate(value)
-                    for value in self.store.iter_records("evidence-fragment")
-                ),
+                fragments=self._evidence_fragments(),
                 claims=(Claim.model_validate(value) for value in self.store.iter_records("claim")),
                 controversies=(
                     Controversy.model_validate(value)
@@ -324,10 +321,7 @@ class SQLiteKnowledgeProjection:
                     KnowledgeGap.model_validate(value)
                     for value in self.store.iter_records("knowledge-gap")
                 ),
-                observations=(
-                    ThreatObservation.model_validate(value)
-                    for value in self.store.iter_records("threat-observation")
-                ),
+                observations=self._threat_observations(),
                 assessments=(
                     ThreatAssessment.model_validate(value)
                     for value in self.store.iter_records("threat-assessment")
@@ -434,6 +428,67 @@ class SQLiteKnowledgeProjection:
                     ),
                 )
             )
+        return tuple(selected)
+
+    def _evidence_fragments(self) -> tuple[EvidenceFragment, ...]:
+        """Select one projection row for each content-derived evidence identity."""
+        grouped: dict[str, list[EvidenceFragment]] = {}
+        for value in self.store.iter_records("evidence-fragment"):
+            item = EvidenceFragment.model_validate(value)
+            grouped.setdefault(item.id, []).append(item)
+        selected = []
+        for fragment_id, items in sorted(grouped.items()):
+            identities = {
+                json.dumps(
+                    item.model_dump(mode="json", exclude={"created_at"}),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                for item in items
+            }
+            if len(identities) != 1:
+                raise ValueError(
+                    f"conflicting canonical evidence records share ID {fragment_id}"
+                )
+            # Evidence identity intentionally excludes observation time. Preserve
+            # the earliest immutable observation in the disposable projection.
+            selected.append(
+                min(
+                    items,
+                    key=lambda item: (
+                        item.created_at,
+                        json.dumps(
+                            item.model_dump(mode="json"),
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                    ),
+                )
+            )
+        return tuple(selected)
+
+    def _threat_observations(self) -> tuple[ThreatObservation, ...]:
+        """Select one projection row for each content-derived threat identity."""
+        grouped: dict[str, list[ThreatObservation]] = {}
+        for value in self.store.iter_records("threat-observation"):
+            item = ThreatObservation.model_validate(value)
+            grouped.setdefault(item.id, []).append(item)
+        selected = []
+        for observation_id, items in sorted(grouped.items()):
+            identities = {
+                json.dumps(
+                    item.model_dump(mode="json", exclude={"detected_at"}),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                for item in items
+            }
+            if len(identities) != 1:
+                raise ValueError(
+                    "conflicting canonical threat observations share ID "
+                    f"{observation_id}"
+                )
+            selected.append(min(items, key=lambda item: item.detected_at))
         return tuple(selected)
 
     @staticmethod
@@ -871,11 +926,11 @@ class SQLiteKnowledgeProjection:
         for item in concepts:
             connection.executemany(
                 "INSERT INTO concept_parent VALUES (?, ?)",
-                ((item.id, parent) for parent in item.broader),
+                ((item.id, parent) for parent in sorted(set(item.broader))),
             )
             connection.executemany(
                 "INSERT INTO concept_synonym VALUES (?, ?)",
-                ((item.id, synonym) for synonym in item.synonyms),
+                ((item.id, synonym) for synonym in sorted(set(item.synonyms))),
             )
         for item in sources:
             counts["sources"] += 1
@@ -998,7 +1053,7 @@ class SQLiteKnowledgeProjection:
             )
             connection.executemany(
                 "INSERT INTO claim_evidence VALUES (?, ?)",
-                ((item.id, evidence_id) for evidence_id in item.evidence),
+                ((item.id, evidence_id) for evidence_id in sorted(set(item.evidence))),
             )
             if item.review_state.value == "accepted":
                 add_fts(
@@ -1027,7 +1082,7 @@ class SQLiteKnowledgeProjection:
             )
             connection.executemany(
                 "INSERT INTO controversy_claim VALUES (?, ?)",
-                ((item.id, claim_id) for claim_id in item.claim_ids),
+                ((item.id, claim_id) for claim_id in sorted(set(item.claim_ids))),
             )
             if item.review_state.value == "accepted":
                 add_fts(
@@ -1056,11 +1111,17 @@ class SQLiteKnowledgeProjection:
             )
             connection.executemany(
                 "INSERT INTO gap_claim VALUES (?, ?)",
-                ((item.id, claim_id) for claim_id in item.related_claim_ids),
+                (
+                    (item.id, claim_id)
+                    for claim_id in sorted(set(item.related_claim_ids))
+                ),
             )
             connection.executemany(
                 "INSERT INTO gap_query_plan VALUES (?, ?)",
-                ((item.id, plan_id) for plan_id in item.searched_query_plan_ids),
+                (
+                    (item.id, plan_id)
+                    for plan_id in sorted(set(item.searched_query_plan_ids))
+                ),
             )
             if item.review_state.value == "accepted":
                 add_fts(

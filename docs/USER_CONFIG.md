@@ -100,6 +100,10 @@ ontology_defaults:
   max_batches_per_source: null
   max_sources: null
   model_parallelism: 1
+  acceptance:
+    mode: auto
+    canonical_ref: refs/heads/main
+    promotion_directory: promotions
 profiles:
   default:
     ontology_directory: ontologies
@@ -122,6 +126,8 @@ settings operators most often change.
 configuration. The eligible fields are generic facets, discovery and refresh
 limits, provider/model parameters, worker timing and reserves, connection
 retries, anchor batching, source/batch caps, and serial model parallelism.
+Acceptance policy is also global: `auto` resolves to Git-mediated acceptance
+when the selected profile has `ontology_git`, and to proposal-only otherwise.
 Topic identity, description, scope and competency questions, queries, seed
 bundles, source-library snapshot, repository freshness overrides, output path,
 and tainted-source index stay ontology-specific.
@@ -133,6 +139,18 @@ validated before any discovery or model call. `ontology-init` still writes all
 effective fields so a new ontology remains inspectable. Running `config-init`
 after an upgrade materializes newly introduced global defaults without
 overwriting values already present in `config.yaml`.
+
+Git-mediated acceptance has no built-in HITL requirement. An exact promotion
+manifest becomes accepted when a repository-authorized actor—human or
+automation—puts it on `canonical_ref`. The builder reads it from that ref,
+verifies it against immutable proposal/evidence records, and idempotently
+materializes accepted records. Set `mode: proposal_only` to keep all model
+output non-canonical even when Git-backed, or `mode: git` to require Git.
+
+New `ontology-init` configurations also record `topic_recorded_at` and
+`topic_recorded_by`. These trusted fields materialize only the root topic
+concept, never model claims, so first-run proposals can refer to a stable
+parent and remain promotable.
 
 Create an ontology in the selected profile and later address it by name:
 

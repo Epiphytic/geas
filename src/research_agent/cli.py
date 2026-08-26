@@ -1462,6 +1462,8 @@ def main() -> None:
             "version": 1,
             "topic": args.topic,
             "topic_concept_id": args.concept_id,
+            "topic_recorded_at": datetime.now(UTC),
+            "topic_recorded_by": f"ontology-init:os-user:{getpass.getuser()}",
             "output_directory": (
                 Path("data") / "ontologies" / ontology_name / "generated"
                 if shared_default
@@ -1756,6 +1758,26 @@ def main() -> None:
             config_path,
             defaults=user_config.ontology_defaults,
         )
+        acceptance_repository = None
+        ontology_directory = None
+        resolved_config = config_path.resolve()
+        if ontology_root is not None and resolved_config.is_relative_to(
+            ontology_root.resolve()
+        ):
+            _profile_name, selected_profile = user_config.profile(args.geas_profile)
+            if selected_profile.ontology_git is not None:
+                acceptance_repository = ontology_root
+                ontology_directory = resolved_config.parent.relative_to(
+                    ontology_root.resolve()
+                )
+        resolved_workspace = args.workspace.resolve()
+        if (
+            acceptance_repository is None
+            and (resolved_workspace / ".git").is_dir()
+            and resolved_config.is_relative_to(resolved_workspace)
+        ):
+            acceptance_repository = resolved_workspace
+            ontology_directory = resolved_config.parent.relative_to(resolved_workspace)
         research_policy = ResearchPolicy.from_yaml(args.research_policy)
         _, providers = load_provider_configs(args.providers)
         credential_names = {
@@ -1776,6 +1798,9 @@ def main() -> None:
             budget_policy_path=args.budget_policy,
             truth_policy_path=args.truth_policy,
             vocabulary_path=args.vocabulary,
+            acceptance_repository=acceptance_repository,
+            ontology_directory=ontology_directory,
+            ontology_config_path=config_path,
             force_refresh=args.refresh,
             force_reextract=args.reextract,
         )

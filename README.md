@@ -221,6 +221,12 @@ Only artifact roles whose embedded input revision changed are uploaded. See
 and per-ontology freshness settings, lazy paths, rights checks, and the
 non-canonical cache boundary.
 
+Ontology acceptance defaults to `auto`: Git-backed profile ontologies use
+Git-mediated acceptance on `refs/heads/main`, while non-Git ontologies remain
+proposal-only. No HITL is hardcoded; a human or automation actor may merge the
+proposal, but only the exact canonical-ref bytes—not the model—define
+acceptance. See [Git-native promotion](docs/PROMOTIONS.md).
+
 Create an immutable store and archive a source:
 
 ```bash

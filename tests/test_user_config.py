@@ -42,6 +42,11 @@ def test_user_config_initializes_explicit_profile_and_secret_scaffold(
     assert serialized["ontology_defaults"]["max_output_tokens"] == 65_536
     assert serialized["ontology_defaults"]["max_queries"] is None
     assert serialized["ontology_defaults"]["max_sources"] is None
+    assert serialized["ontology_defaults"]["acceptance"] == {
+        "mode": "auto",
+        "canonical_ref": "refs/heads/main",
+        "promotion_directory": "promotions",
+    }
     assert serialized["ontology_defaults"]["model_parameters"] == {
         "thinking": True,
         "reasoning_effort": "high",

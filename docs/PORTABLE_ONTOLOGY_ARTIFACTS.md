@@ -99,6 +99,21 @@ unchanged library, and changing another ontology does not touch these assets.
 An asset is uploaded before its manifest reference, so a failed Git push can
 leave only an unreferenced, harmless content-addressed release.
 
+A partial publication is valid: a source library can be useful before any
+knowledge is accepted. It is not, however, a complete portable accepted-
+knowledge release. Before announcing that completion, require and hydrate the
+projection role explicitly:
+
+```bash
+geas ontology-artifact-sync model-routing-for-ai-red-blue-teaming \
+  --role knowledge-projection
+geas topic-show concept:model-routing-ai-red-blue-teaming \
+  --database model-routing-for-ai-red-blue-teaming
+```
+
+The first command fails closed when the manifest omits the role; the second
+tests the same name-based lazy hydration path used by a fresh consumer.
+
 `--storage-rights-basis` is mandatory because SQLite and Markdown can contain
 exact source text. Private repository access does not infer a license or
 storage permission. `usage.sqlite`, model logs, checkpoints, and secrets are

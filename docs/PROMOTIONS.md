@@ -35,6 +35,32 @@ Repository rules decide who or what may merge a commit. Required reviews,
 branch protection, Radicle delegates, CI policies, automatic approval, and
 automatic merge are intentionally outside this application.
 
+No human-in-the-loop step is intrinsically required. A human, CI service,
+policy bot, or other repository-authorized actor may perform the merge. The
+model still cannot accept itself: only the exact bytes reachable from the
+configured canonical branch have acceptance authority.
+
+## Per-ontology acceptance policy
+
+Generic defaults live under `ontology_defaults.acceptance`, and an ontology
+may override them in `build.yaml`:
+
+```yaml
+acceptance:
+  mode: auto
+  canonical_ref: refs/heads/main
+  promotion_directory: promotions
+```
+
+`auto` is the default. It resolves to `git` when the selected profile backs
+ontologies with `ontology_git`, and to `proposal_only` otherwise. `git`
+requires the repository explicitly; `proposal_only` never applies promotion
+manifests. At the beginning of a named Git-backed build, Geas inventories JSON
+manifests beneath the ontology's promotion directory on `canonical_ref`,
+verifies each from the Git object database, and applies them idempotently.
+Working-tree, topic-branch, open-PR/MR, and unmerged Radicle-patch files are not
+accepted.
+
 ## CLI workflow
 
 Start on a topic branch after creating an extraction proposal:

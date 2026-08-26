@@ -111,6 +111,94 @@ def test_general_ontology_default_is_64k() -> None:
     assert config.max_run_seconds == 1800
 
 
+def test_configured_topic_seed_is_materialized_without_model_authority(
+    tmp_path: Path,
+) -> None:
+    config = OntologyBuildConfig.model_validate(
+        {
+            "version": 1,
+            "topic": "Configured topic",
+            "topic_concept_id": "concept:configured-topic",
+            "topic_recorded_at": datetime(2026, 8, 26, tzinfo=UTC),
+            "topic_recorded_by": "ontology-config:test",
+            "description": "A trusted operator-configured ontology topic.",
+            "output_directory": "ontology/test/generated",
+        }
+    )
+    builder = _builder(tmp_path, config)
+    builder.store.initialize()
+
+    builder._ensure_topic_concept()
+    builder._ensure_topic_concept()
+
+    concepts = tuple(builder.store.iter_records("concept"))
+    assert len(concepts) == 1
+    assert concepts[0]["id"] == "concept:configured-topic"
+    assert concepts[0]["recorded_by"] == "ontology-config:test"
+    assert tuple(builder.store.iter_records("claim")) == ()
+
+
+def test_git_topic_seed_requires_build_config_from_canonical_ref(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "ontologies"
+    ontology = repository / "routing"
+    ontology.mkdir(parents=True)
+    subprocess.run(("git", "-C", str(repository), "init", "-b", "main"), check=True)
+    subprocess.run(
+        ("git", "-C", str(repository), "config", "user.name", "Test Operator"),
+        check=True,
+    )
+    subprocess.run(
+        (
+            "git",
+            "-C",
+            str(repository),
+            "config",
+            "user.email",
+            "operator@example.invalid",
+        ),
+        check=True,
+    )
+    build_path = ontology / "build.yaml"
+    build_path.write_text(
+        """\
+version: 1
+topic: Canonical topic
+topic_concept_id: concept:canonical-topic
+topic_recorded_at: 2026-08-26T00:00:00Z
+topic_recorded_by: ontology-config:test
+output_directory: data/routing/generated
+"""
+    )
+    subprocess.run(("git", "-C", str(repository), "add", "."), check=True)
+    subprocess.run(
+        ("git", "-C", str(repository), "commit", "-m", "canonical config"),
+        check=True,
+    )
+    config = OntologyBuildConfig.from_yaml(build_path)
+    builder = OntologyBuilder(
+        config=config,
+        root=tmp_path / "runtime",
+        workspace=Path("."),
+        providers_path=Path("config/providers.toml"),
+        research_policy_path=Path("config/research-policy.yaml"),
+        model_policy_path=Path("config/model-policy.yaml"),
+        budget_policy_path=Path("config/budget-policy.yaml"),
+        truth_policy_path=Path("config/truth-policy.yaml"),
+        vocabulary_path=Path("config/query-vocabulary.yaml"),
+        acceptance_repository=repository,
+        ontology_directory=Path("routing"),
+        ontology_config_path=build_path,
+    )
+
+    builder._assert_config_matches_canonical_ref()
+    build_path.write_text(build_path.read_text().replace("Canonical", "Dirty"))
+
+    with pytest.raises(ValueError, match="differs from the canonical Git ref"):
+        builder._assert_config_matches_canonical_ref()
+
+
 def test_ontology_yaml_inherits_global_defaults_and_deep_merges_model_parameters(
     tmp_path: Path,
 ) -> None:
@@ -173,6 +261,32 @@ output_directory: data/local/generated
 
     assert config.provider == "deepseek_local"
     assert config.result_limit == 12
+
+
+def test_ontology_acceptance_auto_resolves_to_git_and_deep_merges(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "build.yaml"
+    path.write_text(
+        """\
+version: 1
+topic: Git acceptance
+topic_concept_id: concept:git-acceptance
+acceptance:
+  promotion_directory: reviews
+output_directory: data/git-acceptance/generated
+"""
+    )
+
+    config = OntologyBuildConfig.from_yaml(path)
+
+    assert config.acceptance.canonical_ref == "refs/heads/main"
+    assert config.acceptance.promotion_directory == Path("reviews")
+    assert config.acceptance.resolved_mode(has_git_repository=True) == "git"
+    assert (
+        config.acceptance.resolved_mode(has_git_repository=False)
+        == "proposal_only"
+    )
 
 
 def test_ontology_worker_duration_and_reserves_are_configurable() -> None:
@@ -682,6 +796,9 @@ def test_ontology_init_writes_every_default_explicitly(tmp_path: Path) -> None:
         assert build["finalization_reserve_seconds"] == 120
         assert build["max_queries"] is None
         assert build["max_sources"] is None
+        assert build["topic_recorded_at"] is not None
+        assert build["topic_recorded_by"].startswith("ontology-init:os-user:")
+        assert build["acceptance"]["mode"] == "auto"
         assert library["include_all_parsed_sources"] is True
         assert set(library) == {
             "version",
@@ -746,6 +863,7 @@ def test_ontology_init_defaults_to_shared_user_config_and_build_resolves_name(
     assert build["max_output_tokens"] == 131_072
     assert build["result_limit"] == 200
     assert build["approve_large_queries"] is True
+    assert build["acceptance"]["mode"] == "auto"
 
     checked = subprocess.run(
         (
@@ -763,7 +881,9 @@ def test_ontology_init_defaults_to_shared_user_config_and_build_resolves_name(
         text=True,
         env=environment,
     )
-    assert json.loads(checked.stdout)["checked_only"] is True
+    checked_receipt = json.loads(checked.stdout)
+    assert checked_receipt["checked_only"] is True
+    assert checked_receipt["acceptance_mode"] == "git"
 
 
 def test_reasoning_evaluation_runner_has_valid_shell_syntax() -> None:

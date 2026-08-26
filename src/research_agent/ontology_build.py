@@ -17,7 +17,7 @@ from typing import Literal
 from uuid import uuid4
 
 import yaml
-from pydantic import Field, ValidationError, field_validator
+from pydantic import Field, ValidationError, field_validator, model_validator
 
 from research_agent.approvals import ApprovalRegistry
 from research_agent.audit import DeterministicKnowledgeAuditor
@@ -46,7 +46,12 @@ from research_agent.extraction import (
     ExtractionRequest,
     ValidatedExtractionProposal,
 )
-from research_agent.knowledge import KnowledgeGap
+from research_agent.knowledge import (
+    Concept,
+    KnowledgeGap,
+    KnowledgeImporter,
+    KnowledgePack,
+)
 from research_agent.model_policy import (
     DataClass,
     InputKind,
@@ -70,6 +75,7 @@ from research_agent.planning import (
     deterministic_proposal,
 )
 from research_agent.projection import KnowledgeQueryEngine, SQLiteKnowledgeProjection
+from research_agent.promotion import GitPromotionManager
 from research_agent.providers import ModelClient, ModelOutputTruncatedError, load_provider_configs
 from research_agent.render import render_topic_markdown
 from research_agent.research import DiscoveryExecutor
@@ -90,6 +96,8 @@ class OntologyBuildConfig(OntologyBuildDefaults):
     version: Literal[1]
     topic: str = Field(min_length=1)
     topic_concept_id: str = Field(pattern=r"^concept:[A-Za-z0-9][A-Za-z0-9._:-]*$")
+    topic_recorded_at: datetime | None = None
+    topic_recorded_by: str | None = Field(default=None, min_length=1, max_length=500)
     description: str = Field(default="", max_length=4000)
     scope_criteria: tuple[str, ...] = ()
     competency_questions: tuple[str, ...] = ()
@@ -103,6 +111,19 @@ class OntologyBuildConfig(OntologyBuildDefaults):
     queries: tuple[str, ...] = ()
     output_directory: Path
     tainted_source_index: Path | None = None
+
+    @field_validator("topic_recorded_by")
+    @classmethod
+    def topic_recorded_by_is_clean(cls, value: str | None) -> str | None:
+        return value.strip() if value is not None else None
+
+    @model_validator(mode="after")
+    def topic_seed_is_complete(self) -> OntologyBuildConfig:
+        if (self.topic_recorded_at is None) != (self.topic_recorded_by is None):
+            raise ValueError(
+                "topic_recorded_at and topic_recorded_by must be configured together"
+            )
+        return self
 
     @field_validator("seed_bundles", "output_directory", "tainted_source_index")
     @classmethod
@@ -224,6 +245,8 @@ class OntologyBuildReceipt(StrictModel):
     resumable: bool = False
     work_remaining: int = 0
     run_elapsed_seconds: float = 0.0
+    acceptance_mode: Literal["git", "proposal_only"] = "proposal_only"
+    accepted_promotions: tuple[str, ...] = ()
 
 
 class BuildProgress:
@@ -317,6 +340,9 @@ class OntologyBuilder:
         budget_policy_path: Path,
         truth_policy_path: Path,
         vocabulary_path: Path,
+        acceptance_repository: Path | None = None,
+        ontology_directory: Path | None = None,
+        ontology_config_path: Path | None = None,
         force_refresh: bool = False,
         force_reextract: bool = False,
     ) -> None:
@@ -329,6 +355,13 @@ class OntologyBuilder:
         self.budget_policy_path = budget_policy_path
         self.truth_policy_path = truth_policy_path
         self.vocabulary_path = vocabulary_path
+        self.acceptance_repository = (
+            acceptance_repository.resolve() if acceptance_repository is not None else None
+        )
+        self.ontology_directory = ontology_directory
+        self.ontology_config_path = (
+            ontology_config_path.resolve() if ontology_config_path is not None else None
+        )
         self.force_refresh = force_refresh
         self.force_reextract = force_reextract
         self.store = ImmutableStore(self.root)
@@ -336,9 +369,12 @@ class OntologyBuilder:
         discovery_fields = config.model_dump(
             exclude={
                 "provider",
+                "acceptance",
                 "scope_criteria",
                 "ontology_facets",
                 "competency_questions",
+                "topic_recorded_at",
+                "topic_recorded_by",
                 "source_library_snapshot_id",
                 "max_output_tokens",
                 "model_parameters",
@@ -370,11 +406,14 @@ class OntologyBuilder:
             config_sha256=self.config_sha256,
             checked_only=True,
             completed=False,
+            acceptance_mode=self._acceptance_mode(),
         )
 
     def run(self) -> OntologyBuildReceipt:
         self._validate_inputs()
         self.store.initialize()
+        self._ensure_topic_concept()
+        accepted_promotions = self._apply_canonical_promotions()
         self._run_started_monotonic = time.monotonic()
         self.progress.event("build", "started", "Starting or resuming ontology build")
         state = self._load_state()
@@ -879,6 +918,8 @@ class OntologyBuilder:
             candidate_bundle_count=len(set(bundles)),
             failure_count=len(set(failures)),
             audit_clean=audit_clean,
+            acceptance_mode=self._acceptance_mode(),
+            accepted_promotions=accepted_promotions,
             run_limit_reached=run_limit_reached,
             work_remaining=work_remaining,
         )
@@ -930,6 +971,8 @@ class OntologyBuilder:
             and not token_exhaustions,
             work_remaining=work_remaining,
             run_elapsed_seconds=self._run_elapsed_seconds(),
+            acceptance_mode=self._acceptance_mode(),
+            accepted_promotions=accepted_promotions,
         )
 
     def _run_elapsed_seconds(self) -> float:
@@ -1042,6 +1085,131 @@ class OntologyBuilder:
         policy = ResearchPolicy.from_yaml(self.research_policy_path)
         if self.config.discovery_enabled and not policy.provider("connector:mojeek").enabled:
             raise ValueError("ontology build requires enabled Mojeek discovery")
+        if self._acceptance_mode() == "git" and (
+            self.acceptance_repository is None or self.ontology_directory is None
+        ):
+            raise ValueError(
+                "Git-mediated ontology acceptance requires a configured ontology "
+                "Git repository"
+            )
+
+    def _acceptance_mode(self) -> Literal["git", "proposal_only"]:
+        return self.config.acceptance.resolved_mode(
+            has_git_repository=self.acceptance_repository is not None
+        )
+
+    def _ensure_topic_concept(self) -> None:
+        existing = {
+            value.get("id") for value in self.store.iter_records("concept")
+        }
+        if self.config.topic_concept_id in existing:
+            return
+        if self.config.topic_recorded_at is None or self.config.topic_recorded_by is None:
+            return
+        if self._acceptance_mode() == "git":
+            self._assert_config_matches_canonical_ref()
+        concept = Concept(
+            id=self.config.topic_concept_id,
+            label=self.config.topic,
+            description=(
+                self.config.description
+                or f"Root concept for the maintained ontology topic {self.config.topic}."
+            ),
+            recorded_at=self.config.topic_recorded_at,
+            recorded_by=self.config.topic_recorded_by,
+        )
+        KnowledgeImporter(
+            store=self.store,
+            clock=lambda: self.config.topic_recorded_at,
+        ).import_pack(
+            KnowledgePack(
+                version=1,
+                topic=self.config.topic,
+                topic_concept_id=self.config.topic_concept_id,
+                concepts=(concept,),
+                evidence=(),
+                claims=(),
+            ),
+            imported_by=self.config.topic_recorded_by,
+        )
+
+    def _apply_canonical_promotions(self) -> tuple[str, ...]:
+        if self._acceptance_mode() != "git":
+            return ()
+        assert self.acceptance_repository is not None
+        assert self.ontology_directory is not None
+        self._assert_config_matches_canonical_ref()
+        promotion_root = self.ontology_directory / self.config.acceptance.promotion_directory
+        prefix = promotion_root.as_posix()
+        result = subprocess.run(
+            (
+                "git",
+                "-C",
+                str(self.acceptance_repository),
+                "ls-tree",
+                "-r",
+                "--name-only",
+                "-z",
+                self.config.acceptance.canonical_ref,
+                "--",
+                prefix,
+            ),
+            check=False,
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            raise ValueError("cannot inspect the canonical ontology acceptance ref")
+        paths = tuple(
+            sorted(
+                Path(item.decode("utf-8", errors="strict"))
+                for item in result.stdout.split(b"\0")
+                if item and item.decode("utf-8", errors="strict").endswith(".json")
+            )
+        )
+        manager = GitPromotionManager(
+            store=self.store,
+            repository=self.acceptance_repository,
+        )
+        receipts = tuple(
+            manager.apply(path, canonical_ref=self.config.acceptance.canonical_ref)
+            for path in paths
+        )
+        if receipts:
+            self.progress.event(
+                "acceptance",
+                "completed",
+                f"Applied {len(receipts)} promotion(s) accepted on the canonical Git ref",
+                canonical_ref=self.config.acceptance.canonical_ref,
+                human_review_required=False,
+            )
+        return tuple(item.id for item in receipts)
+
+    def _assert_config_matches_canonical_ref(self) -> None:
+        assert self.acceptance_repository is not None
+        assert self.ontology_directory is not None
+        if self.ontology_config_path is None:
+            raise ValueError(
+                "Git-mediated topic initialization requires the ontology config path"
+            )
+        relative = self.ontology_directory / self.ontology_config_path.name
+        result = subprocess.run(
+            (
+                "git",
+                "-C",
+                str(self.acceptance_repository),
+                "show",
+                f"{self.config.acceptance.canonical_ref}:{relative.as_posix()}",
+            ),
+            check=False,
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            raise ValueError("ontology build config is absent from the canonical Git ref")
+        if result.stdout != self.ontology_config_path.read_bytes():
+            raise ValueError(
+                "ontology build config differs from the canonical Git ref; merge it "
+                "before materializing the topic concept"
+            )
 
     def _seed_paths(self) -> tuple[Path, ...]:
         paths = set(self.config.seed_bundles)

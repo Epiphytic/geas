@@ -187,7 +187,11 @@ Edit the resulting `build.yaml` before live work. Define scope criteria,
 ontology facets, competency questions, discovery queries, source limits, model
 route, output capacity, timing, and paths. Generic worker fields may instead be
 set once under global `ontology_defaults`; ontology-local fields win when
-present. Validate without network or model calls:
+present. The default `acceptance.mode: auto` uses Git-mediated acceptance when
+the selected profile has an ontology repository and otherwise leaves changes
+proposal-only. It does not require a human reviewer: merge to the configured
+canonical branch by any repository-authorized actor is the acceptance event.
+Validate without network or model calls:
 
 ```bash
 uv run geas ontology-build example-project \
@@ -204,9 +208,11 @@ uv run geas ontology-build example-project \
 
 Each worker is bounded and resumable. Acquired sources, exact anchors,
 validated proposals, gaps, and checkpoints survive interruption. Model output
-remains proposal-only. Review candidate bundles and use the Git promotion
-workflow before treating them as accepted knowledge; rerun the build after
-promotion to rebuild the accepted SQLite and Markdown projections.
+remains proposal-only until its exact promotion manifest reaches the
+configured canonical Git ref. A human or automation actor may perform that
+merge; models never acquire merge authority from source text or model output.
+Rerun the build after promotion to apply canonical manifests and rebuild the
+accepted SQLite and Markdown projections.
 
 Synchronize shared configuration explicitly when needed:
 

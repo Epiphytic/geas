@@ -1,10 +1,39 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from pathlib import Path
+from typing import Literal
 
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 
 from research_agent.models import ModelParameters, StrictModel
+
+
+class OntologyAcceptanceConfig(StrictModel):
+    """How reviewed ontology changes acquire canonical authority."""
+
+    mode: Literal["auto", "git", "proposal_only"] = "auto"
+    canonical_ref: str = "refs/heads/main"
+    promotion_directory: Path = Path("promotions")
+
+    @field_validator("canonical_ref")
+    @classmethod
+    def canonical_ref_is_full(cls, value: str) -> str:
+        if not value.startswith("refs/heads/") or value.removeprefix("refs/heads/") == "":
+            raise ValueError("ontology acceptance canonical_ref must be a full branch ref")
+        return value
+
+    @field_validator("promotion_directory")
+    @classmethod
+    def promotion_directory_is_confined(cls, value: Path) -> Path:
+        if value.is_absolute() or ".." in value.parts or value == Path("."):
+            raise ValueError("ontology promotion_directory must be a confined relative path")
+        return value
+
+    def resolved_mode(self, *, has_git_repository: bool) -> Literal["git", "proposal_only"]:
+        if self.mode == "auto":
+            return "git" if has_git_repository else "proposal_only"
+        return self.mode
 
 
 class OntologyBuildDefaults(StrictModel):
@@ -46,6 +75,9 @@ class OntologyBuildDefaults(StrictModel):
     max_batches_per_source: int | None = Field(default=None, ge=1, le=500)
     max_sources: int | None = Field(default=None, ge=1, le=10_000)
     model_parallelism: int = Field(default=1, ge=1, le=1)
+    acceptance: OntologyAcceptanceConfig = Field(
+        default_factory=OntologyAcceptanceConfig
+    )
 
     @model_validator(mode="after")
     def defaults_are_safe(self) -> OntologyBuildDefaults:
@@ -69,9 +101,15 @@ class OntologyBuildDefaults(StrictModel):
             parameters = self.model_parameters.model_dump(mode="python", exclude_none=False)
             parameters.update(local_parameters)
             merged["model_parameters"] = parameters
+        local_acceptance = value.get("acceptance")
+        if isinstance(local_acceptance, Mapping):
+            acceptance = self.acceptance.model_dump(mode="python", exclude_none=False)
+            acceptance.update(local_acceptance)
+            merged["acceptance"] = acceptance
         merged.update(
             (key, item)
             for key, item in value.items()
-            if key != "model_parameters" or not isinstance(item, Mapping)
+            if key not in {"model_parameters", "acceptance"}
+            or not isinstance(item, Mapping)
         )
         return merged
