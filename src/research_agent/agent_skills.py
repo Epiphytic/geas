@@ -533,13 +533,83 @@ def install_builtin_geas_skill(
     )
 
 
-def unlink_skill(path: Path, *, home: Path, force: bool = False) -> SkillRemovalReceipt:
-    """Remove only exact managed agent links, leaving the snapshot untouched."""
+def resolve_skill_snapshot(path: Path, *, force: bool = False) -> tuple[Path, SkillManifest]:
+    """Resolve a snapshot directory or its manifest and validate its managed bytes."""
     snapshot = _snapshot_directory(path)
     manifest = _read_existing_manifest(snapshot, force=force)
     if manifest is None:
-        raise ValueError("skill snapshot must be a directory")
+        raise ValueError("skill snapshot manifest is missing or invalid")
+    return snapshot, manifest
+
+
+def refresh_skill(
+    files: Mapping[Path, bytes],
+    path: Path,
+    *,
+    config_root: Path,
+    home: Path,
+    force: bool,
+    which: Callable[[str], str | None],
+) -> SkillExportReceipt:
+    """Atomically replace one exact managed snapshot and repair its known links."""
+    snapshot, existing = resolve_skill_snapshot(path, force=force)
+    candidate = _manifest_from_files(files)
+    if candidate.skill.name != existing.skill.name:
+        raise ValueError("skill update cannot change the managed skill name")
     repository = _containing_worktree(snapshot)
+    _assert_managed_snapshot_scope(
+        snapshot,
+        candidate,
+        repository=repository,
+        config_root=config_root,
+    )
+    receipt = install_snapshot(files, snapshot, force=force)
+    detections = detect_agents(home=home, which=which)
+    if repository is None:
+        targets = _user_link_targets(candidate.skill.name, home=home, detections=detections)
+        root = home
+        relative = False
+    else:
+        targets = _repository_link_targets(
+            repository,
+            snapshot=snapshot,
+            skill_name=candidate.skill.name,
+            detections=detections,
+        )
+        root = repository
+        relative = True
+    links = _install_links(
+        targets,
+        snapshot=snapshot,
+        root=root,
+        relative=relative,
+        force=force,
+    )
+    return SkillExportReceipt(
+        path=receipt.path,
+        manifest=receipt.manifest,
+        unchanged=receipt.unchanged and all(item.unchanged for item in links),
+        links=links,
+    )
+
+
+def unlink_skill(
+    path: Path,
+    *,
+    home: Path,
+    force: bool = False,
+    config_root: Path | None = None,
+) -> SkillRemovalReceipt:
+    """Remove only exact managed agent links, leaving the snapshot untouched."""
+    snapshot, manifest = resolve_skill_snapshot(path, force=force)
+    repository = _containing_worktree(snapshot)
+    if config_root is not None:
+        _assert_managed_snapshot_scope(
+            snapshot,
+            manifest,
+            repository=repository,
+            config_root=config_root,
+        )
     if repository is None:
         targets = _user_link_targets(
             manifest.skill.name,
@@ -567,9 +637,15 @@ def unlink_skill(path: Path, *, home: Path, force: bool = False) -> SkillRemoval
     )
 
 
-def remove_skill(path: Path, *, home: Path, force: bool = False) -> SkillRemovalReceipt:
+def remove_skill(
+    path: Path,
+    *,
+    home: Path,
+    force: bool = False,
+    config_root: Path | None = None,
+) -> SkillRemovalReceipt:
     """Detach managed links and delete only the exact managed snapshot directory."""
-    detached = unlink_skill(path, home=home, force=force)
+    detached = unlink_skill(path, home=home, force=force, config_root=config_root)
     _remove_directory(detached.path)
     return SkillRemovalReceipt(
         path=detached.path,
@@ -577,6 +653,27 @@ def remove_skill(path: Path, *, home: Path, force: bool = False) -> SkillRemoval
         removed_snapshot=True,
         regeneration_command=detached.regeneration_command,
     )
+
+
+def _assert_managed_snapshot_scope(
+    snapshot: Path,
+    manifest: SkillManifest,
+    *,
+    repository: Path | None,
+    config_root: Path,
+) -> None:
+    if repository is None:
+        expected = _absolute_path(config_root) / "skills" / manifest.skill.name
+        if snapshot != expected:
+            raise ValueError("user skill snapshot is outside the selected Geas config root")
+        return
+    relative = snapshot.relative_to(repository)
+    expected = {
+        Path(".agents") / "skills" / manifest.skill.name,
+        Path(".geas") / "skills" / manifest.skill.name,
+    }
+    if relative not in expected:
+        raise ValueError("repository skill snapshot is outside a managed skill path")
 
 
 def _write_snapshot_candidate(files: Mapping[Path, bytes], candidate: Path) -> None:

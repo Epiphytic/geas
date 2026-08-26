@@ -6,13 +6,26 @@ import json
 import math
 import mimetypes
 import os
+import shutil
 import sys
 from datetime import UTC, datetime
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from uuid import uuid4
 
 from pydantic_core import to_jsonable_python
 
+from research_agent.agent_skills import (
+    SkillExportReceipt,
+    SkillManifest,
+    SkillRemovalReceipt,
+    canonical_manifest_bytes,
+    export_skill,
+    refresh_skill,
+    remove_skill,
+    resolve_skill_snapshot,
+    unlink_skill,
+)
 from research_agent.approvals import ApprovalRegistry, AuthenticatedPrincipal
 from research_agent.audit import DeterministicKnowledgeAuditor
 from research_agent.benchmark import ProjectionBenchmark
@@ -51,6 +64,7 @@ from research_agent.discovery import (
 )
 from research_agent.discovery_acquisition import GitHubDiscoveryAcquirer
 from research_agent.extraction import AnchorGroundedExtractionManager
+from research_agent.geas_update import GeasUpdater, GeasUpdateReceipt
 from research_agent.identifiers import doi_locator, normalize_doi
 from research_agent.knowledge import KnowledgeImporter, KnowledgePack
 from research_agent.library import (
@@ -79,6 +93,7 @@ from research_agent.models import (
 )
 from research_agent.onboarding import build_setup_guide, render_setup_guide_markdown
 from research_agent.ontology_artifacts import (
+    ArtifactHydrationReceipt,
     ArtifactRole,
     GitHubReleaseArtifactStore,
     OntologyArtifactManager,
@@ -109,12 +124,14 @@ from research_agent.projection import (
     KnowledgeQueryEngine,
     QueryRecordType,
     SQLiteKnowledgeProjection,
+    TopicView,
 )
 from research_agent.promotion import GitPromotionManager
 from research_agent.providers import ModelClient, load_provider_configs
 from research_agent.remote_acquisition import LicenseGatedAcquirer
 from research_agent.render import (
     render_agent_instructions,
+    render_ontology_skill,
     render_topic_markdown,
     render_topic_obsidian,
     write_obsidian_vault,
@@ -125,6 +142,7 @@ from research_agent.store import ImmutableStore
 from research_agent.structure import AnchorKind, StructuralAnchor, StructuralDocumentManager
 from research_agent.truth import SQLiteProjectionGuard, TruthManager, TruthPolicy, TruthSnapshot
 from research_agent.user_config import (
+    GeasProfile,
     GeasUserConfig,
     UserConfigManager,
     default_config_path,
@@ -334,6 +352,165 @@ def _resolve_cli_config_paths(args: argparse.Namespace) -> None:
             field,
             user_path if user_path.is_file() else default_config_path(filename),
         )
+
+
+def _normalized_git_url(value: str) -> str:
+    return value.rstrip("/").removesuffix(".git")
+
+
+def _require_profile_matches_manifest(profile: GeasProfile, manifest: SkillManifest) -> None:
+    configured = profile.ontology_git
+    if configured is None:
+        raise ValueError(
+            "the selected Geas profile has no ontology_git configuration; configure its "
+            "trusted URL and branch before updating this skill"
+        )
+    if (
+        _normalized_git_url(configured.url)
+        != _normalized_git_url(manifest.ontology.repository_url)
+        or configured.branch != manifest.ontology.branch
+    ):
+        raise ValueError(
+            "the selected Geas profile URL/branch does not match the skill manifest; "
+            "configure the active profile explicitly instead of trusting generated content"
+        )
+
+
+def _selected_ontology(
+    root: Path,
+    name: str,
+    *,
+    user_config: GeasUserConfig,
+) -> tuple[Path, str]:
+    inventory = inventory_ontologies(root, defaults=user_config.ontology_defaults)
+    matches = tuple(item for item in inventory.ontologies if item.name == name)
+    if len(matches) != 1 or matches[0].status != "valid":
+        raise ValueError(
+            f"ontology {name!r} is not one valid ontology in the selected profile catalog"
+        )
+    selected = matches[0]
+    if selected.topic_concept_id is None:
+        build = root / name / "build.yaml"
+        raise ValueError(
+            "portable skill export requires one explicit topic_concept_id; set it in "
+            f"{build} (or run `geas ontology-init {name} --topic TOPIC "
+            "--concept-id CONCEPT_ID`)"
+        )
+    return root / name, selected.topic_concept_id
+
+
+def _load_portable_topic(
+    ontology_directory: Path,
+    *,
+    profile: GeasProfile,
+    topic_concept_id: str,
+) -> tuple[TopicView, ArtifactHydrationReceipt]:
+    """Hydrate and verify only the manifest-pinned knowledge projection artifact."""
+    if profile.ontology_git is None:
+        raise ValueError("the selected Geas profile has no ontology artifact source")
+    manager = OntologyArtifactManager(ontology_directory)
+    if not manager.manifest_path.is_file() or manager.manifest_path.is_symlink():
+        raise ValueError(
+            "portable skill export requires a verified knowledge-projection artifact; "
+            "publish one with `geas ontology-artifact-publish "
+            f"{ontology_directory.name} --knowledge-projection PATH ...`"
+        )
+    hydration = manager.hydrate(
+        store=GitHubReleaseArtifactStore(
+            profile.ontology_git.url,
+            branch=profile.ontology_git.branch,
+        ),
+        roles=(ArtifactRole.KNOWLEDGE_PROJECTION,),
+    )
+    if len(hydration.hydrated) != 1:
+        raise ValueError("verified ontology artifacts did not yield one knowledge projection")
+    database = Path(hydration.hydrated[0].path)
+    topic = KnowledgeQueryEngine(database).topic(topic_concept_id)
+    return topic, hydration
+
+
+def _installed_geas_version() -> str:
+    try:
+        return version("geas")
+    except PackageNotFoundError:
+        return "0.1.0"
+
+
+def _skill_export_payload(
+    receipt: SkillExportReceipt,
+    *,
+    profile_name: str,
+    ontology_commit: str,
+    artifact: object,
+    geas_update: GeasUpdateReceipt | None = None,
+    changed_paths: tuple[str, ...] | None = None,
+    unchanged_paths: tuple[str, ...] | None = None,
+) -> dict[str, object]:
+    links = tuple(
+        {
+            "path": str(item.path),
+            "target": str(item.target),
+            "unchanged": item.unchanged,
+        }
+        for item in sorted(receipt.links, key=lambda item: os.fspath(item.path))
+    )
+    phases = [
+        {"phase": "ontology", "commit": ontology_commit},
+        {"phase": "projection", "receipt": artifact},
+        {
+            "phase": "skill",
+            "snapshot_sha256": receipt.manifest.snapshot_sha256,
+            "unchanged": receipt.unchanged,
+        },
+    ]
+    if geas_update is not None:
+        phases.append({"phase": "geas", "receipt": geas_update})
+    all_paths = tuple(
+        sorted((*tuple(item.path for item in receipt.manifest.files), "geas-skill.json"))
+    )
+    if changed_paths is None:
+        changed_paths = () if receipt.unchanged else all_paths
+    if unchanged_paths is None:
+        unchanged_paths = all_paths if receipt.unchanged else ()
+    return {
+        "profile": profile_name,
+        "ontology": receipt.manifest.ontology.name,
+        "path": str(receipt.path),
+        "unchanged": receipt.unchanged,
+        "snapshot_sha256": receipt.manifest.snapshot_sha256,
+        "projection_snapshot_id": receipt.manifest.projection.snapshot_id,
+        "topic_concept_id": receipt.manifest.projection.topic_concept_id,
+        "links": links,
+        "changed_paths": tuple(sorted(changed_paths)),
+        "unchanged_paths": tuple(sorted(unchanged_paths)),
+        "conflicts": (),
+        "phases": tuple(sorted(phases, key=lambda item: str(item["phase"]))),
+    }
+
+
+def _skill_file_lifecycle(
+    previous: SkillManifest,
+    candidate: SkillManifest,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    before = {item.path: item.sha256 for item in previous.files}
+    after = {item.path: item.sha256 for item in candidate.files}
+    names = set(before) | set(after)
+    changed = {name for name in names if before.get(name) != after.get(name)}
+    unchanged = names - changed
+    if canonical_manifest_bytes(previous) != canonical_manifest_bytes(candidate):
+        changed.add("geas-skill.json")
+    else:
+        unchanged.add("geas-skill.json")
+    return tuple(sorted(changed)), tuple(sorted(unchanged))
+
+
+def _skill_removal_payload(receipt: SkillRemovalReceipt) -> dict[str, object]:
+    return {
+        "path": str(receipt.path),
+        "removed_paths": tuple(str(path) for path in receipt.removed_paths),
+        "removed_snapshot": receipt.removed_snapshot,
+        "regeneration_command": receipt.regeneration_command,
+    }
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -1069,6 +1246,38 @@ def _build_parser() -> argparse.ArgumentParser:
         help="relative link to a companion Obsidian export for agent instructions",
     )
 
+    skill_export = subparsers.add_parser(
+        "skill-export",
+        help="export one active-profile ontology as a portable Agent Skill",
+    )
+    skill_export.add_argument("ontology")
+    skill_export.add_argument("--name")
+    skill_export.add_argument("--link", action="store_true")
+    skill_export.add_argument("--repo", type=Path)
+    skill_export.add_argument("--force", action="store_true")
+
+    skill_update = subparsers.add_parser(
+        "skill-update",
+        help="refresh one exact managed Agent Skill through trusted update provenance",
+    )
+    skill_update.add_argument("skill_path", type=Path)
+    skill_update.add_argument("--force", action="store_true")
+    skill_update.add_argument("--geas-update-continuation")
+
+    skill_unlink = subparsers.add_parser(
+        "skill-unlink",
+        help="remove exact managed agent links and preserve the snapshot",
+    )
+    skill_unlink.add_argument("skill_path", type=Path)
+    skill_unlink.add_argument("--force", action="store_true")
+
+    skill_remove = subparsers.add_parser(
+        "skill-remove",
+        help="remove exact managed links and the managed snapshot",
+    )
+    skill_remove.add_argument("skill_path", type=Path)
+    skill_remove.add_argument("--force", action="store_true")
+
     benchmark = subparsers.add_parser(
         "projection-benchmark",
         help="measure canonical writes, rebuilds, and deterministic queries",
@@ -1111,6 +1320,146 @@ def _build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = _build_parser().parse_args()
     _resolve_cli_config_paths(args)
+
+    if args.command == "skill-export":
+        manager = _user_config_manager(args)
+        user_config = manager.load()
+        profile_name, profile = user_config.profile(args.geas_profile)
+        if profile.ontology_git is None:
+            raise ValueError(
+                f"Geas profile {profile_name!r} has no trusted ontology_git config"
+            )
+        print("Synchronizing the trusted ontology checkout for skill export.", file=sys.stderr)
+        ontology_root = manager.ontology_root(profile)
+        pull = OntologyRepositoryManager(
+            checkout=ontology_root,
+            config=profile.ontology_git,
+        ).pull()
+        ontology_commit = pull.get("commit")
+        if not isinstance(ontology_commit, str):
+            raise ValueError("the synchronized ontology checkout has no committed HEAD")
+        ontology_directory, topic_concept_id = _selected_ontology(
+            ontology_root,
+            args.ontology,
+            user_config=user_config,
+        )
+        print("Verifying the portable knowledge projection.", file=sys.stderr)
+        topic, artifact = _load_portable_topic(
+            ontology_directory,
+            profile=profile,
+            topic_concept_id=topic_concept_id,
+        )
+        files = render_ontology_skill(
+            topic,
+            skill_name=args.name or args.ontology,
+            ontology_name=args.ontology,
+            repository_url=profile.ontology_git.url,
+            branch=profile.ontology_git.branch,
+            ontology_commit=ontology_commit,
+            geas_version=_installed_geas_version(),
+            geas_commit=None,
+        )
+        print("Installing the complete verified skill snapshot.", file=sys.stderr)
+        receipt = export_skill(
+            files,
+            config_root=manager.root,
+            home=Path.home(),
+            repository=args.repo,
+            link=args.link,
+            force=args.force,
+            which=shutil.which,
+        )
+        _json(
+            _skill_export_payload(
+                receipt,
+                profile_name=profile_name,
+                ontology_commit=ontology_commit,
+                artifact=artifact,
+            )
+        )
+        return
+
+    if args.command == "skill-update":
+        manager = _user_config_manager(args)
+        snapshot, manifest = resolve_skill_snapshot(args.skill_path, force=args.force)
+        print("Validating trusted Geas update provenance.", file=sys.stderr)
+        geas_receipt = GeasUpdater().update_and_reexec(
+            tuple(sys.argv),
+            continuation=args.geas_update_continuation,
+        )
+        user_config = manager.load()
+        profile_name, profile = user_config.profile(args.geas_profile)
+        _require_profile_matches_manifest(profile, manifest)
+        assert profile.ontology_git is not None
+        ontology_root = manager.ontology_root(profile)
+        print("Fast-forwarding the trusted ontology checkout.", file=sys.stderr)
+        pull = OntologyRepositoryManager(
+            checkout=ontology_root,
+            config=profile.ontology_git,
+        ).pull()
+        ontology_commit = pull.get("commit")
+        if not isinstance(ontology_commit, str):
+            raise ValueError("the synchronized ontology checkout has no committed HEAD")
+        ontology_directory, topic_concept_id = _selected_ontology(
+            ontology_root,
+            manifest.ontology.name,
+            user_config=user_config,
+        )
+        print("Verifying the updated portable knowledge projection.", file=sys.stderr)
+        topic, artifact = _load_portable_topic(
+            ontology_directory,
+            profile=profile,
+            topic_concept_id=topic_concept_id,
+        )
+        files = render_ontology_skill(
+            topic,
+            skill_name=manifest.skill.name,
+            ontology_name=manifest.ontology.name,
+            repository_url=profile.ontology_git.url,
+            branch=profile.ontology_git.branch,
+            ontology_commit=ontology_commit,
+            geas_version=geas_receipt.new_version,
+            geas_commit=geas_receipt.new_commit,
+        )
+        candidate_manifest = SkillManifest.model_validate_json(files[Path("geas-skill.json")])
+        changed_paths, unchanged_paths = _skill_file_lifecycle(
+            manifest,
+            candidate_manifest,
+        )
+        print("Atomically replacing the verified skill snapshot.", file=sys.stderr)
+        receipt = refresh_skill(
+            files,
+            snapshot,
+            config_root=manager.root,
+            home=Path.home(),
+            force=args.force,
+            which=shutil.which,
+        )
+        _json(
+            _skill_export_payload(
+                receipt,
+                profile_name=profile_name,
+                ontology_commit=ontology_commit,
+                artifact=artifact,
+                geas_update=geas_receipt,
+                changed_paths=changed_paths,
+                unchanged_paths=unchanged_paths,
+            )
+        )
+        return
+
+    if args.command in {"skill-unlink", "skill-remove"}:
+        manager = _user_config_manager(args)
+        print(f"Resolving exact managed target for {args.command}.", file=sys.stderr)
+        operation = remove_skill if args.command == "skill-remove" else unlink_skill
+        receipt = operation(
+            args.skill_path,
+            home=Path.home(),
+            force=args.force,
+            config_root=manager.root,
+        )
+        _json(_skill_removal_payload(receipt))
+        return
 
     if args.command == "setup-guide":
         manager = _user_config_manager(args)
