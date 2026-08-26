@@ -2400,6 +2400,8 @@ def main() -> None:
             args.database,
             snapshot,
             truth_report=truth_report,
+            expected_schema_version=SQLiteKnowledgeProjection.schema_version,
+            expected_builder_version=SQLiteKnowledgeProjection.builder_version,
         )
         _json(report)
         if not report.clean:

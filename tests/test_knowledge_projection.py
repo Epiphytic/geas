@@ -568,6 +568,22 @@ def test_projection_is_stamped_and_mutation_is_detected(tmp_path: Path) -> None:
     assert report.recommended_action == "discard_and_rebuild"
 
 
+def test_query_engine_rejects_matching_but_incompatible_projection_stamp(
+    tmp_path: Path,
+) -> None:
+    """Catches topic reads proceeding into an old projection schema."""
+    _, database, (_, manager, snapshot, _) = _build_projection(tmp_path)
+    SQLiteProjectionGuard(clock=lambda: INSTANT).stamp(
+        database,
+        snapshot,
+        schema_version=8,
+        builder_version="sqlite-knowledge-projection/9",
+    )
+
+    with pytest.raises(ValueError, match="incompatible projection"):
+        KnowledgeQueryEngine(database).topic("concept:community-water-fluoridation")
+
+
 def test_query_compiler_treats_fts_syntax_as_inert_tokens() -> None:
     plan = DeterministicQueryCompiler().compile(
         '" OR threat:* NOT',

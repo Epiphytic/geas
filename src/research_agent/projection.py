@@ -1583,6 +1583,11 @@ class SQLiteKnowledgeProjection:
 class KnowledgeQueryEngine:
     def __init__(self, database: Path) -> None:
         self.database = database.resolve()
+        SQLiteProjectionGuard().require_compatible(
+            self.database,
+            expected_schema_version=SQLiteKnowledgeProjection.schema_version,
+            expected_builder_version=SQLiteKnowledgeProjection.builder_version,
+        )
 
     def query(
         self,
