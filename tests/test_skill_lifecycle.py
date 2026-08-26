@@ -643,6 +643,29 @@ def test_export_resolves_relative_config_root_before_creating_user_link(
     assert link.resolve() == receipt.path
 
 
+def test_export_rejects_symlinked_config_root_without_touching_its_target(tmp_path: Path) -> None:
+    """Catches export resolving a config-root symlink before the snapshot guard sees it."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    config_root = tmp_path / "config"
+    config_root.symlink_to(outside, target_is_directory=True)
+    home = tmp_path / "home"
+    home.mkdir()
+
+    with pytest.raises(ValueError, match="symbolic"):
+        export_skill(
+            _files(),
+            config_root=config_root,
+            home=home,
+            repository=None,
+            link=False,
+            force=False,
+            which=_which(),
+        )
+
+    assert list(outside.iterdir()) == []
+
+
 def test_remove_rejects_symlinked_agent_parent_without_touching_outside(tmp_path: Path) -> None:
     """Catches removal following an adapter parent symlink before deleting the snapshot."""
     from research_agent.agent_skills import remove_skill

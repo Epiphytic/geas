@@ -384,7 +384,7 @@ def export_skill(
     """Install a managed snapshot in user configuration or a Git worktree."""
     manifest = _manifest_from_files(files)
     if repository is None:
-        target = config_root.expanduser().resolve(strict=False) / "skills" / manifest.skill.name
+        target = _absolute_path(config_root) / "skills" / manifest.skill.name
         receipt = install_snapshot(files, target, force=force)
         if not link:
             return receipt
