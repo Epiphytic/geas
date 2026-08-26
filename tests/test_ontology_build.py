@@ -32,6 +32,8 @@ from research_agent.ontology_build import (
     OntologyBuildReceipt,
     TokenLimitExhaustion,
 )
+from research_agent.ontology_config import OntologyBuildDefaults
+from research_agent.user_config import GeasUserConfig
 
 
 def _builder(tmp_path: Path, config: OntologyBuildConfig) -> OntologyBuilder:
@@ -107,6 +109,70 @@ def test_general_ontology_default_is_64k() -> None:
     )
     assert config.max_output_tokens == 65_536
     assert config.max_run_seconds == 1800
+
+
+def test_ontology_yaml_inherits_global_defaults_and_deep_merges_model_parameters(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "build.yaml"
+    path.write_text(
+        """\
+version: 1
+topic: Inherited defaults
+topic_concept_id: concept:inherited-defaults
+model_parameters:
+  temperature: 0.25
+max_sources: null
+output_directory: data/inherited/generated
+"""
+    )
+    defaults = OntologyBuildDefaults(
+        provider="codex_oneshot",
+        max_output_tokens=131_072,
+        result_limit=200,
+        max_sources=25,
+        model_parameters=ModelParameters(
+            thinking=True,
+            reasoning_effort="xhigh",
+            temperature=0,
+            seed=0,
+        ),
+    )
+
+    config = OntologyBuildConfig.from_yaml(path, defaults=defaults)
+
+    assert config.provider == "codex_oneshot"
+    assert config.max_output_tokens == 131_072
+    assert config.result_limit == 200
+    assert config.max_sources is None
+    assert config.model_parameters.reasoning_effort == "xhigh"
+    assert config.model_parameters.temperature == 0.25
+    assert config.model_parameters.seed == 0
+
+
+def test_ontology_local_values_override_global_defaults(tmp_path: Path) -> None:
+    path = tmp_path / "build.yaml"
+    path.write_text(
+        """\
+version: 1
+topic: Local override
+topic_concept_id: concept:local-override
+provider: deepseek_local
+result_limit: 12
+output_directory: data/local/generated
+"""
+    )
+
+    config = OntologyBuildConfig.from_yaml(
+        path,
+        defaults=OntologyBuildDefaults(
+            provider="codex_oneshot",
+            result_limit=200,
+        ),
+    )
+
+    assert config.provider == "deepseek_local"
+    assert config.result_limit == 12
 
 
 def test_ontology_worker_duration_and_reserves_are_configurable() -> None:
@@ -638,6 +704,18 @@ def test_ontology_init_defaults_to_shared_user_config_and_build_resolves_name(
     tmp_path: Path,
 ) -> None:
     config_home = tmp_path / "geas-config"
+    config_home.mkdir()
+    user_config = GeasUserConfig.default().model_copy(
+        update={
+            "ontology_defaults": OntologyBuildDefaults(
+                provider="codex_oneshot",
+                max_output_tokens=131_072,
+                result_limit=200,
+                approve_large_queries=True,
+            )
+        }
+    )
+    (config_home / "config.yaml").write_text(user_config.explicit_yaml())
     environment = {**os.environ, "GEAS_CONFIG_HOME": str(config_home)}
     initialized = subprocess.run(
         (
@@ -664,6 +742,10 @@ def test_ontology_init_defaults_to_shared_user_config_and_build_resolves_name(
     assert receipt["ontology_name"] == "shared-routing"
     build = yaml.safe_load((expected / "build.yaml").read_text())
     assert build["output_directory"] == "data/ontologies/shared-routing/generated"
+    assert build["provider"] == "codex_oneshot"
+    assert build["max_output_tokens"] == 131_072
+    assert build["result_limit"] == 200
+    assert build["approve_large_queries"] is True
 
     checked = subprocess.run(
         (

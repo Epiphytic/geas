@@ -474,7 +474,8 @@ def test_projection_is_stamped_and_mutation_is_detected(tmp_path: Path) -> None:
 
     with sqlite3.connect(database) as connection:
         connection.execute(
-            "UPDATE knowledge_gap SET rationale = 'database is not canonical' LIMIT 1"
+            "UPDATE knowledge_gap SET rationale = 'database is not canonical' "
+            "WHERE rowid IN (SELECT rowid FROM knowledge_gap LIMIT 1)"
         )
 
     report = guard.verify(

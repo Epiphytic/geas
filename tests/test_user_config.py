@@ -38,6 +38,20 @@ def test_user_config_initializes_explicit_profile_and_secret_scaffold(
         "max_age_seconds": 3600,
         "hydrate_artifacts_before_use": False,
     }
+    assert serialized["ontology_defaults"]["provider"] == "deepseek_local"
+    assert serialized["ontology_defaults"]["max_output_tokens"] == 65_536
+    assert serialized["ontology_defaults"]["max_queries"] is None
+    assert serialized["ontology_defaults"]["max_sources"] is None
+    assert serialized["ontology_defaults"]["model_parameters"] == {
+        "thinking": True,
+        "reasoning_effort": "high",
+        "temperature": 0.0,
+        "top_p": None,
+        "top_k": None,
+        "min_p": None,
+        "seed": None,
+        "stop": [],
+    }
     assert serialized["profiles"]["default"]["ontology_git"] == {
         "url": DEFAULT_ONTOLOGY_REPOSITORY,
         "branch": "main",
@@ -71,6 +85,40 @@ def test_user_config_supports_team_profiles_and_confines_paths(tmp_path: Path) -
     )
     with pytest.raises(ValueError, match="unknown Geas profile"):
         manager.profile("missing")
+
+
+def test_config_init_materializes_new_global_defaults_without_overwriting_values(
+    tmp_path: Path,
+) -> None:
+    manager = UserConfigManager(tmp_path / "geas" / "config.yaml")
+    manager.root.mkdir(parents=True)
+    manager.path.write_text(
+        yaml.safe_dump(
+            {
+                "version": 1,
+                "default_profile": "default",
+                "profiles": {
+                    "default": {
+                        "ontology_directory": "custom/ontologies",
+                        "secret_sources": [],
+                        "ontology_git": None,
+                    }
+                },
+            },
+            sort_keys=False,
+        )
+    )
+
+    config = manager.load_or_create()
+    serialized = yaml.safe_load(manager.path.read_text())
+
+    assert config.ontology_defaults.provider == "deepseek_local"
+    assert serialized["ontology_defaults"]["provider"] == "deepseek_local"
+    assert serialized["ontology_freshness"]["max_age_seconds"] == 3600
+    assert serialized["profiles"]["default"]["ontology_directory"] == (
+        "custom/ontologies"
+    )
+    assert serialized["profiles"]["default"]["secret_sources"] == []
 
 
 def test_user_config_rejects_escaping_and_credential_bearing_values() -> None:

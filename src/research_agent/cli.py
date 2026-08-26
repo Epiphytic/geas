@@ -206,7 +206,10 @@ def _profile_ontology_root(
     local_build = root / ontology_name / "build.yaml" if ontology_name else None
     if local_build is not None and local_build.is_file() and not local_build.is_symlink():
         try:
-            override = OntologyBuildConfig.from_yaml(local_build).repository_sync
+            override = OntologyBuildConfig.from_yaml(
+                local_build,
+                defaults=user_config.ontology_defaults,
+            ).repository_sync
         except (OSError, ValueError):
             override = None
         if override is not None:
@@ -505,7 +508,11 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     ontology_init.add_argument("--topic", required=True)
     ontology_init.add_argument("--concept-id", required=True)
-    ontology_init.add_argument("--provider", default="deepseek_local")
+    ontology_init.add_argument(
+        "--provider",
+        default=None,
+        help="override the provider inherited from global ontology_defaults",
+    )
     ontology_init.add_argument("--force", action="store_true")
     ontology_init.add_argument(
         "--pull",
@@ -1260,20 +1267,25 @@ def main() -> None:
     if args.command == "ontology-list":
         manager = _user_config_manager(args)
         profile_name = None
+        user_config = (
+            manager.load() if manager.path.exists() else GeasUserConfig.default()
+        )
         if args.directory is None:
             if manager.path.exists():
                 profile_name, _profile = manager.profile(args.geas_profile)
                 root = _profile_ontology_root(args, pull_before_read=True)
                 assert root is not None
             else:
-                user_config = GeasUserConfig.default()
                 profile_name, profile = user_config.profile(args.geas_profile)
                 root = manager.ontology_root(profile)
             location = "selected_profile"
         else:
             root = args.directory
             location = "provided_directory"
-        inventory = inventory_ontologies(root)
+        inventory = inventory_ontologies(
+            root,
+            defaults=user_config.ontology_defaults,
+        )
         _json(
             {
                 **inventory.model_dump(mode="json"),
@@ -1380,12 +1392,18 @@ def main() -> None:
     if args.command == "ontology-init":
         shared_default = args.directory is None
         manager = _user_config_manager(args)
+        user_config = (
+            manager.load_or_create()
+            if shared_default
+            else (
+                manager.load() if manager.path.exists() else GeasUserConfig.default()
+            )
+        )
         profile_name = None
         repository = None
         pull_receipt = None
         push_receipt = None
         if shared_default:
-            user_config = manager.load_or_create()
             profile_name, profile = user_config.profile(args.geas_profile)
             ontology_root = manager.ontology_root(profile)
             ontology_name = shared_ontology_directory(
@@ -1440,16 +1458,21 @@ def main() -> None:
                 "ontology configuration already exists; pass --force to replace: "
                 + ", ".join(str(path) for path in existing)
             )
-        config = OntologyBuildConfig(
-            version=1,
-            topic=args.topic,
-            topic_concept_id=args.concept_id,
-            provider=args.provider,
-            output_directory=(
+        ontology_values: dict[str, object] = {
+            "version": 1,
+            "topic": args.topic,
+            "topic_concept_id": args.concept_id,
+            "output_directory": (
                 Path("data") / "ontologies" / ontology_name / "generated"
                 if shared_default
                 else directory / "generated"
             ),
+        }
+        if args.provider is not None:
+            ontology_values["provider"] = args.provider
+        config = OntologyBuildConfig.from_defaults(
+            user_config.ontology_defaults,
+            **ontology_values,
         )
         library = SourceLibraryManifest(
             version=1,
@@ -1725,7 +1748,14 @@ def main() -> None:
             if ontology_root is not None
             else resolve_ontology_build_config(args.config)
         )
-        config = OntologyBuildConfig.from_yaml(config_path)
+        manager = _user_config_manager(args)
+        user_config = (
+            manager.load() if manager.path.exists() else GeasUserConfig.default()
+        )
+        config = OntologyBuildConfig.from_yaml(
+            config_path,
+            defaults=user_config.ontology_defaults,
+        )
         research_policy = ResearchPolicy.from_yaml(args.research_policy)
         _, providers = load_provider_configs(args.providers)
         credential_names = {

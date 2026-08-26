@@ -38,12 +38,13 @@ uv run geas ontology-init \
 This writes `build.yaml` and `library.yaml` beneath the selected profile's
 OS-standard ontology directory. The ontology can subsequently be addressed as
 `network-engineering`. Passing an explicit directory instead keeps the
-repository-local workflow used by the maintained example. Every application default,
-including null and empty settings, model parameters, discovery limits, worker
-timing, retry behavior, extraction selection, output paths, and library
-selectors is written explicitly. The files can be edited before the first run;
-the CLI does not silently rely on omitted values. Existing files fail closed
-unless `--force` is supplied.
+repository-local workflow used by the maintained example. `ontology-init`
+writes every effective default, including null and empty settings, model
+parameters, discovery limits, worker timing, retry behavior, extraction
+selection, output paths, and library selectors. Hand-edited build files may
+omit globally eligible fields; they then inherit `ontology_defaults` from the
+selected Geas `config.yaml`. Explicit ontology values always win. Existing
+files fail closed unless `--force` is supplied.
 
 Validate the complete configuration without making network or model calls:
 
@@ -63,7 +64,7 @@ uv run geas --env-file .env ontology-build \
 ```
 
 Each invocation is a bounded worker. `max_run_seconds` defaults to 1,800 seconds
-and is explicitly configurable in each ontology; when useful work remains, a
+and is configurable globally or per ontology; when useful work remains, a
 clean worker checkpoint exits successfully and the same command resumes from
 immutable records. A source work claim prevents two workers sharing a runtime
 root from issuing the same extraction request.

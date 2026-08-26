@@ -12,6 +12,7 @@ import yaml
 from pydantic import Field, field_validator, model_validator
 
 from research_agent.models import StrictModel
+from research_agent.ontology_config import OntologyBuildDefaults
 from research_agent.paths import geas_config_home
 
 DEFAULT_ONTOLOGY_REPOSITORY = "https://github.com/liamhelmer-bel/ontologies.git"
@@ -106,6 +107,7 @@ class GeasUserConfig(StrictModel):
     ontology_freshness: OntologyFreshnessConfig = Field(
         default_factory=OntologyFreshnessConfig
     )
+    ontology_defaults: OntologyBuildDefaults = Field(default_factory=OntologyBuildDefaults)
     profiles: dict[str, GeasProfile]
 
     @field_validator("default_profile")
@@ -166,7 +168,18 @@ class UserConfigManager:
 
     def load_or_create(self, *, update_defaults: bool = False) -> GeasUserConfig:
         if self.path.exists():
-            config = self.load()
+            raw = yaml.safe_load(self.path.read_text())
+            config = GeasUserConfig.model_validate(raw)
+            explicit = config.model_dump(mode="json", exclude_none=False)
+            if _fill_missing(raw, explicit):
+                _atomic_write(
+                    self.path,
+                    yaml.safe_dump(
+                        raw,
+                        sort_keys=False,
+                        allow_unicode=True,
+                    ).encode(),
+                )
         else:
             self.root.mkdir(parents=True, exist_ok=True)
             config = GeasUserConfig.default()
@@ -326,6 +339,20 @@ def default_config_path(filename: str) -> Path:
 
 def _sha256(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
+
+
+def _fill_missing(target: object, defaults: object) -> bool:
+    """Materialize only absent config defaults without changing operator values."""
+    if not isinstance(target, dict) or not isinstance(defaults, dict):
+        return False
+    changed = False
+    for key, value in defaults.items():
+        if key not in target:
+            target[key] = value
+            changed = True
+        else:
+            changed = _fill_missing(target[key], value) or changed
+    return changed
 
 
 def _atomic_write(path: Path, value: bytes) -> None:

@@ -108,6 +108,11 @@ def test_identity_preserving_text_parse_reuses_content_addressed_source(tmp_path
 def test_pdf_uses_native_sandbox_and_records_runtime(monkeypatch) -> None:
     observed: dict[str, object] = {}
 
+    monkeypatch.setattr(
+        "research_agent.parsing.shutil.which",
+        lambda executable: f"/usr/bin/{executable}",
+    )
+
     def fake_run(
         self,
         executable,

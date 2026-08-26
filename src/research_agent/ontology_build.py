@@ -17,7 +17,7 @@ from typing import Literal
 from uuid import uuid4
 
 import yaml
-from pydantic import Field, ValidationError, field_validator, model_validator
+from pydantic import Field, ValidationError, field_validator
 
 from research_agent.approvals import ApprovalRegistry
 from research_agent.audit import DeterministicKnowledgeAuditor
@@ -56,12 +56,12 @@ from research_agent.model_policy import (
     ModelUsePolicy,
 )
 from research_agent.models import (
-    ModelParameters,
     StrictModel,
     ThreatObservation,
     canonical_json,
     utc_now,
 )
+from research_agent.ontology_config import OntologyBuildDefaults
 from research_agent.operator_policy import ResearchPolicy
 from research_agent.planning import (
     ConceptVocabulary,
@@ -86,26 +86,12 @@ class OntologySyncOverride(StrictModel):
     hydrate_artifacts_before_use: bool | None = None
 
 
-class OntologyBuildConfig(StrictModel):
+class OntologyBuildConfig(OntologyBuildDefaults):
     version: Literal[1]
     topic: str = Field(min_length=1)
     topic_concept_id: str = Field(pattern=r"^concept:[A-Za-z0-9][A-Za-z0-9._:-]*$")
     description: str = Field(default="", max_length=4000)
     scope_criteria: tuple[str, ...] = ()
-    ontology_facets: tuple[str, ...] = (
-        "identity",
-        "scope",
-        "architecture",
-        "interfaces",
-        "inputs",
-        "outputs",
-        "persistent state",
-        "security",
-        "evaluation",
-        "limitations",
-        "dissent",
-        "knowledge gaps",
-    )
     competency_questions: tuple[str, ...] = ()
     seed_bundles: tuple[Path, ...] = ()
     seed_bundle_globs: tuple[str, ...] = ()
@@ -114,29 +100,7 @@ class OntologyBuildConfig(StrictModel):
         pattern=r"^source-library-snapshot:sha256:[0-9a-f]{64}$",
     )
     repository_sync: OntologySyncOverride = Field(default_factory=OntologySyncOverride)
-    discovery_enabled: bool = True
     queries: tuple[str, ...] = ()
-    include_gap_queries: bool = True
-    refresh_after_hours: int | None = Field(default=168, ge=1, le=87_600)
-    max_queries: int | None = Field(default=None, ge=1, le=10_000)
-    result_limit: int = Field(default=30, ge=1, le=200)
-    approve_large_queries: bool = False
-    repository_limit_per_query: int = Field(default=20, ge=1, le=100)
-    provider: str = "deepseek_local"
-    max_output_tokens: int = Field(default=65_536, ge=1024, le=524_288)
-    model_parameters: ModelParameters = Field(default_factory=ModelParameters)
-    debug_reasoning: bool = True
-    timeout_seconds: float = Field(default=3600.0, ge=1.0, le=86_400.0)
-    max_run_seconds: float = Field(default=1800.0, gt=0.0)
-    minimum_model_window_seconds: float = Field(default=300.0, gt=0.0)
-    finalization_reserve_seconds: float = Field(default=120.0, ge=0.0)
-    work_claim_grace_seconds: float = Field(default=60.0, ge=0.0)
-    connection_attempts: int = Field(default=10, ge=1, le=20)
-    connection_retry_seconds: float = Field(default=2.0, ge=0.0, le=30.0)
-    anchors_per_batch: int = Field(default=200, ge=1, le=200)
-    max_batches_per_source: int | None = Field(default=None, ge=1, le=500)
-    max_sources: int | None = Field(default=None, ge=1, le=10_000)
-    model_parallelism: int = Field(default=1, ge=1, le=1)
     output_directory: Path
     tainted_source_index: Path | None = None
 
@@ -159,29 +123,33 @@ class OntologyBuildConfig(StrictModel):
                 raise ValueError("ontology seed globs must be workspace-relative")
         return value
 
-    @model_validator(mode="after")
-    def defaults_are_safe(self) -> OntologyBuildConfig:
-        if self.model_parallelism != 1:
-            raise ValueError("ontology extraction currently requires model_parallelism: 1")
-        if self.minimum_model_window_seconds >= self.max_run_seconds:
-            raise ValueError(
-                "minimum_model_window_seconds must leave time inside max_run_seconds"
-            )
-        if self.finalization_reserve_seconds >= self.max_run_seconds:
-            raise ValueError(
-                "finalization_reserve_seconds must be less than max_run_seconds"
-            )
-        return self
+    @classmethod
+    def from_yaml(
+        cls,
+        path: Path,
+        *,
+        defaults: OntologyBuildDefaults | None = None,
+    ) -> OntologyBuildConfig:
+        raw = yaml.safe_load(path.read_text())
+        if not isinstance(raw, dict):
+            raise ValueError("ontology build configuration must be a mapping")
+        effective_defaults = defaults or OntologyBuildDefaults()
+        return cls.model_validate(effective_defaults.merge_ontology(raw))
 
     @classmethod
-    def from_yaml(cls, path: Path) -> OntologyBuildConfig:
-        return cls.model_validate(yaml.safe_load(path.read_text()))
+    def from_defaults(
+        cls,
+        defaults: OntologyBuildDefaults,
+        **values: object,
+    ) -> OntologyBuildConfig:
+        return cls.model_validate(defaults.merge_ontology(values))
 
     def explicit_yaml(self) -> str:
         header = (
             "# Complete ontology worker configuration.\n"
-            "# Every default is explicit; edit values here rather than relying on\n"
-            "# application defaults. Connector and provider capabilities are still\n"
+            "# Every effective default is explicit. Fields omitted from a hand-edited\n"
+            "# file inherit ontology_defaults from the Geas user configuration.\n"
+            "# Connector and provider capabilities are still\n"
             "# validated when the worker starts.\n"
         )
         return header + yaml.safe_dump(

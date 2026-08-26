@@ -119,8 +119,9 @@ To add or change an LLM, update all of these boundaries together:
 2. `~/.config/geas/model-policy.yaml` authorizes the exact provider, endpoint, model,
    operation, and data classes.
 3. `~/.config/geas/budget-policy.yaml` limits calls and token/cost exposure.
-4. The ontology's `build.yaml` selects the provider, output limit, and model
-   parameters.
+4. `ontology_defaults` in `~/.config/geas/config.yaml` selects the inherited
+   provider, output limit, and model parameters; present fields in an
+   ontology's `build.yaml` override them.
 
 An entry in one file alone does not authorize a new route. Test a configured
 provider through the same policy and accounting gates used by real work:
@@ -184,8 +185,9 @@ uv run geas ontology-init \
 
 Edit the resulting `build.yaml` before live work. Define scope criteria,
 ontology facets, competency questions, discovery queries, source limits, model
-route, output capacity, timing, and paths. Validate without network or model
-calls:
+route, output capacity, timing, and paths. Generic worker fields may instead be
+set once under global `ontology_defaults`; ontology-local fields win when
+present. Validate without network or model calls:
 
 ```bash
 uv run geas ontology-build example-project \

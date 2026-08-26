@@ -6,6 +6,7 @@ from typing import Literal
 from research_agent.library import SourceLibraryManifest
 from research_agent.models import StrictModel
 from research_agent.ontology_build import OntologyBuildConfig
+from research_agent.ontology_config import OntologyBuildDefaults
 
 
 class OntologyInventoryItem(StrictModel):
@@ -30,7 +31,11 @@ class OntologyInventory(StrictModel):
     ontologies: tuple[OntologyInventoryItem, ...]
 
 
-def inventory_ontologies(root: Path) -> OntologyInventory:
+def inventory_ontologies(
+    root: Path,
+    *,
+    defaults: OntologyBuildDefaults | None = None,
+) -> OntologyInventory:
     """List direct child ontology configurations without following symlinks."""
     expanded = root.expanduser()
     if expanded.is_symlink():
@@ -60,7 +65,7 @@ def inventory_ontologies(root: Path) -> OntologyInventory:
             raise ValueError(f"ontology config cannot be a symbolic link: {directory.name}")
         if build_path.is_file():
             try:
-                build = OntologyBuildConfig.from_yaml(build_path)
+                build = OntologyBuildConfig.from_yaml(build_path, defaults=defaults)
             except (OSError, ValueError):
                 problems.append("invalid build.yaml")
         else:

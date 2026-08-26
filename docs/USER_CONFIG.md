@@ -70,6 +70,36 @@ ontology_freshness:
   check_before_use: true
   max_age_seconds: 3600
   hydrate_artifacts_before_use: false
+ontology_defaults:
+  provider: deepseek_local
+  max_output_tokens: 65536
+  model_parameters:
+    thinking: true
+    reasoning_effort: high
+    temperature: 0.0
+    top_p: null
+    top_k: null
+    min_p: null
+    seed: null
+    stop: []
+  discovery_enabled: true
+  include_gap_queries: true
+  refresh_after_hours: 168
+  max_queries: null
+  result_limit: 30
+  approve_large_queries: false
+  repository_limit_per_query: 20
+  timeout_seconds: 3600.0
+  max_run_seconds: 1800.0
+  minimum_model_window_seconds: 300.0
+  finalization_reserve_seconds: 120.0
+  work_claim_grace_seconds: 60.0
+  connection_attempts: 10
+  connection_retry_seconds: 2.0
+  anchors_per_batch: 200
+  max_batches_per_source: null
+  max_sources: null
+  model_parallelism: 1
 profiles:
   default:
     ontology_directory: ontologies
@@ -83,6 +113,26 @@ profiles:
       pull_before_update: false
       push_on_update: false
 ```
+
+The generated file also includes the complete generic `ontology_facets` list
+and `debug_reasoning`. The abbreviated example above highlights the operational
+settings operators most often change.
+
+`ontology_defaults` applies to every ontology loaded with this Geas user
+configuration. The eligible fields are generic facets, discovery and refresh
+limits, provider/model parameters, worker timing and reserves, connection
+retries, anchor batching, source/batch caps, and serial model parallelism.
+Topic identity, description, scope and competency questions, queries, seed
+bundles, source-library snapshot, repository freshness overrides, output path,
+and tainted-source index stay ontology-specific.
+
+An ontology `build.yaml` inherits an eligible field only when that field is
+absent. A present value wins even when it is `null`; `model_parameters` is
+merged field-by-field. The resulting complete configuration is strictly
+validated before any discovery or model call. `ontology-init` still writes all
+effective fields so a new ontology remains inspectable. Running `config-init`
+after an upgrade materializes newly introduced global defaults without
+overwriting values already present in `config.yaml`.
 
 Create an ontology in the selected profile and later address it by name:
 

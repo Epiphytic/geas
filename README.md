@@ -190,9 +190,12 @@ uv run geas ontology-build example \
 ```
 
 This writes the ontology configuration in the OS-standard per-user Geas
-directory. Edit its explicit `build.yaml` and `library.yaml`, then rerun the
-second command without `--check` to build or resume. Explicit workspace paths
-remain supported. See [user configuration and Git sync](docs/USER_CONFIG.md)
+directory. Generic ontology worker defaults come from `ontology_defaults` in
+the OS-standard Geas `config.yaml`; an ontology inherits absent eligible fields
+and overrides present ones. Edit its explicit `build.yaml` and `library.yaml`,
+then rerun the second command without `--check` to build or resume. Explicit
+workspace paths remain supported. See
+[user configuration and Git sync](docs/USER_CONFIG.md)
 and
 [the ontology quick start](docs/QUICKSTART_ONTOLOGY.md) for credentials,
 checkpointing, candidate review, promotion, and final projection.
