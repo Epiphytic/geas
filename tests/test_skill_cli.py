@@ -10,8 +10,9 @@ from pathlib import Path
 
 import pytest
 
+import research_agent.agent_skills as agent_skills
 import research_agent.cli as cli
-from research_agent.agent_skills import export_skill, refresh_skill
+from research_agent.agent_skills import export_skill, refresh_skill, validate_snapshot
 from research_agent.bundles import KnowledgeBundleImporter
 from research_agent.geas_update import GeasUpdateReceipt
 from research_agent.library import SourceLibraryManifest
@@ -322,7 +323,7 @@ def test_update_rejects_profile_locator_mismatch_before_ontology_pull(
     FakeOntologyRepository.pulls = 0
     monkeypatch.setattr(cli, "GeasUpdater", FakeGeasUpdater)
 
-    with pytest.raises(ValueError, match="does not match"):
+    with pytest.raises(SystemExit) as exited:
         _run_main(
             monkeypatch,
             [
@@ -335,7 +336,11 @@ def test_update_rejects_profile_locator_mismatch_before_ontology_pull(
             ],
         )
 
+    assert exited.value.code == 1
     assert FakeOntologyRepository.pulls == 0
+    failure = json.loads(capsys.readouterr().err.splitlines()[-1])
+    assert "does not match" in failure["detail"]
+    assert set(failure["completed_phases"]) == {"geas"}
 
 
 def test_later_artifact_failure_preserves_previous_snapshot(
@@ -359,7 +364,7 @@ def test_later_artifact_failure_preserves_previous_snapshot(
 
     monkeypatch.setattr(cli, "_load_portable_topic", fail_artifact)
 
-    with pytest.raises(ValueError, match="artifact verification failed"):
+    with pytest.raises(SystemExit) as exited:
         _run_main(
             monkeypatch,
             [
@@ -371,6 +376,7 @@ def test_later_artifact_failure_preserves_previous_snapshot(
                 "continued",
             ],
         )
+    assert exited.value.code == 1
 
     captured = capsys.readouterr()
     after = {
@@ -383,6 +389,99 @@ def test_later_artifact_failure_preserves_previous_snapshot(
     failure = json.loads(captured.err.splitlines()[-1])
     assert failure["error"] == "skill-update-failed"
     assert failure["completed_phases"]["geas"]["new_commit"] == NEW_COMMIT
+    assert failure["completed_phases"]["ontology"] == {
+        "old_commit": OLD_COMMIT,
+        "new_commit": NEW_COMMIT,
+    }
+
+
+def test_console_update_failure_exits_nonzero_with_final_structured_stderr(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    context = _install_export(tmp_path, monkeypatch)
+    receipt = json.loads(capsys.readouterr().out)
+    snapshot = Path(receipt["path"])
+    site = tmp_path / "subprocess-site"
+    site.mkdir()
+    (site / "sitecustomize.py").write_text(
+        """from pathlib import Path
+import research_agent.cli as cli
+from research_agent.geas_update import GeasUpdateReceipt
+
+class FakeGeasUpdater:
+    def update_and_reexec(self, argv, *, continuation):
+        return GeasUpdateReceipt(
+            installer="git-development",
+            directory=Path("/trusted/geas"),
+            executable=Path("/trusted/geas/bin/geas"),
+            old_commit="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            new_commit="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            old_version="0.1.0",
+            new_version="0.1.0",
+            reinstalled=True,
+            reexec_depth=1,
+        )
+
+class FakeOntologyRepository:
+    def __init__(self, *, checkout, config):
+        self.checkout = checkout
+        self.config = config
+
+    def pull(self):
+        return {
+            "checkout": str(self.checkout),
+            "repository": self.config.url,
+            "branch": self.config.branch,
+            "cloned": False,
+            "pulled": True,
+            "old_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "new_commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        }
+
+def fail_artifact(*args, **kwargs):
+    raise ValueError("artifact verification failed")
+
+cli.GeasUpdater = FakeGeasUpdater
+cli.OntologyRepositoryManager = FakeOntologyRepository
+cli._load_portable_topic = fail_artifact
+"""
+    )
+    environment = {
+        **os.environ,
+        "PYTHONPATH": os.pathsep.join((str(site), str(Path("src").resolve()))),
+    }
+
+    completed = subprocess.run(
+        (
+            "uv",
+            "run",
+            "geas",
+            "--geas-config",
+            str(context["config"]),
+            "skill-update",
+            str(snapshot),
+            "--geas-update-continuation",
+            "continued",
+        ),
+        cwd=Path.cwd(),
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 1
+    assert completed.stdout == ""
+    assert "Traceback" not in completed.stderr
+    failure = json.loads(completed.stderr.splitlines()[-1])
+    assert failure["error"] == "skill-update-failed"
+    assert failure["completed_phases"]["ontology"] == {
+        "old_commit": OLD_COMMIT,
+        "new_commit": NEW_COMMIT,
+    }
 
 
 def test_update_fast_forwards_and_reports_sorted_file_lifecycle(
@@ -569,6 +668,148 @@ def test_refresh_rolls_back_snapshot_and_prior_link_on_mid_link_failure(
     assert _snapshot_bytes(installed.path) == before
     assert not (home / ".agents" / "skills" / "test-ontology").exists()
     assert not (home / ".claude" / "skills" / "test-ontology").exists()
+
+
+def test_refresh_never_overwrites_an_adjacent_path_created_after_planning(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_root = tmp_path / "config"
+    home = tmp_path / "home"
+    installed = export_skill(
+        _skill_files(commit=OLD_COMMIT, snapshot="truth:old"),
+        config_root=config_root,
+        home=home,
+        repository=None,
+        link=False,
+        force=False,
+        which=lambda _name: None,
+    )
+    raced_path = installed.path.with_name(f".{installed.path.name}.geas-backup")
+    original_mkdtemp = agent_skills.tempfile.mkdtemp
+    injected = False
+
+    def inject_adjacent_path(*args: object, **kwargs: object) -> str:
+        nonlocal injected
+        result = original_mkdtemp(*args, **kwargs)
+        if not injected:
+            raced_path.mkdir()
+            injected = True
+        return result
+
+    monkeypatch.setattr(agent_skills.tempfile, "mkdtemp", inject_adjacent_path)
+
+    receipt = refresh_skill(
+        _skill_files(commit=NEW_COMMIT, snapshot="truth:new"),
+        installed.path,
+        config_root=config_root,
+        home=home,
+        force=False,
+        which=lambda _name: None,
+    )
+
+    assert receipt.manifest.ontology.commit == NEW_COMMIT
+    assert raced_path.is_dir()
+    assert tuple(raced_path.iterdir()) == ()
+
+
+def test_refresh_never_uses_an_adjacent_raced_link_backup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_root = tmp_path / "config"
+    home = tmp_path / "home"
+    installed = export_skill(
+        _skill_files(commit=OLD_COMMIT, snapshot="truth:old"),
+        config_root=config_root,
+        home=home,
+        repository=None,
+        link=False,
+        force=False,
+        which=lambda _name: None,
+    )
+    link = home / ".agents" / "skills" / "test-ontology"
+    link.parent.mkdir(parents=True)
+    link.write_bytes(b"operator-owned\n")
+    raced_path = link.with_name(f".{link.name}.geas-backup")
+    original_mkdtemp = agent_skills.tempfile.mkdtemp
+
+    def inject_adjacent_path(*args: object, **kwargs: object) -> str:
+        result = original_mkdtemp(*args, **kwargs)
+        raced_path.mkdir()
+        return result
+
+    monkeypatch.setattr(agent_skills.tempfile, "mkdtemp", inject_adjacent_path)
+
+    receipt = refresh_skill(
+        _skill_files(commit=NEW_COMMIT, snapshot="truth:new"),
+        installed.path,
+        config_root=config_root,
+        home=home,
+        force=True,
+        which=lambda name: "/bin/codex" if name == "codex" else None,
+    )
+
+    assert receipt.manifest.ontology.commit == NEW_COMMIT
+    assert link.is_symlink() and link.resolve() == installed.path
+    assert raced_path.is_dir()
+    assert tuple(raced_path.iterdir()) == ()
+
+
+def test_refresh_cleanup_failure_keeps_committed_snapshot_and_links_successful(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_root = tmp_path / "config"
+    home = tmp_path / "home"
+
+    def available(name: str) -> str | None:
+        return "/bin/agent" if name in {"codex", "claude"} else None
+
+    installed = export_skill(
+        _skill_files(commit=OLD_COMMIT, snapshot="truth:old"),
+        config_root=config_root,
+        home=home,
+        repository=None,
+        link=True,
+        force=False,
+        which=available,
+    )
+    original_rmtree = agent_skills.shutil.rmtree
+
+    def fail_transaction_cleanup(path: Path, *args: object, **kwargs: object) -> None:
+        name = Path(path).name
+        if "geas-backup" in name or "geas-transaction-" in name:
+            raise RuntimeError("injected committed cleanup failure")
+        original_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(agent_skills.shutil, "rmtree", fail_transaction_cleanup)
+
+    receipt = refresh_skill(
+        _skill_files(commit=NEW_COMMIT, snapshot="truth:new"),
+        installed.path,
+        config_root=config_root,
+        home=home,
+        force=False,
+        which=available,
+    )
+
+    assert receipt.manifest.ontology.commit == NEW_COMMIT
+    assert receipt.cleanup_warning == "skill transaction cleanup retained"
+    assert validate_snapshot(installed.path).ontology.commit == NEW_COMMIT
+    for link in (
+        home / ".agents" / "skills" / "test-ontology",
+        home / ".claude" / "skills" / "test-ontology",
+    ):
+        assert link.is_symlink()
+        assert link.resolve() == installed.path
+    payload = cli._skill_export_payload(
+        receipt,
+        profile_name="default",
+        ontology_commit=NEW_COMMIT,
+        artifact={"verified": True},
+    )
+    assert payload["cleanup_warnings"] == ("skill transaction cleanup retained",)
 
 
 def test_skill_update_uses_real_exact_fetch_and_verified_artifact(

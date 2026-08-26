@@ -64,7 +64,6 @@ class _LinkPlan:
     expected_target: Path
     signature: tuple[object, ...]
     unchanged: bool
-    backup: Path
 
 
 @dataclass(frozen=True)
@@ -75,6 +74,7 @@ class SkillExportReceipt:
     manifest: SkillManifest
     unchanged: bool
     links: tuple[LinkReceipt, ...] = ()
+    cleanup_warning: str | None = None
 
 
 @dataclass(frozen=True)
@@ -461,6 +461,7 @@ def export_skill(
         manifest=receipt.manifest,
         unchanged=receipt.unchanged and all(item.unchanged for item in links),
         links=links,
+        cleanup_warning=receipt.cleanup_warning,
     )
 
 
@@ -604,6 +605,7 @@ def refresh_skill(
         manifest=receipt.manifest,
         unchanged=receipt.unchanged and all(item.unchanged for item in links),
         links=links,
+        cleanup_warning=receipt.cleanup_warning,
     )
 
 
@@ -1038,16 +1040,12 @@ def _plan_links(
         exists = destination.exists() or destination.is_symlink()
         if exists and not unchanged and not force:
             raise ValueError(f"skill link conflict at {destination}")
-        backup = destination.with_name(f".{destination.name}.geas-backup")
-        if not unchanged and (backup.exists() or backup.is_symlink()):
-            raise ValueError(f"skill link backup conflict at {backup}")
         plans.append(
             _LinkPlan(
                 destination=destination,
                 expected_target=expected,
                 signature=_path_signature(destination),
                 unchanged=unchanged,
-                backup=backup,
             )
         )
     return tuple(plans)
@@ -1062,74 +1060,94 @@ def _replace_snapshot_and_links(
     plans: tuple[_LinkPlan, ...],
     root: Path,
 ) -> tuple[SkillExportReceipt, tuple[LinkReceipt, ...]]:
-    """Commit one snapshot/link plan or restore every exact prior target."""
+    """Commit one visible snapshot/link state or restore every prior target."""
     try:
         snapshot_unchanged = validate_snapshot(snapshot) == manifest
     except ValueError:
         snapshot_unchanged = False
-    snapshot_backup = snapshot.with_name(f".{snapshot.name}.geas-backup")
-    if not snapshot_unchanged and (snapshot_backup.exists() or snapshot_backup.is_symlink()):
-        raise ValueError("skill snapshot backup target already exists")
+    if snapshot_unchanged and all(plan.unchanged for plan in plans):
+        return (
+            SkillExportReceipt(path=snapshot, manifest=manifest, unchanged=True),
+            tuple(
+                LinkReceipt(path=plan.destination, target=snapshot, unchanged=True)
+                for plan in plans
+            ),
+        )
 
-    candidate: Path | None = None
-    if not snapshot_unchanged:
-        candidate = Path(tempfile.mkdtemp(prefix=f".{snapshot.name}.", dir=snapshot.parent))
-        _write_snapshot_candidate(files, candidate)
-        if validate_snapshot(candidate) != manifest:
-            shutil.rmtree(candidate)
-            raise ValueError("skill snapshot candidate does not match its validated files")
-
-    changed_links: list[_LinkPlan] = []
+    _reject_symlink_ancestry(snapshot.parent)
+    transaction = Path(
+        tempfile.mkdtemp(
+            prefix=f".{snapshot.name}.geas-transaction-",
+            dir=snapshot.parent,
+        )
+    )
+    snapshot_backup = transaction / "snapshot"
+    candidate = transaction / "candidate"
+    changed_links: list[tuple[_LinkPlan, Path]] = []
     receipts: list[LinkReceipt] = []
     snapshot_moved = False
+    committed = False
     try:
+        if not snapshot_unchanged:
+            candidate.mkdir()
+            _write_snapshot_candidate(files, candidate)
+            if validate_snapshot(candidate) != manifest:
+                raise ValueError("skill snapshot candidate does not match its validated files")
         if _snapshot_signature(snapshot) != snapshot_signature:
             raise ValueError("skill snapshot changed during update")
-        if candidate is not None:
+        if not snapshot_unchanged:
             os.replace(snapshot, snapshot_backup)
             snapshot_moved = True
             os.replace(candidate, snapshot)
-            candidate = None
-        for plan in plans:
+        for index, plan in enumerate(plans):
             _confined_link_parent(plan.destination.parent, root)
             if _path_signature(plan.destination) != plan.signature:
                 raise ValueError(f"skill link changed during update at {plan.destination}")
             if plan.unchanged:
                 receipts.append(LinkReceipt(path=plan.destination, target=snapshot, unchanged=True))
                 continue
+            backup = transaction / f"link-{index}"
             if plan.destination.exists() or plan.destination.is_symlink():
-                os.replace(plan.destination, plan.backup)
-            changed_links.append(plan)
+                os.replace(plan.destination, backup)
+            changed_links.append((plan, backup))
             plan.destination.symlink_to(plan.expected_target, target_is_directory=True)
             receipts.append(LinkReceipt(path=plan.destination, target=snapshot, unchanged=False))
+        # Commit point: every desired visible snapshot and link now exists.
+        committed = True
     except Exception:
-        for plan in reversed(changed_links):
+        for plan, backup in reversed(changed_links):
             if plan.destination.exists() or plan.destination.is_symlink():
                 _remove_exact_target(plan.destination)
-            if plan.backup.exists() or plan.backup.is_symlink():
-                os.replace(plan.backup, plan.destination)
+            if backup.exists() or backup.is_symlink():
+                os.replace(backup, plan.destination)
         if snapshot_moved:
             if snapshot.exists() or snapshot.is_symlink():
                 _remove_exact_target(snapshot)
             os.replace(snapshot_backup, snapshot)
+        _discard_transaction(transaction)
         raise
-    finally:
-        if candidate is not None and candidate.exists():
-            shutil.rmtree(candidate)
 
-    for plan in changed_links:
-        if plan.backup.exists() or plan.backup.is_symlink():
-            _remove_exact_target(plan.backup)
-    if snapshot_moved:
-        _remove_exact_target(snapshot_backup)
+    assert committed
+    cleanup_warning = None
+    if not _discard_transaction(transaction):
+        cleanup_warning = "skill transaction cleanup retained"
     return (
         SkillExportReceipt(
             path=snapshot,
             manifest=manifest,
             unchanged=snapshot_unchanged,
+            cleanup_warning=cleanup_warning,
         ),
         tuple(sorted(receipts, key=lambda item: os.fspath(item.path))),
     )
+
+
+def _discard_transaction(path: Path) -> bool:
+    try:
+        shutil.rmtree(path)
+    except Exception:
+        return False
+    return True
 
 
 def _path_signature(path: Path) -> tuple[object, ...]:

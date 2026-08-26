@@ -492,11 +492,20 @@ def _skill_export_payload(
             "old_commit": old_ontology_commit,
             "new_commit": ontology_commit,
         }
+    if receipt.cleanup_warning is not None:
+        payload["cleanup_warnings"] = (receipt.cleanup_warning,)
     return payload
 
 
 class SkillUpdatePhaseError(ValueError):
     """A later lifecycle phase failed after a trusted Geas update completed."""
+
+    def __init__(self, message: str, *, old_commit: str, new_commit: str) -> None:
+        super().__init__(message)
+        self.ontology_update = {
+            "old_commit": old_commit,
+            "new_commit": new_commit,
+        }
 
 
 def _complete_skill_update(
@@ -521,51 +530,58 @@ def _complete_skill_update(
     if not isinstance(ontology_commit, str):
         raise ValueError("the synchronized ontology checkout has no committed HEAD")
     old_ontology_commit = manifest.ontology.commit
-    ontology_directory, topic_concept_id = _selected_ontology(
-        ontology_root,
-        manifest.ontology.name,
-        user_config=user_config,
-    )
-    print("Verifying the updated portable knowledge projection.", file=sys.stderr)
-    topic, artifact = _load_portable_topic(
-        ontology_directory,
-        profile=profile,
-        topic_concept_id=topic_concept_id,
-    )
-    files = render_ontology_skill(
-        topic,
-        skill_name=manifest.skill.name,
-        ontology_name=manifest.ontology.name,
-        repository_url=profile.ontology_git.url,
-        branch=profile.ontology_git.branch,
-        ontology_commit=ontology_commit,
-        geas_version=geas_receipt.new_version,
-        geas_commit=geas_receipt.new_commit,
-    )
-    candidate_manifest = SkillManifest.model_validate_json(files[Path("geas-skill.json")])
-    changed_paths, unchanged_paths = _skill_file_lifecycle(
-        manifest,
-        candidate_manifest,
-    )
-    print("Atomically replacing the verified skill snapshot.", file=sys.stderr)
-    receipt = refresh_skill(
-        files,
-        snapshot,
-        config_root=manager.root,
-        home=Path.home(),
-        force=args.force,
-        which=shutil.which,
-    )
-    return _skill_export_payload(
-        receipt,
-        profile_name=profile_name,
-        ontology_commit=ontology_commit,
-        old_ontology_commit=old_ontology_commit,
-        artifact=artifact,
-        geas_update=geas_receipt,
-        changed_paths=changed_paths,
-        unchanged_paths=unchanged_paths,
-    )
+    try:
+        ontology_directory, topic_concept_id = _selected_ontology(
+            ontology_root,
+            manifest.ontology.name,
+            user_config=user_config,
+        )
+        print("Verifying the updated portable knowledge projection.", file=sys.stderr)
+        topic, artifact = _load_portable_topic(
+            ontology_directory,
+            profile=profile,
+            topic_concept_id=topic_concept_id,
+        )
+        files = render_ontology_skill(
+            topic,
+            skill_name=manifest.skill.name,
+            ontology_name=manifest.ontology.name,
+            repository_url=profile.ontology_git.url,
+            branch=profile.ontology_git.branch,
+            ontology_commit=ontology_commit,
+            geas_version=geas_receipt.new_version,
+            geas_commit=geas_receipt.new_commit,
+        )
+        candidate_manifest = SkillManifest.model_validate_json(files[Path("geas-skill.json")])
+        changed_paths, unchanged_paths = _skill_file_lifecycle(
+            manifest,
+            candidate_manifest,
+        )
+        print("Atomically replacing the verified skill snapshot.", file=sys.stderr)
+        receipt = refresh_skill(
+            files,
+            snapshot,
+            config_root=manager.root,
+            home=Path.home(),
+            force=args.force,
+            which=shutil.which,
+        )
+        return _skill_export_payload(
+            receipt,
+            profile_name=profile_name,
+            ontology_commit=ontology_commit,
+            old_ontology_commit=old_ontology_commit,
+            artifact=artifact,
+            geas_update=geas_receipt,
+            changed_paths=changed_paths,
+            unchanged_paths=unchanged_paths,
+        )
+    except Exception as error:
+        raise SkillUpdatePhaseError(
+            str(error),
+            old_commit=old_ontology_commit,
+            new_commit=ontology_commit,
+        ) from error
 
 
 def _skill_file_lifecycle(
@@ -1474,16 +1490,19 @@ def main() -> None:
                 geas_receipt=geas_receipt,
             )
         except Exception as error:
+            completed_phases: dict[str, object] = {"geas": geas_receipt}
+            if isinstance(error, SkillUpdatePhaseError):
+                completed_phases["ontology"] = error.ontology_update
             detail = {
                 "error": "skill-update-failed",
                 "detail": str(error),
-                "completed_phases": {"geas": geas_receipt},
+                "completed_phases": completed_phases,
             }
             print(
                 json.dumps(to_jsonable_python(detail), sort_keys=True),
                 file=sys.stderr,
             )
-            raise SkillUpdatePhaseError(str(error)) from error
+            raise SystemExit(1) from None
         _json(payload)
         return
 
