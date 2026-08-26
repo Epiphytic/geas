@@ -476,6 +476,7 @@ def _skill_export_payload(
     payload: dict[str, object] = {
         "profile": profile_name,
         "ontology": receipt.manifest.ontology.name,
+        "ontology_commit": ontology_commit,
         "path": str(receipt.path),
         "unchanged": receipt.unchanged,
         "snapshot_sha256": receipt.manifest.snapshot_sha256,

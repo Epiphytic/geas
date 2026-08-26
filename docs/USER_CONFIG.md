@@ -22,6 +22,14 @@ The default locations are:
 `GEAS_CONFIG_HOME` overrides the root on every OS. `--geas-config` selects a
 specific `config.yaml`, useful for a completely separate deployment.
 
+`config-init` also installs the packaged generic `geas` Agent Skill at
+`<config-root>/skills/geas`. When Codex, Claude, or OpenCode is installed,
+Geas can create an exact managed link in the agent's standard skills directory;
+Codex and OpenCode share `.agents/skills` and are deduplicated. The snapshot is
+safe to read without a working `geas` command, but it does not install Geas,
+load secrets, or authorize updates. See [Portable Agent Skills](AGENT_SKILLS.md)
+for paths, ontology exports, deterministic receipts, and unlink/remove.
+
 ## Managed provider and policy configuration
 
 `config-init` installs every live provider, policy, workload, truth, deposit,

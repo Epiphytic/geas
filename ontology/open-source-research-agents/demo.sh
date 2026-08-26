@@ -10,6 +10,7 @@ if [[ -e "$demo_root/records" || -e "$demo_root/blobs" || -e "$demo_root/query.s
   exit 2
 fi
 mkdir -p "$demo_root"
+demo_root=$(cd "$demo_root" && pwd -P)
 
 cd "$workspace_root"
 
@@ -66,6 +67,61 @@ uv run geas topic-export \
   --database "$demo_root/query.sqlite" \
   > "$demo_root/topic-export.json"
 
+demo_commit=$(git rev-parse HEAD)
+uv run python - "$demo_root" "$demo_commit" <<'PY'
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+from research_agent.agent_skills import install_snapshot, validate_snapshot
+from research_agent.projection import KnowledgeQueryEngine
+from research_agent.render import render_ontology_skill
+
+root = Path(sys.argv[1])
+topic = KnowledgeQueryEngine(root / "query.sqlite").topic(
+    "concept:open-source-research-agents"
+)
+files = render_ontology_skill(
+    topic,
+    skill_name="open-source-research-agents",
+    ontology_name="open-source-research-agents",
+    repository_url="https://github.com/Epiphytic/geas.git",
+    branch="main",
+    ontology_commit=sys.argv[2],
+    geas_version="0.1.0",
+    geas_commit=None,
+)
+target = root / "agent-skill" / "open-source-research-agents"
+first = install_snapshot(files, target)
+second = install_snapshot(files, target)
+manifest = validate_snapshot(target)
+
+def receipt(value):
+    return {
+        "path": str(value.path),
+        "snapshot_sha256": value.manifest.snapshot_sha256,
+        "unchanged": value.unchanged,
+    }
+
+(root / "skill-export-first.json").write_text(
+    json.dumps(receipt(first), indent=2, sort_keys=True) + "\n"
+)
+(root / "skill-export-second.json").write_text(
+    json.dumps(receipt(second), indent=2, sort_keys=True) + "\n"
+)
+hashes = {
+    path.relative_to(target).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+    for path in sorted(target.rglob("*"))
+    if path.is_file()
+}
+(root / "skill-export-files.json").write_text(
+    json.dumps(hashes, indent=2, sort_keys=True) + "\n"
+)
+if manifest.snapshot_sha256 != first.manifest.snapshot_sha256:
+    raise SystemExit("demo skill manifest digest mismatch")
+PY
+
 uv run geas projection-check \
   "$demo_root/snapshot.json" \
   "$demo_root/query.sqlite" \
@@ -82,6 +138,7 @@ jq -n \
   --slurpfile storm "$demo_root/query-storm.json" \
   --slurpfile audit "$demo_root/audit.json" \
   --slurpfile drift "$demo_root/drift-check.json" \
+  --slurpfile skill "$demo_root/skill-export-second.json" \
   '{
     demo_root: $root,
     topic: $imported[0].topic,
@@ -97,5 +154,7 @@ jq -n \
     storm_query_hits: ($storm[0].hits | length),
     audit_clean: $audit[0].report.clean,
     drift_clean: $drift[0].clean,
-    agent_readable_topic: ($root + "/topic.md")
+    agent_readable_topic: ($root + "/topic.md"),
+    portable_skill: $skill[0].path,
+    portable_skill_sha256: $skill[0].snapshot_sha256
   }'

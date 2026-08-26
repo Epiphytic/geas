@@ -46,6 +46,11 @@ policy templates into the OS-standard user configuration root, and subsequent
 CLI invocations resolve those live files from any working directory. Global
 path options remain available for deliberate one-command overrides.
 
+`config-init` also installs the optional generic Geas Agent Skill. It is a
+local operational reference, not a source of automatic configuration or
+updates. See [Portable Agent Skills](AGENT_SKILLS.md) for its paths and
+conflict behavior.
+
 ## 2. Initialize user configuration
 
 Create the OS-standard configuration, shared ontology, and modular-secret
@@ -68,6 +73,22 @@ Inspect the generated walkthrough with its resolved paths:
 ```bash
 uv run geas setup-guide --format markdown
 ```
+
+## 2a. Give an agent a verified ontology snapshot
+
+After an active profile has a trusted ontology checkout and a published,
+verified knowledge-projection artifact, export its accepted context:
+
+```bash
+geas skill-export my-ontology --link
+```
+
+The snapshot holds references and evidence excerpts, not every acquired
+document, and remains readable when `geas` is absent. Use `--repo PATH` for
+reviewable repository additions, `skill-update` for trusted refresh,
+`skill-unlink` to retain a snapshot but detach agents, and `skill-remove` to
+delete the exact managed snapshot. See [Portable Agent Skills](AGENT_SKILLS.md)
+for the complete workflow.
 
 ## 3. Configure APIs and LLMs
 

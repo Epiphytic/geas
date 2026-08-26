@@ -32,6 +32,11 @@ the [executable ontology quick start](docs/QUICKSTART_ONTOLOGY.md) to build a
 topic immediately. The [documentation index](docs/README.md) maps operational,
 security, model, provenance, and architecture guides.
 
+Geas can also install a generic operational Agent Skill and export verified,
+portable ontology snapshots for Codex, Claude, or OpenCode. See [Portable Agent
+Skills](docs/AGENT_SKILLS.md) for optional installation, deterministic receipts,
+agent-link paths, and unlink/removal.
+
 ### What Geas is not
 
 Geas is not a chat UI, a report generator, or an embedding database. Reports
