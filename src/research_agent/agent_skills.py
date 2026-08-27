@@ -399,6 +399,8 @@ def install_snapshot(
                 raise ValueError("skill snapshot target is unmanaged or modified") from None
         if existing is not None and existing == manifest:
             return SkillExportReceipt(path=destination, manifest=manifest, unchanged=True)
+        if existing is not None and _preserves_known_geas_commit(existing, manifest):
+            return SkillExportReceipt(path=destination, manifest=existing, unchanged=True)
 
     destination.parent.mkdir(parents=True, exist_ok=True)
     _reject_symlink_ancestry(destination.parent)
@@ -900,6 +902,18 @@ def _manifest_from_files(files: Mapping[Path, bytes]) -> SkillManifest:
     if raw != canonical_manifest_bytes(manifest):
         raise ValueError("skill snapshot manifest must use canonical JSON encoding")
     return manifest
+
+
+def _preserves_known_geas_commit(existing: SkillManifest, candidate: SkillManifest) -> bool:
+    """Keep a verified installed Geas commit when an otherwise equal export lacks one."""
+    if existing.geas.commit is None or candidate.geas.commit is not None:
+        return False
+    return (
+        existing.model_copy(
+            update={"geas": existing.geas.model_copy(update={"commit": None})}
+        )
+        == candidate
+    )
 
 
 def _read_existing_manifest(path: Path, *, force: bool) -> SkillManifest | None:

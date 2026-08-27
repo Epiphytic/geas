@@ -58,10 +58,21 @@ For a project-local snapshot:
 geas skill-export research-agents --repo /path/to/project --link
 ```
 
-That writes `/path/to/project/.agents/skills/research-agents`. The additions are
-ordinary uncommitted Git changes for review; commit them only if the project
-wants to share the snapshot, or add the path to its ignore rules. Geas never
-commits it automatically.
+Geas prefers `/path/to/project/.agents/skills/research-agents` because it is
+the standard project agent-skill location. The additions are ordinary
+uncommitted Git changes for review; commit them only if the project wants to
+share the snapshot. Geas never commits them automatically, and projects should
+not normally ignore this preferred snapshot path.
+
+Before choosing the location, Geas runs `git check-ignore` for the exact
+candidate path. If the preferred `.agents/skills/research-agents` path is
+ignored, it instead uses the trackable canonical fallback
+`/path/to/project/.geas/skills/research-agents`. With `--link`, the normal
+`.agents/skills/research-agents` (Codex/OpenCode) and
+`.claude/skills/research-agents` locations become relative managed links to
+that fallback. If both candidate snapshot paths are ignored, export fails;
+change the repository ignore rules rather than treating an ignored snapshot as
+the normal workflow.
 
 Refresh an existing managed snapshot with:
 

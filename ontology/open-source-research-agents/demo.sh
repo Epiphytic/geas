@@ -94,31 +94,49 @@ files = render_ontology_skill(
 )
 target = root / "agent-skill" / "open-source-research-agents"
 first = install_snapshot(files, target)
-second = install_snapshot(files, target)
-manifest = validate_snapshot(target)
-
-def receipt(value):
-    return {
-        "path": str(value.path),
-        "snapshot_sha256": value.manifest.snapshot_sha256,
-        "unchanged": value.unchanged,
-    }
-
-(root / "skill-export-first.json").write_text(
-    json.dumps(receipt(first), indent=2, sort_keys=True) + "\n"
-)
-(root / "skill-export-second.json").write_text(
-    json.dumps(receipt(second), indent=2, sort_keys=True) + "\n"
-)
-hashes = {
+first_hashes = {
     path.relative_to(target).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
     for path in sorted(target.rglob("*"))
     if path.is_file()
 }
-(root / "skill-export-files.json").write_text(
-    json.dumps(hashes, indent=2, sort_keys=True) + "\n"
-)
-if manifest.snapshot_sha256 != first.manifest.snapshot_sha256:
+second = install_snapshot(files, target)
+manifest = validate_snapshot(target)
+second_hashes = {
+    path.relative_to(target).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+    for path in sorted(target.rglob("*"))
+    if path.is_file()
+}
+
+def receipt(value):
+    return {
+        "ontology_commit": value.manifest.ontology.commit,
+        "path": str(value.path),
+        "projection_snapshot_id": value.manifest.projection.snapshot_id,
+        "snapshot_sha256": value.manifest.snapshot_sha256,
+        "unchanged": value.unchanged,
+    }
+
+def write_json(name, value):
+    path = root / name
+    path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+    return json.loads(path.read_text())
+
+first_receipt = write_json("skill-export-first.json", receipt(first))
+second_receipt = write_json("skill-export-second.json", receipt(second))
+first_inventory = write_json("skill-export-first-files.json", first_hashes)
+second_inventory = write_json("skill-export-second-files.json", second_hashes)
+write_json("skill-export-files.json", second_hashes)
+
+if first_receipt["unchanged"] is not False or second_receipt["unchanged"] is not True:
+    raise SystemExit("demo skill exports must be changed then unchanged")
+for field in ("snapshot_sha256", "projection_snapshot_id", "ontology_commit"):
+    if first_receipt[field] != second_receipt[field]:
+        raise SystemExit(f"demo skill receipts disagree on {field}")
+if list(first_inventory) != sorted(first_inventory) or list(second_inventory) != sorted(second_inventory):
+    raise SystemExit("demo skill file inventories must be sorted")
+if first_inventory != second_inventory:
+    raise SystemExit("demo skill file inventories differ")
+if manifest.snapshot_sha256 != first_receipt["snapshot_sha256"]:
     raise SystemExit("demo skill manifest digest mismatch")
 PY
 

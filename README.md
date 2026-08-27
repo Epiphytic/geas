@@ -167,6 +167,13 @@ reasoning tier than the local extraction model. They receive only selected
 source anchors and return proposal JSON; discovery and ontology writes remain
 outside the coding agent.
 
+## Installation
+
+Install Geas from a checkout with Python 3.12 and `uv`, or make its CLI
+available outside the checkout with `uv tool install .`. The complete
+installation and configuration workflow is in
+[Build and use Geas end to end](docs/GETTING_STARTED.md#1-build-the-project).
+
 ## Quick start
 
 Python 3.12 and `uv` are recommended:

@@ -32,6 +32,15 @@ GEAS_OLD_COMMIT = "a" * 40
 GEAS_NEW_COMMIT = "b" * 40
 INSTANT = datetime(2026, 8, 26, 12, tzinfo=UTC)
 FULL_DOCUMENT_SENTINEL = "FULL-ACQUIRED-DOCUMENT-MUST-NOT-BE-EXPORTED"
+SECRET_SENTINEL = "GEAS_TEST_SECRET=must-not-leave-the-acquired-document"
+LOCAL_PATH_SENTINEL = "/private/geas-test/local-only/source.txt"
+HOST_USER_TIMESTAMP_SENTINEL = "2099-12-31T23:59:59Z host=offline-fixture user=operator"
+PROHIBITED_PORTABLE_SENTINELS = (
+    FULL_DOCUMENT_SENTINEL,
+    SECRET_SENTINEL,
+    LOCAL_PATH_SENTINEL,
+    HOST_USER_TIMESTAMP_SENTINEL,
+)
 
 
 class MemoryArtifactStore:
@@ -125,12 +134,11 @@ def _projection(tmp_path: Path) -> Path:
         Path("ontology/open-source-research-agents/bundle.yaml"),
         imported_by="operator:lifecycle-test",
     )
-    # This models acquired material that must stay outside portable snapshots.
-    acquired = root / "blobs" / "sha256" / hashlib.sha256(
-        FULL_DOCUMENT_SENTINEL.encode("utf-8")
-    ).hexdigest()
+    # This models full acquired material that must stay outside portable snapshots.
+    acquired_text = "\n".join(PROHIBITED_PORTABLE_SENTINELS)
+    acquired = root / "blobs" / "sha256" / hashlib.sha256(acquired_text.encode("utf-8")).hexdigest()
     acquired.parent.mkdir(parents=True, exist_ok=True)
-    acquired.write_text(FULL_DOCUMENT_SENTINEL)
+    acquired.write_text(acquired_text)
     truth = TruthManager(
         workspace_root=Path("."),
         store_root=root,
@@ -242,7 +250,9 @@ def test_skill_lifecycle_is_portable_repeatable_and_reviewable(
     monkeypatch.setattr(
         cli.shutil,
         "which",
-        lambda executable: "/controlled/codex" if executable == "codex" else None,
+        lambda executable: "/controlled/agent"
+        if executable in {"codex", "claude"}
+        else None,
     )
 
     export_args = (
@@ -273,7 +283,13 @@ def test_skill_lifecycle_is_portable_repeatable_and_reviewable(
     assert TRUSTED_URL in text
     assert old_commit in text
     assert "Original source:" in text
-    assert FULL_DOCUMENT_SENTINEL not in text
+    assert "Claim ID:" in text
+    assert "Source ID:" in text
+    assert "Selector type:" in text
+    assert "Controversies" in text
+    assert "Knowledge gaps" in text
+    assert "Threat ID:" in text
+    assert all(sentinel not in text for sentinel in PROHIBITED_PORTABLE_SENTINELS)
     readable = subprocess.run(
         (
             sys.executable,
@@ -309,6 +325,7 @@ def test_skill_lifecycle_is_portable_repeatable_and_reviewable(
     updated = json.loads(capsys.readouterr().out)
     assert updated["ontology_update"] == {"old_commit": old_commit, "new_commit": new_commit}
     assert validate_snapshot(snapshot).ontology.commit == new_commit
+    updated_files = _snapshot_bytes(snapshot)
 
     _run(monkeypatch, "--geas-config", str(config), "skill-unlink", str(snapshot))
     unlinked = json.loads(capsys.readouterr().out)
@@ -316,9 +333,11 @@ def test_skill_lifecycle_is_portable_repeatable_and_reviewable(
     assert snapshot.is_dir()
     assert not (home / ".agents" / "skills" / "research-agents").exists()
 
-    _run(monkeypatch, *export_args, "--force")
+    _run(monkeypatch, *export_args)
     relinked = json.loads(capsys.readouterr().out)
     assert Path(relinked["path"]) == snapshot
+    assert relinked["unchanged"] is False
+    assert _snapshot_bytes(snapshot) == updated_files
     assert (home / ".agents" / "skills" / "research-agents").resolve() == snapshot
 
     _run(monkeypatch, "--geas-config", str(config), "skill-remove", str(snapshot))
@@ -339,6 +358,10 @@ def test_skill_lifecycle_is_portable_repeatable_and_reviewable(
     repository_first = json.loads(capsys.readouterr().out)
     repository_snapshot = Path(repository_first["path"])
     repository_files = _snapshot_bytes(repository_snapshot)
+    repository_link = repository / ".claude" / "skills" / "research-agents"
+    assert repository_link.is_symlink()
+    assert not repository_link.readlink().is_absolute()
+    assert repository_link.resolve() == repository_snapshot
     _run(monkeypatch, *repository_args)
     repository_second = json.loads(capsys.readouterr().out)
     assert repository_second["unchanged"] is True
@@ -346,7 +369,57 @@ def test_skill_lifecycle_is_portable_repeatable_and_reviewable(
     assert _portable_digest(_snapshot_bytes(repository_snapshot)) == _portable_digest(
         repository_files
     )
-    assert "?? .agents/" in _git(repository, "status", "--short")
+    assert set(_git(repository, "status", "--short").splitlines()) == {
+        "?? .agents/",
+        "?? .claude/",
+    }
+
+    # Repository-managed snapshots receive the same trusted fast-forward lifecycle.
+    (upstream / "trusted-repository-update.yaml").write_text("revision: three\n")
+    _git(upstream, "add", "trusted-repository-update.yaml")
+    _git(upstream, "commit", "-m", "trusted repository update")
+    _git(upstream, "push", "origin", "main")
+    repository_commit = _git(upstream, "rev-parse", "HEAD")
+    _run(
+        monkeypatch,
+        "--geas-config",
+        str(config),
+        "skill-update",
+        str(repository_snapshot),
+        "--geas-update-continuation",
+        "lifecycle",
+    )
+    repository_updated = json.loads(capsys.readouterr().out)
+    assert repository_updated["ontology_update"] == {
+        "old_commit": new_commit,
+        "new_commit": repository_commit,
+    }
+    assert validate_snapshot(repository_snapshot).ontology.commit == repository_commit
+    assert repository_link.is_symlink()
+    assert not repository_link.readlink().is_absolute()
+    assert repository_link.resolve() == repository_snapshot
+    assert set(_git(repository, "status", "--short").splitlines()) == {
+        "?? .agents/",
+        "?? .claude/",
+    }
+
+    _run(monkeypatch, "--geas-config", str(config), "skill-unlink", str(repository_snapshot))
+    assert json.loads(capsys.readouterr().out)["removed_snapshot"] is False
+    unlinked_repository_files = _snapshot_bytes(repository_snapshot)
+    assert not repository_link.exists()
+    assert _git(repository, "status", "--short") == "?? .agents/"
+
+    _run(monkeypatch, *repository_args)
+    repository_relinked = json.loads(capsys.readouterr().out)
+    assert repository_relinked["unchanged"] is False
+    assert _snapshot_bytes(repository_snapshot) == unlinked_repository_files
+    assert repository_link.is_symlink()
+    assert not repository_link.readlink().is_absolute()
+    assert repository_link.resolve() == repository_snapshot
+    assert set(_git(repository, "status", "--short").splitlines()) == {
+        "?? .agents/",
+        "?? .claude/",
+    }
 
     _run(monkeypatch, "--geas-config", str(config), "skill-remove", str(repository_snapshot))
     assert json.loads(capsys.readouterr().out)["removed_snapshot"] is True
@@ -370,14 +443,21 @@ def test_maintained_demo_exports_a_verified_repeatable_skill() -> None:
         second = json.loads((demo_root / "skill-export-second.json").read_text())
         snapshot = Path(second["path"])
         hashes = json.loads((demo_root / "skill-export-files.json").read_text())
+        first_hashes = json.loads((demo_root / "skill-export-first-files.json").read_text())
+        second_hashes = json.loads((demo_root / "skill-export-second-files.json").read_text())
         assert first["unchanged"] is False
         assert second["unchanged"] is True
         assert first["snapshot_sha256"] == second["snapshot_sha256"]
-        assert hashes == {
+        assert first["projection_snapshot_id"] == second["projection_snapshot_id"]
+        assert first["ontology_commit"] == second["ontology_commit"]
+        expected_hashes = {
             path.relative_to(snapshot).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
             for path in sorted(snapshot.rglob("*"))
             if path.is_file()
         }
+        assert list(first_hashes) == sorted(first_hashes)
+        assert list(second_hashes) == sorted(second_hashes)
+        assert first_hashes == second_hashes == hashes == expected_hashes
         assert validate_snapshot(snapshot).skill.name == "open-source-research-agents"
     finally:
         shutil.rmtree(demo_root)
