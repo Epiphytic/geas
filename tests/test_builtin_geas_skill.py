@@ -74,6 +74,84 @@ def test_builtin_skill_installs_a_valid_snapshot_and_deduplicated_agent_links(
     assert (home / ".claude" / "skills" / "geas").resolve() == snapshot
 
 
+def test_builtin_skill_rolls_back_initial_snapshot_and_links_after_link_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches config-init leaving a snapshot or first link after a later link failure."""
+    home = tmp_path / "home"
+    home.mkdir()
+    snapshot = tmp_path / "config" / "skills" / "geas"
+    first_link = home / ".agents" / "skills" / "geas"
+    failing_link = home / ".claude" / "skills" / "geas"
+    original_symlink_to = Path.symlink_to
+
+    def fail_second_link(
+        path: Path,
+        target: Path | str,
+        target_is_directory: bool = False,
+    ) -> None:
+        if path == failing_link:
+            raise OSError("injected builtin link failure")
+        original_symlink_to(path, target, target_is_directory=target_is_directory)
+
+    monkeypatch.setattr(Path, "symlink_to", fail_second_link)
+    with pytest.raises(OSError, match="injected builtin link failure"):
+        install_builtin_geas_skill(
+            config_root=tmp_path / "config",
+            home=home,
+            which=_which("codex", "claude"),
+        )
+
+    assert not snapshot.exists()
+    assert not first_link.is_symlink()
+    assert not failing_link.is_symlink()
+
+
+def test_builtin_skill_removal_receipt_regenerates_through_config_init(tmp_path: Path) -> None:
+    """Catches the generic skill receipt suggesting an ontology export that cannot rebuild it."""
+    from research_agent.agent_skills import remove_skill
+
+    home = tmp_path / "home"
+    home.mkdir()
+    config_root = tmp_path / "config"
+    installed = install_builtin_geas_skill(
+        config_root=config_root,
+        home=home,
+        which=_which("codex"),
+    )
+
+    removed = remove_skill(installed.installed[0], home=home, config_root=config_root)
+
+    assert removed.regeneration_command == "geas config-init"
+
+
+def test_builtin_skill_reports_transaction_cleanup_failure_after_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches config-init hiding retained transaction state after a successful install."""
+    import research_agent.agent_skills as skills
+
+    home = tmp_path / "home"
+    home.mkdir()
+    config_root = tmp_path / "config"
+    original_rmtree = skills.shutil.rmtree
+
+    def fail_transaction_cleanup(path: Path | str, *args: object, **kwargs: object) -> None:
+        if ".geas-transaction-" in Path(path).name:
+            raise OSError("injected cleanup failure")
+        original_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(skills.shutil, "rmtree", fail_transaction_cleanup)
+    receipt = install_builtin_geas_skill(
+        config_root=config_root,
+        home=home,
+        which=_which("codex"),
+    )
+
+    assert receipt.cleanup_warnings == ("skill transaction cleanup retained",)
+    assert validate_snapshot(config_root / "skills" / "geas").skill.name == "geas"
+
+
 def test_builtin_skill_is_idempotent_updates_managed_content_and_preserves_conflicts(
     tmp_path: Path,
     monkeypatch,

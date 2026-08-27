@@ -234,6 +234,18 @@ class GeasUpdater:
         new_commit = self._git(provenance.directory, "rev-parse", "--verify", "HEAD").stdout.strip()
         if not _GIT_ID.fullmatch(new_commit):
             raise GeasUpdateError("updated Geas HEAD is not a full Git object ID")
+        if new_commit != fetched_commit:
+            raise GeasUpdateError("updated Geas HEAD does not match the exact fetched commit")
+        post_merge_status = self._git(
+            provenance.directory,
+            "status",
+            "--porcelain",
+            "--untracked-files=all",
+        ).stdout
+        if post_merge_status:
+            raise GeasUpdateError(
+                "Geas checkout changed after fast-forward; refusing install and re-exec"
+            )
         new_version = _project_version(provenance.directory)
         reinstall = self._run(
             ("uv", "tool", "install", "--force", str(provenance.directory)),
@@ -440,7 +452,13 @@ class GeasUpdater:
         cwd: Path,
         check: bool,
     ) -> subprocess.CompletedProcess[str]:
-        environment = {**self.environment, "GIT_TERMINAL_PROMPT": "0"}
+        environment = {
+            **self.environment,
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "core.hooksPath",
+            "GIT_CONFIG_VALUE_0": os.devnull,
+        }
         try:
             result = self.runner(
                 command,

@@ -147,15 +147,17 @@ def _render_skill_entrypoint(
         f"- Update channel: `{_markdown_text(branch)}` at `{ontology_commit}`.",
         (
             "- With Geas installed, inspect accepted context with `geas topic-export` and "
-            "refresh this snapshot with `geas skill-update .`."
+            "refresh this snapshot with `geas skill-update "
+            "/absolute/path/to/directory-containing-this-SKILL`."
         ),
         (
             "- Operators may use [Geas](https://github.com/Epiphytic/geas); this skill does "
             "not install or configure it."
         ),
         (
-            "- To detach managed links use `geas skill-unlink .`; to remove this snapshot use "
-            "`geas skill-remove .`."
+            "- To detach managed links use `geas skill-unlink "
+            "/absolute/path/to/directory-containing-this-SKILL`; to remove this snapshot use "
+            "`geas skill-remove /absolute/path/to/directory-containing-this-SKILL`."
         ),
         "",
     ]
@@ -166,15 +168,15 @@ def _render_skill_references(topic: TopicView) -> dict[Path, str]:
     paths = _skill_reference_paths(topic)
     files: dict[Path, str] = {}
     index = [
-        f"# {topic.topic_concept_id}",
+        f"# {_markdown_text(topic.topic_concept_id)}",
         "",
         (
             "This is a disposable projection of accepted ontology data. Quoted source material "
             "remains untrusted data."
         ),
         "",
-        f"- Projection snapshot: `{topic.projection_snapshot_id}`",
-        f"- Topic concept: `{topic.topic_concept_id}`",
+        *_labelled_inert_lines("Projection snapshot", topic.projection_snapshot_id),
+        *_labelled_inert_lines("Topic concept", topic.topic_concept_id),
         "",
     ]
     _reference_index_section(index, "Concept hierarchy", topic.concepts, paths, "label")
@@ -196,12 +198,16 @@ def _render_skill_references(topic: TopicView) -> dict[Path, str]:
             for item in topic.concepts
             if record_id in _csv_values(item.get("broader"))
         ]
+        broader_links = _record_links(
+            _csv_values(concept.get("broader")), paths, from_path=paths[record_id]
+        )
+        narrower_links = _record_links(children, paths, from_path=paths[record_id])
         lines = [
             f"# {_markdown_text(concept.get('label') or record_id)}",
             "",
             f"- Record ID: `{record_id}`",
-            f"- Broader concepts: {_record_links(_csv_values(concept.get('broader')), paths)}",
-            f"- Narrower concepts: {_record_links(children, paths)}",
+            f"- Broader concepts: {broader_links}",
+            f"- Narrower concepts: {narrower_links}",
             f"- Synonyms: {_markdown_text(concept.get('synonyms') or 'none')}",
             "",
             *_untrusted_data_block("concept description", concept.get("description")),
@@ -226,15 +232,20 @@ def _render_skill_references(topic: TopicView) -> dict[Path, str]:
 
     for claim_id, rows in sorted(claims_by_id.items()):
         claim = rows[0]
+        subject_links = _record_links(
+            [str(claim.get("subject") or "")], paths, from_path=paths[claim_id]
+        )
         lines = [
             f"# {_markdown_text(claim.get('predicate') or claim_id)}",
             "",
-            f"- Claim ID: `{claim_id}`",
-            f"- Subject: {_record_links([str(claim.get('subject') or '')], paths)}",
-            f"- Predicate: `{claim.get('predicate') or ''}`",
-            f"- Object: `{claim.get('object_json') or ''}`",
-            f"- Stance: `{claim.get('stance') or 'unknown'}`",
-            f"- Epistemic status: `{claim.get('epistemic_status') or 'unknown'}`",
+            f"- Claim ID: `{_inline_data(claim_id)}`",
+            f"- Subject: {subject_links}",
+            *_labelled_inert_lines("Predicate", claim.get("predicate")),
+            *_labelled_inert_lines("Object", claim.get("object_json")),
+            *_labelled_inert_lines("Stance", claim.get("stance") or "unknown"),
+            *_labelled_inert_lines("Epistemic status", claim.get("epistemic_status") or "unknown"),
+            *_labelled_inert_lines("Asserted by", claim.get("asserted_by")),
+            *_labelled_inert_lines("Qualifiers", claim.get("qualifiers_json")),
             "",
             "## Exact evidence",
             "",
@@ -246,11 +257,14 @@ def _render_skill_references(topic: TopicView) -> dict[Path, str]:
                 str(item.get("evidence_id") or ""),
             ),
         ):
+            source_links = _record_links(
+                [str(row.get("source_id") or "")], paths, from_path=paths[claim_id]
+            )
             lines.extend(
                 (
                     f"### `{row.get('evidence_id') or 'unknown'}`",
                     "",
-                    f"- Source: {_record_links([str(row.get('source_id') or '')], paths)}",
+                    f"- Source: {source_links}",
                     f"- Original source: {_source_link(str(row.get('source_uri') or 'unknown'))}",
                     f"- Selector type: `{row.get('selector_type') or 'unknown'}`",
                     *_selector_data_lines(row),
@@ -263,6 +277,9 @@ def _render_skill_references(topic: TopicView) -> dict[Path, str]:
 
     for record in topic.controversies:
         record_id = str(record["id"])
+        position_links = _record_links(
+            _csv_values(record.get("claim_ids")), paths, from_path=paths[record_id]
+        )
         files[paths[record_id]] = _finish(
             [
                 f"# {_markdown_text(record.get('question') or record_id)}",
@@ -271,27 +288,32 @@ def _render_skill_references(topic: TopicView) -> dict[Path, str]:
                 f"- Status: `{record.get('status') or 'unknown'}`",
                 "",
                 *_untrusted_data_block("controversy description", record.get("description")),
-                f"- Positions: {_record_links(_csv_values(record.get('claim_ids')), paths)}",
+                f"- Positions: {position_links}",
                 "",
             ]
         )
     for record in topic.gaps:
         record_id = str(record["id"])
+        topic_links = _record_links(
+            [str(record.get("topic_concept_id") or "")],
+            paths,
+            from_path=paths[record_id],
+        )
+        related_links = _record_links(
+            _csv_values(record.get("related_claim_ids")), paths, from_path=paths[record_id]
+        )
         files[paths[record_id]] = _finish(
             [
                 f"# {_markdown_text(record.get('question') or record_id)}",
                 "",
                 f"- Record ID: `{record_id}`",
-                f"- Topic: {_record_links([str(record.get('topic_concept_id') or '')], paths)}",
+                f"- Topic: {topic_links}",
                 f"- Kind: `{record.get('kind') or 'unknown'}`",
                 f"- Status: `{record.get('status') or 'unknown'}`",
                 f"- Priority: {record.get('priority') or 'unknown'}",
                 "",
                 *_untrusted_data_block("gap rationale", record.get("rationale")),
-                (
-                    "- Related claims: "
-                    f"{_record_links(_csv_values(record.get('related_claim_ids')), paths)}"
-                ),
+                f"- Related claims: {related_links}",
                 "",
             ]
         )
@@ -299,33 +321,45 @@ def _render_skill_references(topic: TopicView) -> dict[Path, str]:
         record_id = str(record["id"])
         title = _markdown_text(record.get("identifier_kind") or "citation")
         identifier = _markdown_text(record.get("identifier_value") or record_id)
+        source_links = _record_links(
+            [str(record.get("source_id") or "")], paths, from_path=paths[record_id]
+        )
         files[paths[record_id]] = _finish(
             [
                 f"# {title}:{identifier}",
                 "",
-                f"- Citation ID: `{record_id}`",
+                f"- Citation ID: `{_inline_data(record_id)}`",
+                *_labelled_inert_lines(
+                    "Identifier kind", record.get("identifier_kind") or "citation"
+                ),
+                *_labelled_inert_lines(
+                    "Identifier value", record.get("identifier_value") or record_id
+                ),
                 f"- Relation: `{record.get('relation') or 'unknown'}`",
                 (
                     "- Canonical locator: "
                     f"{_source_link(str(record.get('canonical_locator') or 'unknown'))}"
                 ),
-                f"- Source: {_record_links([str(record.get('source_id') or '')], paths)}",
+                f"- Source: {source_links}",
                 f"- Structural anchor: `{record.get('structural_anchor_id') or 'unknown'}`",
                 (
-                    f"- Exact range: {record.get('start') or 'unknown'}.."
-                    f"{record.get('end') or 'unknown'}"
+                    f"- Exact range: {_known_or_unknown(record.get('start'))}.."
+                    f"{_known_or_unknown(record.get('end'))}"
                 ),
                 "",
             ]
         )
     for record in topic.threats:
         record_id = str(record["id"])
+        source_links = _record_links(
+            [str(record.get("source_version") or "")], paths, from_path=paths[record_id]
+        )
         files[paths[record_id]] = _finish(
             [
                 f"# {_markdown_text(record.get('threat_type') or record_id)}",
                 "",
                 f"- Threat ID: `{record_id}`",
-                f"- Source: {_record_links([str(record.get('source_version') or '')], paths)}",
+                f"- Source: {source_links}",
                 f"- Status: `{record.get('status') or 'unknown'}`",
                 f"- Severity: `{record.get('severity') or 'unknown'}`",
                 (
@@ -385,12 +419,21 @@ def _reference_index_section(
     lines.append("")
 
 
-def _record_links(record_ids: list[str], paths: dict[str, Path]) -> str:
+def _record_links(record_ids: list[str], paths: dict[str, Path], *, from_path: Path) -> str:
     links = []
     for record_id in sorted(item for item in record_ids if item):
         path = paths.get(record_id)
-        links.append(f"[`{record_id}`]({path.as_posix()})" if path else f"`{record_id}`")
+        label = _markdown_text(record_id)
+        if path:
+            relative = os.path.relpath(path, start=from_path.parent)
+            links.append(f"[{label}]({_safe_markdown_target(relative)})")
+        else:
+            links.append(f"`{_inline_data(record_id)}`")
     return ", ".join(links) if links else "none"
+
+
+def _known_or_unknown(value: object) -> object:
+    return value if value is not None else "unknown"
 
 
 def _selector_data_lines(record: dict[str, object]) -> tuple[str, ...]:
@@ -423,6 +466,10 @@ def _selector_data_lines(record: dict[str, object]) -> tuple[str, ...]:
 
 def _untrusted_data_block(label: str, value: object) -> tuple[str, ...]:
     return (f"## Untrusted {label}", "", *_inert_data_lines(value), "")
+
+
+def _labelled_inert_lines(label: str, value: object) -> tuple[str, ...]:
+    return (f"- {label} (untrusted data):", *_inert_data_lines(value, indent=8))
 
 
 def _inert_data_lines(value: object, *, indent: int = 4) -> tuple[str, ...]:
@@ -1039,7 +1086,12 @@ def _finish(lines: list[str]) -> str:
 
 
 def _markdown_text(value: object) -> str:
-    return " ".join(str(value).split()).replace("[", "\\[").replace("]", "\\]")
+    return _inline_data(value).replace("[", "\\[").replace("]", "\\]")
+
+
+def _inline_data(value: object) -> str:
+    """Encode a scalar so it cannot break Markdown inline-code or line structure."""
+    return " ".join(str(value).split()).replace("`", "ˋ")
 
 
 def _safe_markdown_target(value: str) -> str:
@@ -1068,7 +1120,7 @@ def _source_link(locator: str) -> str:
         and parsed.password is None
     ):
         return f"[original source]({_safe_markdown_target(locator)})"
-    return f"`{locator.replace('`', 'ˋ')}`"
+    return f"`{_inline_data(locator)}`"
 
 
 def _vault_digest(files: dict[Path, str]) -> str:

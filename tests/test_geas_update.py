@@ -411,6 +411,62 @@ def test_update_binds_merge_to_exact_fetched_head_not_forged_tracking_ref(
     assert any(command[:3] == ("uv", "tool", "install") for command in runner.commands)
 
 
+def test_update_rejects_post_merge_tracked_file_tampering_before_install_or_reexec(
+    tmp_path: Path,
+) -> None:
+    """Catches installing a dirty checkout whose bytes differ from its stamped commit."""
+    checkout, _old, _new = _checkout(tmp_path)
+    reexec: list[tuple[tuple[str, ...], dict[str, str]]] = []
+
+    class TamperingRunner(RecordingRunner):
+        def __call__(
+            self, command: tuple[str, ...], **kwargs: object
+        ) -> subprocess.CompletedProcess[str]:
+            result = super().__call__(command, **kwargs)
+            if command[:3] == ("git", "merge", "--ff-only"):
+                (self.checkout / "state.txt").write_text("tampered\n")
+            return result
+
+    runner = TamperingRunner(checkout=checkout)
+    with pytest.raises(GeasUpdateError, match="changed after|local changes"):
+        _updater(tmp_path, checkout, runner=runner, reexec=reexec).update_and_reexec(
+            ("geas", "skill-update", "/snapshot"), continuation=None
+        )
+
+    assert not any(command[:3] == ("uv", "tool", "install") for command in runner.commands)
+    assert reexec == []
+
+
+def test_update_rejects_wrong_post_merge_head_before_install_or_reexec(tmp_path: Path) -> None:
+    """Catches installing clean bytes from a commit other than the exact fetched object."""
+    checkout, old, _new = _checkout(tmp_path)
+    reexec: list[tuple[tuple[str, ...], dict[str, str]]] = []
+
+    class HeadReplacingRunner(RecordingRunner):
+        def __call__(
+            self, command: tuple[str, ...], **kwargs: object
+        ) -> subprocess.CompletedProcess[str]:
+            result = super().__call__(command, **kwargs)
+            if command[:3] == ("git", "merge", "--ff-only"):
+                subprocess.run(
+                    ("git", "reset", "--hard", old),
+                    cwd=self.checkout,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+            return result
+
+    runner = HeadReplacingRunner(checkout=checkout)
+    with pytest.raises(GeasUpdateError, match="fetched commit"):
+        _updater(tmp_path, checkout, runner=runner, reexec=reexec).update_and_reexec(
+            ("geas", "skill-update", "/snapshot"), continuation=None
+        )
+
+    assert not any(command[:3] == ("uv", "tool", "install") for command in runner.commands)
+    assert reexec == []
+
+
 def test_fast_forward_reinstalls_exact_directory_and_reexecs_once(tmp_path: Path) -> None:
     checkout, old, new = _checkout(tmp_path)
     runner = RecordingRunner(checkout=checkout)

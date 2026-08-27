@@ -22,7 +22,9 @@ geas config-init
 `config-init` automatically installs `geas` at `<config-root>/skills/geas` and
 records local ownership in `<config-root>/state/builtin-skills/`. Subsequent
 runs refresh only that managed copy; an operator-owned or modified snapshot is
-preserved and reported as a conflict.
+preserved and reported as a conflict. A successful install with retained
+post-commit transaction cleanup is reported in `cleanup_warnings` rather than
+turned into a false installation failure.
 
 When discovered, agent links are managed at:
 
@@ -55,7 +57,7 @@ produce byte-identical files and an `unchanged: true` receipt.
 For a project-local snapshot:
 
 ```bash
-geas skill-export research-agents --repo /path/to/project --link
+geas skill-export research-agents --repo /path/to/project
 ```
 
 Geas prefers `/path/to/project/.agents/skills/research-agents` because it is
@@ -67,7 +69,8 @@ not normally ignore this preferred snapshot path.
 Before choosing the location, Geas runs `git check-ignore` for the exact
 candidate path. If the preferred `.agents/skills/research-agents` path is
 ignored, it instead uses the trackable canonical fallback
-`/path/to/project/.geas/skills/research-agents`. With `--link`, the normal
+`/path/to/project/.geas/skills/research-agents`. Repository export always links
+detected agents, so the normal
 `.agents/skills/research-agents` (Codex/OpenCode) and
 `.claude/skills/research-agents` locations become relative managed links to
 that fallback. If both candidate snapshot paths are ignored, export fails;
@@ -80,9 +83,22 @@ Refresh an existing managed snapshot with:
 geas skill-update /path/to/skills/research-agents
 ```
 
-Update validates the manifest, requires the active profile URL/branch to match,
-fast-forwards only the configured remote, verifies the new artifact, then
-atomically replaces the snapshot. Receipts expose completed phases and old/new
+`skill-update` is an explicit software-update boundary for an already installed,
+trusted Geas. Before ontology work, it accepts only supported `uv` directory-tool
+receipt or Git-development provenance, requires the fixed Geas project URL and
+`main` branch, and requires a clean checkout. It fetches and fast-forwards to the
+exact fetched object with hooks disabled, verifies the resulting HEAD and clean
+bytes, reinstalls that checkout with `uv`, and reexecutes Geas through one bounded
+continuation marker. An absent or ambiguously installed Geas is never installed
+implicitly; use the project setup instructions as a separate operator action.
+
+Dirty state, remote mismatch, fetch or non-fast-forward failure, post-merge
+tampering, reinstall failure, version/provenance mismatch after reexec, and a
+repeated continuation marker all fail closed before ontology artifacts or skill
+rendering. Once that trusted Geas boundary succeeds, update validates the skill
+manifest, requires the active ontology profile URL/branch to match, fast-forwards
+only the configured ontology remote, verifies the new artifact, then atomically
+replaces the snapshot. Receipts expose completed phases and old/new software and
 ontology commits. Source links and excerpts are provenance, not authority or a
 guarantee that the linked source is safe, current, licensed, or complete.
 

@@ -98,20 +98,27 @@ class OntologyRepositoryManager:
                 "ontology checkout has local changes; commit/push or restore them before pull"
             )
         fetched_ref = self._fetched_ref()
-        exists = (
-            self._run(
-                (
-                    "git",
-                    "ls-remote",
-                    "--exit-code",
-                    "--heads",
-                    self.config.remote,
-                    self.config.branch,
-                ),
-                check=False,
-            ).returncode
-            == 0
+        remote_branch = self._run(
+            (
+                "git",
+                "ls-remote",
+                "--exit-code",
+                "--heads",
+                self.config.remote,
+                self.config.branch,
+            ),
+            check=False,
         )
+        if remote_branch.returncode not in {0, 2}:
+            raise OntologySyncError(
+                "Git ls-remote failed for the configured ontology remote; "
+                "check network access and authentication"
+            )
+        exists = remote_branch.returncode == 0
+        if not exists and old_commit is not None:
+            raise OntologySyncError(
+                f"configured ontology branch {self.config.branch!r} does not exist on the remote"
+            )
         if exists:
             self._run(
                 (
@@ -135,6 +142,15 @@ class OntologyRepositoryManager:
                     self._run(("git", "merge", "--ff-only", fetched_commit))
             else:
                 self._run(("git", "checkout", "-B", self.config.branch, fetched_commit))
+            integrated_commit = self._head()
+            if integrated_commit != fetched_commit:
+                raise OntologySyncError(
+                    "ontology checkout HEAD does not match the exact fetched commit"
+                )
+            if self._status(ignore_generated_gitignore=True):
+                raise OntologySyncError(
+                    "ontology checkout changed after fast-forward; refusing downstream work"
+                )
         else:
             self._set_unborn_branch()
         self.ensure_gitignore()
@@ -464,7 +480,13 @@ class OntologyRepositoryManager:
         cwd: Path,
         check: bool,
     ) -> subprocess.CompletedProcess[str]:
-        environment = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+        environment = {
+            **os.environ,
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "core.hooksPath",
+            "GIT_CONFIG_VALUE_0": os.devnull,
+        }
         completed = subprocess.run(
             command,
             cwd=cwd,

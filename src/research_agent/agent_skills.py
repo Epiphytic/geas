@@ -96,6 +96,7 @@ class BuiltinSkillReceipt(StrictModel):
     linked: tuple[Path, ...] = ()
     skipped: tuple[Path, ...] = ()
     conflicts: tuple[Path, ...] = ()
+    cleanup_warnings: tuple[str, ...] = ()
 
     @model_validator(mode="after")
     def sorted_paths(self) -> BuiltinSkillReceipt:
@@ -387,34 +388,21 @@ def install_snapshot(
     files: Mapping[Path, bytes], target: Path, *, force: bool = False
 ) -> SkillExportReceipt:
     """Atomically install a complete, manifest-verified snapshot at one exact target."""
-    destination = _absolute_path(target)
-    _reject_symlink_ancestry(destination.parent)
-    manifest = _validate_snapshot_files(files)
-    existing: SkillManifest | None = None
-    if destination.exists() or destination.is_symlink():
-        try:
-            existing = validate_snapshot(destination)
-        except ValueError:
-            if not force:
-                raise ValueError("skill snapshot target is unmanaged or modified") from None
-        if existing is not None and existing == manifest:
-            return SkillExportReceipt(path=destination, manifest=manifest, unchanged=True)
-
+    destination, manifest, unchanged = _prepare_snapshot_install(files, target, force=force)
+    if unchanged:
+        return SkillExportReceipt(path=destination, manifest=manifest, unchanged=True)
     destination.parent.mkdir(parents=True, exist_ok=True)
     _reject_symlink_ancestry(destination.parent)
-    candidate = Path(tempfile.mkdtemp(prefix=f".{destination.name}.", dir=destination.parent))
-    try:
-        _write_snapshot_candidate(files, candidate)
-        if validate_snapshot(candidate) != manifest:
-            raise ValueError("skill snapshot candidate does not match its validated files")
-        if destination.exists() or destination.is_symlink():
-            _replace_snapshot(candidate, destination)
-        else:
-            os.replace(candidate, destination)
-        return SkillExportReceipt(path=destination, manifest=manifest, unchanged=False)
-    finally:
-        if candidate.exists():
-            shutil.rmtree(candidate)
+    signature = _snapshot_state_signature(destination)
+    receipt, _links = _replace_snapshot_and_links(
+        files,
+        snapshot=destination,
+        manifest=manifest,
+        snapshot_signature=signature,
+        plans=(),
+        root=destination.parent,
+    )
+    return receipt
 
 
 def export_skill(
@@ -428,33 +416,47 @@ def export_skill(
     which: Callable[[str], str | None],
 ) -> SkillExportReceipt:
     """Install a managed snapshot in user configuration or a Git worktree."""
-    manifest = _manifest_from_files(files)
+    manifest = _validate_snapshot_files(files)
     if repository is None:
         target = _absolute_path(config_root) / "skills" / manifest.skill.name
-        receipt = install_snapshot(files, target, force=force)
-        if not link:
-            return receipt
-        targets = _user_link_targets(
-            manifest.skill.name, home=home, detections=detect_agents(home=home, which=which)
+        targets = (
+            _user_link_targets(
+                manifest.skill.name, home=home, detections=detect_agents(home=home, which=which)
+            )
+            if link
+            else ()
         )
+        root = home
         relative = False
     else:
         worktree = _git_worktree(repository)
         target = _repository_snapshot_path(worktree, manifest.skill.name)
-        receipt = install_snapshot(files, target, force=force)
         targets = _repository_link_targets(
             worktree,
             snapshot=target,
             skill_name=manifest.skill.name,
             detections=detect_agents(home=home, which=which),
         )
+        root = worktree
         relative = True
-    links = _install_links(
+    target, manifest, _unchanged = _prepare_snapshot_install(files, target, force=force)
+    snapshot_signature = _snapshot_state_signature(target)
+    plans = _plan_links(
         targets,
-        snapshot=receipt.path,
-        root=home if repository is None else worktree,
+        snapshot=target,
+        root=root,
         relative=relative,
         force=force,
+    )
+    target.parent.mkdir(parents=True, exist_ok=True)
+    _reject_symlink_ancestry(target.parent)
+    receipt, links = _replace_snapshot_and_links(
+        files,
+        snapshot=target,
+        manifest=manifest,
+        snapshot_signature=snapshot_signature,
+        plans=plans,
+        root=root,
     )
     return SkillExportReceipt(
         path=receipt.path,
@@ -497,10 +499,42 @@ def install_builtin_geas_skill(
 
     _prepare_builtin_skill_state_parent(state_path)
     try:
-        snapshot_receipt = install_snapshot(files, snapshot)
+        snapshot, manifest, _unchanged = _prepare_snapshot_install(files, snapshot, force=False)
     except ValueError:
         conflicts.append(snapshot)
         return _builtin_receipt(conflicts=conflicts)
+
+    snapshot_signature = _snapshot_state_signature(snapshot)
+    detections = detect_agents(home=home, which=which)
+    plans: list[_LinkPlan] = []
+    for destination in _user_link_targets(
+        _BUILTIN_SKILL_NAME, home=home, detections=detections
+    ):
+        try:
+            plans.extend(
+                _plan_links(
+                    (destination,),
+                    snapshot=snapshot,
+                    root=home,
+                    relative=False,
+                    force=False,
+                )
+            )
+        except ValueError:
+            conflicts.append(destination)
+    if conflicts:
+        return _builtin_receipt(conflicts=conflicts)
+
+    snapshot.parent.mkdir(parents=True, exist_ok=True)
+    _reject_symlink_ancestry(snapshot.parent)
+    snapshot_receipt, link_receipts = _replace_snapshot_and_links(
+        files,
+        snapshot=snapshot,
+        manifest=manifest,
+        snapshot_signature=snapshot_signature,
+        plans=tuple(plans),
+        root=home,
+    )
     _write_builtin_skill_state(
         state_path,
         _builtin_skill_state_from_manifest(snapshot_receipt.manifest),
@@ -513,19 +547,8 @@ def install_builtin_geas_skill(
     else:
         installed.append(snapshot)
 
-    detections = detect_agents(home=home, which=which)
-    for destination in _user_link_targets(_BUILTIN_SKILL_NAME, home=home, detections=detections):
-        try:
-            (link_receipt,) = _install_links(
-                (destination,),
-                snapshot=snapshot,
-                root=home,
-                relative=False,
-                force=False,
-            )
-        except ValueError:
-            conflicts.append(destination)
-            continue
+    for link_receipt in link_receipts:
+        destination = link_receipt.path
         if link_receipt.unchanged:
             skipped.append(destination)
         else:
@@ -537,6 +560,9 @@ def install_builtin_geas_skill(
         linked=linked,
         skipped=skipped,
         conflicts=conflicts,
+        cleanup_warnings=(
+            (snapshot_receipt.cleanup_warning,) if snapshot_receipt.cleanup_warning else ()
+        ),
     )
 
 
@@ -563,14 +589,12 @@ def refresh_skill(
     candidate = _validate_snapshot_files(files)
     if candidate.skill.name != existing.skill.name:
         raise ValueError("skill update cannot change the managed skill name")
-    repository = _containing_worktree(snapshot)
-    _assert_managed_snapshot_scope(
+    repository = _managed_snapshot_repository(
         snapshot,
         candidate,
-        repository=repository,
         config_root=config_root,
     )
-    snapshot_signature = _snapshot_signature(snapshot)
+    snapshot_signature = _snapshot_state_signature(snapshot)
     detections = detect_agents(home=home, which=which)
     if repository is None:
         targets = _user_link_targets(candidate.skill.name, home=home, detections=detections)
@@ -618,14 +642,14 @@ def unlink_skill(
 ) -> SkillRemovalReceipt:
     """Remove only exact managed agent links, leaving the snapshot untouched."""
     snapshot, manifest = resolve_skill_snapshot(path, force=force)
-    repository = _containing_worktree(snapshot)
     if config_root is not None:
-        _assert_managed_snapshot_scope(
+        repository = _managed_snapshot_repository(
             snapshot,
             manifest,
-            repository=repository,
             config_root=config_root,
         )
+    else:
+        repository = _containing_worktree(snapshot)
     if repository is None:
         targets = _user_link_targets(
             manifest.skill.name,
@@ -690,6 +714,26 @@ def _assert_managed_snapshot_scope(
     }
     if relative not in expected:
         raise ValueError("repository skill snapshot is outside a managed skill path")
+
+
+def _managed_snapshot_repository(
+    snapshot: Path,
+    manifest: SkillManifest,
+    *,
+    config_root: Path,
+) -> Path | None:
+    """Classify exact selected user scope before considering Git containment."""
+    expected_user = _absolute_path(config_root) / "skills" / manifest.skill.name
+    if snapshot == expected_user:
+        return None
+    repository = _containing_worktree(snapshot)
+    _assert_managed_snapshot_scope(
+        snapshot,
+        manifest,
+        repository=repository,
+        config_root=config_root,
+    )
+    return repository
 
 
 def _write_snapshot_candidate(files: Mapping[Path, bytes], candidate: Path) -> None:
@@ -878,6 +922,7 @@ def _builtin_receipt(
     linked: Iterable[Path] = (),
     skipped: Iterable[Path] = (),
     conflicts: Iterable[Path] = (),
+    cleanup_warnings: Iterable[str] = (),
 ) -> BuiltinSkillReceipt:
     return BuiltinSkillReceipt(
         installed=tuple(sorted(installed, key=os.fspath)),
@@ -886,6 +931,7 @@ def _builtin_receipt(
         linked=tuple(sorted(linked, key=os.fspath)),
         skipped=tuple(sorted(skipped, key=os.fspath)),
         conflicts=tuple(sorted(conflicts, key=os.fspath)),
+        cleanup_warnings=tuple(sorted(cleanup_warnings)),
     )
 
 
@@ -921,17 +967,21 @@ def _read_existing_manifest(path: Path, *, force: bool) -> SkillManifest | None:
             return None
 
 
-def _replace_snapshot(candidate: Path, destination: Path) -> None:
-    backup = destination.parent / f".{destination.name}.backup"
-    if backup.exists() or backup.is_symlink():
-        raise ValueError("skill snapshot backup target already exists")
-    os.replace(destination, backup)
-    try:
-        os.replace(candidate, destination)
-    except Exception:
-        os.replace(backup, destination)
-        raise
-    _remove_exact_target(backup)
+def _prepare_snapshot_install(
+    files: Mapping[Path, bytes], target: Path, *, force: bool
+) -> tuple[Path, SkillManifest, bool]:
+    """Validate candidate and existing state without changing visible filesystem state."""
+    destination = _absolute_path(target)
+    _reject_symlink_ancestry(destination.parent)
+    manifest = _validate_snapshot_files(files)
+    existing: SkillManifest | None = None
+    if destination.exists() or destination.is_symlink():
+        try:
+            existing = validate_snapshot(destination)
+        except ValueError:
+            if not force:
+                raise ValueError("skill snapshot target is unmanaged or modified") from None
+    return destination, manifest, existing == manifest
 
 
 def _git_worktree(repository: Path) -> Path:
@@ -1000,30 +1050,6 @@ def _deduplicated_paths(paths: Iterable[Path]) -> tuple[Path, ...]:
     return tuple(sorted(set(paths), key=os.fspath))
 
 
-def _install_links(
-    targets: tuple[Path, ...],
-    *,
-    snapshot: Path,
-    root: Path,
-    relative: bool,
-    force: bool,
-) -> tuple[LinkReceipt, ...]:
-    receipts: list[LinkReceipt] = []
-    for destination in targets:
-        _confined_link_parent(destination.parent, root)
-        expected_target = _expected_link_target(destination, snapshot=snapshot, relative=relative)
-        if destination.is_symlink() and _link_points_to(destination, expected_target):
-            receipts.append(LinkReceipt(path=destination, target=snapshot, unchanged=True))
-            continue
-        if destination.exists() or destination.is_symlink():
-            if not force:
-                raise ValueError(f"skill link conflict at {destination}")
-            _remove_exact_target(destination)
-        destination.symlink_to(expected_target, target_is_directory=True)
-        receipts.append(LinkReceipt(path=destination, target=snapshot, unchanged=False))
-    return tuple(sorted(receipts, key=lambda item: os.fspath(item.path)))
-
-
 def _plan_links(
     targets: tuple[Path, ...],
     *,
@@ -1034,6 +1060,8 @@ def _plan_links(
 ) -> tuple[_LinkPlan, ...]:
     plans: list[_LinkPlan] = []
     for destination in targets:
+        if _absolute_path(destination) == _absolute_path(snapshot):
+            raise ValueError("skill snapshot and link target overlap")
         _confined_link_parent(destination.parent, root, create=False)
         expected = _expected_link_target(destination, snapshot=snapshot, relative=relative)
         unchanged = destination.is_symlink() and _link_points_to(destination, expected)
@@ -1056,7 +1084,7 @@ def _replace_snapshot_and_links(
     *,
     snapshot: Path,
     manifest: SkillManifest,
-    snapshot_signature: str,
+    snapshot_signature: tuple[object, ...],
     plans: tuple[_LinkPlan, ...],
     root: Path,
 ) -> tuple[SkillExportReceipt, tuple[LinkReceipt, ...]]:
@@ -1086,6 +1114,7 @@ def _replace_snapshot_and_links(
     changed_links: list[tuple[_LinkPlan, Path]] = []
     receipts: list[LinkReceipt] = []
     snapshot_moved = False
+    snapshot_installed = False
     committed = False
     try:
         if not snapshot_unchanged:
@@ -1093,12 +1122,14 @@ def _replace_snapshot_and_links(
             _write_snapshot_candidate(files, candidate)
             if validate_snapshot(candidate) != manifest:
                 raise ValueError("skill snapshot candidate does not match its validated files")
-        if _snapshot_signature(snapshot) != snapshot_signature:
+        if _snapshot_state_signature(snapshot) != snapshot_signature:
             raise ValueError("skill snapshot changed during update")
         if not snapshot_unchanged:
-            os.replace(snapshot, snapshot_backup)
-            snapshot_moved = True
+            if snapshot.exists() or snapshot.is_symlink():
+                os.replace(snapshot, snapshot_backup)
+                snapshot_moved = True
             os.replace(candidate, snapshot)
+            snapshot_installed = True
         for index, plan in enumerate(plans):
             _confined_link_parent(plan.destination.parent, root)
             if _path_signature(plan.destination) != plan.signature:
@@ -1120,9 +1151,9 @@ def _replace_snapshot_and_links(
                 _remove_exact_target(plan.destination)
             if backup.exists() or backup.is_symlink():
                 os.replace(backup, plan.destination)
+        if snapshot_installed and (snapshot.exists() or snapshot.is_symlink()):
+            _remove_exact_target(snapshot)
         if snapshot_moved:
-            if snapshot.exists() or snapshot.is_symlink():
-                _remove_exact_target(snapshot)
             os.replace(snapshot_backup, snapshot)
         _discard_transaction(transaction)
         raise
@@ -1176,6 +1207,14 @@ def _snapshot_signature(snapshot: Path) -> str:
         else:
             digest.update(b"directory")
     return digest.hexdigest()
+
+
+def _snapshot_state_signature(snapshot: Path) -> tuple[object, ...]:
+    if snapshot.is_symlink() or not snapshot.exists():
+        return _path_signature(snapshot)
+    if not snapshot.is_dir():
+        return _path_signature(snapshot)
+    return ("snapshot", _snapshot_signature(snapshot))
 
 
 def _expected_link_target(destination: Path, *, snapshot: Path, relative: bool) -> Path:
@@ -1269,6 +1308,12 @@ def _remove_exact_target(path: Path) -> None:
 
 
 def _regeneration_command(manifest: SkillManifest) -> str:
+    if (
+        manifest.skill.name == _BUILTIN_SKILL_NAME
+        and manifest.projection.snapshot_id == "builtin:geas"
+        and manifest.projection.topic_concept_id == "builtin:geas"
+    ):
+        return "geas config-init"
     return f"geas skill-export {manifest.ontology.name} --name {manifest.skill.name}"
 
 

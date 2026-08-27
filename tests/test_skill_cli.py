@@ -812,6 +812,55 @@ def test_refresh_cleanup_failure_keeps_committed_snapshot_and_links_successful(
     assert payload["cleanup_warnings"] == ("skill transaction cleanup retained",)
 
 
+def test_user_skill_lifecycle_uses_exact_config_scope_inside_git_worktree(tmp_path: Path) -> None:
+    """Catches Git containment misclassifying an exact user-config skill as repository scope."""
+    from research_agent.agent_skills import remove_skill, unlink_skill
+
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    subprocess.run(("git", "init", "-q", str(repository)), check=True)
+    config_root = repository / ".config" / "geas"
+    home = tmp_path / "home"
+    home.mkdir()
+
+    installed = export_skill(
+        _skill_files(commit=OLD_COMMIT, snapshot="truth:old"),
+        config_root=config_root,
+        home=home,
+        repository=None,
+        link=True,
+        force=False,
+        which=lambda name: "/bin/codex" if name == "codex" else None,
+    )
+    link = home / ".agents" / "skills" / "test-ontology"
+
+    refreshed = refresh_skill(
+        _skill_files(commit=NEW_COMMIT, snapshot="truth:new"),
+        installed.path,
+        config_root=config_root,
+        home=home,
+        force=False,
+        which=lambda name: "/bin/codex" if name == "codex" else None,
+    )
+    detached = unlink_skill(installed.path, home=home, config_root=config_root)
+    relinked = refresh_skill(
+        _skill_files(commit=NEW_COMMIT, snapshot="truth:new"),
+        installed.path,
+        config_root=config_root,
+        home=home,
+        force=False,
+        which=lambda name: "/bin/codex" if name == "codex" else None,
+    )
+    removed = remove_skill(installed.path, home=home, config_root=config_root)
+
+    assert refreshed.manifest.ontology.commit == NEW_COMMIT
+    assert detached.removed_paths == (link,)
+    assert relinked.links[0].path == link
+    assert removed.removed_snapshot is True
+    assert not installed.path.exists()
+    assert not link.is_symlink()
+
+
 def test_skill_update_uses_real_exact_fetch_and_verified_artifact(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

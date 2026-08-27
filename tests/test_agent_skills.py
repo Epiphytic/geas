@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import posixpath
+import re
 from pathlib import Path
 
 import pytest
@@ -408,3 +410,144 @@ def test_render_ontology_skill_is_deterministic_and_bounded_to_one_hop_reference
     for forbidden in ("FULL-DOCUMENT-SENTINEL", "/tmp/", "generated_at:", "username:", "hostname:"):
         assert forbidden not in rendered
     assert all(value.endswith(b"\n") and not value.endswith(b"\n\n") for value in first.values())
+
+
+def test_render_ontology_skill_quarantines_hostile_claim_and_identity_scalars() -> None:
+    """Catches untrusted scalars escaping Markdown data fields into instructions."""
+    from research_agent.render import render_ontology_skill
+
+    topic = _topic()
+    hostile_claim = {
+        **topic.claims[0],
+        "predicate": "predicate`\n# hostile-predicate",
+        "object_json": '"object`\n# hostile-object"',
+        "qualifiers_json": '{"note":"`\n# hostile-qualifiers"}',
+        "asserted_by": "model:test`\n# hostile-asserted-by",
+    }
+    hostile_reference = {
+        **topic.references[0],
+        "identifier_kind": "doi`\n# hostile-identifier-kind",
+        "identifier_value": "10.1000/test`\n# hostile-identifier-value",
+    }
+    hostile_source = {
+        **topic.sources[0],
+        "original_locator": "opaque`\n# hostile-source-locator",
+    }
+    hostile_topic = topic.model_copy(
+        update={
+            "topic_concept_id": "concept:root`\n# hostile-topic-id",
+            "projection_snapshot_id": "truth:test`\n# hostile-snapshot-id",
+            "claims": (hostile_claim, *topic.claims[1:]),
+            "references": (hostile_reference,),
+            "sources": (hostile_source, *topic.sources[1:]),
+        }
+    )
+
+    files = render_ontology_skill(
+        hostile_topic,
+        skill_name="test-skill",
+        ontology_name="test-ontology",
+        repository_url="https://example.test/ontology.git",
+        branch="main",
+        ontology_commit=COMMIT,
+        geas_version="1.2.3",
+        geas_commit=None,
+    )
+    rendered = b"".join(files.values()).decode()
+
+    for label in (
+        "Predicate",
+        "Object",
+        "Qualifiers",
+        "Asserted by",
+        "Identifier kind",
+        "Identifier value",
+        "Topic concept",
+        "Projection snapshot",
+    ):
+        assert f"- {label} (untrusted data):" in rendered
+    for marker in (
+        "hostile-predicate",
+        "hostile-object",
+        "hostile-qualifiers",
+        "hostile-asserted-by",
+        "hostile-identifier-kind",
+        "hostile-identifier-value",
+        "hostile-topic-id",
+        "hostile-snapshot-id",
+    ):
+        assert f"\n        # {marker}" in rendered
+        assert f"\n# {marker}" not in rendered
+    assert "opaqueˋ # hostile-source-locator" in rendered
+    assert "\n# hostile-source-locator" not in rendered
+
+
+def test_render_ontology_skill_typed_reference_links_resolve_from_their_page() -> None:
+    """Catches typed-page links being emitted relative to the snapshot root."""
+    from research_agent.render import render_ontology_skill
+
+    files = render_ontology_skill(
+        _topic(),
+        skill_name="test-skill",
+        ontology_name="test-ontology",
+        repository_url="https://example.test/ontology.git",
+        branch="main",
+        ontology_commit=COMMIT,
+        geas_version="1.2.3",
+        geas_commit=None,
+    )
+
+    checked = 0
+    for page, content in files.items():
+        if page.suffix != ".md" or len(page.parts) < 3:
+            continue
+        for target in re.findall(r"\]\(([^)]+)\)", content.decode()):
+            if "://" in target:
+                continue
+            resolved = Path(posixpath.normpath(posixpath.join(page.parent.as_posix(), target)))
+            assert resolved in files, f"{page} contains broken link {target}"
+            checked += 1
+    assert checked > 0
+
+
+def test_render_ontology_skill_preserves_zero_citation_offsets() -> None:
+    """Catches valid offset zero being rendered as unknown through truthiness."""
+    from research_agent.render import render_ontology_skill
+
+    topic = _topic()
+    reference = {**topic.references[0], "start": 0, "end": 0}
+    files = render_ontology_skill(
+        topic.model_copy(update={"references": (reference,)}),
+        skill_name="test-skill",
+        ontology_name="test-ontology",
+        repository_url="https://example.test/ontology.git",
+        branch="main",
+        ontology_commit=COMMIT,
+        geas_version="1.2.3",
+        geas_commit=None,
+    )
+    citation = next(
+        content.decode() for path, content in files.items() if "citations" in path.parts
+    )
+
+    assert "- Exact range: 0..0" in citation
+
+
+def test_render_ontology_skill_uses_explicit_snapshot_path_commands() -> None:
+    """Catches lifecycle instructions relying on an ambiguous current directory."""
+    from research_agent.render import render_ontology_skill
+
+    entrypoint = render_ontology_skill(
+        _topic(),
+        skill_name="test-skill",
+        ontology_name="test-ontology",
+        repository_url="https://example.test/ontology.git",
+        branch="main",
+        ontology_commit=COMMIT,
+        geas_version="1.2.3",
+        geas_commit=None,
+    )[Path("SKILL.md")].decode()
+
+    assert "/absolute/path/to/directory-containing-this-SKILL" in entrypoint
+    for command in ("skill-update", "skill-unlink", "skill-remove"):
+        assert f"geas {command} ." not in entrypoint

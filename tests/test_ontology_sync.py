@@ -209,3 +209,110 @@ def test_pull_binds_merge_to_exact_remote_head_despite_custom_refspec(
     assert _git("rev-parse", "HEAD", cwd=local.checkout).stdout.strip() == legitimate
     assert (local.checkout / "legitimate.yaml").is_file()
     assert not (local.checkout / "malicious.yaml").exists()
+
+
+def test_pull_rejects_ls_remote_transport_failure_before_downstream_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches network/auth/protocol failure being accepted as an absent branch."""
+    remote = tmp_path / "remote.git"
+    remote.mkdir()
+    _git("init", "--bare", "--initial-branch=main", cwd=remote)
+    seed = _manager(remote, tmp_path / "seed")
+    seed.pull()
+    (seed.checkout / "ontology.yaml").write_text("version: 1\n")
+    seed.push(relative_paths=(Path("ontology.yaml"),), message="seed")
+    local = _manager(remote, tmp_path / "local")
+    local.pull()
+    remote.rename(tmp_path / "unavailable.git")
+
+    def forbid_downstream() -> None:
+        raise AssertionError("downstream work must not run after ls-remote failure")
+
+    monkeypatch.setattr(local, "ensure_gitignore", forbid_downstream)
+    with pytest.raises(OntologySyncError, match="ls-remote|remote branch"):
+        local.pull()
+
+
+def test_pull_rejects_missing_remote_branch_when_local_head_exists(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches a deleted configured branch returning a stale local HEAD as synchronized."""
+    remote = tmp_path / "remote.git"
+    remote.mkdir()
+    _git("init", "--bare", "--initial-branch=main", cwd=remote)
+    seed = _manager(remote, tmp_path / "seed")
+    seed.pull()
+    (seed.checkout / "ontology.yaml").write_text("version: 1\n")
+    seed.push(relative_paths=(Path("ontology.yaml"),), message="seed")
+    local = _manager(remote, tmp_path / "local")
+    local.pull()
+    _git("update-ref", "-d", "refs/heads/main", cwd=remote)
+
+    def forbid_downstream() -> None:
+        raise AssertionError("downstream work must not run without a fetched commit")
+
+    monkeypatch.setattr(local, "ensure_gitignore", forbid_downstream)
+    with pytest.raises(OntologySyncError, match="branch.*does not exist"):
+        local.pull()
+
+
+def test_pull_disables_post_merge_hooks(tmp_path: Path) -> None:
+    """Catches repository hooks changing bytes after the trusted preflight."""
+    remote = tmp_path / "remote.git"
+    remote.mkdir()
+    _git("init", "--bare", "--initial-branch=main", cwd=remote)
+    seed = _manager(remote, tmp_path / "seed")
+    seed.pull()
+    (seed.checkout / "ontology.yaml").write_text("version: 1\n")
+    seed.push(relative_paths=(Path("ontology.yaml"),), message="seed")
+    local = _manager(remote, tmp_path / "local")
+    local.pull()
+    upstream = _manager(remote, tmp_path / "upstream")
+    upstream.pull()
+    (upstream.checkout / "ontology.yaml").write_text("version: 2\n")
+    upstream.push(relative_paths=(Path("ontology.yaml"),), message="advance")
+    hook = local.checkout / ".git" / "hooks" / "post-merge"
+    hook.write_text("#!/bin/sh\nprintf 'hook ran\\n' > hook-ran.txt\n")
+    hook.chmod(0o755)
+
+    receipt = local.pull()
+
+    assert receipt["new_commit"] == _git("rev-parse", "HEAD", cwd=upstream.checkout).stdout.strip()
+    assert not (local.checkout / "hook-ran.txt").exists()
+
+
+def test_pull_rejects_post_merge_tracked_file_tampering_before_downstream_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches clean preflight bytes being changed between merge and rendering."""
+    remote = tmp_path / "remote.git"
+    remote.mkdir()
+    _git("init", "--bare", "--initial-branch=main", cwd=remote)
+    seed = _manager(remote, tmp_path / "seed")
+    seed.pull()
+    (seed.checkout / "ontology.yaml").write_text("version: 1\n")
+    seed.push(relative_paths=(Path("ontology.yaml"),), message="seed")
+    local = _manager(remote, tmp_path / "local")
+    local.pull()
+    upstream = _manager(remote, tmp_path / "upstream")
+    upstream.pull()
+    (upstream.checkout / "ontology.yaml").write_text("version: 2\n")
+    upstream.push(relative_paths=(Path("ontology.yaml"),), message="advance")
+    original_run = local._run
+
+    def tampering_run(
+        command: tuple[str, ...], *, check: bool = True
+    ) -> subprocess.CompletedProcess[str]:
+        result = original_run(command, check=check)
+        if command[:3] == ("git", "merge", "--ff-only"):
+            (local.checkout / "ontology.yaml").write_text("tampered: true\n")
+        return result
+
+    def forbid_downstream() -> None:
+        raise AssertionError("downstream work must not run after post-merge tampering")
+
+    monkeypatch.setattr(local, "_run", tampering_run)
+    monkeypatch.setattr(local, "ensure_gitignore", forbid_downstream)
+    with pytest.raises(OntologySyncError, match="changed after|local changes"):
+        local.pull()

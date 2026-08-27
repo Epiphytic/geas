@@ -214,6 +214,92 @@ def test_export_refuses_conflicting_agent_target_without_force(tmp_path: Path, k
     assert receipt.links[0].unchanged is False
 
 
+def test_initial_export_preflights_every_link_before_installing_snapshot(tmp_path: Path) -> None:
+    """Catches a second-link conflict leaving a new snapshot and first link behind."""
+    home = tmp_path / "home"
+    home.mkdir()
+    first_link = home / ".agents" / "skills" / "test-skill"
+    conflict = home / ".claude" / "skills" / "test-skill"
+    conflict.parent.mkdir(parents=True)
+    conflict.write_text("operator-owned\n")
+    snapshot = tmp_path / "config" / "skills" / "test-skill"
+
+    with pytest.raises(ValueError, match="conflict"):
+        export_skill(
+            _files(),
+            config_root=tmp_path / "config",
+            home=home,
+            repository=None,
+            link=True,
+            force=False,
+            which=_which("codex", "claude"),
+        )
+
+    assert not snapshot.exists()
+    assert not first_link.is_symlink()
+    assert conflict.read_text() == "operator-owned\n"
+
+
+def test_initial_export_rolls_back_snapshot_and_links_after_mid_link_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches an injected second-link failure leaving any visible export state."""
+    home = tmp_path / "home"
+    home.mkdir()
+    first_link = home / ".agents" / "skills" / "test-skill"
+    failing_link = home / ".claude" / "skills" / "test-skill"
+    snapshot = tmp_path / "config" / "skills" / "test-skill"
+    original_symlink_to = Path.symlink_to
+
+    def fail_second_link(
+        path: Path,
+        target: Path | str,
+        target_is_directory: bool = False,
+    ) -> None:
+        if path == failing_link:
+            raise OSError("injected link failure")
+        original_symlink_to(path, target, target_is_directory=target_is_directory)
+
+    monkeypatch.setattr(Path, "symlink_to", fail_second_link)
+    with pytest.raises(OSError, match="injected link failure"):
+        export_skill(
+            _files(),
+            config_root=tmp_path / "config",
+            home=home,
+            repository=None,
+            link=True,
+            force=False,
+            which=_which("codex", "claude"),
+        )
+
+    assert not snapshot.exists()
+    assert not first_link.is_symlink()
+    assert not failing_link.is_symlink()
+
+
+def test_initial_export_rejects_exact_snapshot_link_overlap_even_with_force(
+    tmp_path: Path,
+) -> None:
+    """Catches force deleting a new snapshot and replacing it with a self-link."""
+    home = tmp_path / "home"
+    home.mkdir()
+    snapshot = home / ".agents" / "skills" / "test-skill"
+
+    with pytest.raises(ValueError, match="overlap"):
+        export_skill(
+            _files(),
+            config_root=home / ".agents",
+            home=home,
+            repository=None,
+            link=True,
+            force=True,
+            which=_which("codex"),
+        )
+
+    assert not snapshot.exists()
+    assert not snapshot.is_symlink()
+
+
 def test_install_snapshot_is_atomic_idempotent_and_updates_managed_content(tmp_path: Path) -> None:
     """Catches snapshot installs that replace identical content or cannot update managed state."""
     from research_agent.agent_skills import install_snapshot
@@ -294,9 +380,9 @@ def test_install_snapshot_restores_previous_snapshot_when_replace_fails(
         destination_path = Path(destination)
         if (
             destination_path == target
-            and source_path.parent == target.parent
-            and source_path.name.startswith(".test-skill.")
-            and ".backup" not in source_path.name
+            and source_path.name == "candidate"
+            and source_path.parent.parent == target.parent
+            and source_path.parent.name.startswith(".test-skill.geas-transaction-")
         ):
             raise OSError("injected failure")
         original_replace(source, destination)
@@ -306,6 +392,45 @@ def test_install_snapshot_restores_previous_snapshot_when_replace_fails(
         install_snapshot(_files(body=b"new\n"), target)
 
     assert (target / "SKILL.md").read_bytes() == b"skill\n"
+
+
+def test_install_snapshot_reserves_unique_transaction_paths(tmp_path: Path) -> None:
+    """Catches replacement relying on a fixed adjacent backup path that can be raced."""
+    target = tmp_path / "skills" / "test-skill"
+    install_snapshot(_files(), target)
+    adjacent = target.parent / ".test-skill.backup"
+    adjacent.mkdir()
+    sentinel = adjacent / "operator-owned"
+    sentinel.write_text("preserve me\n")
+
+    receipt = install_snapshot(_files(body=b"updated\n"), target)
+
+    assert receipt.unchanged is False
+    assert (target / "SKILL.md").read_bytes() == b"updated\n"
+    assert sentinel.read_text() == "preserve me\n"
+
+
+def test_install_snapshot_reports_cleanup_failure_after_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches successful replacement surfacing cleanup as a failed install."""
+    import research_agent.agent_skills as skills
+
+    target = tmp_path / "skills" / "test-skill"
+    install_snapshot(_files(), target)
+    original_rmtree = skills.shutil.rmtree
+
+    def fail_transaction_cleanup(path: Path | str, *args: object, **kwargs: object) -> None:
+        candidate = Path(path)
+        if candidate.parent == target.parent and candidate.name.startswith(".test-skill"):
+            raise OSError("injected cleanup failure")
+        original_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(skills.shutil, "rmtree", fail_transaction_cleanup)
+    receipt = install_snapshot(_files(body=b"updated\n"), target)
+
+    assert receipt.cleanup_warning == "skill transaction cleanup retained"
+    assert (target / "SKILL.md").read_bytes() == b"updated\n"
 
 
 def test_export_repository_prefers_trackable_agents_path_and_leaves_changes_uncommitted(
