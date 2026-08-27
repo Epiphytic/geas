@@ -64,7 +64,7 @@ from research_agent.discovery import (
 )
 from research_agent.discovery_acquisition import GitHubDiscoveryAcquirer
 from research_agent.extraction import AnchorGroundedExtractionManager
-from research_agent.geas_update import GeasUpdater, GeasUpdateReceipt
+from research_agent.geas_update import GeasUpdateError, GeasUpdater, GeasUpdateReceipt
 from research_agent.identifiers import doi_locator, normalize_doi
 from research_agent.knowledge import KnowledgeImporter, KnowledgePack
 from research_agent.library import (
@@ -428,6 +428,15 @@ def _installed_geas_version() -> str:
         return version("geas")
     except PackageNotFoundError:
         return "0.1.0"
+
+
+def _current_geas_identity() -> tuple[str, str | None]:
+    """Return independently verified current Geas provenance when it is available."""
+    try:
+        provenance = GeasUpdater().inspect()
+    except GeasUpdateError:
+        return _installed_geas_version(), None
+    return provenance.version, provenance.commit
 
 
 def _skill_export_payload(
@@ -1444,6 +1453,7 @@ def main() -> None:
             profile=profile,
             topic_concept_id=topic_concept_id,
         )
+        geas_version, geas_commit = _current_geas_identity()
         files = render_ontology_skill(
             topic,
             skill_name=args.name or args.ontology,
@@ -1451,8 +1461,8 @@ def main() -> None:
             repository_url=profile.ontology_git.url,
             branch=profile.ontology_git.branch,
             ontology_commit=ontology_commit,
-            geas_version=_installed_geas_version(),
-            geas_commit=None,
+            geas_version=geas_version,
+            geas_commit=geas_commit,
         )
         print("Installing the complete verified skill snapshot.", file=sys.stderr)
         receipt = export_skill(

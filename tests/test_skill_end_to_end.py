@@ -17,7 +17,7 @@ import pytest
 import research_agent.cli as cli
 from research_agent.agent_skills import validate_snapshot
 from research_agent.bundles import KnowledgeBundleImporter
-from research_agent.geas_update import GeasUpdateReceipt
+from research_agent.geas_update import GeasInstallProvenance, GeasUpdateReceipt
 from research_agent.library import SourceLibraryManifest
 from research_agent.ontology_artifacts import OntologyArtifact, OntologyArtifactManager
 from research_agent.ontology_build import OntologyBuildConfig
@@ -68,10 +68,26 @@ class MemoryArtifactStore:
 class FakeGeasUpdater:
     """Trusted local update receipt; no installer or network process is started."""
 
+    current_commit = GEAS_OLD_COMMIT
+    current_version = "0.1.0"
+
+    def inspect(self) -> GeasInstallProvenance:
+        return GeasInstallProvenance(
+            installer="git-development",
+            directory=Path("/trusted/geas"),
+            executable=Path("/trusted/geas/bin/geas"),
+            module_file=Path("/trusted/geas/src/research_agent/geas_update.py"),
+            repository_url="https://github.com/Epiphytic/geas.git",
+            branch="main",
+            commit=self.current_commit,
+            version=self.current_version,
+        )
+
     def update_and_reexec(
         self, _argv: tuple[str, ...], *, continuation: str | None
     ) -> GeasUpdateReceipt:
         assert continuation == "lifecycle"
+        type(self).current_commit = GEAS_NEW_COMMIT
         return GeasUpdateReceipt(
             installer="git-development",
             directory=Path("/trusted/geas"),
@@ -254,6 +270,9 @@ def test_skill_lifecycle_is_portable_repeatable_and_reviewable(
         if executable in {"codex", "claude"}
         else None,
     )
+    FakeGeasUpdater.current_commit = GEAS_OLD_COMMIT
+    FakeGeasUpdater.current_version = "0.1.0"
+    monkeypatch.setattr(cli, "GeasUpdater", FakeGeasUpdater)
 
     export_args = (
         "--geas-config",
@@ -312,7 +331,6 @@ def test_skill_lifecycle_is_portable_repeatable_and_reviewable(
     _git(upstream, "commit", "-m", "trusted update")
     _git(upstream, "push", "origin", "main")
     new_commit = _git(upstream, "rev-parse", "HEAD")
-    monkeypatch.setattr(cli, "GeasUpdater", FakeGeasUpdater)
     _run(
         monkeypatch,
         "--geas-config",

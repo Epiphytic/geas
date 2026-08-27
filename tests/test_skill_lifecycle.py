@@ -18,11 +18,18 @@ from research_agent.agent_skills import (
     canonical_manifest_bytes,
     detect_agents,
     export_skill,
+    install_snapshot,
     snapshot_digest,
+    validate_snapshot,
 )
 
 
-def _files(name: str = "test-skill", body: bytes = b"skill\n") -> dict[Path, bytes]:
+def _files(
+    name: str = "test-skill",
+    body: bytes = b"skill\n",
+    *,
+    geas_commit: str | None = None,
+) -> dict[Path, bytes]:
     inventory = (SkillFile(path="SKILL.md", sha256=hashlib.sha256(body).hexdigest()),)
     manifest = SkillManifest(
         format_version=1,
@@ -33,7 +40,11 @@ def _files(name: str = "test-skill", body: bytes = b"skill\n") -> dict[Path, byt
             branch="main",
             commit="a" * 40,
         ),
-        geas=GeasIdentity(project_url="https://github.com/Epiphytic/geas", version="1.2.3"),
+        geas=GeasIdentity(
+            project_url="https://github.com/Epiphytic/geas",
+            version="1.2.3",
+            commit=geas_commit,
+        ),
         projection=ProjectionIdentity(
             snapshot_id="truth:sha256:example", topic_concept_id="concept:root"
         ),
@@ -41,6 +52,20 @@ def _files(name: str = "test-skill", body: bytes = b"skill\n") -> dict[Path, byt
         snapshot_sha256=snapshot_digest(inventory),
     )
     return {Path("SKILL.md"): body, Path("geas-skill.json"): canonical_manifest_bytes(manifest)}
+
+
+def test_force_install_replaces_candidate_that_only_changes_geas_commit(tmp_path: Path) -> None:
+    """Catches treating unsigned existing manifest provenance as authoritative."""
+    target = tmp_path / "skills" / "test-skill"
+    install_snapshot(_files(geas_commit="a" * 40), target)
+    candidate = _files()
+
+    receipt = install_snapshot(candidate, target, force=True)
+
+    expected = SkillManifest.model_validate_json(candidate[Path("geas-skill.json")])
+    assert receipt.unchanged is False
+    assert receipt.manifest == expected
+    assert validate_snapshot(target) == expected
 
 
 def _which(*available: str) -> Callable[[str], str | None]:
