@@ -535,7 +535,6 @@ def install_builtin_geas_skill(
         plans=tuple(plans),
         root=home,
         state_path=state_path,
-        builtin_state=_builtin_skill_state_from_manifest(manifest),
     )
 
     if snapshot_receipt.unchanged:
@@ -1077,6 +1076,26 @@ def _plan_links(
     return tuple(plans)
 
 
+def _assert_builtin_state_path_is_disjoint(
+    state_path: Path,
+    *,
+    snapshot: Path,
+    plans: tuple[_LinkPlan, ...],
+) -> None:
+    """Reject a state target that could be moved or removed as another transaction target."""
+    targets = (snapshot, *(plan.destination for plan in plans))
+    for target in targets:
+        absolute_target = _absolute_path(target)
+        try:
+            state_path.relative_to(absolute_target)
+        except ValueError:
+            try:
+                absolute_target.relative_to(state_path)
+            except ValueError:
+                continue
+        raise ValueError("builtin skill state path overlaps a snapshot or managed link target")
+
+
 def _replace_snapshot_and_links(
     files: Mapping[Path, bytes],
     *,
@@ -1086,16 +1105,26 @@ def _replace_snapshot_and_links(
     plans: tuple[_LinkPlan, ...],
     root: Path,
     state_path: Path | None = None,
-    builtin_state: BuiltinSkillState | None = None,
 ) -> tuple[SkillExportReceipt, tuple[LinkReceipt, ...]]:
     """Commit one visible snapshot/link state or restore every prior target."""
-    if (state_path is None) != (builtin_state is None):
-        raise ValueError("builtin skill state transaction requires both path and state")
+    builtin_state: BuiltinSkillState | None = None
+    state_unchanged = True
+    if state_path is not None:
+        state_path = _absolute_path(state_path)
+        _assert_builtin_state_path_is_disjoint(state_path, snapshot=snapshot, plans=plans)
+        if manifest.skill.name != _BUILTIN_SKILL_NAME:
+            raise ValueError("builtin skill state transaction requires the Geas skill manifest")
+        builtin_state = _builtin_skill_state_from_manifest(manifest)
+        existing_state = _load_builtin_skill_state(state_path)
+        state_unchanged = (
+            existing_state is not None
+            and _builtin_state_matches_manifest(existing_state, manifest)
+        )
     try:
         snapshot_unchanged = validate_snapshot(snapshot) == manifest
     except ValueError:
         snapshot_unchanged = False
-    if snapshot_unchanged and all(plan.unchanged for plan in plans):
+    if snapshot_unchanged and state_unchanged and all(plan.unchanged for plan in plans):
         return (
             SkillExportReceipt(path=snapshot, manifest=manifest, unchanged=True),
             tuple(
@@ -1119,6 +1148,7 @@ def _replace_snapshot_and_links(
     snapshot_moved = False
     snapshot_installed = False
     state_moved = False
+    state_write_attempted = False
     committed = False
     try:
         if not snapshot_unchanged:
@@ -1158,11 +1188,16 @@ def _replace_snapshot_and_links(
             receipts.append(LinkReceipt(path=plan.destination, target=snapshot, unchanged=False))
         if state_path is not None:
             assert builtin_state is not None
+            state_write_attempted = True
             _write_builtin_skill_state(state_path, builtin_state)
         # Commit point: every desired visible snapshot and link now exists.
         committed = True
     except Exception:
-        if state_path is not None and (state_path.exists() or state_path.is_symlink()):
+        if (
+            state_write_attempted
+            and state_path is not None
+            and (state_path.exists() or state_path.is_symlink())
+        ):
             _remove_exact_target(state_path)
         if state_moved:
             os.replace(state_backup, state_path)

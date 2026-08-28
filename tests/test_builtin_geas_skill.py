@@ -167,6 +167,131 @@ def test_builtin_skill_rolls_back_snapshot_links_and_state_after_state_write_fai
     assert state.read_bytes() == state_before
 
 
+def test_builtin_skill_preserves_visible_state_when_candidate_fails_before_state_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches pre-state failures deleting the prior ownership-state file."""
+    import research_agent.agent_skills as skills
+
+    home = tmp_path / "home"
+    home.mkdir()
+    config_root = tmp_path / "config"
+    first = install_builtin_geas_skill(
+        config_root=config_root,
+        home=home,
+        which=_which("codex"),
+    )
+    snapshot = first.installed[0]
+    state = config_root / "state" / "builtin-skills" / "geas.json"
+    link = home / ".agents" / "skills" / "geas"
+    snapshot_before = {
+        path.relative_to(snapshot): path.read_bytes()
+        for path in snapshot.rglob("*")
+        if path.is_file()
+    }
+    state_before = state.read_bytes()
+    original_files = skills._builtin_skill_source_files
+
+    monkeypatch.setattr(
+        skills,
+        "_builtin_skill_source_files",
+        lambda: {**original_files(), Path("references/cli.md"): b"updated packaged help\n"},
+    )
+    monkeypatch.setattr(
+        skills,
+        "_write_snapshot_candidate",
+        lambda _files, _candidate: (_ for _ in ()).throw(
+            OSError("injected candidate write failure")
+        ),
+    )
+
+    with pytest.raises(OSError, match="injected candidate write failure"):
+        install_builtin_geas_skill(
+            config_root=config_root,
+            home=home,
+            which=_which("codex"),
+        )
+
+    snapshot_after = {
+        path.relative_to(snapshot): path.read_bytes()
+        for path in snapshot.rglob("*")
+        if path.is_file()
+    }
+    assert snapshot_after == snapshot_before
+    assert link.is_symlink()
+    assert link.readlink() == snapshot
+    assert state.read_bytes() == state_before
+
+
+def test_builtin_skill_restores_missing_state_after_unchanged_state_only_race(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches an unchanged install reporting success after its state file disappears."""
+    import research_agent.agent_skills as skills
+
+    home = tmp_path / "home"
+    home.mkdir()
+    config_root = tmp_path / "config"
+    first = install_builtin_geas_skill(
+        config_root=config_root,
+        home=home,
+        which=_which("codex"),
+    )
+    snapshot = first.installed[0]
+    state = config_root / "state" / "builtin-skills" / "geas.json"
+    state_before = state.read_bytes()
+    original_prepare = skills._prepare_snapshot_install
+
+    def remove_state_after_prepare(
+        files: dict[Path, bytes], target: Path, *, force: bool
+    ) -> tuple[Path, skills.SkillManifest, bool]:
+        result = original_prepare(files, target, force=force)
+        state.unlink()
+        return result
+
+    monkeypatch.setattr(skills, "_prepare_snapshot_install", remove_state_after_prepare)
+    receipt = install_builtin_geas_skill(
+        config_root=config_root,
+        home=home,
+        which=_which("codex"),
+    )
+
+    assert receipt.unchanged == (snapshot,)
+    assert state.read_bytes() == state_before
+
+
+def test_builtin_skill_transaction_rejects_state_target_overlap(
+    tmp_path: Path,
+) -> None:
+    """Catches an ownership-state target aliasing a snapshot or managed link target."""
+    import research_agent.agent_skills as skills
+
+    files = skills._builtin_skill_snapshot_files()
+    manifest = skills._validate_snapshot_files(files)
+    snapshot = tmp_path / "config" / "skills" / "geas"
+    link = tmp_path / "home" / ".agents" / "skills" / "geas"
+    snapshot.parent.mkdir(parents=True)
+    plans = skills._plan_links(
+        (link,),
+        snapshot=snapshot,
+        root=tmp_path,
+        relative=False,
+        force=False,
+    )
+
+    for state_path in (snapshot / "state.json", link):
+        with pytest.raises(ValueError, match="state path overlaps"):
+            skills._replace_snapshot_and_links(
+                files,
+                snapshot=snapshot,
+                manifest=manifest,
+                snapshot_signature=skills._snapshot_state_signature(snapshot),
+                plans=plans,
+                root=tmp_path,
+                state_path=state_path,
+            )
+
+
 def test_builtin_skill_removal_receipt_regenerates_through_config_init(tmp_path: Path) -> None:
     """Catches the generic skill receipt suggesting an ontology export that cannot rebuild it."""
     from research_agent.agent_skills import remove_skill
