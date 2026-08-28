@@ -512,6 +512,56 @@ def test_render_ontology_skill_inerts_hostile_topic_and_concept_record_ids() -> 
     assert "\n# hostile-record-id" not in rendered
 
 
+def test_render_ontology_skill_keeps_hostile_cross_record_link_labels_inert() -> None:
+    """Catches backslash parity closing a label into an external link or raw HTML."""
+    from research_agent.render import render_ontology_skill
+
+    hostile_id = "concept:hostile\\](https://attacker.invalid/)"
+    hostile_label = f"{hostile_id}<script>alert(1)</script>"
+    topic = _topic()
+    hostile_topic = topic.model_copy(
+        update={
+            "topic_concept_id": hostile_id,
+            "descendant_concept_ids": (hostile_id, "concept:child"),
+            "concepts": (
+                {**topic.concepts[0], "id": hostile_id, "label": hostile_label},
+                {**topic.concepts[1], "broader": hostile_id},
+            ),
+            "claims": (
+                topic.claims[0],
+                {**topic.claims[1], "subject": hostile_id},
+            ),
+            "gaps": ({**topic.gaps[0], "topic_concept_id": hostile_id},),
+        }
+    )
+
+    files = render_ontology_skill(
+        hostile_topic,
+        skill_name="test-skill",
+        ontology_name="test-ontology",
+        repository_url="https://example.test/ontology.git",
+        branch="main",
+        ontology_commit=COMMIT,
+        geas_version="1.2.3",
+        geas_commit=None,
+    )
+    index = files[Path("references/index.md")].decode()
+    hostile_line = next(
+        line
+        for line in index.splitlines()
+        if line.startswith("- [") and "attacker.invalid" in line
+    )
+
+    # An unescaped closing bracket has an even number of preceding backslashes.
+    targets = re.findall(r"(?<!\\)(?:\\\\)*\]\(([^)]+)\)", hostile_line)
+
+    assert len(targets) == 1
+    assert "attacker.invalid" not in targets[0]
+    assert Path(posixpath.normpath(posixpath.join("references", targets[0]))) in files
+    assert "<script>" not in hostile_line
+    assert "&lt;script&gt;" in hostile_line
+
+
 def test_render_ontology_skill_typed_reference_links_resolve_from_their_page() -> None:
     """Catches typed-page links being emitted relative to the snapshot root."""
     from research_agent.render import render_ontology_skill

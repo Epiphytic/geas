@@ -1090,7 +1090,15 @@ def _finish(lines: list[str]) -> str:
 
 
 def _markdown_text(value: object) -> str:
-    return _inline_data(value).replace("[", "\\[").replace("]", "\\]")
+    return (
+        _inline_data(value)
+        .replace("\\", "\\\\")
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace("[", "\\[")
+        .replace("]", "\\]")
+    )
 
 
 def _inline_data(value: object) -> str:
