@@ -107,6 +107,66 @@ def test_builtin_skill_rolls_back_initial_snapshot_and_links_after_link_failure(
     assert not failing_link.is_symlink()
 
 
+def test_builtin_skill_rolls_back_snapshot_links_and_state_after_state_write_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches ownership-state failures committing a replacement without its prior state."""
+    import research_agent.agent_skills as skills
+
+    home = tmp_path / "home"
+    home.mkdir()
+    config_root = tmp_path / "config"
+    first = install_builtin_geas_skill(
+        config_root=config_root,
+        home=home,
+        which=_which("codex"),
+    )
+    snapshot = first.installed[0]
+    state = config_root / "state" / "builtin-skills" / "geas.json"
+    first_link = home / ".agents" / "skills" / "geas"
+    failing_link = home / ".claude" / "skills" / "geas"
+    snapshot_before = {
+        path.relative_to(snapshot): path.read_bytes()
+        for path in snapshot.rglob("*")
+        if path.is_file()
+    }
+    state_before = state.read_bytes()
+    original_files = skills._builtin_skill_source_files
+    original_write_state = skills._write_builtin_skill_state
+
+    monkeypatch.setattr(
+        skills,
+        "_builtin_skill_source_files",
+        lambda: {**original_files(), Path("references/cli.md"): b"updated packaged help\n"},
+    )
+
+    def fail_after_state_write(path: Path, value: skills.BuiltinSkillState) -> None:
+        assert (snapshot / "references" / "cli.md").read_bytes() == b"updated packaged help\n"
+        assert failing_link.is_symlink()
+        original_write_state(path, value)
+        raise OSError("injected builtin state write failure")
+
+    monkeypatch.setattr(skills, "_write_builtin_skill_state", fail_after_state_write)
+    with pytest.raises(OSError, match="injected builtin state write failure"):
+        install_builtin_geas_skill(
+            config_root=config_root,
+            home=home,
+            which=_which("codex", "claude"),
+        )
+
+    snapshot_after = {
+        path.relative_to(snapshot): path.read_bytes()
+        for path in snapshot.rglob("*")
+        if path.is_file()
+    }
+    assert snapshot_after == snapshot_before
+    assert first_link.is_symlink()
+    assert first_link.readlink() == snapshot
+    assert not failing_link.exists()
+    assert not failing_link.is_symlink()
+    assert state.read_bytes() == state_before
+
+
 def test_builtin_skill_removal_receipt_regenerates_through_config_init(tmp_path: Path) -> None:
     """Catches the generic skill receipt suggesting an ontology export that cannot rebuild it."""
     from research_agent.agent_skills import remove_skill

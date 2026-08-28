@@ -534,10 +534,8 @@ def install_builtin_geas_skill(
         snapshot_signature=snapshot_signature,
         plans=tuple(plans),
         root=home,
-    )
-    _write_builtin_skill_state(
-        state_path,
-        _builtin_skill_state_from_manifest(snapshot_receipt.manifest),
+        state_path=state_path,
+        builtin_state=_builtin_skill_state_from_manifest(manifest),
     )
 
     if snapshot_receipt.unchanged:
@@ -1087,8 +1085,12 @@ def _replace_snapshot_and_links(
     snapshot_signature: tuple[object, ...],
     plans: tuple[_LinkPlan, ...],
     root: Path,
+    state_path: Path | None = None,
+    builtin_state: BuiltinSkillState | None = None,
 ) -> tuple[SkillExportReceipt, tuple[LinkReceipt, ...]]:
     """Commit one visible snapshot/link state or restore every prior target."""
+    if (state_path is None) != (builtin_state is None):
+        raise ValueError("builtin skill state transaction requires both path and state")
     try:
         snapshot_unchanged = validate_snapshot(snapshot) == manifest
     except ValueError:
@@ -1110,11 +1112,13 @@ def _replace_snapshot_and_links(
         )
     )
     snapshot_backup = transaction / "snapshot"
+    state_backup = transaction / "builtin-state"
     candidate = transaction / "candidate"
     changed_links: list[tuple[_LinkPlan, Path]] = []
     receipts: list[LinkReceipt] = []
     snapshot_moved = False
     snapshot_installed = False
+    state_moved = False
     committed = False
     try:
         if not snapshot_unchanged:
@@ -1130,6 +1134,15 @@ def _replace_snapshot_and_links(
                 snapshot_moved = True
             os.replace(candidate, snapshot)
             snapshot_installed = True
+        if state_path is not None:
+            _prepare_builtin_skill_state_parent(state_path)
+            if state_path.is_symlink():
+                raise ValueError("builtin skill state must not be a symbolic link")
+            if state_path.exists():
+                if not state_path.is_file():
+                    raise ValueError("builtin skill state must be a regular file")
+                os.replace(state_path, state_backup)
+                state_moved = True
         for index, plan in enumerate(plans):
             _confined_link_parent(plan.destination.parent, root)
             if _path_signature(plan.destination) != plan.signature:
@@ -1143,9 +1156,16 @@ def _replace_snapshot_and_links(
             changed_links.append((plan, backup))
             plan.destination.symlink_to(plan.expected_target, target_is_directory=True)
             receipts.append(LinkReceipt(path=plan.destination, target=snapshot, unchanged=False))
+        if state_path is not None:
+            assert builtin_state is not None
+            _write_builtin_skill_state(state_path, builtin_state)
         # Commit point: every desired visible snapshot and link now exists.
         committed = True
     except Exception:
+        if state_path is not None and (state_path.exists() or state_path.is_symlink()):
+            _remove_exact_target(state_path)
+        if state_moved:
+            os.replace(state_backup, state_path)
         for plan, backup in reversed(changed_links):
             if plan.destination.exists() or plan.destination.is_symlink():
                 _remove_exact_target(plan.destination)
