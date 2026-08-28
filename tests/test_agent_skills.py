@@ -482,6 +482,36 @@ def test_render_ontology_skill_quarantines_hostile_claim_and_identity_scalars() 
     assert "\n# hostile-source-locator" not in rendered
 
 
+def test_render_ontology_skill_inerts_hostile_topic_and_concept_record_ids() -> None:
+    """Catches record IDs closing inline code and creating active Markdown headings."""
+    from research_agent.render import render_ontology_skill
+
+    hostile_id = "concept:hostile`\n# hostile-record-id"
+    topic = _topic()
+    hostile_topic = topic.model_copy(
+        update={
+            "topic_concept_id": hostile_id,
+            "descendant_concept_ids": (hostile_id, "concept:child"),
+            "concepts": ({**topic.concepts[0], "id": hostile_id}, *topic.concepts[1:]),
+        }
+    )
+
+    files = render_ontology_skill(
+        hostile_topic,
+        skill_name="test-skill",
+        ontology_name="test-ontology",
+        repository_url="https://example.test/ontology.git",
+        branch="main",
+        ontology_commit=COMMIT,
+        geas_version="1.2.3",
+        geas_commit=None,
+    )
+    rendered = b"".join(files.values()).decode()
+
+    assert "Record ID: `concept:hostileˋ # hostile-record-id`" in rendered
+    assert "\n# hostile-record-id" not in rendered
+
+
 def test_render_ontology_skill_typed_reference_links_resolve_from_their_page() -> None:
     """Catches typed-page links being emitted relative to the snapshot root."""
     from research_agent.render import render_ontology_skill
