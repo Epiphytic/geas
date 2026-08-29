@@ -12,6 +12,15 @@ from research_agent.ontology_sync import (
 from research_agent.user_config import OntologyGitConfig
 
 
+@pytest.fixture(autouse=True)
+def _deterministic_git_identity(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep repository-manager commit tests independent of host Git config."""
+    monkeypatch.setenv("GIT_AUTHOR_NAME", "Geas Test")
+    monkeypatch.setenv("GIT_AUTHOR_EMAIL", "geas-test@example.invalid")
+    monkeypatch.setenv("GIT_COMMITTER_NAME", "Geas Test")
+    monkeypatch.setenv("GIT_COMMITTER_EMAIL", "geas-test@example.invalid")
+
+
 def _git(*arguments: str, cwd: Path) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ("git", *arguments),
@@ -43,14 +52,7 @@ def _manager(remote: Path, checkout: Path) -> OntologyRepositoryManager:
     return OntologyRepositoryManager(checkout=checkout, config=config)
 
 
-def test_git_sync_initializes_pushes_and_fast_forward_pulls(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
-    monkeypatch.setenv("GIT_AUTHOR_NAME", "Geas Test")
-    monkeypatch.setenv("GIT_AUTHOR_EMAIL", "geas-test@example.invalid")
-    monkeypatch.setenv("GIT_COMMITTER_NAME", "Geas Test")
-    monkeypatch.setenv("GIT_COMMITTER_EMAIL", "geas-test@example.invalid")
+def test_git_sync_initializes_pushes_and_fast_forward_pulls(tmp_path: Path) -> None:
     remote = tmp_path / "remote.git"
     remote.mkdir()
     _git("init", "--bare", "--initial-branch=main", cwd=remote)
@@ -108,12 +110,7 @@ def test_git_sync_rejects_secret_content_and_unrelated_staging(
 
 def test_freshness_check_fetches_at_most_once_per_window(
     tmp_path: Path,
-    monkeypatch,
 ) -> None:
-    monkeypatch.setenv("GIT_AUTHOR_NAME", "Geas Test")
-    monkeypatch.setenv("GIT_AUTHOR_EMAIL", "geas-test@example.invalid")
-    monkeypatch.setenv("GIT_COMMITTER_NAME", "Geas Test")
-    monkeypatch.setenv("GIT_COMMITTER_EMAIL", "geas-test@example.invalid")
     remote = tmp_path / "remote.git"
     remote.mkdir()
     _git("init", "--bare", "--initial-branch=main", cwd=remote)
