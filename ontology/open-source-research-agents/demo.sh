@@ -68,18 +68,85 @@ uv run geas topic-export \
   > "$demo_root/topic-export.json"
 
 demo_commit=$(git rev-parse HEAD)
-uv run python - "$demo_root" "$demo_commit" <<'PY'
+demo_ref=$(git symbolic-ref -q HEAD || printf '%s' "$demo_commit")
+uv run python - "$demo_root" "$workspace_root" "$demo_commit" "$demo_ref" <<'PY'
 import hashlib
 import json
+import shutil
 import sys
 from pathlib import Path
 
-from research_agent.agent_skills import install_snapshot, validate_snapshot
+from research_agent.agent_skills import (
+    OntologyIdentity,
+    PortableArtifactIdentity,
+    bind_catalog_skill_provenance,
+    install_snapshot,
+    validate_snapshot,
+)
+from research_agent.ontology_artifacts import (
+    ArtifactRole,
+    OntologyArtifact,
+    OntologyArtifactManager,
+)
 from research_agent.projection import KnowledgeQueryEngine
 from research_agent.render import render_ontology_skill
+from research_agent.repository_catalog import verify_catalog
+
+
+class LocalArtifactStore:
+    """Offline content-addressed store used to exercise artifact hydration."""
+
+    def __init__(self, directory: Path) -> None:
+        self.directory = directory
+        directory.mkdir(parents=True)
+
+    def _path(self, artifact: OntologyArtifact) -> Path:
+        return self.directory / artifact.asset_name
+
+    def ensure(self, artifact: OntologyArtifact, source: Path) -> bool:
+        destination = self._path(artifact)
+        if destination.is_file():
+            return False
+        shutil.copyfile(source, destination)
+        return True
+
+    def available(self, artifact: OntologyArtifact) -> bool:
+        return self._path(artifact).is_file()
+
+    def download(self, artifact: OntologyArtifact, destination: Path) -> None:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(self._path(artifact), destination)
 
 root = Path(sys.argv[1])
-topic = KnowledgeQueryEngine(root / "query.sqlite").topic(
+workspace = Path(sys.argv[2])
+ontology_commit = sys.argv[3]
+active_ref = sys.argv[4]
+catalog_ontology = verify_catalog(
+    workspace / "geas.yaml", names=("open-source-research-agents",)
+)[0]
+portable_ontology = root / "portable-ontology" / "open-source-research-agents"
+portable_ontology.mkdir(parents=True)
+artifact_store = LocalArtifactStore(root / "artifact-store")
+artifact_manager = OntologyArtifactManager(portable_ontology)
+published = artifact_manager.publish(
+    store=artifact_store,
+    published_by="operator:demo",
+    storage_rights_basis=(
+        "Offline deterministic demo projection over accepted project-authored source cards."
+    ),
+    knowledge_projection=root / "query.sqlite",
+)
+first_hydration = artifact_manager.hydrate(
+    store=artifact_store,
+    roles=(ArtifactRole.KNOWLEDGE_PROJECTION,),
+)
+second_hydration = artifact_manager.hydrate(
+    store=artifact_store,
+    roles=(ArtifactRole.KNOWLEDGE_PROJECTION,),
+)
+first_artifact = first_hydration.hydrated[0]
+second_artifact = second_hydration.hydrated[0]
+topic = KnowledgeQueryEngine(Path(first_artifact.path)).topic(
     "concept:open-source-research-agents"
 )
 files = render_ontology_skill(
@@ -87,10 +154,30 @@ files = render_ontology_skill(
     skill_name="open-source-research-agents",
     ontology_name="open-source-research-agents",
     repository_url="https://github.com/Epiphytic/geas.git",
-    branch="main",
-    ontology_commit=sys.argv[2],
+    branch=active_ref.removeprefix("refs/heads/"),
+    ontology_commit=ontology_commit,
     geas_version="0.1.0",
-    geas_commit=None,
+    geas_commit=ontology_commit,
+)
+files = bind_catalog_skill_provenance(
+    files,
+    ontology=OntologyIdentity(
+        name="open-source-research-agents",
+        repository_url="https://github.com/Epiphytic/geas.git",
+        branch=active_ref.removeprefix("refs/heads/"),
+        commit=ontology_commit,
+        active_ref=active_ref,
+        ontology_commit=ontology_commit,
+        subscription_name="geas-samples",
+        catalog_path="geas.yaml",
+        ontology_path="ontology/open-source-research-agents",
+        bundle_sha256=catalog_ontology.bundle_sha256,
+    ),
+    artifact=PortableArtifactIdentity(
+        role=first_artifact.role.value,
+        content_sha256=first_artifact.content_sha256,
+        input_revision=first_artifact.input_revision,
+    ),
 )
 target = root / "agent-skill" / "open-source-research-agents"
 first = install_snapshot(files, target)
@@ -123,6 +210,9 @@ def write_json(name, value):
 
 first_receipt = write_json("skill-export-first.json", receipt(first))
 second_receipt = write_json("skill-export-second.json", receipt(second))
+write_json("artifact-publish.json", published.model_dump(mode="json"))
+write_json("artifact-hydration-first.json", first_artifact.model_dump(mode="json"))
+write_json("artifact-hydration-second.json", second_artifact.model_dump(mode="json"))
 first_inventory = write_json("skill-export-first-files.json", first_hashes)
 second_inventory = write_json("skill-export-second-files.json", second_hashes)
 write_json("skill-export-files.json", second_hashes)
@@ -138,6 +228,10 @@ if first_inventory != second_inventory:
     raise SystemExit("demo skill file inventories differ")
 if manifest.snapshot_sha256 != first_receipt["snapshot_sha256"]:
     raise SystemExit("demo skill manifest digest mismatch")
+if first_artifact.downloaded is not True or second_artifact.downloaded is not False:
+    raise SystemExit("demo artifact hydration must download then reuse the preseeded asset")
+if first_artifact.content_sha256 != second_artifact.content_sha256:
+    raise SystemExit("demo artifact hydration content addresses differ")
 PY
 
 uv run geas projection-check \

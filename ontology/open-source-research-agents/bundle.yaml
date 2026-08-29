@@ -6,8 +6,8 @@ recorded_at: 2026-08-03T16:00:00Z
 sources:
   - key: gpt-researcher
     path: sources/gpt-researcher.md
-    expected_sha256: affc4976ed1c0f5e808b476515afd39a60414ca1a81263b406f25c3eabbe5047
-    acquired_at: 2026-08-03T15:00:00Z
+    expected_sha256: fb099d31504d7739d008733d85067c2749650107bcdad5c30c311ddc963f1395
+    acquired_at: 2026-08-29T16:00:00Z
     original_locator: https://github.com/assafelovic/gpt-researcher
     title: GPT Researcher source card
     authors: [Geas maintainers]
@@ -58,8 +58,8 @@ sources:
     provenance_note: Curated from the official repository and pinned default-branch commit.
   - key: deerflow
     path: sources/deerflow.md
-    expected_sha256: 388af987a1839b0fcc7423fdf369893b2eceb8423f4a712b1ebfe85238b3aec9
-    acquired_at: 2026-08-03T15:00:00Z
+    expected_sha256: 41348af3177c439c6c73bc753c889c1118ef7990af67bf77819ac146d3ce1445
+    acquired_at: 2026-08-29T16:00:00Z
     original_locator: https://github.com/bytedance/deer-flow
     title: DeerFlow source card
     authors: [Geas maintainers]
@@ -219,6 +219,12 @@ evidence:
   - key: gptr-recursion
     source_key: gpt-researcher
     exact: The project documents recursive tree-like exploration with configurable breadth and depth.
+  - key: gptr-scholarly-retrieval
+    source_key: gpt-researcher
+    exact: At the observed commit, the retriever package includes OpenAlex and PubMed Central adapters, and the v3.6.1 release notes document scholarly-retriever configuration.
+  - key: gptr-url-security
+    source_key: gpt-researcher
+    exact: The observed release also adds URL-security handling and regression tests for unsafe retrieved destinations.
   - key: gptr-license
     source_key: gpt-researcher
     exact: The repository identifies its software license as Apache-2.0.
@@ -288,6 +294,9 @@ evidence:
   - key: deer-rewrite
     source_key: deerflow
     exact: The active 2.0 line is a ground-up rewrite; the original research framework remains on a 1.x branch.
+  - key: deer-persisted-runs
+    source_key: deerflow
+    exact: The v2.0.0 release documents RunStore-backed run hydration with persisted interruption state and per-user custom agents that can persist edits to their own configuration.
   - key: deer-license
     source_key: deerflow
     exact: The repository identifies its software license as MIT.
@@ -365,6 +374,22 @@ claims:
     epistemic_status: observed
     asserted_by: curator:epiphytic
     evidence_keys: [gptr-recursion]
+  - key: gptr-scholarly-retrieval
+    subject: project:gpt-researcher
+    predicate: ep:retrieval_interfaces
+    object: OpenAlex and PubMed Central scholarly retrievers
+    stance: asserts
+    epistemic_status: observed
+    asserted_by: curator:epiphytic
+    evidence_keys: [gptr-scholarly-retrieval]
+  - key: gptr-url-security
+    subject: project:gpt-researcher
+    predicate: ep:security_boundary
+    object: URL-security handling for unsafe retrieved destinations
+    stance: reports
+    epistemic_status: observed
+    asserted_by: curator:epiphytic
+    evidence_keys: [gptr-url-security]
   - key: gptr-license
     subject: project:gpt-researcher
     predicate: ep:software_license
@@ -550,6 +575,14 @@ claims:
     epistemic_status: observed
     asserted_by: curator:epiphytic
     evidence_keys: [deer-rewrite]
+  - key: deer-persisted-runs
+    subject: project:deerflow
+    predicate: ep:persistent_state
+    object: RunStore-backed interruption state and per-user custom-agent configuration
+    stance: reports
+    epistemic_status: observed
+    asserted_by: curator:epiphytic
+    evidence_keys: [deer-persisted-runs]
   - key: deer-license
     subject: project:deerflow
     predicate: ep:software_license

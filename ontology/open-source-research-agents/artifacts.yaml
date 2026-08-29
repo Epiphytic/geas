@@ -1,0 +1,18 @@
+# Rebuildable, non-canonical ontology artifacts.
+# Verify hashes and embedded SQLite projection stamps before use.
+version: 1
+ontology: open-source-research-agents
+published_at: '2026-08-29T15:46:16.581117Z'
+published_by: operator:epiphytic-maintainer
+artifacts:
+- role: knowledge-projection
+  format: sqlite
+  input_revision: 78613f22bfeb0f7dcef840846ff98f62ec0f05365859c4dc1914931e0546791c
+  content_sha256: 75a072b0e705fa1f34d0330208f7fb6c1a925e82bbf5984af384c901a0acff13
+  size_bytes: 770048
+  asset_name: geas-knowledge-projection-75a072b0e705fa1f34d0330208f7fb6c1a925e82bbf5984af384c901a0acff13.sqlite
+  release_tag: geas-artifact-75a072b0e705fa1f34d0330208f7fb6c1a925e82bbf5984af384c901a0acff13
+  contains_source_text: true
+  storage_rights_basis: Rebuildable accepted-knowledge projection containing attributed
+    project-authored source-card excerpts; no acquired full documents or private source
+    material.

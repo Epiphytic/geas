@@ -1,6 +1,6 @@
 # DeerFlow source card
 
-Observed on 2026-08-03 at default-branch commit bf2cb19ce75d553b730183807786cb7f5bb35a40.
+Observed on 2026-08-29 at default-branch commit c6f6a01f56b04b6c99d73df82ed6053beb8c1a10.
 
 DeerFlow 2.0 is documented as a general super-agent harness that grew from a deep-research framework.
 
@@ -10,6 +10,8 @@ The project documents parallel scoped sub-agents and a lead-agent synthesis step
 
 The active 2.0 line is a ground-up rewrite; the original research framework remains on a 1.x branch.
 
+The v2.0.0 release documents RunStore-backed run hydration with persisted interruption state and per-user custom agents that can persist edits to their own configuration.
+
 The repository identifies its software license as MIT.
 
 Its broad tool surface and configurable sandbox modes create a different security boundary from a fixed deterministic research control plane.
@@ -17,5 +19,6 @@ Its broad tool surface and configurable sandbox modes create a different securit
 ## References
 
 - https://github.com/bytedance/deer-flow
-- https://github.com/bytedance/deer-flow/commit/bf2cb19ce75d553b730183807786cb7f5bb35a40
+- https://github.com/bytedance/deer-flow/commit/c6f6a01f56b04b6c99d73df82ed6053beb8c1a10
+- https://github.com/bytedance/deer-flow/releases/tag/v2.0.0
 - https://github.com/bytedance/deer-flow/tree/main-1.x
