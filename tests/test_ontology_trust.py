@@ -828,3 +828,201 @@ def test_choice_three_rolls_back_all_snapshots_when_single_final_config_write_fa
     assert writes == 1
     assert manager.path.read_bytes() == before
     assert not (manager.root / "snapshots").exists()
+
+
+def test_authorization_rejects_new_catalog_below_previous_deepest_catalog(
+    tmp_path: Path, resolved_catalog: ResolvedRepositoryCatalog
+) -> None:
+    """Reverification must include a newly added catalog before the original CWD."""
+    assert resolved_catalog.repository_root is not None
+    repository = resolved_catalog.repository_root
+    nested_root = repository / "service"
+    nested = _catalog_entry(nested_root, "nested", b"topic: nested\n")
+    nested_root.joinpath("geas.yaml").write_text(
+        yaml.safe_dump({"version": 1, "ontologies": [nested]}, sort_keys=False)
+    )
+    discovery_start = nested_root / "api/deep"
+    discovery_start.mkdir(parents=True)
+    _git(repository, "add", ".")
+    _git(repository, "commit", "-m", "initial nested scope")
+    catalog = resolve_repository_catalog(discovery_start)
+    deeper = _catalog_entry(nested_root / "api", "deeper", b"topic: deeper\n")
+    nested_root.joinpath("api/geas.yaml").write_text(
+        yaml.safe_dump({"version": 1, "ontologies": [deeper]}, sort_keys=False)
+    )
+    manager = _manager(tmp_path)
+
+    with pytest.raises(ValueError, match="changed after integrity verification"):
+        authorize_repository_catalog(
+            catalog,
+            manager=manager,
+            profile_name="default",
+            yolo=True,
+            prompt=None,
+        )
+
+
+def test_source_denial_removes_future_path_and_old_digest_allows_on_denied_ref(
+    tmp_path: Path, resolved_catalog: ResolvedRepositoryCatalog
+) -> None:
+    """A later path addition or digest reversion must remain denied on the ref."""
+    assert resolved_catalog.repository_root is not None
+    repository = resolved_catalog.repository_root
+    old_alpha = resolved_catalog.by_name("alpha")
+    old_digest = old_alpha.bundle_sha256
+    old_alpha.ontology_path.joinpath("build.yaml").write_text("topic: changed alpha\n")
+    refresh_catalog(resolved_catalog.catalog_paths[0], names=("alpha",))
+    current = resolve_repository_catalog(repository)
+    future_allow = _rule(True, paths=("ontology/future",))
+    old_digest_allow = _rule(True, digests=(old_digest,))
+    other_ref_allow = _rule(
+        True,
+        refs=("refs/heads/release",),
+        paths=("ontology/future",),
+    )
+    other_repository_allow = _rule(
+        True,
+        repository="https://github.com/Owner/Other",
+        paths=("ontology/future",),
+    )
+    manager = _manager(tmp_path)
+    profile = (
+        manager.load()
+        .profiles["default"]
+        .model_copy(
+            update={
+                "trust_rules": (
+                    future_allow,
+                    old_digest_allow,
+                    other_ref_allow,
+                    other_repository_allow,
+                )
+            }
+        )
+    )
+    _replace_profile(manager, "default", profile)
+
+    assert (
+        authorize_repository_catalog(
+            current,
+            manager=manager,
+            profile_name="default",
+            yolo=False,
+            prompt=FakePrompt("4"),
+        )
+        == ()
+    )
+
+    denied_rules = manager.load().profiles["default"].trust_rules
+    assert other_ref_allow in denied_rules
+    assert other_repository_allow in denied_rules
+    assert future_allow not in denied_rules
+    assert old_digest_allow not in denied_rules
+
+    old_alpha.ontology_path.joinpath("build.yaml").write_text("topic: alpha\n")
+    refresh_catalog(resolved_catalog.catalog_paths[0], names=("alpha",))
+    catalog_value = yaml.safe_load(resolved_catalog.catalog_paths[0].read_text())
+    catalog_value["ontologies"].append(_catalog_entry(repository, "future", b"topic: future\n"))
+    resolved_catalog.catalog_paths[0].write_text(yaml.safe_dump(catalog_value, sort_keys=False))
+    later = resolve_repository_catalog(repository)
+
+    assert (
+        authorize_repository_catalog(
+            later,
+            manager=manager,
+            profile_name="default",
+            yolo=False,
+            prompt=None,
+        )
+        == ()
+    )
+
+
+def test_shared_snapshot_identity_ignores_nonphysical_metadata_differences(
+    tmp_path: Path, resolved_catalog: ResolvedRepositoryCatalog
+) -> None:
+    """Differing description/file metadata must not hide a shared physical path."""
+    manager = _manager(tmp_path)
+    snapshot = install_snapshot(
+        resolved_catalog.by_name("alpha"), manager=manager, profile_name="default"
+    )
+    variant = snapshot.model_copy(update={"description": "Different profile metadata", "files": ()})
+    config = manager.load()
+    manager.replace(
+        config.model_copy(
+            update={
+                "profiles": {
+                    **config.profiles,
+                    "second": GeasProfile(installed_ontologies=(variant,)),
+                }
+            }
+        )
+    )
+    destination = manager.root / snapshot.path
+
+    assert remove_snapshot(snapshot, manager=manager, profile_name="default").removed is False
+    assert destination.is_dir()
+    assert remove_snapshot(variant, manager=manager, profile_name="second").removed is True
+    assert not destination.exists()
+
+
+@pytest.mark.parametrize("failure", [OSError, KeyboardInterrupt])
+def test_last_snapshot_removal_quarantines_before_config_write_and_restores_on_failure(
+    tmp_path: Path,
+    resolved_catalog: ResolvedRepositoryCatalog,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: type[BaseException],
+) -> None:
+    """Config failure or interruption must restore exact bytes before returning."""
+    manager = _manager(tmp_path)
+    snapshot = install_snapshot(
+        resolved_catalog.by_name("alpha"), manager=manager, profile_name="default"
+    )
+    destination = manager.root / snapshot.path
+    original_replace = manager.replace
+
+    def fail_after_quarantine(config: GeasUserConfig) -> None:
+        assert not destination.exists()
+        assert len(tuple(destination.parent.glob(f".{destination.name}.remove-*"))) == 1
+        raise failure("injected removal interruption")
+
+    monkeypatch.setattr(manager, "replace", fail_after_quarantine)
+    with pytest.raises(failure, match="injected removal interruption"):
+        remove_snapshot(snapshot, manager=manager, profile_name="default")
+    monkeypatch.setattr(manager, "replace", original_replace)
+
+    assert destination.is_dir()
+    assert snapshot in manager.load().profiles["default"].installed_ontologies
+    assert not tuple(destination.parent.glob(f".{destination.name}.remove-*"))
+
+
+def test_last_snapshot_removal_restores_registration_if_quarantine_delete_is_interrupted(
+    tmp_path: Path,
+    resolved_catalog: ResolvedRepositoryCatalog,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Post-config interruption must roll both registration and bytes back coherently."""
+    manager = _manager(tmp_path)
+    snapshot = install_snapshot(
+        resolved_catalog.by_name("alpha"), manager=manager, profile_name="default"
+    )
+    destination = manager.root / snapshot.path
+    original_remove = __import__(
+        "research_agent.ontology_trust", fromlist=["_remove_exact_directory"]
+    )._remove_exact_directory
+
+    def interrupt_quarantine(path: Path) -> None:
+        if ".remove-" in path.name:
+            raise KeyboardInterrupt("injected quarantine deletion interruption")
+        original_remove(path)
+
+    monkeypatch.setattr(
+        "research_agent.ontology_trust._remove_exact_directory",
+        interrupt_quarantine,
+    )
+    with pytest.raises(KeyboardInterrupt, match="quarantine deletion"):
+        remove_snapshot(snapshot, manager=manager, profile_name="default")
+
+    assert destination.is_dir()
+    assert snapshot in manager.load().profiles["default"].installed_ontologies
+    assert not tuple(destination.parent.glob(f".{destination.name}.remove-*"))

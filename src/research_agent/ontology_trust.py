@@ -231,16 +231,6 @@ def _matches(rule: TrustRule, context: TrustContext) -> bool:
     )
 
 
-def _selector_matches(rule: TrustRule, context: TrustContext) -> bool:
-    """Match selectors without the dirty-ref allow exception."""
-    return (
-        rule.repository == context.repository
-        and (rule.refs == "*" or context.ref in rule.refs)
-        and (rule.paths == "*" or context.path in rule.paths)
-        and (rule.bundle_sha256 == "*" or context.bundle_sha256 in rule.bundle_sha256)
-    )
-
-
 def evaluate_trust(context: TrustContext, rules: Sequence[TrustRule]) -> TrustDecision:
     """Apply highest selector specificity, resolving equal scores to deny."""
     matches = tuple(rule for rule in rules if _matches(rule, context))
@@ -284,10 +274,9 @@ def _fresh_catalog(catalog: ResolvedRepositoryCatalog) -> ResolvedRepositoryCata
     """Repeat integrity and repository metadata resolution before authorization."""
     if catalog.repository_root is None:
         raise ValueError("repository catalog has no repository root")
-    discovery_scope = (
-        catalog.catalog_paths[-1].parent if catalog.catalog_paths else catalog.repository_root
-    )
-    fresh = resolve_repository_catalog(discovery_scope)
+    if catalog.discovery_start is None:
+        raise ValueError("repository catalog has no discovery start")
+    fresh = resolve_repository_catalog(catalog.discovery_start)
     if fresh != catalog:
         raise ValueError("repository catalog changed after integrity verification")
     return fresh
@@ -347,7 +336,6 @@ def _profile_with_effective_ref_denial(
 ) -> GeasProfile:
     if catalog.active_ref is None:
         raise ValueError("repository catalog has no active Git ref")
-    contexts = tuple(_context(catalog, ontology) for ontology in catalog.ontologies)
     denial = _interactive_rule(
         catalog,
         decision="deny",
@@ -369,12 +357,15 @@ def _profile_with_effective_ref_denial(
         )
         if selectors == denial_selectors:
             continue
-        if (
-            rule.decision == "allow"
-            and _specificity(rule) >= _specificity(denial)
-            and any(_selector_matches(rule, context) for context in contexts)
-        ):
-            continue
+        if rule.decision == "allow" and rule.repository == denial.repository:
+            if rule.refs == "*":
+                if rule.paths != "*" or rule.bundle_sha256 != "*":
+                    continue
+            elif catalog.active_ref in rule.refs:
+                remaining_refs = tuple(ref for ref in rule.refs if ref != catalog.active_ref)
+                if not remaining_refs:
+                    continue
+                rule = rule.model_copy(update={"refs": remaining_refs})
         retained.append(rule)
     return profile.model_copy(update={"trust_rules": (*retained, denial)})
 
@@ -607,6 +598,20 @@ def _rollback_staged_snapshots(staged: Sequence[_StagedSnapshot]) -> None:
             _remove_empty_snapshot_parents(item.destination)
 
 
+def _physical_snapshot_identity(
+    snapshot: InstalledOntologySnapshot,
+    *,
+    manager: UserConfigManager,
+) -> tuple[str, str, Path]:
+    expected = Path("snapshots") / snapshot.name / snapshot.bundle_sha256
+    if snapshot.path != expected:
+        raise ValueError("registered ontology snapshot destination is invalid")
+    destination = Path(os.path.abspath(manager.root / snapshot.path))
+    if not destination.is_relative_to(manager.root):
+        raise ValueError("registered ontology snapshot destination escapes config root")
+    return snapshot.name, snapshot.bundle_sha256, destination
+
+
 def _stage_snapshot(
     ontology: VerifiedCatalogOntology,
     *,
@@ -726,10 +731,8 @@ def remove_snapshot(
         raise ValueError(f"unknown Geas profile: {profile_name}") from None
     if snapshot not in profile.installed_ontologies:
         raise ValueError("ontology snapshot is not registered in the selected profile")
-    expected = Path("snapshots") / snapshot.name / snapshot.bundle_sha256
-    if snapshot.path != expected:
-        raise ValueError("registered ontology snapshot destination is invalid")
-    destination = manager.root / snapshot.path
+    physical_identity = _physical_snapshot_identity(snapshot, manager=manager)
+    destination = physical_identity[2]
     _reject_symlink_ancestry(destination)
     if not destination.is_dir():
         raise ValueError("registered ontology snapshot directory is missing")
@@ -738,11 +741,23 @@ def remove_snapshot(
     updated_config = config.model_copy(
         update={"profiles": {**config.profiles, profile_name: updated_profile}}
     )
-    shared = any(
-        snapshot in candidate.installed_ontologies for candidate in updated_config.profiles.values()
-    )
-    manager.replace(updated_config)
+    shared = False
+    for candidate_profile in updated_config.profiles.values():
+        for candidate in candidate_profile.installed_ontologies:
+            try:
+                candidate_identity = _physical_snapshot_identity(
+                    candidate,
+                    manager=manager,
+                )
+            except ValueError:
+                continue
+            if candidate_identity == physical_identity:
+                shared = True
+                break
+        if shared:
+            break
     if shared:
+        manager.replace(updated_config)
         return SnapshotRemovalReceipt(
             name=snapshot.name,
             bundle_sha256=snapshot.bundle_sha256,
@@ -751,8 +766,14 @@ def remove_snapshot(
         )
 
     moved = destination.with_name(f".{destination.name}.remove-{uuid4().hex}")
+    os.replace(destination, moved)
     try:
-        os.replace(destination, moved)
+        manager.replace(updated_config)
+    except BaseException:
+        if moved.exists() and not destination.exists():
+            os.replace(moved, destination)
+        raise
+    try:
         _remove_exact_directory(moved)
     except BaseException:
         if moved.exists() and not destination.exists():

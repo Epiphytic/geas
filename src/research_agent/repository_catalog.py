@@ -129,12 +129,25 @@ class ResolvedRepositoryCatalog(StrictModel):
     """Verified effective entries from the direct Git-root-to-cwd catalog chain."""
 
     repository_root: Path | None = None
+    discovery_start: Path | None = None
     repository_identity: str | None = None
     identity_kind: Literal["remote", "machine_local"] | None = None
     active_ref: str | None = None
     commit: str | None = None
     catalog_paths: tuple[Path, ...] = ()
     ontologies: tuple[VerifiedCatalogOntology, ...] = ()
+
+    @model_validator(mode="after")
+    def discovery_scope_is_confined(self) -> ResolvedRepositoryCatalog:
+        if self.repository_root is None:
+            if self.discovery_start is not None:
+                raise ValueError("catalog discovery start requires a repository root")
+            return self
+        if self.discovery_start is None:
+            raise ValueError("repository catalog must record its discovery start")
+        if not self.discovery_start.is_relative_to(self.repository_root):
+            raise ValueError("catalog discovery start escapes repository root")
+        return self
 
     def by_name(self, name: str) -> VerifiedCatalogOntology:
         for ontology in self.ontologies:
@@ -237,7 +250,8 @@ def resolve_repository_catalog(start: Path) -> ResolvedRepositoryCatalog:
     worktree = _git_worktree(start)
     if worktree is None:
         return ResolvedRepositoryCatalog()
-    catalog_paths = discover_catalogs(start)
+    discovery_start = _start_directory(start)
+    catalog_paths = discover_catalogs(discovery_start)
     entries: dict[str, tuple[Path, CatalogOntology]] = {}
     for catalog_path in catalog_paths:
         for entry in load_catalog(catalog_path).ontologies:
@@ -259,6 +273,7 @@ def resolve_repository_catalog(start: Path) -> ResolvedRepositoryCatalog:
     active_ref = _git(worktree, "symbolic-ref", "-q", "HEAD", required=False) or commit
     return ResolvedRepositoryCatalog(
         repository_root=worktree,
+        discovery_start=discovery_start,
         repository_identity=identity,
         identity_kind=identity_kind,
         active_ref=active_ref,

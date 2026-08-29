@@ -362,6 +362,19 @@ def test_non_git_discovery_is_empty(tmp_path: Path) -> None:
     assert discover_catalogs(tmp_path) == ()
 
 
+def test_resolved_catalog_preserves_exact_discovery_start(git_repo: Path) -> None:
+    """Reverification must retain the endpoint below the deepest present catalog."""
+    _catalog_ontology(git_repo)
+    discovery_start = git_repo / "service/api"
+    discovery_start.mkdir(parents=True)
+    _git(git_repo, "add", ".")
+    _git(git_repo, "commit", "-m", "discovery endpoint fixture")
+
+    result = resolve_repository_catalog(discovery_start)
+
+    assert result.discovery_start == discovery_start.resolve()
+
+
 def test_resolved_catalog_includes_normalized_git_receipt_and_declared_file_dirtiness(
     git_repo: Path,
 ) -> None:
