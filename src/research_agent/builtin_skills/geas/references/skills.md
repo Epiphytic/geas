@@ -6,6 +6,19 @@ Exported ontology skills are portable projections with their own strict
 manifest and evidence/provenance context; they are not canonical ontology
 truth and do not bundle every acquired source document.
 
+A catalog-bound export records the declaring `repository_url`, `active_ref`,
+exact `ontology_commit`, `catalog_path`, `ontology_path`, and
+`bundle_sha256`. Its knowledge-projection identity records
+`content_sha256` and `input_revision`; the projection snapshot stamp remains
+separate. These values locate and verify the export. They do not grant trust
+to later repository bytes.
+
+An exported ontology skill is usable without Geas: begin at its local
+`references/index.md` and follow only the typed pages needed. Its entry point
+also links to the repository and optional Geas installation, and gives exact
+`geas list`, artifact lookup, `skill-update`, `skill-unlink`, and
+`skill-remove` routes.
+
 `config-init` installs or refreshes the packaged generic `geas` skill at
 `<geas-config-root>/skills/geas`, then links it for detected agents. Codex and
 OpenCode share `~/.agents/skills/geas`; Claude uses
@@ -27,6 +40,12 @@ development invocation. The checkout must use the fixed Geas project URL and
 fetched commit with hooks disabled, rechecks HEAD and clean bytes, reinstalls the
 exact directory with `uv`, and reexecutes once with a bounded continuation
 marker before ontology synchronization or rendering continues.
+
+For a catalog-bound skill, update selects the same named subscription and
+rechecks its URL, active ref, catalog path, ontology path, resolved commit,
+bundle inventory, artifact digest, projection stamp, and executing Geas
+identity before replacement. A mismatch or interruption preserves the
+previous complete snapshot.
 
 Remote mismatch, dirty or divergent history, fetch failure, post-merge changes,
 installer failure, post-reexec version or provenance mismatch, unsupported

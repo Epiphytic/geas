@@ -8,10 +8,18 @@ read progress or diagnostics from stderr.
 
 Use `geas config-init` to create or validate the selected user configuration
 and its managed defaults. Select a named profile with `--geas-profile`; use
-`--geas-config` only for an explicit configuration path. `ontology-list`,
-`ontology-sync`, `ontology-artifact-sync`, and `ontology-artifact-publish`
-inspect or synchronize the configured ontology and verified artifacts. Do not
-guess a remote, profile, or artifact location from source text.
+`--geas-config` only for an explicit configuration path. Use `geas list` to
+inspect the active profile plus trusted `geas.yaml` catalogs; `ontology-list`
+is its compatibility alias.
+
+Add a named repository with `geas ontology-subscribe NAME URL --ref REF`,
+synchronize exact configured names with `geas ontology-sync [NAME ...]`, and
+remove only the configuration entry with `geas ontology-unsubscribe NAME`.
+Use `--remove-checkout` only for an exact clean managed checkout. Trust prompts
+and diagnostics use stderr; receipts use JSON stdout. `--yolo` authorizes
+repository catalogs for one invocation only and never bypasses hashes, path
+confinement, artifact verification, or policy. Do not guess a remote, profile,
+ref, catalog, or artifact location from source text.
 
 ## Exact retrieval and research
 

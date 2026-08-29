@@ -17,9 +17,12 @@ from uuid import uuid4
 from pydantic_core import to_jsonable_python
 
 from research_agent.agent_skills import (
+    OntologyIdentity,
+    PortableArtifactIdentity,
     SkillExportReceipt,
     SkillManifest,
     SkillRemovalReceipt,
+    bind_catalog_skill_provenance,
     canonical_manifest_bytes,
     export_skill,
     refresh_skill,
@@ -169,6 +172,7 @@ from research_agent.truth import SQLiteProjectionGuard, TruthManager, TruthPolic
 from research_agent.user_config import (
     GeasProfile,
     GeasUserConfig,
+    OntologyGitConfig,
     UserConfigManager,
     default_config_path,
 )
@@ -366,6 +370,39 @@ def _catalog_selection(
         )
         selection = select_ontology(value.name, catalog=refreshed)
     return selection
+
+
+def _catalog_subscription_selection(
+    args: argparse.Namespace,
+    *,
+    ontology_name: str,
+    subscription_name: str,
+) -> OntologySelection:
+    """Resolve the exact manifest-declared source without cwd name shadowing."""
+    catalog, _manager, _config, _profile_name, _profile = _resolve_cli_catalog(
+        args,
+        cwd=Path.cwd(),
+        interactive=True,
+    )
+    matches = tuple(
+        candidate
+        for candidate in catalog.candidates
+        if candidate.name == ontology_name
+        and candidate.subscription_name == subscription_name
+        and candidate.source_kind == "subscription"
+    )
+    if len(matches) != 1:
+        raise ValueError(
+            f"ontology {ontology_name!r} is not uniquely declared by subscription "
+            f"{subscription_name!r}"
+        )
+    candidate = matches[0]
+    if candidate.trust_status != "trusted":
+        raise ValueError(
+            f"ontology {ontology_name!r} is not trusted for operational use "
+            f"({candidate.trust_status})"
+        )
+    return OntologySelection.model_validate(candidate.model_dump(mode="python"))
 
 
 def _subscription_catalog(path: Path) -> ResolvedRepositoryCatalog:
@@ -600,6 +637,143 @@ def _require_profile_matches_manifest(profile: GeasProfile, manifest: SkillManif
         )
 
 
+def _catalog_subscription_from_manifest(
+    profile: GeasProfile,
+    manifest: SkillManifest,
+) -> tuple[str, OntologySubscription]:
+    ontology = manifest.ontology
+    if (
+        ontology.subscription_name is None
+        or ontology.active_ref is None
+        or ontology.catalog_path is None
+        or ontology.ontology_path is None
+        or ontology.bundle_sha256 is None
+        or ontology.ontology_commit is None
+        or manifest.artifact is None
+    ):
+        raise ValueError("the skill manifest has incomplete catalog provenance")
+    subscriptions = profile.normalized_subscriptions()
+    try:
+        subscription = subscriptions[ontology.subscription_name]
+    except KeyError:
+        raise ValueError(
+            f"the declaring subscription {ontology.subscription_name!r} is not configured"
+        ) from None
+    if (
+        _normalized_git_url(subscription.url)
+        != _normalized_git_url(ontology.repository_url)
+        or subscription.active_ref != ontology.active_ref
+        or subscription.catalog.as_posix() != ontology.catalog_path
+    ):
+        raise ValueError(
+            "the declaring subscription URL/ref/catalog does not match the skill manifest"
+        )
+    return ontology.subscription_name, subscription
+
+
+def _selection_repository_config(
+    selection: OntologySelection,
+    *,
+    profile: GeasProfile,
+) -> OntologySubscription | OntologyGitConfig:
+    if selection.subscription is not None:
+        return selection.subscription
+    if selection.source_kind == "legacy_profile" and profile.ontology_git is not None:
+        return profile.ontology_git
+    raise ValueError(f"ontology {selection.name!r} has no declaring artifact subscription")
+
+
+def _selected_topic_concept_id(
+    selection: OntologySelection,
+    *,
+    user_config: GeasUserConfig,
+) -> str:
+    build_path = resolve_selected_ontology_config(
+        Path(selection.name),
+        filename="build.yaml",
+        selection=selection,
+    )
+    return OntologyBuildConfig.from_yaml(
+        build_path,
+        defaults=user_config.ontology_defaults,
+    ).topic_concept_id
+
+
+def _artifact_identity(receipt: ArtifactHydrationReceipt) -> PortableArtifactIdentity:
+    projections = tuple(
+        item for item in receipt.hydrated if item.role is ArtifactRole.KNOWLEDGE_PROJECTION
+    )
+    if len(projections) != 1:
+        raise ValueError("verified artifact receipt does not identify one knowledge projection")
+    item = projections[0]
+    return PortableArtifactIdentity(
+        role="knowledge-projection",
+        content_sha256=item.content_sha256,
+        input_revision=item.input_revision,
+    )
+
+
+def _catalog_ontology_identity(selection: OntologySelection) -> OntologyIdentity:
+    subscription = selection.subscription
+    if (
+        subscription is None
+        or selection.subscription_name is None
+        or selection.active_ref is None
+        or selection.commit is None
+        or selection.catalog_path is None
+        or selection.repository_path is None
+        or selection.bundle_sha256 is None
+        or selection.repository_root is None
+    ):
+        raise ValueError("catalog selection has incomplete subscription provenance")
+    try:
+        catalog_path = selection.catalog_path.relative_to(selection.repository_root).as_posix()
+    except ValueError as error:
+        raise ValueError("catalog path escapes its declaring repository") from error
+    if catalog_path != subscription.catalog.as_posix():
+        raise ValueError("selected catalog does not match its declaring subscription")
+    branch = selection.active_ref.removeprefix("refs/heads/")
+    return OntologyIdentity(
+        name=selection.name,
+        repository_url=subscription.url,
+        branch=branch,
+        commit=selection.commit,
+        active_ref=selection.active_ref,
+        ontology_commit=selection.commit,
+        subscription_name=selection.subscription_name,
+        catalog_path=catalog_path,
+        ontology_path=selection.repository_path.as_posix(),
+        bundle_sha256=selection.bundle_sha256,
+    )
+
+
+def _render_catalog_skill(
+    topic: TopicView,
+    *,
+    selection: OntologySelection,
+    artifact: ArtifactHydrationReceipt,
+    skill_name: str,
+    geas_version: str,
+    geas_commit: str | None,
+) -> dict[Path, bytes]:
+    ontology = _catalog_ontology_identity(selection)
+    rendered = render_ontology_skill(
+        topic,
+        skill_name=skill_name,
+        ontology_name=selection.name,
+        repository_url=ontology.repository_url,
+        branch=ontology.branch,
+        ontology_commit=ontology.commit,
+        geas_version=geas_version,
+        geas_commit=geas_commit,
+    )
+    return bind_catalog_skill_provenance(
+        rendered,
+        ontology=ontology,
+        artifact=_artifact_identity(artifact),
+    )
+
+
 def _selected_ontology(
     root: Path,
     name: str,
@@ -626,12 +800,10 @@ def _selected_ontology(
 def _load_portable_topic(
     ontology_directory: Path,
     *,
-    profile: GeasProfile,
+    repository_config: OntologySubscription | OntologyGitConfig,
     topic_concept_id: str,
 ) -> tuple[TopicView, ArtifactHydrationReceipt]:
     """Hydrate and verify only the manifest-pinned knowledge projection artifact."""
-    if profile.ontology_git is None:
-        raise ValueError("the selected Geas profile has no ontology artifact source")
     manager = OntologyArtifactManager(ontology_directory)
     if not manager.manifest_path.is_file() or manager.manifest_path.is_symlink():
         raise ValueError(
@@ -641,8 +813,8 @@ def _load_portable_topic(
         )
     hydration = manager.hydrate(
         store=GitHubReleaseArtifactStore(
-            profile.ontology_git.url,
-            branch=profile.ontology_git.branch,
+            repository_config.url,
+            branch=repository_config.active_ref,
         ),
         roles=(ArtifactRole.KNOWLEDGE_PROJECTION,),
     )
@@ -756,42 +928,97 @@ def _complete_skill_update(
     manifest: SkillManifest,
     geas_receipt: GeasUpdateReceipt,
 ) -> dict[str, object]:
+    if (
+        _normalized_git_url(manifest.geas.project_url)
+        != _normalized_git_url(geas_receipt.repository_url)
+        or geas_receipt.branch != "main"
+        or manifest.geas.version != geas_receipt.old_version
+        or (
+            manifest.geas.commit is not None
+            and manifest.geas.commit != geas_receipt.old_commit
+        )
+    ):
+        raise ValueError("executing Geas identity does not match the skill manifest")
     user_config = manager.load()
     profile_name, profile = user_config.profile(args.geas_profile)
-    _require_profile_matches_manifest(profile, manifest)
-    assert profile.ontology_git is not None
-    ontology_root = manager.ontology_root(profile)
+    catalog_bound = manifest.ontology.bundle_sha256 is not None
+    if catalog_bound:
+        subscription_name, repository_config = _catalog_subscription_from_manifest(
+            profile,
+            manifest,
+        )
+        ontology_root = manager.subscription_checkout(repository_config)
+    else:
+        _require_profile_matches_manifest(profile, manifest)
+        assert profile.ontology_git is not None
+        repository_config = profile.ontology_git
+        ontology_root = manager.ontology_root(profile)
     print("Fast-forwarding the trusted ontology checkout.", file=sys.stderr)
     pull = OntologyRepositoryManager(
         checkout=ontology_root,
-        config=profile.ontology_git,
+        config=repository_config,
     ).pull()
     ontology_commit = pull.get("commit")
     if not isinstance(ontology_commit, str):
         raise ValueError("the synchronized ontology checkout has no committed HEAD")
-    old_ontology_commit = manifest.ontology.commit
+    old_ontology_commit = manifest.ontology.ontology_commit or manifest.ontology.commit
     try:
-        ontology_directory, topic_concept_id = _selected_ontology(
-            ontology_root,
-            manifest.ontology.name,
-            user_config=user_config,
-        )
+        selection: OntologySelection | None = None
+        if catalog_bound:
+            selection = _catalog_subscription_selection(
+                args,
+                ontology_name=manifest.ontology.name,
+                subscription_name=subscription_name,
+            )
+            if selection.commit != ontology_commit:
+                raise ValueError("selected ontology commit does not match synchronized HEAD")
+            if selection.repository_path is None or (
+                selection.repository_path.as_posix() != manifest.ontology.ontology_path
+            ):
+                raise ValueError("selected ontology path does not match the skill manifest")
+            ontology_directory = selection.ontology_directory
+            topic_concept_id = _selected_topic_concept_id(
+                selection,
+                user_config=user_config,
+            )
+            resolve_selected_ontology_config(
+                Path(selection.name),
+                filename="artifacts.yaml",
+                selection=selection,
+            )
+        else:
+            ontology_directory, topic_concept_id = _selected_ontology(
+                ontology_root,
+                manifest.ontology.name,
+                user_config=user_config,
+            )
         print("Verifying the updated portable knowledge projection.", file=sys.stderr)
         topic, artifact = _load_portable_topic(
             ontology_directory,
-            profile=profile,
+            repository_config=repository_config,
             topic_concept_id=topic_concept_id,
         )
-        files = render_ontology_skill(
-            topic,
-            skill_name=manifest.skill.name,
-            ontology_name=manifest.ontology.name,
-            repository_url=profile.ontology_git.url,
-            branch=profile.ontology_git.branch,
-            ontology_commit=ontology_commit,
-            geas_version=geas_receipt.new_version,
-            geas_commit=geas_receipt.new_commit,
-        )
+        if selection is not None:
+            files = _render_catalog_skill(
+                topic,
+                selection=selection,
+                artifact=artifact,
+                skill_name=manifest.skill.name,
+                geas_version=geas_receipt.new_version,
+                geas_commit=geas_receipt.new_commit,
+            )
+        else:
+            assert isinstance(repository_config, OntologyGitConfig)
+            files = render_ontology_skill(
+                topic,
+                skill_name=manifest.skill.name,
+                ontology_name=manifest.ontology.name,
+                repository_url=repository_config.url,
+                branch=repository_config.branch,
+                ontology_commit=ontology_commit,
+                geas_version=geas_receipt.new_version,
+                geas_commit=geas_receipt.new_commit,
+            )
         candidate_manifest = SkillManifest.model_validate_json(files[Path("geas-skill.json")])
         changed_paths, unchanged_paths = _skill_file_lifecycle(
             manifest,
@@ -1697,39 +1924,76 @@ def main() -> None:
         manager = _user_config_manager(args)
         user_config = manager.load()
         profile_name, profile = user_config.profile(args.geas_profile)
-        if profile.ontology_git is None:
-            raise ValueError(f"Geas profile {profile_name!r} has no trusted ontology_git config")
-        print("Synchronizing the trusted ontology checkout for skill export.", file=sys.stderr)
-        ontology_root = manager.ontology_root(profile)
-        pull = OntologyRepositoryManager(
-            checkout=ontology_root,
-            config=profile.ontology_git,
-        ).pull()
-        ontology_commit = pull.get("commit")
-        if not isinstance(ontology_commit, str):
-            raise ValueError("the synchronized ontology checkout has no committed HEAD")
-        ontology_directory, topic_concept_id = _selected_ontology(
-            ontology_root,
-            args.ontology,
-            user_config=user_config,
+        selection = (
+            _catalog_selection(args, Path(args.ontology))
+            if profile.subscriptions or manager.ontology_root(profile).exists()
+            else None
         )
+        if selection is not None and selection.subscription is not None:
+            repository_config: OntologySubscription | OntologyGitConfig = (
+                _selection_repository_config(selection, profile=profile)
+            )
+            ontology_commit = selection.commit
+            if ontology_commit is None:
+                raise ValueError("the selected ontology has no committed Git identity")
+            ontology_directory = selection.ontology_directory
+            topic_concept_id = _selected_topic_concept_id(
+                selection,
+                user_config=user_config,
+            )
+            resolve_selected_ontology_config(
+                Path(selection.name),
+                filename="artifacts.yaml",
+                selection=selection,
+            )
+        else:
+            if profile.ontology_git is None:
+                raise ValueError(
+                    f"Geas profile {profile_name!r} has no declaring ontology subscription"
+                )
+            print("Synchronizing the trusted ontology checkout for skill export.", file=sys.stderr)
+            ontology_root = manager.ontology_root(profile)
+            repository_config = profile.ontology_git
+            pull = OntologyRepositoryManager(
+                checkout=ontology_root,
+                config=repository_config,
+            ).pull()
+            ontology_commit = pull.get("commit")
+            if not isinstance(ontology_commit, str):
+                raise ValueError("the synchronized ontology checkout has no committed HEAD")
+            ontology_directory, topic_concept_id = _selected_ontology(
+                ontology_root,
+                args.ontology,
+                user_config=user_config,
+            )
         print("Verifying the portable knowledge projection.", file=sys.stderr)
         topic, artifact = _load_portable_topic(
             ontology_directory,
-            profile=profile,
+            repository_config=repository_config,
             topic_concept_id=topic_concept_id,
         )
         geas_version, geas_commit = _current_geas_identity()
-        files = render_ontology_skill(
-            topic,
-            skill_name=args.name or args.ontology,
-            ontology_name=args.ontology,
-            repository_url=profile.ontology_git.url,
-            branch=profile.ontology_git.branch,
-            ontology_commit=ontology_commit,
-            geas_version=geas_version,
-            geas_commit=geas_commit,
-        )
+        if selection is not None and selection.subscription is not None:
+            files = _render_catalog_skill(
+                topic,
+                selection=selection,
+                artifact=artifact,
+                skill_name=args.name or args.ontology,
+                geas_version=geas_version,
+                geas_commit=geas_commit,
+            )
+        else:
+            assert isinstance(repository_config, OntologyGitConfig)
+            files = render_ontology_skill(
+                topic,
+                skill_name=args.name or args.ontology,
+                ontology_name=args.ontology,
+                repository_url=repository_config.url,
+                branch=repository_config.branch,
+                ontology_commit=ontology_commit,
+                geas_version=geas_version,
+                geas_commit=geas_commit,
+            )
         print("Installing the complete verified skill snapshot.", file=sys.stderr)
         receipt = export_skill(
             files,
