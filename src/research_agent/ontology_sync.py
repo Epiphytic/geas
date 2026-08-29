@@ -89,6 +89,22 @@ class OntologyRepositoryManager:
         self.checkout = checkout.expanduser().resolve()
         self.config = config
 
+    def assert_pushable(self) -> None:
+        """Read-only proof that artifact publication can be followed by a safe push."""
+        if not self._is_branch_ref():
+            raise OntologySyncError(
+                "tag and commit ontology refs are read-only; publication requires a branch"
+            )
+        if not (self.checkout / ".git").is_dir():
+            raise OntologySyncError("ontology publication checkout is not a Git repository")
+        self._assert_checkout_root()
+        self._assert_remote(create_missing=False)
+        self._assert_active_checkout()
+        if self._status(ignore_generated_gitignore=True):
+            raise OntologySyncError(
+                "ontology checkout has local changes; refusing artifact publication"
+            )
+
     def pull(self) -> dict[str, object]:
         cloned = self._ensure_checkout()
         self._assert_remote()

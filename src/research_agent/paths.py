@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import sys
@@ -94,7 +95,44 @@ def resolve_selected_ontology_config(
         return value
     if value.exists() or value.is_absolute() or len(value.parts) != 1:
         return value
-    return selection.ontology_directory / filename
+    return selected_conventional_path(selection, filename=filename)
+
+
+def selected_conventional_path(
+    selection: OntologySelection,
+    *,
+    filename: str,
+) -> Path:
+    """Resolve and reverify one conventional file from a selected ontology."""
+    relative = Path(filename)
+    if (
+        not filename
+        or relative.is_absolute()
+        or len(relative.parts) != 1
+        or relative.name != filename
+        or relative.name.startswith(".")
+    ):
+        raise ValueError("selected ontology filename must be one conventional relative name")
+    path = selection.ontology_directory / relative
+    if selection.files is None:
+        return path
+    declared = next((item for item in selection.files if item.path == relative), None)
+    if declared is None:
+        raise ValueError(
+            f"ontology input {filename!r} is not declared in the verified bundle inventory"
+        )
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"declared ontology input is missing or symbolic: {filename}")
+    resolved = path.resolve(strict=True)
+    if not resolved.is_relative_to(selection.ontology_directory.resolve()):
+        raise ValueError("declared ontology input escapes the selected ontology directory")
+    content = resolved.read_bytes()
+    if (
+        len(content) != declared.size_bytes
+        or hashlib.sha256(content).hexdigest() != declared.sha256
+    ):
+        raise ValueError(f"declared ontology input size or digest mismatch: {filename}")
+    return resolved
 
 
 def _resolve_ontology_config(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -11,12 +12,14 @@ import pytest
 import yaml
 
 from research_agent import cli
+from research_agent.ontology_resolution import OntologySelection
 from research_agent.ontology_subscriptions import (
     OntologySubscription,
+    SubscriptionManager,
     SubscriptionMutationReceipt,
     SubscriptionSyncReceipt,
 )
-from research_agent.repository_catalog import load_catalog, refresh_catalog
+from research_agent.repository_catalog import CatalogFile, load_catalog, refresh_catalog
 from research_agent.user_config import GeasProfile, GeasUserConfig, UserConfigManager
 
 
@@ -299,6 +302,46 @@ def test_untrusted_named_build_fails_before_build_config_parsing(
     assert parsed == []
 
 
+def test_undeclared_named_build_fails_before_build_config_parsing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _manager(tmp_path)
+    catalog_path = _repository(tmp_path / "repository", "undeclared")
+    ontology = catalog_path.parent / "ontology" / "undeclared"
+    payload = ontology / "payload.txt"
+    payload.write_text("declared payload\n")
+    document = yaml.safe_load(catalog_path.read_text())
+    document["ontologies"][0]["files"] = [
+        {"path": "payload.txt", "sha256": "0" * 64, "size_bytes": 0}
+    ]
+    catalog_path.write_text(yaml.safe_dump(document, sort_keys=False))
+    refresh_catalog(catalog_path)
+    _git(catalog_path.parent, "add", ".")
+    _git(catalog_path.parent, "commit", "-m", "declare payload only")
+    monkeypatch.chdir(catalog_path.parent)
+    parsed: list[Path] = []
+
+    def forbidden_parse(path: Path, **kwargs: object) -> object:
+        parsed.append(path)
+        raise AssertionError("build parser crossed the inventory gate")
+
+    monkeypatch.setattr(cli.OntologyBuildConfig, "from_yaml", forbidden_parse)
+
+    with pytest.raises(ValueError, match="not declared"):
+        _run_main(
+            monkeypatch,
+            "--geas-config",
+            str(manager.path),
+            "--yolo",
+            "ontology-build",
+            "undeclared",
+            "--check",
+        )
+
+    assert parsed == []
+
+
 def test_subscription_selection_freshens_only_after_initial_authorization(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -357,3 +400,230 @@ def test_subscription_selection_freshens_only_after_initial_authorization(
             subscription.pull_before_update,
         )
     ]
+
+
+def _artifact_selection(
+    tmp_path: Path,
+    *,
+    active_ref: str,
+    declare_manifest: bool = True,
+) -> tuple[OntologySelection, Path]:
+    repository = tmp_path / "repository"
+    ontology = repository / "ontology" / "example"
+    ontology.mkdir(parents=True)
+    manifest = ontology / "artifacts.yaml"
+    content = b"version: 1\nontology: example\nartifacts: []\n"
+    manifest.write_bytes(content)
+    files = (
+        (
+            CatalogFile(
+                path=Path("artifacts.yaml"),
+                sha256=hashlib.sha256(content).hexdigest(),
+                size_bytes=len(content),
+            ),
+        )
+        if declare_manifest
+        else ()
+    )
+    subscription = OntologySubscription(
+        url="https://example.invalid/repository.git",
+        active_ref=active_ref,
+        checkout=Path("subscriptions/default/example"),
+    )
+    return (
+        OntologySelection(
+            name="example",
+            source="subscription:example",
+            source_kind="subscription",
+            ontology_directory=ontology,
+            repository_identity="https://example.invalid/repository",
+            repository_root=repository,
+            active_ref=active_ref,
+            commit="a" * 40,
+            catalog_path=repository / "geas.yaml",
+            repository_path=Path("ontology/example"),
+            bundle_sha256="b" * 64,
+            files=files,
+            trust_status="trusted",
+            authorization="yolo",
+            subscription_name="example",
+            subscription=subscription,
+        ),
+        manifest,
+    )
+
+
+@pytest.mark.parametrize("active_ref", ("refs/tags/v1", "a" * 40))
+def test_artifact_publish_rejects_read_only_ref_before_artifact_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    active_ref: str,
+) -> None:
+    manager = _manager(tmp_path)
+    selection, manifest = _artifact_selection(tmp_path, active_ref=active_ref)
+    before = manifest.read_bytes()
+    artifact_calls: list[str] = []
+    monkeypatch.setattr(cli, "_catalog_selection", lambda *args, **kwargs: selection)
+
+    class ForbiddenArtifactManager:
+        def __init__(self, directory: Path) -> None:
+            artifact_calls.append("manager")
+            raise AssertionError("artifact manager crossed push preflight")
+
+    monkeypatch.setattr(cli, "OntologyArtifactManager", ForbiddenArtifactManager)
+
+    with pytest.raises(RuntimeError, match="read-only|branch"):
+        _run_main(
+            monkeypatch,
+            "--geas-config",
+            str(manager.path),
+            "ontology-artifact-publish",
+            "example",
+            "--published-by",
+            "tester",
+            "--storage-rights-basis",
+            "fixture",
+        )
+
+    assert artifact_calls == []
+    assert manifest.read_bytes() == before
+
+
+def test_undeclared_artifact_manifest_fails_before_artifact_construction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _manager(tmp_path)
+    selection, _manifest = _artifact_selection(
+        tmp_path,
+        active_ref="refs/heads/main",
+        declare_manifest=False,
+    )
+    artifact_calls: list[str] = []
+    monkeypatch.setattr(cli, "_catalog_selection", lambda *args, **kwargs: selection)
+    monkeypatch.setattr(
+        cli.OntologyRepositoryManager,
+        "assert_pushable",
+        lambda self: None,
+        raising=False,
+    )
+
+    class ForbiddenArtifactManager:
+        def __init__(self, directory: Path) -> None:
+            artifact_calls.append("manager")
+            raise AssertionError("artifact manager crossed inventory gate")
+
+    monkeypatch.setattr(cli, "OntologyArtifactManager", ForbiddenArtifactManager)
+
+    with pytest.raises(ValueError, match="not declared"):
+        _run_main(
+            monkeypatch,
+            "--geas-config",
+            str(manager.path),
+            "ontology-artifact-sync",
+            "example",
+        )
+
+    assert artifact_calls == []
+
+
+@pytest.mark.parametrize("failure", ("clone", "catalog", "trust"))
+def test_first_subscribe_failure_restores_absent_config_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    manager = UserConfigManager(tmp_path / failure / "config.yaml")
+
+    class StagingRepository:
+        def __init__(self, checkout: Path) -> None:
+            self.checkout = checkout
+
+        def pull(self) -> dict[str, object]:
+            self.checkout.mkdir(parents=True)
+            (self.checkout / ".git").mkdir()
+            (self.checkout / "geas.yaml").write_text("version: 1\nontologies: []\n")
+            if failure == "clone":
+                raise RuntimeError("injected clone failure")
+            return {"commit": "a" * 40}
+
+        def push(self) -> dict[str, object]:
+            return {"pushed": False}
+
+        def assert_removable(self) -> None:
+            return None
+
+    def verify(path: Path) -> object:
+        if failure == "catalog":
+            raise RuntimeError("injected catalog failure")
+        return path
+
+    def authorize(verified: object) -> object:
+        if failure == "trust":
+            raise RuntimeError("injected trust failure")
+        return verified
+
+    def service(
+        args: object,
+        *,
+        manager: UserConfigManager,
+        profile_name: str,
+    ) -> SubscriptionManager:
+        return SubscriptionManager(
+            config_manager=manager,
+            profile_name=profile_name,
+            catalog_verifier=verify,
+            authorizer=authorize,
+            repository_factory=lambda checkout, subscription: StagingRepository(checkout),
+        )
+
+    monkeypatch.setattr(cli, "_subscription_service", service)
+
+    with pytest.raises(RuntimeError, match=f"injected {failure}"):
+        _run_main(
+            monkeypatch,
+            "--geas-config",
+            str(manager.path),
+            "ontology-subscribe",
+            "sample",
+            "https://example.invalid/sample.git",
+        )
+
+    assert not manager.path.exists()
+    assert not manager.root.exists()
+
+
+def test_configless_yolo_lists_and_selects_without_durable_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    manager = UserConfigManager(tmp_path / "config" / "config.yaml")
+    catalog = _repository(tmp_path / "repository", "local")
+    monkeypatch.chdir(catalog.parent)
+
+    _run_main(
+        monkeypatch,
+        "--geas-config",
+        str(manager.path),
+        "--yolo",
+        "list",
+    )
+    receipt = json.loads(capsys.readouterr().out)
+    args = cli._build_parser().parse_args(
+        [
+            "--geas-config",
+            str(manager.path),
+            "--yolo",
+            "ontology-build",
+            "local",
+            "--check",
+        ]
+    )
+    selection = cli._catalog_selection(args, Path("local"), freshen=False)
+
+    assert receipt["ontologies"][0]["trust_status"] == "trusted"
+    assert selection is not None
+    assert selection.authorization == "yolo"
+    assert not manager.path.exists()
+    assert not manager.root.exists()

@@ -15,6 +15,7 @@ from research_agent.ontology_resolution import (
 )
 from research_agent.ontology_subscriptions import OntologySubscription
 from research_agent.ontology_trust import InstalledOntologySnapshot, TrustRule
+from research_agent.paths import resolve_selected_ontology_config
 from research_agent.repository_catalog import (
     CatalogFile,
     CatalogOntology,
@@ -211,8 +212,54 @@ def test_subscription_candidate_preserves_declaring_repository_metadata(
     assert candidate.active_ref == "refs/heads/main"
     assert candidate.commit == _git(checkout, "rev-parse", "HEAD")
     assert candidate.bundle_sha256
+    assert [item.path for item in candidate.files] == [Path("payload.txt")]
     assert candidate.trust_status == "trusted"
     assert select_ontology("subscribed", catalog=catalog).subscription == subscription
+
+
+def test_selected_conventional_input_must_be_in_verified_inventory(tmp_path: Path) -> None:
+    manager = _manager(tmp_path, GeasProfile(ontology_git=None))
+    repository = _repository(tmp_path / "repository", "closed-world")
+    undeclared = repository / "ontology" / "closed-world" / "build.yaml"
+    undeclared.write_text("must: remain inert\n")
+    catalog = resolve_ontology_catalog(
+        user_config=manager.load(),
+        manager=manager,
+        cwd=repository,
+        yolo=True,
+        prompt=None,
+    )
+    selection = select_ontology("closed-world", catalog=catalog)
+
+    with pytest.raises(ValueError, match="not declared"):
+        resolve_selected_ontology_config(
+            Path("closed-world"),
+            filename="build.yaml",
+            selection=selection,
+        )
+
+
+def test_selected_conventional_input_is_rehashed_immediately_before_use(
+    tmp_path: Path,
+) -> None:
+    manager = _manager(tmp_path, GeasProfile(ontology_git=None))
+    repository = _repository(tmp_path / "repository", "changed")
+    catalog = resolve_ontology_catalog(
+        user_config=manager.load(),
+        manager=manager,
+        cwd=repository,
+        yolo=True,
+        prompt=None,
+    )
+    selection = select_ontology("changed", catalog=catalog)
+    (selection.ontology_directory / "payload.txt").write_text("changed after selection\n")
+
+    with pytest.raises(ValueError, match="mismatch"):
+        resolve_selected_ontology_config(
+            Path("changed"),
+            filename="payload.txt",
+            selection=selection,
+        )
 
 
 def test_installed_snapshot_is_a_trusted_exact_path_candidate(tmp_path: Path) -> None:

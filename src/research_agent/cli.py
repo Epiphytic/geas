@@ -303,11 +303,15 @@ def _resolve_cli_catalog(
     interactive: bool,
 ) -> tuple[OntologyCatalog, UserConfigManager, GeasUserConfig, str, GeasProfile]:
     manager = _user_config_manager(args)
-    if not manager.path.exists():
+    if not manager.path.exists() and not args.yolo:
         raise ValueError(
             "catalog-aware ontology resolution requires an initialized Geas user config"
         )
-    user_config, profile_name, profile = _selected_user_config(args, manager)
+    if manager.path.exists():
+        user_config, profile_name, profile = _selected_user_config(args, manager)
+    else:
+        user_config = GeasUserConfig.default()
+        profile_name, profile = user_config.profile(args.geas_profile)
     catalog = resolve_ontology_catalog(
         user_config=user_config,
         manager=manager,
@@ -327,7 +331,7 @@ def _catalog_selection(
     if value.exists() or value.is_absolute() or len(value.parts) != 1:
         return None
     manager = _user_config_manager(args)
-    if not manager.path.exists():
+    if not manager.path.exists() and not args.yolo:
         return None
     catalog, manager, _config, profile_name, _profile = _resolve_cli_catalog(
         args,
@@ -390,6 +394,30 @@ def _subscription_service(
             prompt=prompt,
         ),
     )
+
+
+def _rollback_first_subscription_config(
+    manager: UserConfigManager,
+    *,
+    expected_config: bytes,
+    checkout: Path,
+    root_existed: bool,
+) -> None:
+    """Restore the exact absent-config state after a first subscribe failure."""
+    if not manager.path.is_file() or manager.path.read_bytes() != expected_config:
+        raise RuntimeError("cannot safely restore absent Geas configuration state")
+    manager.path.unlink()
+    current = (manager.root / checkout).parent
+    while current.is_relative_to(manager.root):
+        if current == manager.root and root_existed:
+            break
+        try:
+            current.rmdir()
+        except OSError:
+            break
+        if current == manager.root:
+            break
+        current = current.parent
 
 
 def _profile_ontology_root(
@@ -483,6 +511,11 @@ def _resolve_portable_database(
     if repository_config is None:
         return value
     ontology_directory = selection.ontology_directory
+    resolve_selected_ontology_config(
+        value,
+        filename="artifacts.yaml",
+        selection=selection,
+    )
     artifact_manager = OntologyArtifactManager(ontology_directory)
     if not artifact_manager.manifest_path.is_file():
         return value
@@ -1821,6 +1854,9 @@ def main() -> None:
     if args.command in {"ontology-subscribe", "ontology-unsubscribe", "ontology-sync"}:
         manager = _user_config_manager(args)
         subscription = None
+        first_config = False
+        first_config_bytes = b""
+        root_existed = manager.root.exists()
         if args.command == "ontology-subscribe":
             validate_subscription_name(args.name)
             initial = manager.load() if manager.path.exists() else GeasUserConfig.default()
@@ -1832,7 +1868,11 @@ def main() -> None:
                 catalog=args.catalog,
                 freshness=initial.ontology_freshness,
             )
-        user_config = manager.load_or_create()
+            if not manager.path.exists():
+                manager.replace(initial)
+                first_config = True
+                first_config_bytes = manager.path.read_bytes()
+        user_config = manager.load() if first_config else manager.load_or_create()
         profile_name, _profile = user_config.profile(args.geas_profile)
         subscriptions = _subscription_service(
             args,
@@ -1842,7 +1882,18 @@ def main() -> None:
         if args.command == "ontology-subscribe":
             assert subscription is not None
             print(f"Subscribing and verifying {args.name!r}.", file=sys.stderr)
-            _json(subscriptions.subscribe(args.name, subscription))
+            try:
+                receipt = subscriptions.subscribe(args.name, subscription)
+            except BaseException:
+                if first_config:
+                    _rollback_first_subscription_config(
+                        manager,
+                        expected_config=first_config_bytes,
+                        checkout=subscription.checkout,
+                        root_existed=root_existed,
+                    )
+                raise
+            _json(receipt)
             return
         if args.command == "ontology-unsubscribe":
             print(f"Unsubscribing {args.name!r}.", file=sys.stderr)
@@ -1915,6 +1966,20 @@ def main() -> None:
             raise ValueError(
                 f"ontology {ontology_value.name!r} has no declaring artifact subscription"
             )
+        resolve_selected_ontology_config(
+            ontology_value,
+            filename="artifacts.yaml",
+            selection=selection,
+        )
+        repository = None
+        if args.command == "ontology-artifact-publish":
+            if repository_root is None:
+                raise ValueError("ontology artifact publication has no repository checkout")
+            repository = OntologyRepositoryManager(
+                checkout=repository_root,
+                config=repository_config,
+            )
+            repository.assert_pushable()
         artifact_manager = OntologyArtifactManager(ontology_directory)
         artifact_store = GitHubReleaseArtifactStore(
             repository_config.url,
@@ -1943,9 +2008,7 @@ def main() -> None:
             knowledge_projection=args.knowledge_projection,
             generated_content=args.generated_content,
         )
-        if repository_root is None:
-            raise ValueError("ontology artifact publication has no repository checkout")
-        repository = OntologyRepositoryManager(checkout=repository_root, config=repository_config)
+        assert repository is not None
         relative = selection.repository_path or Path(ontology_value.name)
         push = repository.push(
             relative_paths=(relative,),

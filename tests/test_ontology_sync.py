@@ -195,6 +195,47 @@ def test_push_rejects_read_only_tag_and_commit_refs_before_staging(
         assert _git("status", "--porcelain", cwd=manager.checkout).stdout == before
 
 
+def test_assert_pushable_verifies_clean_exact_branch_without_mutation(
+    tmp_path: Path,
+) -> None:
+    remote = tmp_path / "remote.git"
+    commit, _ = _seed_remote(remote, tmp_path / "seed")
+    manager = _subscription_manager(
+        remote,
+        tmp_path / "checkout",
+        active_ref="refs/heads/main",
+    )
+    manager.pull()
+    before_status = _git("status", "--porcelain", cwd=manager.checkout).stdout
+    before_head = _git("rev-parse", "HEAD", cwd=manager.checkout).stdout
+
+    manager.assert_pushable()
+
+    assert _git("status", "--porcelain", cwd=manager.checkout).stdout == before_status
+    assert _git("rev-parse", "HEAD", cwd=manager.checkout).stdout == before_head
+    assert before_head.strip() == commit
+
+
+def test_assert_pushable_rejects_wrong_branch_before_mutation(tmp_path: Path) -> None:
+    remote = tmp_path / "remote.git"
+    _seed_remote(remote, tmp_path / "seed")
+    manager = _subscription_manager(
+        remote,
+        tmp_path / "checkout",
+        active_ref="refs/heads/main",
+    )
+    manager.pull()
+    _git("switch", "-c", "other", cwd=manager.checkout)
+    before_status = _git("status", "--porcelain", cwd=manager.checkout).stdout
+    before_head = _git("rev-parse", "HEAD", cwd=manager.checkout).stdout
+
+    with pytest.raises(OntologySyncError, match="branch"):
+        manager.assert_pushable()
+
+    assert _git("status", "--porcelain", cwd=manager.checkout).stdout == before_status
+    assert _git("rev-parse", "HEAD", cwd=manager.checkout).stdout == before_head
+
+
 def test_git_sync_initializes_pushes_and_fast_forward_pulls(tmp_path: Path) -> None:
     remote = tmp_path / "remote.git"
     remote.mkdir()

@@ -18,6 +18,7 @@ from research_agent.ontology_trust import (
     evaluate_trust,
 )
 from research_agent.repository_catalog import (
+    CatalogFile,
     CatalogOntology,
     ResolvedRepositoryCatalog,
     VerifiedCatalogOntology,
@@ -43,6 +44,7 @@ class OntologyCandidate(StrictModel):
     catalog_path: Path | None = None
     repository_path: Path | None = None
     bundle_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    files: tuple[CatalogFile, ...] | None = None
     trust_status: Literal["trusted", "untrusted", "denied"]
     authorization: Literal["profile", "rule", "interactive", "snapshot", "yolo"] | None = None
     subscription_name: str | None = None
@@ -226,6 +228,7 @@ def _snapshot_candidates(
                 source_kind="snapshot",
                 ontology_directory=directory,
                 bundle_sha256=snapshot.bundle_sha256,
+                files=snapshot.files,
                 trust_status="trusted",
                 authorization="snapshot",
             )
@@ -275,12 +278,22 @@ def _repository_candidates(
 ) -> list[OntologyCandidate]:
     authorization: dict[tuple[str, Path], str] = {}
     installed_names: set[str] = set()
-    if yolo or prompt is not None:
+    if yolo:
+        if catalog.discovery_start is None:
+            raise ValueError("repository catalog has no discovery start")
+        fresh = resolve_repository_catalog(catalog.discovery_start)
+        if fresh != catalog:
+            raise ValueError("repository catalog changed after integrity verification")
+        authorization = {
+            (ontology.name, ontology.ontology_path): "yolo"
+            for ontology in catalog.ontologies
+        }
+    elif prompt is not None:
         authorized = authorize_repository_catalog(
             catalog,
             manager=manager,
             profile_name=profile_name,
-            yolo=yolo,
+            yolo=False,
             prompt=prompt,
         )
         authorization = {
@@ -318,6 +331,7 @@ def _repository_candidates(
                 catalog_path=ontology.catalog_path,
                 repository_path=relative,
                 bundle_sha256=ontology.bundle_sha256,
+                files=ontology.files,
                 trust_status=status,
                 authorization=authorized_via,
                 subscription_name=subscription_name,
