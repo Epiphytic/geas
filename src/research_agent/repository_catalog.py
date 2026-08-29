@@ -1,0 +1,471 @@
+"""Strict, confined ontology catalogs declared by repository ``geas.yaml`` files."""
+
+from __future__ import annotations
+
+import hashlib
+import os
+import re
+import subprocess
+import tempfile
+from collections.abc import Iterable, Sequence
+from pathlib import Path, PurePosixPath
+from typing import Literal
+from urllib.parse import urlsplit, urlunsplit
+
+import yaml
+from pydantic import Field, ValidationError, field_validator, model_validator
+
+from research_agent.models import StrictModel, canonical_json
+
+_CATALOG_NAME = "geas.yaml"
+_ONTOLOGY_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+_DIGEST = re.compile(r"[0-9a-f]{64}")
+_GIT_OBJECT_ID = re.compile(r"[0-9a-f]{40,64}")
+_REFERENCE_KEYS = frozenset(
+    {
+        "artifact_manifest",
+        "artifacts_manifest",
+        "build",
+        "build_path",
+        "bundle",
+        "bundle_path",
+        "library",
+        "library_path",
+        "manifest_path",
+        "source_card",
+        "source_card_path",
+        "source_cards",
+        "source_cards_path",
+        "threat_index",
+        "threat_index_path",
+    }
+)
+_PATH_COLLECTION_KEYS = frozenset({"artifacts", "sources"})
+
+
+def _relative_path(value: object, *, label: str) -> Path:
+    if not isinstance(value, (str, Path)):
+        raise ValueError(f"{label} must be a relative path")
+    raw = str(value)
+    if not raw or any(ord(character) < 32 or ord(character) == 127 for character in raw):
+        raise ValueError(f"{label} contains a control character or is empty")
+    if "\\" in raw:
+        raise ValueError(f"{label} must use normalized POSIX separators")
+    pure = PurePosixPath(raw)
+    if pure.is_absolute():
+        raise ValueError(f"{label} must be relative")
+    if any(part in {"", ".", ".."} for part in pure.parts) or pure.as_posix() != raw:
+        raise ValueError(f"{label} must be normalized and cannot contain parent paths")
+    return Path(raw)
+
+
+class CatalogFile(StrictModel):
+    path: Path
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    size_bytes: int = Field(ge=0)
+
+    @field_validator("path", mode="before")
+    @classmethod
+    def path_is_confined(cls, value: object) -> Path:
+        return _relative_path(value, label="catalog file path")
+
+
+class CatalogOntology(StrictModel):
+    name: str
+    description: str = Field(min_length=1)
+    path: Path
+    files: tuple[CatalogFile, ...]
+    bundle_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @field_validator("name")
+    @classmethod
+    def name_is_safe(cls, value: str) -> str:
+        if not _ONTOLOGY_NAME.fullmatch(value):
+            raise ValueError("ontology name is invalid")
+        return value
+
+    @field_validator("path", mode="before")
+    @classmethod
+    def path_is_confined(cls, value: object) -> Path:
+        return _relative_path(value, label="ontology path")
+
+    @model_validator(mode="after")
+    def inventory_is_canonical(self) -> CatalogOntology:
+        if not self.files:
+            raise ValueError("ontology file inventory must not be empty")
+        paths = tuple(item.path.as_posix() for item in self.files)
+        if len(paths) != len(set(paths)):
+            raise ValueError("ontology file inventory paths must be unique")
+        if paths != tuple(sorted(paths, key=lambda item: item.encode("utf-8"))):
+            raise ValueError("ontology file inventory must be in ascending UTF-8 path order")
+        return self
+
+
+class RepositoryCatalog(StrictModel):
+    version: Literal[1] = 1
+    ontologies: tuple[CatalogOntology, ...]
+
+    @model_validator(mode="after")
+    def ontologies_are_unique(self) -> RepositoryCatalog:
+        names = tuple(item.name for item in self.ontologies)
+        if len(names) != len(set(names)):
+            raise ValueError("ontology names must be unique")
+        return self
+
+
+class VerifiedCatalogOntology(StrictModel):
+    """A catalog entry whose declared bytes and portable bundle identity match."""
+
+    name: str
+    description: str
+    catalog_path: Path
+    ontology_path: Path
+    files: tuple[CatalogFile, ...]
+    bundle_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    dirty: bool = False
+
+
+class ResolvedRepositoryCatalog(StrictModel):
+    """Verified effective entries from the direct Git-root-to-cwd catalog chain."""
+
+    repository_root: Path | None = None
+    repository_identity: str | None = None
+    identity_kind: Literal["remote", "machine_local"] | None = None
+    active_ref: str | None = None
+    commit: str | None = None
+    catalog_paths: tuple[Path, ...] = ()
+    ontologies: tuple[VerifiedCatalogOntology, ...] = ()
+
+    def by_name(self, name: str) -> VerifiedCatalogOntology:
+        for ontology in self.ontologies:
+            if ontology.name == name:
+                return ontology
+        raise ValueError(f"unknown catalog ontology: {name}")
+
+
+def ontology_bundle_sha256(entry: CatalogOntology) -> str:
+    payload = {
+        "description": entry.description,
+        "files": [item.model_dump(mode="json") for item in entry.files],
+        "format": "geas-ontology-bundle/1",
+        "name": entry.name,
+    }
+    return hashlib.sha256(canonical_json(payload)).hexdigest()
+
+
+def load_catalog(path: Path) -> RepositoryCatalog:
+    """Load one strict catalog without resolving or trusting any ontology input."""
+    catalog_path = _catalog_path(path)
+    try:
+        value = yaml.safe_load(catalog_path.read_text())
+    except (OSError, yaml.YAMLError) as error:
+        raise ValueError(f"invalid catalog: {catalog_path}") from error
+    try:
+        return RepositoryCatalog.model_validate(value)
+    except ValidationError as error:
+        raise ValueError(str(error)) from error
+
+
+def verify_catalog(path: Path, *, names: Sequence[str] = ()) -> tuple[VerifiedCatalogOntology, ...]:
+    """Verify declared files, closed-world YAML inputs, and portable digests."""
+    catalog_path = _catalog_path(path)
+    catalog = load_catalog(catalog_path)
+    selected = _selected_entries(catalog, names)
+    return tuple(_verify_entry(catalog_path, entry) for entry in selected)
+
+
+def refresh_catalog(path: Path, *, names: Sequence[str] = ()) -> RepositoryCatalog:
+    """Atomically refresh hashes for already declared inventory files only."""
+    catalog_path = _catalog_path(path)
+    catalog = load_catalog(catalog_path)
+    selected_names = {entry.name for entry in _selected_entries(catalog, names)}
+    refreshed: list[CatalogOntology] = []
+    for entry in catalog.ontologies:
+        if entry.name not in selected_names:
+            refreshed.append(entry)
+            continue
+        ontology_path = _ontology_directory(catalog_path, entry)
+        files = tuple(
+            CatalogFile(
+                path=item.path,
+                sha256=hashlib.sha256(
+                    _regular_file(ontology_path, item.path).read_bytes()
+                ).hexdigest(),
+                size_bytes=_regular_file(ontology_path, item.path).stat().st_size,
+            )
+            for item in entry.files
+        )
+        candidate = entry.model_copy(update={"files": files, "bundle_sha256": "0" * 64})
+        candidate = candidate.model_copy(
+            update={"bundle_sha256": ontology_bundle_sha256(candidate)}
+        )
+        _verify_transitive_inputs(ontology_path, candidate.files)
+        refreshed.append(candidate)
+    result = RepositoryCatalog(version=1, ontologies=tuple(refreshed))
+    _atomic_yaml_replace(catalog_path, result)
+    return result
+
+
+def discover_catalogs(start: Path) -> tuple[Path, ...]:
+    """Return present ``geas.yaml`` files only on Git root-to-start ancestors."""
+    worktree = _git_worktree(start)
+    if worktree is None:
+        return ()
+    current = _start_directory(start)
+    try:
+        relative = current.relative_to(worktree)
+    except ValueError as error:  # pragma: no cover - Git itself should prevent this.
+        raise ValueError("catalog start escapes Git worktree") from error
+    directories = (
+        worktree,
+        *(
+            worktree.joinpath(*relative.parts[:index])
+            for index in range(1, len(relative.parts) + 1)
+        ),
+    )
+    return tuple(
+        candidate
+        for directory in directories
+        if (candidate := directory / _CATALOG_NAME).exists() or candidate.is_symlink()
+    )
+
+
+def resolve_repository_catalog(start: Path) -> ResolvedRepositoryCatalog:
+    """Merge complete catalog entries from Git root to the requested directory."""
+    worktree = _git_worktree(start)
+    if worktree is None:
+        return ResolvedRepositoryCatalog()
+    catalog_paths = discover_catalogs(start)
+    entries: dict[str, tuple[Path, CatalogOntology]] = {}
+    for catalog_path in catalog_paths:
+        for entry in load_catalog(catalog_path).ontologies:
+            entries[entry.name] = (catalog_path, entry)
+    verified = tuple(
+        _verified_with_dirtiness(_verify_entry(catalog_path, entry), worktree)
+        for _, (catalog_path, entry) in sorted(entries.items())
+    )
+    origin = _git(worktree, "remote", "get-url", "origin", required=False)
+    if origin:
+        identity = _normalized_repository_identity(origin)
+        identity_kind: Literal["remote", "machine_local"] = "remote"
+    else:
+        identity = str(worktree)
+        identity_kind = "machine_local"
+    commit = _git(worktree, "rev-parse", "--verify", "HEAD")
+    if not _GIT_OBJECT_ID.fullmatch(commit):
+        raise ValueError("Git HEAD is not a full object ID")
+    active_ref = _git(worktree, "symbolic-ref", "-q", "HEAD", required=False) or commit
+    return ResolvedRepositoryCatalog(
+        repository_root=worktree,
+        repository_identity=identity,
+        identity_kind=identity_kind,
+        active_ref=active_ref,
+        commit=commit,
+        catalog_paths=catalog_paths,
+        ontologies=verified,
+    )
+
+
+def _catalog_path(path: Path) -> Path:
+    expanded = path.expanduser()
+    if expanded.name != _CATALOG_NAME:
+        raise ValueError(f"catalog filename must be {_CATALOG_NAME}")
+    _reject_symlink_ancestry(expanded)
+    if not expanded.exists():
+        raise ValueError(f"catalog is missing: {expanded}")
+    if not expanded.is_file():
+        raise ValueError("catalog must be a regular file")
+    return expanded.resolve(strict=True)
+
+
+def _ontology_directory(catalog_path: Path, entry: CatalogOntology) -> Path:
+    root = catalog_path.parent
+    candidate = root / entry.path
+    _reject_symlink_ancestry(candidate)
+    if not candidate.exists():
+        raise ValueError(f"ontology directory is missing: {entry.path.as_posix()}")
+    if not candidate.is_dir():
+        raise ValueError("ontology path must be a directory")
+    resolved = candidate.resolve(strict=True)
+    if not resolved.is_relative_to(root.resolve()):
+        raise ValueError("ontology directory escapes catalog root")
+    return resolved
+
+
+def _regular_file(ontology_path: Path, relative: Path) -> Path:
+    candidate = ontology_path / relative
+    _reject_symlink_ancestry(candidate)
+    if not candidate.exists():
+        raise ValueError(f"declared inventory file is missing: {relative.as_posix()}")
+    if not candidate.is_file():
+        raise ValueError(f"declared inventory path must be a regular file: {relative.as_posix()}")
+    resolved = candidate.resolve(strict=True)
+    if not resolved.is_relative_to(ontology_path):
+        raise ValueError("declared inventory file escapes ontology directory")
+    return resolved
+
+
+def _verify_entry(catalog_path: Path, entry: CatalogOntology) -> VerifiedCatalogOntology:
+    ontology_path = _ontology_directory(catalog_path, entry)
+    for item in entry.files:
+        file_path = _regular_file(ontology_path, item.path)
+        content = file_path.read_bytes()
+        if len(content) != item.size_bytes:
+            raise ValueError(f"declared inventory size mismatch: {item.path.as_posix()}")
+        if hashlib.sha256(content).hexdigest() != item.sha256:
+            raise ValueError(f"declared inventory sha256 mismatch: {item.path.as_posix()}")
+    _verify_transitive_inputs(ontology_path, entry.files)
+    digest = ontology_bundle_sha256(entry)
+    if digest != entry.bundle_sha256:
+        raise ValueError("catalog bundle digest mismatch")
+    return VerifiedCatalogOntology(
+        name=entry.name,
+        description=entry.description,
+        catalog_path=catalog_path,
+        ontology_path=ontology_path,
+        files=entry.files,
+        bundle_sha256=digest,
+    )
+
+
+def _verify_transitive_inputs(ontology_path: Path, files: Sequence[CatalogFile]) -> None:
+    declared = {item.path.as_posix() for item in files}
+    for item in files:
+        yaml_path = _regular_file(ontology_path, item.path)
+        if yaml_path.suffix not in {".yaml", ".yml"}:
+            continue
+        try:
+            value = yaml.safe_load(yaml_path.read_text())
+        except (OSError, yaml.YAMLError) as error:
+            raise ValueError(f"invalid declared YAML input: {item.path.as_posix()}") from error
+        for reference in _yaml_references(value):
+            relative = _relative_path(reference, label="transitive YAML input path")
+            candidate = yaml_path.parent / relative
+            _reject_symlink_ancestry(candidate)
+            if not candidate.exists():
+                continue
+            if not candidate.is_file():
+                raise ValueError("transitive YAML input must be a regular file")
+            resolved = candidate.resolve(strict=True)
+            if not resolved.is_relative_to(ontology_path):
+                raise ValueError("transitive YAML input escapes ontology directory")
+            contained = resolved.relative_to(ontology_path).as_posix()
+            if contained not in declared:
+                raise ValueError(f"undeclared transitive YAML input: {contained}")
+
+
+def _yaml_references(value: object, *, parent_key: str | None = None) -> Iterable[str]:
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            if not isinstance(key, str):
+                continue
+            if key in _REFERENCE_KEYS or key == "path" and parent_key in _PATH_COLLECTION_KEYS:
+                yield from _path_strings(nested)
+            yield from _yaml_references(nested, parent_key=key)
+    elif isinstance(value, list):
+        for nested in value:
+            yield from _yaml_references(nested, parent_key=parent_key)
+
+
+def _path_strings(value: object) -> Iterable[str]:
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, list):
+        for nested in value:
+            yield from _path_strings(nested)
+
+
+def _selected_entries(
+    catalog: RepositoryCatalog, names: Sequence[str]
+) -> tuple[CatalogOntology, ...]:
+    if not names:
+        return catalog.ontologies
+    requested = tuple(names)
+    if len(requested) != len(set(requested)):
+        raise ValueError("requested catalog ontology names must be unique")
+    by_name = {entry.name: entry for entry in catalog.ontologies}
+    missing = sorted(set(requested).difference(by_name))
+    if missing:
+        raise ValueError(f"unknown ontology in catalog: {', '.join(missing)}")
+    return tuple(by_name[name] for name in requested)
+
+
+def _atomic_yaml_replace(path: Path, catalog: RepositoryCatalog) -> None:
+    rendered = yaml.safe_dump(
+        catalog.model_dump(mode="json"), sort_keys=False, allow_unicode=True
+    ).encode()
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(rendered)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def _reject_symlink_ancestry(path: Path) -> None:
+    absolute = Path(os.path.abspath(path.expanduser()))
+    current = Path(absolute.anchor)
+    for component in absolute.parts[1:]:
+        current /= component
+        if current.is_symlink():
+            raise ValueError(f"symbolic link is not allowed in catalog path: {current}")
+
+
+def _start_directory(start: Path) -> Path:
+    expanded = start.expanduser()
+    if expanded.is_file():
+        expanded = expanded.parent
+    return expanded.resolve()
+
+
+def _git_worktree(start: Path) -> Path | None:
+    output = _git(_start_directory(start), "rev-parse", "--show-toplevel", required=False)
+    return Path(output).resolve() if output else None
+
+
+def _git(directory: Path, *arguments: str, required: bool = True) -> str:
+    completed = subprocess.run(
+        ("git", "-C", str(directory), *arguments),
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode:
+        if required:
+            raise ValueError("Git command failed while resolving repository catalog")
+        return ""
+    return completed.stdout.strip()
+
+
+def _normalized_repository_identity(value: str) -> str:
+    raw = value.strip()
+    github_ssh = re.fullmatch(r"(?:[^@/]+@)?github\.com:/*(.+)", raw, re.IGNORECASE)
+    if github_ssh:
+        return f"https://github.com/{github_ssh.group(1).rstrip('/').removesuffix('.git')}"
+    parsed = urlsplit(raw)
+    if not parsed.scheme or not parsed.hostname:
+        raise ValueError("repository origin URL is invalid")
+    host = parsed.hostname.lower()
+    path = parsed.path.rstrip("/").removesuffix(".git")
+    if host == "github.com":
+        return f"https://github.com/{path.lstrip('/')}"
+    port = f":{parsed.port}" if parsed.port is not None else ""
+    return urlunsplit((parsed.scheme.lower(), f"{host}{port}", path, "", ""))
+
+
+def _verified_with_dirtiness(
+    ontology: VerifiedCatalogOntology, worktree: Path
+) -> VerifiedCatalogOntology:
+    paths = [
+        ontology.catalog_path,
+        *(ontology.ontology_path / item.path for item in ontology.files),
+    ]
+    relative = [str(path.relative_to(worktree)) for path in paths]
+    dirty = bool(_git(worktree, "status", "--porcelain", "--untracked-files=all", "--", *relative))
+    return ontology.model_copy(update={"dirty": dirty})
