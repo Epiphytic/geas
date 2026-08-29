@@ -16,7 +16,7 @@ from importlib.metadata import PackageNotFoundError, version
 from importlib.resources import files as package_files
 from pathlib import Path, PurePosixPath
 from typing import Literal
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 from pydantic import Field, field_validator, model_validator
 
@@ -386,9 +386,24 @@ class SkillManifest(StrictModel):
 
 def canonical_manifest_bytes(manifest: SkillManifest) -> bytes:
     """Serialize a manifest as canonical portable UTF-8 JSON."""
+    payload = manifest.model_dump(mode="json")
+    if manifest.artifact is None:
+        payload.pop("artifact")
+    ontology = payload["ontology"]
+    assert isinstance(ontology, dict)
+    for field_name in (
+        "active_ref",
+        "ontology_commit",
+        "subscription_name",
+        "catalog_path",
+        "ontology_path",
+        "bundle_sha256",
+    ):
+        if ontology[field_name] is None:
+            ontology.pop(field_name)
     return (
         json.dumps(
-            manifest.model_dump(mode="json"),
+            payload,
             sort_keys=True,
             separators=(",", ":"),
             ensure_ascii=False,
@@ -448,7 +463,7 @@ def _catalog_skill_entrypoint(
     assert ontology.ontology_path is not None
     assert ontology.bundle_sha256 is not None
     topic = _inert_inline(manifest.projection.topic_concept_id)
-    name = ontology.name
+    name = _inert_inline(ontology.name)
     snapshot_path = "/absolute/path/to/directory-containing-this-SKILL"
     return "\n".join(
         (
@@ -468,7 +483,8 @@ def _catalog_skill_entrypoint(
             "",
             "## Locate or refresh with Geas (optional)",
             "",
-            f"- Repository: [{ontology.repository_url}]({ontology.repository_url})",
+            f"- Repository: [open]({_inert_markdown_url(ontology.repository_url)}); "
+            f"URL: `{_inert_inline(ontology.repository_url)}`.",
             f"- Subscription: `{_inert_inline(ontology.subscription_name)}`; ontology: `{name}`.",
             f"- Locate it with `geas list`, then inspect `{name}` in that JSON result.",
             f"- Hydrate its verified projection with `geas ontology-artifact-sync {name}`.",
@@ -484,20 +500,33 @@ def _catalog_skill_entrypoint(
             "",
             "## Provenance",
             "",
-            f"- Catalog: `{ontology.catalog_path}`; ontology path: `{ontology.ontology_path}`.",
+            f"- Catalog: `{_inert_inline(ontology.catalog_path)}`; ontology path: "
+            f"`{_inert_inline(ontology.ontology_path)}`.",
             f"- Active ref: `{_inert_inline(ontology.active_ref)}`.",
-            f"- Ontology commit: `{ontology.ontology_commit}`.",
-            f"- Ontology bundle SHA-256: `{ontology.bundle_sha256}`.",
+            f"- Ontology commit: `{_inert_inline(ontology.ontology_commit)}`.",
+            f"- Ontology bundle SHA-256: `{_inert_inline(ontology.bundle_sha256)}`.",
             "",
         )
     )
 
 
 def _inert_inline(value: str) -> str:
-    inert = "".join(
-        " " if _contains_control(character) else character for character in value
-    )
-    return inert.replace("`", "ˋ")
+    safe = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 .,:/@+-=_")
+    encoded: list[str] = []
+    for character in value:
+        if character in safe:
+            encoded.append(character)
+            continue
+        codepoint = ord(character)
+        encoded.append(
+            f"\\u{codepoint:04x}" if codepoint <= 0xFFFF else f"\\U{codepoint:08x}"
+        )
+    return "".join(encoded)
+
+
+def _inert_markdown_url(value: str) -> str:
+    """Percent-encode Markdown delimiters while preserving a usable HTTPS target."""
+    return quote(value, safe=":/?&=%._~-")
 
 
 def validate_snapshot(directory: Path) -> SkillManifest:

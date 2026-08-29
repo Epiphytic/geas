@@ -101,6 +101,7 @@ from research_agent.ontology_artifacts import (
     ArtifactRole,
     GitHubReleaseArtifactStore,
     OntologyArtifactManager,
+    _sqlite_input_revision,
 )
 from research_agent.ontology_build import (
     OntologyBuildConfig,
@@ -756,6 +757,8 @@ def _render_catalog_skill(
     geas_version: str,
     geas_commit: str | None,
 ) -> dict[Path, bytes]:
+    if geas_commit is None:
+        raise ValueError("catalog skill export requires an exact executing Geas commit")
     ontology = _catalog_ontology_identity(selection)
     rendered = render_ontology_skill(
         topic,
@@ -820,7 +823,14 @@ def _load_portable_topic(
     )
     if len(hydration.hydrated) != 1:
         raise ValueError("verified ontology artifacts did not yield one knowledge projection")
-    database = Path(hydration.hydrated[0].path)
+    hydrated = hydration.hydrated[0]
+    database = Path(hydrated.path)
+    actual_input_revision = _sqlite_input_revision(database, hydrated.role)
+    if actual_input_revision != hydrated.input_revision:
+        raise ValueError(
+            "knowledge-projection artifact input revision does not match its verified "
+            "SQLite projection stamp"
+        )
     topic = KnowledgeQueryEngine(database).topic(topic_concept_id)
     return topic, hydration
 
@@ -928,11 +938,13 @@ def _complete_skill_update(
     manifest: SkillManifest,
     geas_receipt: GeasUpdateReceipt,
 ) -> dict[str, object]:
+    catalog_bound = manifest.ontology.bundle_sha256 is not None
     if (
         _normalized_git_url(manifest.geas.project_url)
         != _normalized_git_url(geas_receipt.repository_url)
         or geas_receipt.branch != "main"
         or manifest.geas.version != geas_receipt.old_version
+        or (catalog_bound and manifest.geas.commit is None)
         or (
             manifest.geas.commit is not None
             and manifest.geas.commit != geas_receipt.old_commit
@@ -941,7 +953,6 @@ def _complete_skill_update(
         raise ValueError("executing Geas identity does not match the skill manifest")
     user_config = manager.load()
     profile_name, profile = user_config.profile(args.geas_profile)
-    catalog_bound = manifest.ontology.bundle_sha256 is not None
     if catalog_bound:
         subscription_name, repository_config = _catalog_subscription_from_manifest(
             profile,
