@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "geas",
+  "project_id": "10cd54ef-ea98-4319-bfa2-e11c24ec96cd"
+}
