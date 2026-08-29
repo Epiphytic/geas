@@ -32,6 +32,11 @@ the [executable ontology quick start](docs/QUICKSTART_ONTOLOGY.md) to build a
 topic immediately. The [documentation index](docs/README.md) maps operational,
 security, model, provenance, and architecture guides.
 
+Geas can also install a generic operational Agent Skill and export verified,
+portable ontology snapshots for Codex, Claude, or OpenCode. See [Portable Agent
+Skills](docs/AGENT_SKILLS.md) for optional installation, deterministic receipts,
+agent-link paths, and unlink/removal.
+
 ### What Geas is not
 
 Geas is not a chat UI, a report generator, or an embedding database. Reports
@@ -161,6 +166,13 @@ Use `codex_oneshot` or `claude_oneshot` when ontology assembly needs a stronger
 reasoning tier than the local extraction model. They receive only selected
 source anchors and return proposal JSON; discovery and ontology writes remain
 outside the coding agent.
+
+## Installation
+
+Install Geas from a checkout with Python 3.12 and `uv`, or make its CLI
+available outside the checkout with `uv tool install .`. The complete
+installation and configuration workflow is in
+[Build and use Geas end to end](docs/GETTING_STARTED.md#1-build-the-project).
 
 ## Quick start
 

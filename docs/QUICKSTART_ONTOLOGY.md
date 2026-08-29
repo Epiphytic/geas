@@ -27,6 +27,21 @@ an explicit legacy override.
 The project and its installed CLI are both named Geas; invoke the CLI as
 `geas`.
 
+Once an accepted ontology has a verified portable projection artifact, give an
+agent an optional deterministic snapshot without bundling the full acquired
+source library:
+
+```bash
+geas skill-export network-engineering --link
+```
+
+This snapshot records trusted repository URL/branch/commit and projection
+identity in `geas-skill.json`; unchanged inputs are byte-identical. Use
+`skill-update PATH` for profile-verified refresh, `skill-unlink` to detach
+links, and `skill-remove` to delete the managed snapshot. See [Portable Agent
+Skills](AGENT_SKILLS.md) for paths, repository review behavior, and the
+Geas-absent fallback.
+
 Create a new ontology with complete, inspectable configuration files:
 
 ```bash

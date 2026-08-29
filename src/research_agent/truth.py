@@ -471,7 +471,13 @@ class SQLiteProjectionGuard:
         snapshot: TruthSnapshot,
         *,
         truth_report: DriftReport | None = None,
+        expected_schema_version: int | None = None,
+        expected_builder_version: str | None = None,
     ) -> DriftReport:
+        if (expected_schema_version is None) != (expected_builder_version is None):
+            raise ValueError(
+                "expected projection schema and builder versions must be supplied together"
+            )
         if truth_report is not None and truth_report.snapshot_id != snapshot.id:
             raise ValueError("truth report does not apply to the selected snapshot")
         items = list(truth_report.items if truth_report else ())
@@ -488,6 +494,27 @@ class SQLiteProjectionGuard:
                         )
                     )
                 else:
+                    if (
+                        expected_schema_version is not None
+                        and (
+                            stamp.schema_version != expected_schema_version
+                            or stamp.builder_version != expected_builder_version
+                        )
+                    ):
+                        items.append(
+                            DriftItem(
+                                kind=DriftKind.PROJECTION_STALE,
+                                locator=str(database),
+                                expected=(
+                                    f"schema={expected_schema_version};"
+                                    f"builder={expected_builder_version}"
+                                ),
+                                actual=(
+                                    f"schema={stamp.schema_version};"
+                                    f"builder={stamp.builder_version}"
+                                ),
+                            )
+                        )
                     if (
                         stamp.snapshot_id != snapshot.id
                         or stamp.truth_state_digest != snapshot.state_digest
@@ -526,6 +553,29 @@ class SQLiteProjectionGuard:
             ),
             checked_at=self.clock(),
         )
+
+    def require_compatible(
+        self,
+        database: Path,
+        *,
+        expected_schema_version: int,
+        expected_builder_version: str,
+    ) -> ProjectionStamp:
+        """Reject a projection whose stamp cannot support the current reader."""
+        if not database.is_file():
+            raise ValueError("knowledge projection is missing")
+        with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as connection:
+            stamp = self._read_stamp(connection)
+        if stamp is None:
+            raise ValueError("knowledge projection is unstamped")
+        if (
+            stamp.schema_version != expected_schema_version
+            or stamp.builder_version != expected_builder_version
+        ):
+            raise ValueError(
+                "incompatible projection stamp; rebuild the knowledge projection"
+            )
+        return stamp
 
     def logical_digest(self, connection: sqlite3.Connection) -> str:
         objects = connection.execute(

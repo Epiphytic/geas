@@ -1,4 +1,6 @@
 import json
+import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -194,11 +196,13 @@ def test_packaged_defaults_match_repository_templates() -> None:
 
 def test_cli_uses_managed_user_provider_config_by_default(tmp_path: Path) -> None:
     config = tmp_path / "geas" / "config.yaml"
+    environment = os.environ | {"HOME": str(tmp_path / "home")}
     initialized = subprocess.run(
         ("uv", "run", "geas", "--geas-config", str(config), "config-init"),
         check=True,
         capture_output=True,
         text=True,
+        env=environment,
     )
     receipt = json.loads(initialized.stdout)
     providers = config.parent / "providers.toml"
@@ -214,9 +218,63 @@ def test_cli_uses_managed_user_provider_config_by_default(tmp_path: Path) -> Non
         check=True,
         capture_output=True,
         text=True,
+        env=environment,
     )
 
     assert set(receipt["managed_defaults"]["installed"]) == set(DEFAULT_CONFIG_FILENAMES)
     assert json.loads(listed.stdout)["providers"]["deepseek_local"]["model"] == (
         "operator-managed-model"
     )
+
+
+def test_config_init_reports_generic_skill_lifecycle_without_polluting_stdout(
+    tmp_path: Path,
+) -> None:
+    """Catches hidden lifecycle state, duplicate links, or conflict overwrite."""
+    home = tmp_path / "home"
+    agents = tmp_path / "agents"
+    agents.mkdir()
+    for executable in ("codex", "claude", "opencode"):
+        candidate = agents / executable
+        candidate.write_text("#!/bin/sh\n")
+        candidate.chmod(0o755)
+    config = tmp_path / "geas" / "config.yaml"
+    environment = os.environ | {"HOME": str(home), "PATH": str(agents)}
+    uv = shutil.which("uv")
+    assert uv is not None
+    command = (uv, "run", "geas", "--geas-config", str(config), "config-init")
+
+    first = subprocess.run(command, check=True, capture_output=True, text=True, env=environment)
+    first_receipt = json.loads(first.stdout)
+    snapshot = config.parent / "skills" / "geas"
+
+    assert first_receipt["skills"]["installed"] == [str(snapshot)]
+    assert first_receipt["skills"]["linked"] == [
+        str(home / ".agents" / "skills" / "geas"),
+        str(home / ".claude" / "skills" / "geas"),
+    ]
+    assert "Ensuring packaged Geas agent skill is installed." in first.stderr
+    assert "SKILL.md" not in first.stdout
+
+    second = subprocess.run(command, check=True, capture_output=True, text=True, env=environment)
+    second_receipt = json.loads(second.stdout)
+    assert second_receipt["skills"]["unchanged"] == [str(snapshot)]
+    assert second_receipt["skills"]["skipped"] == [
+        str(home / ".agents" / "skills" / "geas"),
+        str(home / ".claude" / "skills" / "geas"),
+    ]
+
+    shutil.rmtree(snapshot)
+    reinstalled = subprocess.run(
+        command, check=True, capture_output=True, text=True, env=environment
+    )
+    assert json.loads(reinstalled.stdout)["skills"]["installed"] == [str(snapshot)]
+
+    shutil.rmtree(snapshot)
+    snapshot.parent.mkdir(parents=True, exist_ok=True)
+    snapshot.write_text("operator-managed skill\n")
+    conflicted = subprocess.run(
+        command, check=True, capture_output=True, text=True, env=environment
+    )
+    assert json.loads(conflicted.stdout)["skills"]["conflicts"] == [str(snapshot)]
+    assert snapshot.read_text() == "operator-managed skill\n"

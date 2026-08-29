@@ -10,6 +10,7 @@ if [[ -e "$demo_root/records" || -e "$demo_root/blobs" || -e "$demo_root/query.s
   exit 2
 fi
 mkdir -p "$demo_root"
+demo_root=$(cd "$demo_root" && pwd -P)
 
 cd "$workspace_root"
 
@@ -66,6 +67,79 @@ uv run geas topic-export \
   --database "$demo_root/query.sqlite" \
   > "$demo_root/topic-export.json"
 
+demo_commit=$(git rev-parse HEAD)
+uv run python - "$demo_root" "$demo_commit" <<'PY'
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+from research_agent.agent_skills import install_snapshot, validate_snapshot
+from research_agent.projection import KnowledgeQueryEngine
+from research_agent.render import render_ontology_skill
+
+root = Path(sys.argv[1])
+topic = KnowledgeQueryEngine(root / "query.sqlite").topic(
+    "concept:open-source-research-agents"
+)
+files = render_ontology_skill(
+    topic,
+    skill_name="open-source-research-agents",
+    ontology_name="open-source-research-agents",
+    repository_url="https://github.com/Epiphytic/geas.git",
+    branch="main",
+    ontology_commit=sys.argv[2],
+    geas_version="0.1.0",
+    geas_commit=None,
+)
+target = root / "agent-skill" / "open-source-research-agents"
+first = install_snapshot(files, target)
+first_hashes = {
+    path.relative_to(target).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+    for path in sorted(target.rglob("*"))
+    if path.is_file()
+}
+second = install_snapshot(files, target)
+manifest = validate_snapshot(target)
+second_hashes = {
+    path.relative_to(target).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+    for path in sorted(target.rglob("*"))
+    if path.is_file()
+}
+
+def receipt(value):
+    return {
+        "ontology_commit": value.manifest.ontology.commit,
+        "path": str(value.path),
+        "projection_snapshot_id": value.manifest.projection.snapshot_id,
+        "snapshot_sha256": value.manifest.snapshot_sha256,
+        "unchanged": value.unchanged,
+    }
+
+def write_json(name, value):
+    path = root / name
+    path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+    return json.loads(path.read_text())
+
+first_receipt = write_json("skill-export-first.json", receipt(first))
+second_receipt = write_json("skill-export-second.json", receipt(second))
+first_inventory = write_json("skill-export-first-files.json", first_hashes)
+second_inventory = write_json("skill-export-second-files.json", second_hashes)
+write_json("skill-export-files.json", second_hashes)
+
+if first_receipt["unchanged"] is not False or second_receipt["unchanged"] is not True:
+    raise SystemExit("demo skill exports must be changed then unchanged")
+for field in ("snapshot_sha256", "projection_snapshot_id", "ontology_commit"):
+    if first_receipt[field] != second_receipt[field]:
+        raise SystemExit(f"demo skill receipts disagree on {field}")
+if list(first_inventory) != sorted(first_inventory) or list(second_inventory) != sorted(second_inventory):
+    raise SystemExit("demo skill file inventories must be sorted")
+if first_inventory != second_inventory:
+    raise SystemExit("demo skill file inventories differ")
+if manifest.snapshot_sha256 != first_receipt["snapshot_sha256"]:
+    raise SystemExit("demo skill manifest digest mismatch")
+PY
+
 uv run geas projection-check \
   "$demo_root/snapshot.json" \
   "$demo_root/query.sqlite" \
@@ -82,6 +156,7 @@ jq -n \
   --slurpfile storm "$demo_root/query-storm.json" \
   --slurpfile audit "$demo_root/audit.json" \
   --slurpfile drift "$demo_root/drift-check.json" \
+  --slurpfile skill "$demo_root/skill-export-second.json" \
   '{
     demo_root: $root,
     topic: $imported[0].topic,
@@ -97,5 +172,7 @@ jq -n \
     storm_query_hits: ($storm[0].hits | length),
     audit_clean: $audit[0].report.clean,
     drift_clean: $drift[0].clean,
-    agent_readable_topic: ($root + "/topic.md")
+    agent_readable_topic: ($root + "/topic.md"),
+    portable_skill: $skill[0].path,
+    portable_skill_sha256: $skill[0].snapshot_sha256
   }'

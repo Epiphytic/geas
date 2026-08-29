@@ -4,6 +4,8 @@ import hashlib
 import json
 import os
 import re
+import shutil
+from collections.abc import Callable
 from pathlib import Path
 from typing import Literal
 from uuid import uuid4
@@ -11,6 +13,7 @@ from uuid import uuid4
 import yaml
 from pydantic import Field, field_validator, model_validator
 
+from research_agent.agent_skills import BuiltinSkillReceipt, install_builtin_geas_skill
 from research_agent.models import StrictModel
 from research_agent.ontology_config import OntologyBuildDefaults
 from research_agent.paths import geas_config_home
@@ -160,6 +163,7 @@ class UserConfigManager:
         self.path = (path or geas_config_home() / "config.yaml").expanduser().resolve()
         self.root = self.path.parent
         self.last_defaults_receipt: DefaultConfigReceipt | None = None
+        self.last_builtin_skill_receipt: BuiltinSkillReceipt | None = None
 
     def load(self) -> GeasUserConfig:
         if not self.path.is_file():
@@ -272,6 +276,21 @@ class UserConfigManager:
             preserved=tuple(preserved),
             review_candidates=tuple(candidates),
         )
+
+    def install_builtin_skill(
+        self,
+        *,
+        home: Path | None = None,
+        which: Callable[[str], str | None] = shutil.which,
+    ) -> BuiltinSkillReceipt:
+        """Install the generic packaged skill after configuration is valid."""
+        receipt = install_builtin_geas_skill(
+            config_root=self.root,
+            home=home or Path.home(),
+            which=which,
+        )
+        self.last_builtin_skill_receipt = receipt
+        return receipt
 
     def policy_path(self, filename: str) -> Path:
         if filename not in DEFAULT_CONFIG_FILENAMES:

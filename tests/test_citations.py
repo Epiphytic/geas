@@ -187,7 +187,7 @@ def test_parse_auto_derives_and_projection_queries_reference_provenance(
         record_types=(QueryRecordType.REFERENCE,),
     )
 
-    assert build.schema_version == 8
+    assert build.schema_version == 9
     assert build.counts["citation_derivations"] == 1
     assert build.counts["research_identifiers"] == 5
     assert build.counts["bibliographic_references"] == 5

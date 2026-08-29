@@ -438,11 +438,26 @@ def test_projection_supports_lexical_hierarchy_dissent_gaps_and_provenance(
     assert len(topic.descendant_concept_ids) == 4
     assert len(topic.sources) == 5
     assert len({item["id"] for item in topic.claims}) == 7
+    selector = topic.claims[0]
+    assert {
+        "selector_type",
+        "selector_prefix",
+        "selector_suffix",
+        "selector_start",
+        "selector_end",
+        "selector_pointer",
+    } <= set(selector)
+    assert selector["selector_type"] == "text_quote"
+    assert selector["selector_start"] is None
+    assert selector["selector_end"] is None
+    assert selector["selector_pointer"] is None
     assert len(topic.controversies) == 2
     assert len(topic.gaps) == 3
     assert topic.gaps[0]["priority"] == 90
     assert len(topic.threats) == 3
     assert all(item["source_uri"].startswith("file:") for item in topic.claims)
+    assert build.schema_version == 9
+    assert build.builder_version == "sqlite-knowledge-projection/10"
     assert build.counts["claims"] == 7
     assert build.counts["topic_source_associations"] == 5
     assert build.counts["threat_observations"] == 3
@@ -551,6 +566,22 @@ def test_projection_is_stamped_and_mutation_is_detected(tmp_path: Path) -> None:
     )
     assert any(item.kind is DriftKind.PROJECTION_MUTATED for item in report.items)
     assert report.recommended_action == "discard_and_rebuild"
+
+
+def test_query_engine_rejects_matching_but_incompatible_projection_stamp(
+    tmp_path: Path,
+) -> None:
+    """Catches topic reads proceeding into an old projection schema."""
+    _, database, (_, manager, snapshot, _) = _build_projection(tmp_path)
+    SQLiteProjectionGuard(clock=lambda: INSTANT).stamp(
+        database,
+        snapshot,
+        schema_version=8,
+        builder_version="sqlite-knowledge-projection/9",
+    )
+
+    with pytest.raises(ValueError, match="incompatible projection"):
+        KnowledgeQueryEngine(database).topic("concept:community-water-fluoridation")
 
 
 def test_query_compiler_treats_fts_syntax_as_inert_tokens() -> None:

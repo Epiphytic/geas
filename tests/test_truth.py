@@ -226,6 +226,34 @@ def test_projection_stale_against_new_truth_snapshot(tmp_path: Path) -> None:
     assert any(item.kind is DriftKind.PROJECTION_STALE for item in report.items)
 
 
+def test_projection_stale_against_expected_schema_and_builder(tmp_path: Path) -> None:
+    """Catches a matching truth stamp from an incompatible projection schema."""
+    workspace, store = _workspace(tmp_path)
+    instant = datetime(2026, 8, 2, 12, 0, tzinfo=UTC)
+    manager = _manager(workspace, store, instant=instant)
+    snapshot = manager.capture(created_by="operator:test")
+    database = tmp_path / "query.sqlite"
+    guard = SQLiteProjectionGuard(clock=lambda: instant)
+    guard.stamp(
+        database,
+        snapshot,
+        schema_version=8,
+        builder_version="sqlite-knowledge-projection/9",
+    )
+
+    report = guard.verify(
+        database,
+        snapshot,
+        truth_report=manager.verify(snapshot),
+        expected_schema_version=9,
+        expected_builder_version="sqlite-knowledge-projection/10",
+    )
+
+    assert not report.clean
+    assert any(item.kind is DriftKind.PROJECTION_STALE for item in report.items)
+    assert report.recommended_action == "discard_and_rebuild"
+
+
 def test_policy_forbids_database_as_canonical_source() -> None:
     with pytest.raises(ValidationError):
         TruthPolicy.model_validate(
