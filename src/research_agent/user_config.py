@@ -172,6 +172,23 @@ class GeasUserConfig(StrictModel):
         invalid = sorted(name for name in self.profiles if not _PROFILE_NAME.fullmatch(name))
         if invalid:
             raise ValueError(f"invalid profile names: {', '.join(invalid)}")
+        checkouts: list[tuple[str, Path]] = []
+        for profile_name, profile in sorted(self.profiles.items()):
+            normalized = profile.normalized_subscriptions(freshness=self.ontology_freshness)
+            for subscription_name, subscription in normalized.items():
+                identity = f"{profile_name}/{subscription_name}"
+                for existing_identity, existing_checkout in checkouts:
+                    if (
+                        subscription.checkout == existing_checkout
+                        or subscription.checkout.is_relative_to(existing_checkout)
+                        or existing_checkout.is_relative_to(subscription.checkout)
+                    ):
+                        raise ValueError(
+                            "subscription checkouts overlap across profiles: "
+                            f"{existing_identity!r}={existing_checkout.as_posix()!r}, "
+                            f"{identity!r}={subscription.checkout.as_posix()!r}"
+                        )
+                checkouts.append((identity, subscription.checkout))
         return self
 
     @classmethod
@@ -410,14 +427,15 @@ class UserConfigManager:
 
     def validate_subscription_layout(self, config: GeasUserConfig) -> None:
         """Reject filesystem aliases and overlaps without following symlinks."""
-        for profile in config.profiles.values():
+        resolved: list[tuple[str, Path]] = []
+        for profile_name, profile in sorted(config.profiles.items()):
             normalized = profile.normalized_subscriptions(freshness=config.ontology_freshness)
-            resolved: list[tuple[str, Path]] = []
             for name, subscription in normalized.items():
                 checkout = self._confined_subscription_path(subscription.checkout)
                 canonical = checkout.resolve()
                 self._confined_subscription_path(subscription.checkout)
-                for sibling_name, sibling in resolved:
+                identity = f"{profile_name}/{name}"
+                for sibling_identity, sibling in resolved:
                     if (
                         canonical == sibling
                         or canonical.is_relative_to(sibling)
@@ -425,9 +443,49 @@ class UserConfigManager:
                     ):
                         raise ValueError(
                             "subscriptions resolve to the same checkout or overlap: "
-                            f"{sibling_name!r}, {name!r}"
+                            f"{sibling_identity!r}, {identity!r}"
                         )
-                resolved.append((name, canonical))
+                resolved.append((identity, canonical))
+
+    def validate_subscription_removal(
+        self,
+        config: GeasUserConfig,
+        *,
+        profile_name: str,
+        subscription_name: str,
+        expected_checkout: Path,
+    ) -> None:
+        """Prove no configured checkout aliases or overlaps a removal target."""
+        self.validate_subscription_layout(config)
+        _, selected_profile = config.profile(profile_name)
+        try:
+            selected = selected_profile.normalized_subscriptions(
+                freshness=config.ontology_freshness
+            )[subscription_name]
+        except KeyError:
+            raise ValueError(f"unknown ontology subscription: {subscription_name}") from None
+        checkout = self._confined_subscription_path(selected.checkout)
+        if checkout != expected_checkout:
+            raise RuntimeError("subscription checkout identity changed before removal")
+        canonical = checkout.resolve()
+        self._confined_subscription_path(selected.checkout)
+        for other_profile_name, profile in sorted(config.profiles.items()):
+            normalized = profile.normalized_subscriptions(freshness=config.ontology_freshness)
+            for other_name, subscription in normalized.items():
+                if other_profile_name == profile_name and other_name == subscription_name:
+                    continue
+                other_checkout = self._confined_subscription_path(subscription.checkout)
+                other_canonical = other_checkout.resolve()
+                self._confined_subscription_path(subscription.checkout)
+                if (
+                    canonical == other_canonical
+                    or canonical.is_relative_to(other_canonical)
+                    or other_canonical.is_relative_to(canonical)
+                ):
+                    raise ValueError(
+                        "subscription removal checkout overlaps checkout referenced by "
+                        f"{other_profile_name}/{other_name!s}"
+                    )
 
     def secret_paths(self, profile: GeasProfile) -> tuple[tuple[Path, str], ...]:
         return tuple(

@@ -149,12 +149,15 @@ def test_user_config_replace_is_atomic_on_replacement_failure(
     original = GeasUserConfig.default()
     manager.replace(original)
     before = manager.path.read_bytes()
+    other_profile = original.profiles["default"].model_copy(
+        update={"ontology_directory": Path("other-ontologies")}
+    )
     changed = original.model_copy(
         update={
             "default_profile": "other",
             "profiles": {
                 **original.profiles,
-                "other": original.profiles["default"],
+                "other": other_profile,
             },
         }
     )

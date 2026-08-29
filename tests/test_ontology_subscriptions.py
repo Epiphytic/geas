@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
 
 from research_agent.ontology_subscriptions import (
     OntologyFreshnessConfig,
@@ -165,6 +166,51 @@ def test_subscribe_revalidates_git_refs_before_any_write(tmp_path: Path, active_
 
 
 @pytest.mark.parametrize(
+    "active_ref",
+    (
+        " refs/heads/main",
+        "refs/heads/main ",
+        "\trefs/heads/main",
+        "refs/heads/main\t",
+        "\nrefs/heads/main",
+        "refs/heads/main\n",
+        " refs/tags/v1",
+        "refs/tags/v1 ",
+    ),
+)
+def test_subscribe_rejects_boundary_whitespace_in_ref_before_any_work(
+    tmp_path: Path, active_ref: str
+) -> None:
+    manager = _configured_manager(tmp_path)
+    before = manager.path.read_bytes()
+    calls: list[str] = []
+    invalid = OntologySubscription.model_construct(
+        url=URL,
+        active_ref=active_ref,
+        checkout=Path("subscriptions/invalid"),
+        catalog=Path("geas.yaml"),
+        remote="origin",
+        pull_before_update=False,
+        push_on_update=False,
+        freshness=OntologyFreshnessConfig(),
+    )
+    subscriptions = SubscriptionManager(
+        config_manager=manager,
+        profile_name="default",
+        catalog_verifier=lambda path: calls.append("verify"),
+        authorizer=lambda verified: calls.append("authorize"),
+        repository_factory=lambda checkout, subscription: calls.append("repository"),
+    )
+
+    with pytest.raises(ValueError, match="active_ref"):
+        subscriptions.subscribe("invalid", invalid)
+
+    assert manager.path.read_bytes() == before
+    assert calls == []
+    assert not (manager.root / "subscriptions").exists()
+
+
+@pytest.mark.parametrize(
     "url",
     (
         "http://example.invalid/repository.git",
@@ -252,6 +298,43 @@ def test_subscribe_rejects_new_nested_checkout_before_repository_work(
     assert not (manager.root / "repositories").exists()
 
 
+@pytest.mark.parametrize(
+    "new_checkout",
+    ("repositories/shared", "repositories/shared/nested", "repositories"),
+)
+def test_subscribe_rejects_cross_profile_checkout_overlap_before_repository_work(
+    tmp_path: Path, new_checkout: str
+) -> None:
+    manager = _configured_manager(tmp_path)
+    manager.replace(
+        GeasUserConfig(
+            profiles={
+                "default": GeasProfile(ontology_git=None),
+                "other": GeasProfile(
+                    ontology_git=None,
+                    subscriptions={"shared": _subscription(checkout="repositories/shared")},
+                ),
+            }
+        )
+    )
+    before = manager.path.read_bytes()
+    calls: list[str] = []
+    subscriptions = SubscriptionManager(
+        config_manager=manager,
+        profile_name="default",
+        catalog_verifier=lambda path: calls.append("verify"),
+        authorizer=lambda verified: calls.append("authorize"),
+        repository_factory=lambda checkout, configured: calls.append("repository"),
+    )
+
+    with pytest.raises(ValueError, match="overlap|same checkout"):
+        subscriptions.subscribe("candidate", _subscription(checkout=new_checkout))
+
+    assert calls == []
+    assert manager.path.read_bytes() == before
+    assert not (manager.root / "repositories").exists()
+
+
 def test_config_rejects_in_root_symlink_alias_without_rewriting_config(
     tmp_path: Path,
 ) -> None:
@@ -271,6 +354,73 @@ def test_config_rejects_in_root_symlink_alias_without_rewriting_config(
                 },
             )
         }
+    )
+
+    with pytest.raises(ValueError, match="symbolic link|same checkout"):
+        manager.replace(candidate)
+
+    assert manager.path.read_bytes() == before
+    assert alias.is_symlink()
+    assert actual.is_dir()
+
+
+@pytest.mark.parametrize(
+    "other_checkout",
+    ("repositories/shared", "repositories/shared/nested"),
+)
+def test_config_rejects_cross_profile_equal_or_nested_checkouts(
+    tmp_path: Path, other_checkout: str
+) -> None:
+    manager = _configured_manager(tmp_path)
+    before = manager.path.read_bytes()
+    candidate = GeasUserConfig.model_construct(
+        version=1,
+        default_profile="default",
+        ontology_freshness=OntologyFreshnessConfig(),
+        ontology_defaults=manager.load().ontology_defaults,
+        profiles={
+            "default": GeasProfile(
+                ontology_git=None,
+                subscriptions={"shared": _subscription(checkout="repositories/shared")},
+            ),
+            "other": GeasProfile(
+                ontology_git=None,
+                subscriptions={"alias": _subscription(checkout=other_checkout)},
+            ),
+        },
+    )
+
+    with pytest.raises(ValueError, match="overlap|same checkout"):
+        manager.replace(candidate)
+
+    assert manager.path.read_bytes() == before
+    assert not (manager.root / "repositories").exists()
+
+
+def test_config_rejects_cross_profile_symlink_alias_without_rewriting_config(
+    tmp_path: Path,
+) -> None:
+    manager = _configured_manager(tmp_path)
+    before = manager.path.read_bytes()
+    actual = manager.root / "repositories" / "actual"
+    actual.mkdir(parents=True)
+    alias = manager.root / "repositories" / "alias"
+    alias.symlink_to(actual, target_is_directory=True)
+    candidate = GeasUserConfig.model_construct(
+        version=1,
+        default_profile="default",
+        ontology_freshness=OntologyFreshnessConfig(),
+        ontology_defaults=manager.load().ontology_defaults,
+        profiles={
+            "default": GeasProfile(
+                ontology_git=None,
+                subscriptions={"actual": _subscription(checkout="repositories/actual")},
+            ),
+            "other": GeasProfile(
+                ontology_git=None,
+                subscriptions={"alias": _subscription(checkout="repositories/alias")},
+            ),
+        },
     )
 
     with pytest.raises(ValueError, match="symbolic link|same checkout"):
@@ -757,6 +907,72 @@ def test_unsubscribe_rechecks_symlink_race_before_quarantine_or_config_write(
     assert original.is_dir()
     assert (target / "must-remain.txt").read_text() == "preserve\n"
     assert subscription.checkout == Path("subscriptions/sample")
+
+
+@pytest.mark.parametrize(
+    "other_checkout",
+    ("subscriptions/sample", "subscriptions/sample/nested", "subscriptions/alias"),
+)
+def test_unsubscribe_rejects_preexisting_cross_profile_checkout_reference(
+    tmp_path: Path, other_checkout: str
+) -> None:
+    manager, _, checkout = _manager_with_subscription(tmp_path)
+    alias = manager.root / "subscriptions" / "alias"
+    if other_checkout == "subscriptions/alias":
+        alias.symlink_to(checkout, target_is_directory=True)
+    raw = yaml.safe_load(manager.path.read_text())
+    raw["profiles"]["other"] = {
+        "ontology_directory": "ontologies",
+        "secret_sources": [],
+        "ontology_git": None,
+        "subscriptions": {
+            "other": _subscription(checkout=other_checkout).model_dump(
+                mode="json", exclude_none=False
+            )
+        },
+        "trust_rules": [],
+        "installed_ontologies": [],
+    }
+    manager.path.write_text(yaml.safe_dump(raw, sort_keys=False))
+    before = manager.path.read_bytes()
+    identity = checkout.stat(follow_symlinks=False)
+    calls: list[str] = []
+
+    class Repository:
+        def pull(self) -> dict[str, object]:
+            raise AssertionError("pull must not run")
+
+        def push(self) -> dict[str, object]:
+            raise AssertionError("push must not run")
+
+        def assert_removable(self) -> None:
+            calls.append("repository")
+
+    real_replace = manager.replace
+
+    def record_replace(config: GeasUserConfig) -> None:
+        calls.append("config")
+        real_replace(config)
+
+    manager.replace = record_replace  # type: ignore[method-assign]
+    subscriptions = SubscriptionManager(
+        config_manager=manager,
+        profile_name="default",
+        catalog_verifier=lambda path: path,
+        authorizer=lambda verified: verified,
+        repository_factory=lambda path, configured: Repository(),
+    )
+
+    with pytest.raises(ValueError, match="overlap|same checkout|symbolic link"):
+        subscriptions.unsubscribe("sample", remove_checkout=True)
+
+    assert calls == []
+    assert manager.path.read_bytes() == before
+    assert checkout.is_dir()
+    assert os.path.samestat(identity, checkout.stat(follow_symlinks=False))
+    assert not tuple(checkout.parent.glob(".sample.remove-*"))
+    if other_checkout == "subscriptions/alias":
+        assert alias.is_symlink()
 
 
 def test_legacy_primary_inherits_global_freshness_without_moving_checkout() -> None:

@@ -30,9 +30,12 @@ def validate_subscription_name(value: str) -> str:
 
 
 def normalize_active_ref(value: str) -> str:
-    raw = value.strip()
+    raw = value
     if _OBJECT_ID.fullmatch(raw):
-        return raw.lower()
+        normalized = raw.lower()
+        if raw != normalized:
+            raise ValueError("active_ref must exactly match its normalized value")
+        return normalized
     if not raw.startswith(("refs/heads/", "refs/tags/")):
         raise ValueError("active_ref must use full branch/tag refs or commit IDs")
     if (
@@ -238,18 +241,19 @@ class SubscriptionManager:
         validated = OntologySubscription.model_validate(subscription.model_dump(mode="python"))
         original = self.config_manager.load()
         _, profile = original.profile(self.profile_name)
+        prospective_profile = profile.model_copy(
+            update={"subscriptions": {**profile.subscriptions, name: validated}}
+        )
+        prospective = original.model_copy(
+            update={
+                "profiles": {
+                    **original.profiles,
+                    self.profile_name: prospective_profile,
+                }
+            }
+        )
+        self.config_manager.validate_subscription_layout(prospective)
         destination = self.config_manager.subscription_checkout(validated)
-        for sibling_name, sibling in profile.normalized_subscriptions(
-            freshness=original.ontology_freshness
-        ).items():
-            if sibling_name != name and (
-                sibling.checkout == validated.checkout
-                or sibling.checkout.is_relative_to(validated.checkout)
-                or validated.checkout.is_relative_to(sibling.checkout)
-            ):
-                raise ValueError(
-                    f"subscription checkout overlaps checkout used by {sibling_name!r}"
-                )
         before = self.config_manager.path.read_bytes()
         created = not destination.exists()
         staging = (
@@ -350,11 +354,12 @@ class SubscriptionManager:
 
         if checkout.is_symlink():
             raise RuntimeError("subscription checkout cannot be a symbolic link")
-        for sibling_name, sibling in updated_profile.normalized_subscriptions(
-            freshness=config.ontology_freshness
-        ).items():
-            if sibling.checkout == subscription.checkout:
-                raise RuntimeError(f"subscription checkout is still used by {sibling_name!r}")
+        self.config_manager.validate_subscription_removal(
+            config,
+            profile_name=self.profile_name,
+            subscription_name=name,
+            expected_checkout=checkout,
+        )
         repository = self._repository(checkout, subscription)
         repository.assert_removable()
         if self.config_manager.path.read_bytes() != original_config_bytes:
@@ -362,7 +367,12 @@ class SubscriptionManager:
         current_config = self.config_manager.load()
         if current_config != config:
             raise RuntimeError("Geas user config changed during subscription removal")
-        self.config_manager.validate_subscription_layout(current_config)
+        self.config_manager.validate_subscription_removal(
+            current_config,
+            profile_name=self.profile_name,
+            subscription_name=name,
+            expected_checkout=checkout,
+        )
         rechecked = self.config_manager.subscription_checkout(subscription)
         if rechecked != checkout:
             raise RuntimeError("subscription checkout identity changed before removal")
