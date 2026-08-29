@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from research_agent.ontology_subscriptions import OntologySubscription
 from research_agent.ontology_sync import (
     OntologyRepositoryManager,
     OntologySyncError,
@@ -50,6 +51,126 @@ def _manager(remote: Path, checkout: Path) -> OntologyRepositoryManager:
         push_on_update=False,
     )
     return OntologyRepositoryManager(checkout=checkout, config=config)
+
+
+def _subscription_manager(
+    remote: Path, checkout: Path, *, active_ref: str
+) -> OntologyRepositoryManager:
+    config = OntologySubscription.model_construct(
+        url=str(remote),
+        active_ref=active_ref,
+        checkout=checkout,
+        catalog=Path("geas.yaml"),
+        remote="origin",
+        pull_before_update=False,
+        push_on_update=False,
+    )
+    return OntologyRepositoryManager(checkout=checkout, config=config)
+
+
+def _seed_remote(remote: Path, seed: Path) -> tuple[str, str]:
+    remote.mkdir()
+    _git("init", "--bare", "--initial-branch=main", cwd=remote)
+    manager = _manager(remote, seed)
+    manager.pull()
+    (manager.checkout / "ontology.yaml").write_text("version: 1\n")
+    manager.push(relative_paths=(Path("ontology.yaml"),), message="seed")
+    commit = _git("rev-parse", "HEAD", cwd=manager.checkout).stdout.strip()
+    _git("tag", "-a", "release/v1", "-m", "annotated release", cwd=manager.checkout)
+    _git("branch", "release/v1", cwd=manager.checkout)
+    _git(
+        "push",
+        "origin",
+        "refs/tags/release/v1",
+        "refs/heads/release/v1",
+        cwd=manager.checkout,
+    )
+    return commit, manager.checkout.as_posix()
+
+
+@pytest.mark.parametrize(
+    ("active_ref", "detached"),
+    (
+        ("refs/heads/main", False),
+        ("refs/heads/release/v1", False),
+        ("refs/tags/release/v1", True),
+    ),
+)
+def test_pull_resolves_full_branch_and_tag_refs_to_the_exact_commit(
+    tmp_path: Path, active_ref: str, detached: bool
+) -> None:
+    remote = tmp_path / "remote.git"
+    commit, _ = _seed_remote(remote, tmp_path / "seed")
+    manager = _subscription_manager(remote, tmp_path / "checkout", active_ref=active_ref)
+
+    receipt = manager.pull()
+
+    assert receipt["active_ref"] == active_ref
+    assert receipt["new_commit"] == commit
+    assert _git("rev-parse", "HEAD", cwd=manager.checkout).stdout.strip() == commit
+    assert bool(_git("branch", "--show-current", cwd=manager.checkout).stdout.strip()) is (
+        not detached
+    )
+
+
+def test_pull_accepts_exact_sha256_commit_id_when_git_supports_it(tmp_path: Path) -> None:
+    remote = tmp_path / "remote.git"
+    remote.mkdir()
+    initialized = subprocess.run(
+        ("git", "init", "--bare", "--object-format=sha256", "--initial-branch=main"),
+        cwd=remote,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if initialized.returncode != 0:
+        pytest.skip("installed Git does not support SHA-256 repositories")
+    seed = _manager(remote, tmp_path / "seed")
+    seed.pull()
+    (seed.checkout / "ontology.yaml").write_text("version: 1\n")
+    seed.push(relative_paths=(Path("ontology.yaml"),), message="sha256 seed")
+    commit = _git("rev-parse", "HEAD", cwd=seed.checkout).stdout.strip()
+    assert len(commit) == 64
+    manager = _subscription_manager(remote, tmp_path / "checkout", active_ref=commit)
+
+    receipt = manager.pull()
+
+    assert receipt["new_commit"] == commit
+    assert _git("branch", "--show-current", cwd=manager.checkout).stdout.strip() == ""
+
+
+def test_pull_accepts_exact_advertised_commit_id_and_detaches(tmp_path: Path) -> None:
+    remote = tmp_path / "remote.git"
+    commit, _ = _seed_remote(remote, tmp_path / "seed")
+    manager = _subscription_manager(remote, tmp_path / "checkout", active_ref=commit)
+
+    receipt = manager.pull()
+
+    assert receipt["new_commit"] == commit
+    assert _git("branch", "--show-current", cwd=manager.checkout).stdout.strip() == ""
+
+
+@pytest.mark.parametrize("active_ref", ("refs/tags/release/v1", "a" * 40, "b" * 64))
+def test_push_rejects_read_only_tag_and_commit_refs_before_staging(
+    tmp_path: Path, active_ref: str
+) -> None:
+    remote = tmp_path / "remote.git"
+    commit, _ = _seed_remote(remote, tmp_path / "seed")
+    selected_ref = commit if active_ref == "a" * 40 else active_ref
+    manager = _subscription_manager(remote, tmp_path / "checkout", active_ref=selected_ref)
+    if selected_ref != "b" * 64:
+        manager.pull()
+    before = (
+        _git("status", "--porcelain", cwd=manager.checkout).stdout
+        if manager.checkout.exists()
+        else ""
+    )
+
+    with pytest.raises(OntologySyncError, match="read-only|branch"):
+        manager.push(relative_paths=(Path("ontology.yaml"),), message="must fail")
+
+    if manager.checkout.exists():
+        assert _git("status", "--porcelain", cwd=manager.checkout).stdout == before
 
 
 def test_git_sync_initializes_pushes_and_fast_forward_pulls(tmp_path: Path) -> None:

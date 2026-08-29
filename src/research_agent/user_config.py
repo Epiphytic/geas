@@ -16,6 +16,10 @@ from pydantic import Field, field_validator, model_validator
 from research_agent.agent_skills import BuiltinSkillReceipt, install_builtin_geas_skill
 from research_agent.models import StrictModel
 from research_agent.ontology_config import OntologyBuildDefaults
+from research_agent.ontology_subscriptions import (
+    NormalizedProfile,
+    OntologySubscription,
+)
 from research_agent.ontology_trust import InstalledOntologySnapshot, TrustRule
 from research_agent.paths import geas_config_home
 
@@ -72,6 +76,10 @@ class OntologyGitConfig(StrictModel):
     pull_before_update: bool = False
     push_on_update: bool = False
 
+    @property
+    def active_ref(self) -> str:
+        return f"refs/heads/{self.branch}"
+
     @field_validator("url")
     @classmethod
     def url_has_no_embedded_credentials(cls, value: str) -> str:
@@ -96,6 +104,7 @@ class GeasProfile(StrictModel):
         SecretSource(path=Path("secrets/common.env"), format="dotenv"),
     )
     ontology_git: OntologyGitConfig | None = None
+    subscriptions: dict[str, OntologySubscription] = Field(default_factory=dict)
     trust_rules: tuple[TrustRule, ...] = ()
     installed_ontologies: tuple[InstalledOntologySnapshot, ...] = ()
 
@@ -108,6 +117,7 @@ class GeasProfile(StrictModel):
 
     @model_validator(mode="after")
     def trust_selectors_are_unique(self) -> GeasProfile:
+        NormalizedProfile(subscriptions=self.normalized_subscriptions())
         selectors = [
             (
                 rule.repository,
@@ -125,6 +135,20 @@ class GeasProfile(StrictModel):
         if len(snapshots) != len(set(snapshots)):
             raise ValueError("duplicate installed ontology snapshot")
         return self
+
+    def normalized_subscriptions(self) -> dict[str, OntologySubscription]:
+        subscriptions = dict(self.subscriptions)
+        if self.ontology_git is not None and "primary" not in subscriptions:
+            subscriptions["primary"] = OntologySubscription(
+                url=self.ontology_git.url,
+                active_ref=self.ontology_git.active_ref,
+                checkout=self.ontology_directory,
+                catalog=Path("geas.yaml"),
+                remote=self.ontology_git.remote,
+                pull_before_update=self.ontology_git.pull_before_update,
+                push_on_update=self.ontology_git.push_on_update,
+            )
+        return dict(sorted(subscriptions.items()))
 
 
 class GeasUserConfig(StrictModel):
@@ -357,8 +381,21 @@ class UserConfigManager:
             raise ValueError("Geas user config cannot be a symbolic link")
         _atomic_write(self.path, validated.explicit_yaml().encode())
 
+    def restore_bytes(self, value: bytes) -> None:
+        """Atomically restore an exact previously validated configuration snapshot."""
+        try:
+            GeasUserConfig.model_validate(yaml.safe_load(value))
+        except (ValueError, yaml.YAMLError) as error:
+            raise ValueError("cannot restore invalid Geas user configuration bytes") from error
+        if self.path.is_symlink():
+            raise ValueError("Geas user config cannot be a symbolic link")
+        _atomic_write(self.path, value)
+
     def ontology_root(self, profile: GeasProfile) -> Path:
         return self._confined(profile.ontology_directory)
+
+    def subscription_checkout(self, subscription: OntologySubscription) -> Path:
+        return self._confined(subscription.checkout)
 
     def secret_paths(self, profile: GeasProfile) -> tuple[tuple[Path, str], ...]:
         return tuple(

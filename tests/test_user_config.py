@@ -65,6 +65,7 @@ def test_user_config_initializes_explicit_profile_and_secret_scaffold(
         "pull_before_update": False,
         "push_on_update": False,
     }
+    assert serialized["profiles"]["default"]["subscriptions"] == {}
 
 
 def test_user_config_supports_team_profiles_and_confines_paths(tmp_path: Path) -> None:
