@@ -1893,6 +1893,8 @@ def main() -> None:
                         root_existed=root_existed,
                     )
                 raise
+            if first_config:
+                manager.load_or_create()
             _json(receipt)
             return
         if args.command == "ontology-unsubscribe":

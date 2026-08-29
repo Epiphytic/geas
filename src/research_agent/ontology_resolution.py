@@ -35,9 +35,11 @@ class OntologyCandidate(StrictModel):
     source: str
     source_kind: Literal["legacy_profile", "repository", "subscription", "snapshot"]
     ontology_directory: Path
+    verified_ontology_directory: Path | None = None
     description: str | None = None
     repository_identity: str | None = None
     repository_root: Path | None = None
+    verified_repository_root: Path | None = None
     identity_kind: Literal["remote", "machine_local"] | None = None
     active_ref: str | None = None
     commit: str | None = None
@@ -227,6 +229,8 @@ def _snapshot_candidates(
                 source=f"snapshot:{snapshot.bundle_sha256}",
                 source_kind="snapshot",
                 ontology_directory=directory,
+                verified_ontology_directory=directory,
+                verified_repository_root=manager.root,
                 bundle_sha256=snapshot.bundle_sha256,
                 files=snapshot.files,
                 trust_status="trusted",
@@ -323,8 +327,10 @@ def _repository_candidates(
                 source=source or f"repository:{ontology.catalog_path}",
                 source_kind=source_kind,
                 ontology_directory=ontology.ontology_path,
+                verified_ontology_directory=ontology.ontology_path,
                 repository_identity=catalog.repository_identity,
                 repository_root=catalog.repository_root,
+                verified_repository_root=catalog.repository_root,
                 identity_kind=catalog.identity_kind,
                 active_ref=catalog.active_ref,
                 commit=catalog.commit,

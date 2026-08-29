@@ -209,6 +209,8 @@ def test_subscription_candidate_preserves_declaring_repository_metadata(
     assert candidate.subscription == subscription
     assert candidate.catalog_path == catalog_root / "geas.yaml"
     assert candidate.repository_identity == str(checkout.resolve())
+    assert candidate.verified_repository_root == checkout.resolve()
+    assert candidate.verified_ontology_directory == candidate.ontology_directory
     assert candidate.active_ref == "refs/heads/main"
     assert candidate.commit == _git(checkout, "rev-parse", "HEAD")
     assert candidate.bundle_sha256

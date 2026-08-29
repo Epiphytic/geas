@@ -116,6 +116,7 @@ def selected_conventional_path(
     path = selection.ontology_directory / relative
     if selection.files is None:
         return path
+    _assert_selected_directory_identity(selection)
     declared = next((item for item in selection.files if item.path == relative), None)
     if declared is None:
         raise ValueError(
@@ -124,7 +125,9 @@ def selected_conventional_path(
     if path.is_symlink() or not path.is_file():
         raise ValueError(f"declared ontology input is missing or symbolic: {filename}")
     resolved = path.resolve(strict=True)
-    if not resolved.is_relative_to(selection.ontology_directory.resolve()):
+    expected_directory = selection.verified_ontology_directory
+    assert expected_directory is not None
+    if not resolved.is_relative_to(expected_directory):
         raise ValueError("declared ontology input escapes the selected ontology directory")
     content = resolved.read_bytes()
     if (
@@ -133,6 +136,32 @@ def selected_conventional_path(
     ):
         raise ValueError(f"declared ontology input size or digest mismatch: {filename}")
     return resolved
+
+
+def _assert_selected_directory_identity(selection: OntologySelection) -> None:
+    expected_directory = selection.verified_ontology_directory
+    expected_root = selection.verified_repository_root
+    if expected_directory is None or expected_root is None:
+        raise ValueError("selected ontology has no verified directory identity")
+    if selection.ontology_directory != expected_directory:
+        raise ValueError("selected ontology directory identity changed")
+    if (
+        selection.repository_root is not None
+        and selection.repository_root != expected_root
+    ):
+        raise ValueError("selected ontology repository-root identity changed")
+    if not expected_directory.is_relative_to(expected_root):
+        raise ValueError("verified ontology directory escapes its verified root")
+    for candidate in (expected_directory, *expected_directory.parents):
+        if candidate.is_symlink():
+            raise ValueError("selected ontology directory ancestry is symbolic")
+    try:
+        current_root = expected_root.resolve(strict=True)
+        current_directory = expected_directory.resolve(strict=True)
+    except OSError as error:
+        raise ValueError("selected ontology directory identity is no longer present") from error
+    if current_root != expected_root or current_directory != expected_directory:
+        raise ValueError("selected ontology directory identity changed")
 
 
 def _resolve_ontology_config(

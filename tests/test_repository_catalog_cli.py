@@ -20,7 +20,12 @@ from research_agent.ontology_subscriptions import (
     SubscriptionSyncReceipt,
 )
 from research_agent.repository_catalog import CatalogFile, load_catalog, refresh_catalog
-from research_agent.user_config import GeasProfile, GeasUserConfig, UserConfigManager
+from research_agent.user_config import (
+    DEFAULT_CONFIG_FILENAMES,
+    GeasProfile,
+    GeasUserConfig,
+    UserConfigManager,
+)
 
 
 def _git(repository: Path, *arguments: str) -> None:
@@ -342,6 +347,49 @@ def test_undeclared_named_build_fails_before_build_config_parsing(
     assert parsed == []
 
 
+def test_replaced_ontology_directory_fails_before_build_config_parsing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _manager(tmp_path)
+    catalog_path = _repository(tmp_path / "repository", "replaced")
+    catalog = cli.resolve_ontology_catalog(
+        user_config=manager.load(),
+        manager=manager,
+        cwd=catalog_path.parent,
+        yolo=True,
+        prompt=None,
+    )
+    selection = cli.select_ontology("replaced", catalog=catalog)
+    original = selection.ontology_directory
+    external = tmp_path / "external-build"
+    external.mkdir()
+    (external / "build.yaml").write_bytes((original / "build.yaml").read_bytes())
+    original.rename(original.with_name("replaced-original"))
+    original.symlink_to(external, target_is_directory=True)
+    parsed: list[Path] = []
+    monkeypatch.setattr(cli, "_catalog_selection", lambda *args, **kwargs: selection)
+
+    def forbidden_parse(path: Path, **kwargs: object) -> object:
+        parsed.append(path)
+        raise AssertionError("build parser crossed the directory-identity gate")
+
+    monkeypatch.setattr(cli.OntologyBuildConfig, "from_yaml", forbidden_parse)
+
+    with pytest.raises(ValueError, match="directory|symbolic|identity"):
+        _run_main(
+            monkeypatch,
+            "--geas-config",
+            str(manager.path),
+            "--yolo",
+            "ontology-build",
+            "replaced",
+            "--check",
+        )
+
+    assert parsed == []
+
+
 def test_subscription_selection_freshens_only_after_initial_authorization(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -436,8 +484,10 @@ def _artifact_selection(
             source="subscription:example",
             source_kind="subscription",
             ontology_directory=ontology,
+            verified_ontology_directory=ontology,
             repository_identity="https://example.invalid/repository",
             repository_root=repository,
+            verified_repository_root=repository,
             active_ref=active_ref,
             commit="a" * 40,
             catalog_path=repository / "geas.yaml",
@@ -527,6 +577,45 @@ def test_undeclared_artifact_manifest_fails_before_artifact_construction(
     assert artifact_calls == []
 
 
+def test_replaced_ontology_directory_fails_before_artifact_construction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = _manager(tmp_path)
+    selection, manifest = _artifact_selection(
+        tmp_path,
+        active_ref="refs/heads/main",
+    )
+    original = selection.ontology_directory
+    original_parent = original.parent
+    external_parent = tmp_path / "external-artifacts"
+    external = external_parent / original.name
+    external.mkdir(parents=True)
+    (external / "artifacts.yaml").write_bytes(manifest.read_bytes())
+    original_parent.rename(original_parent.with_name("ontology-original"))
+    original_parent.symlink_to(external_parent, target_is_directory=True)
+    artifact_calls: list[str] = []
+    monkeypatch.setattr(cli, "_catalog_selection", lambda *args, **kwargs: selection)
+
+    class ForbiddenArtifactManager:
+        def __init__(self, directory: Path) -> None:
+            artifact_calls.append("manager")
+            raise AssertionError("artifact manager crossed the directory-identity gate")
+
+    monkeypatch.setattr(cli, "OntologyArtifactManager", ForbiddenArtifactManager)
+
+    with pytest.raises(ValueError, match="directory|symbolic|identity"):
+        _run_main(
+            monkeypatch,
+            "--geas-config",
+            str(manager.path),
+            "ontology-artifact-sync",
+            "example",
+        )
+
+    assert artifact_calls == []
+
+
 @pytest.mark.parametrize("failure", ("clone", "catalog", "trust"))
 def test_first_subscribe_failure_restores_absent_config_root(
     tmp_path: Path,
@@ -591,6 +680,60 @@ def test_first_subscribe_failure_restores_absent_config_root(
 
     assert not manager.path.exists()
     assert not manager.root.exists()
+
+
+def test_first_subscribe_success_completes_normal_config_scaffolding(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    manager = UserConfigManager(tmp_path / "config" / "config.yaml")
+
+    class SuccessfulSubscriptions:
+        def subscribe(
+            self,
+            name: str,
+            subscription: OntologySubscription,
+        ) -> SubscriptionMutationReceipt:
+            config = manager.load()
+            profile_name, profile = config.profile()
+            updated = profile.model_copy(
+                update={"subscriptions": {name: subscription}}
+            )
+            manager.replace(
+                config.model_copy(
+                    update={"profiles": {**config.profiles, profile_name: updated}}
+                )
+            )
+            return SubscriptionMutationReceipt(
+                name=name,
+                checkout=manager.subscription_checkout(subscription),
+                subscribed=True,
+            )
+
+    monkeypatch.setattr(
+        cli,
+        "_subscription_service",
+        lambda *args, **kwargs: SuccessfulSubscriptions(),
+    )
+
+    _run_main(
+        monkeypatch,
+        "--geas-config",
+        str(manager.path),
+        "--yolo",
+        "ontology-subscribe",
+        "sample",
+        "https://example.invalid/sample.git",
+    )
+
+    assert json.loads(capsys.readouterr().out)["subscribed"] is True
+    assert manager.load().profiles["default"].subscriptions["sample"].url.endswith(
+        "/sample.git"
+    )
+    assert (manager.root / "secrets" / ".gitignore").read_text() == "*\n!.gitignore\n"
+    assert (manager.root / "defaults-state.json").is_file()
+    assert all((manager.root / name).is_file() for name in DEFAULT_CONFIG_FILENAMES)
 
 
 def test_configless_yolo_lists_and_selects_without_durable_write(
