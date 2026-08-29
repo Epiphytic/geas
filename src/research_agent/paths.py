@@ -5,6 +5,10 @@ import re
 import sys
 from collections.abc import Mapping
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from research_agent.ontology_resolution import OntologySelection
 
 _SLUG_PART = re.compile(r"[^a-z0-9]+")
 
@@ -77,6 +81,20 @@ def resolve_profile_ontology_config(
 ) -> Path:
     """Resolve a config within the selected named profile's ontology root."""
     return _resolve_ontology_config(value, filename, ontology_root=ontology_root)
+
+
+def resolve_selected_ontology_config(
+    value: Path,
+    *,
+    filename: str,
+    selection: OntologySelection | None,
+) -> Path:
+    """Resolve a bare ontology name through an already authorized selection."""
+    if selection is None:
+        return value
+    if value.exists() or value.is_absolute() or len(value.parts) != 1:
+        return value
+    return selection.ontology_directory / filename
 
 
 def _resolve_ontology_config(
