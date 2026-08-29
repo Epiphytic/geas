@@ -16,6 +16,7 @@ from pydantic import Field, field_validator, model_validator
 from research_agent.agent_skills import BuiltinSkillReceipt, install_builtin_geas_skill
 from research_agent.models import StrictModel
 from research_agent.ontology_config import OntologyBuildDefaults
+from research_agent.ontology_trust import InstalledOntologySnapshot, TrustRule
 from research_agent.paths import geas_config_home
 
 DEFAULT_ONTOLOGY_REPOSITORY = "https://github.com/liamhelmer-bel/ontologies.git"
@@ -95,6 +96,8 @@ class GeasProfile(StrictModel):
         SecretSource(path=Path("secrets/common.env"), format="dotenv"),
     )
     ontology_git: OntologyGitConfig | None = None
+    trust_rules: tuple[TrustRule, ...] = ()
+    installed_ontologies: tuple[InstalledOntologySnapshot, ...] = ()
 
     @field_validator("ontology_directory")
     @classmethod
@@ -103,13 +106,31 @@ class GeasProfile(StrictModel):
             raise ValueError("profile ontology_directory must be config-relative")
         return value
 
+    @model_validator(mode="after")
+    def trust_selectors_are_unique(self) -> GeasProfile:
+        selectors = [
+            (
+                rule.repository,
+                rule.refs,
+                rule.paths,
+                rule.bundle_sha256,
+            )
+            for rule in self.trust_rules
+        ]
+        if len(selectors) != len(set(selectors)):
+            raise ValueError("duplicate trust rule selectors")
+        snapshots = [
+            (snapshot.name, snapshot.bundle_sha256) for snapshot in self.installed_ontologies
+        ]
+        if len(snapshots) != len(set(snapshots)):
+            raise ValueError("duplicate installed ontology snapshot")
+        return self
+
 
 class GeasUserConfig(StrictModel):
     version: Literal[1] = 1
     default_profile: str = "default"
-    ontology_freshness: OntologyFreshnessConfig = Field(
-        default_factory=OntologyFreshnessConfig
-    )
+    ontology_freshness: OntologyFreshnessConfig = Field(default_factory=OntologyFreshnessConfig)
     ontology_defaults: OntologyBuildDefaults = Field(default_factory=OntologyBuildDefaults)
     profiles: dict[str, GeasProfile]
 
@@ -187,7 +208,7 @@ class UserConfigManager:
         else:
             self.root.mkdir(parents=True, exist_ok=True)
             config = GeasUserConfig.default()
-            self.path.write_text(config.explicit_yaml())
+            _atomic_write(self.path, config.explicit_yaml().encode())
         self._ensure_secret_scaffold()
         self.last_defaults_receipt = self.install_defaults(update=update_defaults)
         return config
@@ -256,9 +277,7 @@ class UserConfigManager:
                 _atomic_write(candidate, template)
             candidates.append(candidate.name)
             next_files[filename] = ManagedDefaultFile(
-                installed_sha256=(
-                    previous.installed_sha256 if previous is not None else None
-                ),
+                installed_sha256=(previous.installed_sha256 if previous is not None else None),
                 template_sha256=template_hash,
             )
 
@@ -331,13 +350,19 @@ class UserConfigManager:
         config = self.load_or_create() if create else self.load()
         return config.profile(name)
 
+    def replace(self, config: GeasUserConfig) -> None:
+        """Atomically replace trusted user configuration with a validated value."""
+        validated = GeasUserConfig.model_validate(config.model_dump(mode="python"))
+        if self.path.is_symlink():
+            raise ValueError("Geas user config cannot be a symbolic link")
+        _atomic_write(self.path, validated.explicit_yaml().encode())
+
     def ontology_root(self, profile: GeasProfile) -> Path:
         return self._confined(profile.ontology_directory)
 
     def secret_paths(self, profile: GeasProfile) -> tuple[tuple[Path, str], ...]:
         return tuple(
-            (self._confined(source.path), source.format)
-            for source in profile.secret_sources
+            (self._confined(source.path), source.format) for source in profile.secret_sources
         )
 
     def _confined(self, relative: Path) -> Path:
