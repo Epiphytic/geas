@@ -246,6 +246,43 @@ def test_verify_catalog_requires_known_transitive_yaml_inputs_in_inventory(
         verify_catalog(tmp_path / "geas.yaml")
 
 
+def test_verify_catalog_rejects_undeclared_workspace_relative_seed_bundle(
+    tmp_path: Path,
+) -> None:
+    """Ignoring seed_bundles would let build.yaml import an unreviewed bundle."""
+    entry = _entry(
+        tmp_path,
+        files={
+            "build.yaml": b"seed_bundles:\n  - ontology/example/seeds/seed.yaml\n",
+        },
+    )
+    (tmp_path / "ontology/example/seeds").mkdir()
+    (tmp_path / "ontology/example/seeds/seed.yaml").write_text("version: 1\n")
+    _write_catalog(tmp_path / "geas.yaml", entry)
+
+    with pytest.raises(ValueError, match="undeclared"):
+        verify_catalog(tmp_path / "geas.yaml")
+
+
+def test_verify_catalog_rejects_undeclared_tracked_seed_bundle_glob(git_repo: Path) -> None:
+    """Ignoring seed_bundle_globs would let a tracked bundle bypass the inventory."""
+    entry = _entry(
+        git_repo,
+        files={
+            "build.yaml": b"seed_bundle_globs:\n  - ontology/example/seeds/*.yaml\n",
+        },
+    )
+    seed = git_repo / "ontology/example/seeds/seed.yaml"
+    seed.parent.mkdir()
+    seed.write_text("version: 1\n")
+    _write_catalog(git_repo / "geas.yaml", entry)
+    _git(git_repo, "add", ".")
+    _git(git_repo, "commit", "-m", "seed glob fixture")
+
+    with pytest.raises(ValueError, match="undeclared"):
+        verify_catalog(git_repo / "geas.yaml")
+
+
 def test_refresh_rehashes_existing_inventory_and_writes_atomically(tmp_path: Path) -> None:
     """Refresh must preserve the old catalog until a complete replacement is ready."""
     _catalog_ontology(tmp_path)

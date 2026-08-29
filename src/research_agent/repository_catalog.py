@@ -171,13 +171,15 @@ def verify_catalog(path: Path, *, names: Sequence[str] = ()) -> tuple[VerifiedCa
     catalog_path = _catalog_path(path)
     catalog = load_catalog(catalog_path)
     selected = _selected_entries(catalog, names)
-    return tuple(_verify_entry(catalog_path, entry) for entry in selected)
+    workspace = _catalog_workspace(catalog_path)
+    return tuple(_verify_entry(catalog_path, entry, workspace=workspace) for entry in selected)
 
 
 def refresh_catalog(path: Path, *, names: Sequence[str] = ()) -> RepositoryCatalog:
     """Atomically refresh hashes for already declared inventory files only."""
     catalog_path = _catalog_path(path)
     catalog = load_catalog(catalog_path)
+    workspace = _catalog_workspace(catalog_path)
     selected_names = {entry.name for entry in _selected_entries(catalog, names)}
     refreshed: list[CatalogOntology] = []
     for entry in catalog.ontologies:
@@ -199,7 +201,7 @@ def refresh_catalog(path: Path, *, names: Sequence[str] = ()) -> RepositoryCatal
         candidate = candidate.model_copy(
             update={"bundle_sha256": ontology_bundle_sha256(candidate)}
         )
-        _verify_transitive_inputs(ontology_path, candidate.files)
+        _verify_transitive_inputs(ontology_path, candidate.files, workspace=workspace)
         refreshed.append(candidate)
     result = RepositoryCatalog(version=1, ontologies=tuple(refreshed))
     _atomic_yaml_replace(catalog_path, result)
@@ -241,7 +243,7 @@ def resolve_repository_catalog(start: Path) -> ResolvedRepositoryCatalog:
         for entry in load_catalog(catalog_path).ontologies:
             entries[entry.name] = (catalog_path, entry)
     verified = tuple(
-        _verified_with_dirtiness(_verify_entry(catalog_path, entry), worktree)
+        _verified_with_dirtiness(_verify_entry(catalog_path, entry, workspace=worktree), worktree)
         for _, (catalog_path, entry) in sorted(entries.items())
     )
     origin = _git(worktree, "remote", "get-url", "origin", required=False)
@@ -305,7 +307,9 @@ def _regular_file(ontology_path: Path, relative: Path) -> Path:
     return resolved
 
 
-def _verify_entry(catalog_path: Path, entry: CatalogOntology) -> VerifiedCatalogOntology:
+def _verify_entry(
+    catalog_path: Path, entry: CatalogOntology, *, workspace: Path
+) -> VerifiedCatalogOntology:
     ontology_path = _ontology_directory(catalog_path, entry)
     for item in entry.files:
         file_path = _regular_file(ontology_path, item.path)
@@ -314,7 +318,7 @@ def _verify_entry(catalog_path: Path, entry: CatalogOntology) -> VerifiedCatalog
             raise ValueError(f"declared inventory size mismatch: {item.path.as_posix()}")
         if hashlib.sha256(content).hexdigest() != item.sha256:
             raise ValueError(f"declared inventory sha256 mismatch: {item.path.as_posix()}")
-    _verify_transitive_inputs(ontology_path, entry.files)
+    _verify_transitive_inputs(ontology_path, entry.files, workspace=workspace)
     digest = ontology_bundle_sha256(entry)
     if digest != entry.bundle_sha256:
         raise ValueError("catalog bundle digest mismatch")
@@ -328,7 +332,9 @@ def _verify_entry(catalog_path: Path, entry: CatalogOntology) -> VerifiedCatalog
     )
 
 
-def _verify_transitive_inputs(ontology_path: Path, files: Sequence[CatalogFile]) -> None:
+def _verify_transitive_inputs(
+    ontology_path: Path, files: Sequence[CatalogFile], *, workspace: Path
+) -> None:
     declared = {item.path.as_posix() for item in files}
     for item in files:
         yaml_path = _regular_file(ontology_path, item.path)
@@ -339,19 +345,83 @@ def _verify_transitive_inputs(ontology_path: Path, files: Sequence[CatalogFile])
         except (OSError, yaml.YAMLError) as error:
             raise ValueError(f"invalid declared YAML input: {item.path.as_posix()}") from error
         for reference in _yaml_references(value):
-            relative = _relative_path(reference, label="transitive YAML input path")
-            candidate = yaml_path.parent / relative
-            _reject_symlink_ancestry(candidate)
-            if not candidate.exists():
-                continue
-            if not candidate.is_file():
-                raise ValueError("transitive YAML input must be a regular file")
-            resolved = candidate.resolve(strict=True)
-            if not resolved.is_relative_to(ontology_path):
-                raise ValueError("transitive YAML input escapes ontology directory")
-            contained = resolved.relative_to(ontology_path).as_posix()
-            if contained not in declared:
-                raise ValueError(f"undeclared transitive YAML input: {contained}")
+            _require_declared_input(
+                yaml_path.parent / _relative_path(reference, label="transitive YAML input path"),
+                ontology_path=ontology_path,
+                declared=declared,
+                label="transitive YAML input",
+                required=False,
+            )
+        if not isinstance(value, dict):
+            continue
+        for reference in _path_strings(value.get("seed_bundles")):
+            _require_declared_input(
+                workspace / _relative_path(reference, label="workspace seed bundle path"),
+                ontology_path=ontology_path,
+                declared=declared,
+                label="workspace seed bundle",
+                required=True,
+            )
+        for pattern in _path_strings(value.get("seed_bundle_globs")):
+            for bundle_path in _seed_glob_paths(workspace, pattern):
+                _require_declared_input(
+                    bundle_path,
+                    ontology_path=ontology_path,
+                    declared=declared,
+                    label="workspace seed bundle",
+                    required=True,
+                )
+
+
+def _require_declared_input(
+    candidate: Path,
+    *,
+    ontology_path: Path,
+    declared: set[str],
+    label: str,
+    required: bool,
+) -> None:
+    _reject_symlink_ancestry(candidate)
+    if not candidate.exists():
+        if required:
+            raise ValueError(f"{label} is missing")
+        return
+    if not candidate.is_file():
+        raise ValueError(f"{label} must be a regular file")
+    resolved = candidate.resolve(strict=True)
+    if not resolved.is_relative_to(ontology_path):
+        raise ValueError(f"{label} escapes ontology directory")
+    contained = resolved.relative_to(ontology_path).as_posix()
+    if contained not in declared:
+        raise ValueError(f"undeclared {label}: {contained}")
+
+
+def _seed_glob_paths(workspace: Path, pattern: str) -> tuple[Path, ...]:
+    relative_pattern = _relative_path(pattern, label="workspace seed bundle glob")
+    completed = subprocess.run(
+        ("git", "-C", str(workspace), "ls-tree", "-r", "--name-only", "-z", "HEAD", "--"),
+        check=False,
+        capture_output=True,
+    )
+    if completed.returncode:
+        raise ValueError("seed_bundle_globs require an accessible Git HEAD")
+    tracked = frozenset(
+        item.decode("utf-8", errors="strict") for item in completed.stdout.split(b"\0") if item
+    )
+    try:
+        matches = tuple(workspace.glob(relative_pattern.as_posix()))
+    except ValueError as error:
+        raise ValueError("workspace seed bundle glob is invalid") from error
+    return tuple(
+        sorted(
+            (
+                path
+                for path in matches
+                if path.is_file() and path.relative_to(workspace).as_posix() in tracked
+            ),
+            key=lambda path: path.relative_to(workspace).as_posix().encode("utf-8"),
+        )
+    )
 
 
 def _yaml_references(value: object, *, parent_key: str | None = None) -> Iterable[str]:
@@ -427,6 +497,11 @@ def _start_directory(start: Path) -> Path:
 def _git_worktree(start: Path) -> Path | None:
     output = _git(_start_directory(start), "rev-parse", "--show-toplevel", required=False)
     return Path(output).resolve() if output else None
+
+
+def _catalog_workspace(catalog_path: Path) -> Path:
+    """Match OntologyBuilder's workspace-relative seed path interpretation."""
+    return _git_worktree(catalog_path.parent) or catalog_path.parent
 
 
 def _git(directory: Path, *arguments: str, required: bool = True) -> str:
