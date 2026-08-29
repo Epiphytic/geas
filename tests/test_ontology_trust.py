@@ -259,6 +259,28 @@ def _manager(tmp_path: Path) -> UserConfigManager:
     return manager
 
 
+def _replace_profile(manager: UserConfigManager, profile_name: str, profile: GeasProfile) -> None:
+    config = manager.load()
+    manager.replace(
+        config.model_copy(update={"profiles": {**config.profiles, profile_name: profile}})
+    )
+
+
+def _trust_context(
+    catalog: ResolvedRepositoryCatalog, ontology: VerifiedCatalogOntology
+) -> TrustContext:
+    assert catalog.repository_identity is not None
+    assert catalog.repository_root is not None
+    assert catalog.active_ref is not None
+    return TrustContext(
+        repository=catalog.repository_identity,
+        ref=catalog.active_ref,
+        path=ontology.ontology_path.relative_to(catalog.repository_root),
+        bundle_sha256=ontology.bundle_sha256,
+        dirty=ontology.dirty,
+    )
+
+
 class FakePrompt:
     def __init__(
         self,
@@ -549,3 +571,260 @@ def test_snapshot_removal_rejects_symlink_and_rolls_back_failed_config_write(
     with pytest.raises(OSError, match="injected"):
         remove_snapshot(snapshot, manager=manager, profile_name="default")
     assert destination.is_dir()
+
+
+def test_nested_catalog_authorization_reverifies_the_recorded_discovery_scope(
+    tmp_path: Path, resolved_catalog: ResolvedRepositoryCatalog
+) -> None:
+    """Reverification from the Git root must not discard a valid nested catalog."""
+    assert resolved_catalog.repository_root is not None
+    repository = resolved_catalog.repository_root
+    nested_root = repository / "service"
+    nested = _catalog_entry(nested_root, "nested", b"topic: nested\n")
+    nested_root.joinpath("geas.yaml").write_text(
+        yaml.safe_dump({"version": 1, "ontologies": [nested]}, sort_keys=False)
+    )
+    nested_root.joinpath("api").mkdir()
+    _git(repository, "add", ".")
+    _git(repository, "commit", "-m", "nested catalog")
+    catalog = resolve_repository_catalog(nested_root / "api")
+    manager = _manager(tmp_path)
+
+    authorized = authorize_repository_catalog(
+        catalog,
+        manager=manager,
+        profile_name="default",
+        yolo=False,
+        prompt=FakePrompt("1"),
+    )
+
+    assert [item.ontology.name for item in authorized] == ["alpha", "beta", "nested"]
+    nested_root.joinpath("ontology/nested/build.yaml").write_text("mutated\n")
+    with pytest.raises(ValueError, match="size|sha256"):
+        authorize_repository_catalog(
+            catalog,
+            manager=manager,
+            profile_name="default",
+            yolo=True,
+            prompt=None,
+        )
+
+
+@pytest.mark.parametrize("selector_kind", ["ref", "path", "digest"])
+def test_choice_four_replaces_conflicting_allows_with_effective_source_denial(
+    tmp_path: Path,
+    resolved_catalog: ResolvedRepositoryCatalog,
+    selector_kind: str,
+) -> None:
+    """Choice four must return no mutable source even after a prior narrow allow."""
+    alpha_path = resolved_catalog.by_name("alpha").ontology_path / "build.yaml"
+    alpha_path.write_text("topic: dirty alpha\n")
+    refresh_catalog(resolved_catalog.catalog_paths[0], names=("alpha",))
+    assert resolved_catalog.repository_root is not None
+    catalog = resolve_repository_catalog(resolved_catalog.repository_root)
+    alpha = catalog.by_name("alpha")
+    if selector_kind == "ref":
+        allow = _rule(True, refs=("refs/heads/main",))
+    elif selector_kind == "path":
+        allow = _rule(True, paths=("ontology/alpha",))
+    else:
+        allow = _rule(True, digests=(alpha.bundle_sha256,))
+    manager = _manager(tmp_path)
+    profile = manager.load().profiles["default"].model_copy(update={"trust_rules": (allow,)})
+    _replace_profile(manager, "default", profile)
+    prompt = FakePrompt("4")
+
+    authorized = authorize_repository_catalog(
+        catalog,
+        manager=manager,
+        profile_name="default",
+        yolo=False,
+        prompt=prompt,
+    )
+
+    assert authorized == ()
+    assert prompt.actions == 1
+    rules = manager.load().profiles["default"].trust_rules
+    for ontology in catalog.ontologies:
+        decision = evaluate_trust(_trust_context(catalog, ontology), rules)
+        assert decision.matched is True
+        assert decision.allowed is False
+
+
+def test_choice_three_excludes_previously_allowed_source_and_denies_dirty_context(
+    tmp_path: Path, resolved_catalog: ResolvedRepositoryCatalog
+) -> None:
+    """Snapshot selection must not retain a previously accumulated source path."""
+    alpha_path = resolved_catalog.by_name("alpha").ontology_path / "build.yaml"
+    alpha_path.write_text("topic: dirty alpha\n")
+    refresh_catalog(resolved_catalog.catalog_paths[0], names=("alpha",))
+    assert resolved_catalog.repository_root is not None
+    catalog = resolve_repository_catalog(resolved_catalog.repository_root)
+    manager = _manager(tmp_path)
+    allow = _rule(True, paths=("ontology/alpha",))
+    profile = manager.load().profiles["default"].model_copy(update={"trust_rules": (allow,)})
+    _replace_profile(manager, "default", profile)
+
+    authorized = authorize_repository_catalog(
+        catalog,
+        manager=manager,
+        profile_name="default",
+        yolo=False,
+        prompt=FakePrompt("3", selected=("beta",)),
+    )
+
+    assert [item.ontology.name for item in authorized] == ["beta"]
+    assert authorized[0].authorization == "snapshot"
+    rules = manager.load().profiles["default"].trust_rules
+    for ontology in catalog.ontologies:
+        assert evaluate_trust(_trust_context(catalog, ontology), rules).allowed is False
+
+
+def test_snapshot_removal_preserves_bytes_referenced_by_another_profile(
+    tmp_path: Path, resolved_catalog: ResolvedRepositoryCatalog
+) -> None:
+    """One profile must not delete globally shared snapshot bytes still in use."""
+    manager = _manager(tmp_path)
+    snapshot = install_snapshot(
+        resolved_catalog.by_name("alpha"), manager=manager, profile_name="default"
+    )
+    config = manager.load()
+    second = GeasProfile(installed_ontologies=(snapshot,))
+    manager.replace(config.model_copy(update={"profiles": {**config.profiles, "second": second}}))
+    destination = manager.root / snapshot.path
+
+    first_receipt = remove_snapshot(snapshot, manager=manager, profile_name="default")
+
+    assert first_receipt.removed is False
+    assert destination.is_dir()
+    assert snapshot not in manager.load().profiles["default"].installed_ontologies
+    assert snapshot in manager.load().profiles["second"].installed_ontologies
+
+    last_receipt = remove_snapshot(snapshot, manager=manager, profile_name="second")
+
+    assert last_receipt.removed is True
+    assert not destination.exists()
+
+
+def test_snapshot_install_rejects_workspace_reference_invalid_after_relocation(
+    tmp_path: Path, resolved_catalog: ResolvedRepositoryCatalog
+) -> None:
+    """A source-valid workspace path must remain valid in the installed layout."""
+    alpha = resolved_catalog.by_name("alpha")
+    alpha.ontology_path.joinpath("build.yaml").write_text(
+        "seed_bundles:\n  - ontology/alpha/seed.yaml\n"
+    )
+    alpha.ontology_path.joinpath("seed.yaml").write_text("version: 1\n")
+    catalog_value = yaml.safe_load(alpha.catalog_path.read_text())
+    alpha_value = next(item for item in catalog_value["ontologies"] if item["name"] == "alpha")
+    contents = {
+        "build.yaml": alpha.ontology_path.joinpath("build.yaml").read_bytes(),
+        "seed.yaml": alpha.ontology_path.joinpath("seed.yaml").read_bytes(),
+    }
+    inventory = [
+        {
+            "path": path,
+            "sha256": hashlib.sha256(content).hexdigest(),
+            "size_bytes": len(content),
+        }
+        for path, content in sorted(contents.items())
+    ]
+    alpha_value["files"] = inventory
+    alpha_value["bundle_sha256"] = _bundle_digest(
+        name="alpha", description=alpha_value["description"], files=inventory
+    )
+    alpha.catalog_path.write_text(yaml.safe_dump(catalog_value, sort_keys=False))
+    assert resolved_catalog.repository_root is not None
+    relocated = resolve_repository_catalog(resolved_catalog.repository_root).by_name("alpha")
+    manager = _manager(tmp_path)
+
+    with pytest.raises(ValueError, match="workspace seed bundle.*missing"):
+        install_snapshot(relocated, manager=manager, profile_name="default")
+
+    assert not (manager.root / "snapshots").exists()
+    assert manager.load().profiles["default"].installed_ontologies == ()
+
+
+@pytest.mark.parametrize("extra_kind", ["file", "symlink"])
+def test_existing_snapshot_rejects_undeclared_file_or_symlink(
+    tmp_path: Path,
+    resolved_catalog: ResolvedRepositoryCatalog,
+    extra_kind: str,
+) -> None:
+    """Idempotent reuse requires an exact closed-world installed tree."""
+    manager = _manager(tmp_path)
+    alpha = resolved_catalog.by_name("alpha")
+    snapshot = install_snapshot(alpha, manager=manager, profile_name="default")
+    destination = manager.root / snapshot.path
+    unexpected = destination / "unexpected"
+    if extra_kind == "file":
+        unexpected.write_text("undeclared")
+    else:
+        unexpected.symlink_to(destination / "build.yaml")
+
+    with pytest.raises(ValueError, match="undeclared|symbolic link"):
+        install_snapshot(alpha, manager=manager, profile_name="default")
+
+
+class MutatingSelectionPrompt(FakePrompt):
+    def select_ontology(
+        self, ontology: VerifiedCatalogOntology, *, action: Literal["2", "3"]
+    ) -> bool:
+        selected = super().select_ontology(ontology, action=action)
+        if ontology.name == "beta":
+            ontology.ontology_path.joinpath("build.yaml").write_text("corrupt later\n")
+        return selected
+
+
+def test_choice_three_rolls_back_all_staged_snapshots_on_later_selection_failure(
+    tmp_path: Path, resolved_catalog: ResolvedRepositoryCatalog
+) -> None:
+    """A later selected source failure must not retain an earlier registration."""
+    manager = _manager(tmp_path)
+    before = manager.path.read_bytes()
+    prompt = MutatingSelectionPrompt("3", selected=("alpha", "beta"))
+
+    with pytest.raises(ValueError, match="size|sha256"):
+        authorize_repository_catalog(
+            resolved_catalog,
+            manager=manager,
+            profile_name="default",
+            yolo=False,
+            prompt=prompt,
+        )
+
+    assert prompt.selections == [("alpha", "3"), ("beta", "3")]
+    assert manager.path.read_bytes() == before
+    assert not (manager.root / "snapshots").exists()
+
+
+def test_choice_three_rolls_back_all_snapshots_when_single_final_config_write_fails(
+    tmp_path: Path,
+    resolved_catalog: ResolvedRepositoryCatalog,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Choice three must publish registrations and denial in one config replace."""
+    manager = _manager(tmp_path)
+    before = manager.path.read_bytes()
+    prompt = FakePrompt("3", selected=("alpha", "beta"))
+    writes = 0
+
+    def fail_replace(config: GeasUserConfig) -> None:
+        nonlocal writes
+        writes += 1
+        raise OSError("injected final config failure")
+
+    monkeypatch.setattr(manager, "replace", fail_replace)
+    with pytest.raises(OSError, match="injected final"):
+        authorize_repository_catalog(
+            resolved_catalog,
+            manager=manager,
+            profile_name="default",
+            yolo=False,
+            prompt=prompt,
+        )
+
+    assert prompt.selections == [("alpha", "3"), ("beta", "3")]
+    assert writes == 1
+    assert manager.path.read_bytes() == before
+    assert not (manager.root / "snapshots").exists()

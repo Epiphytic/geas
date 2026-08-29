@@ -20,6 +20,7 @@ from research_agent.repository_catalog import (
     CatalogOntology,
     ResolvedRepositoryCatalog,
     VerifiedCatalogOntology,
+    _verify_transitive_inputs,
     ontology_bundle_sha256,
     resolve_repository_catalog,
     verify_catalog,
@@ -187,6 +188,13 @@ class SnapshotRemovalReceipt(StrictModel):
     removed: bool
 
 
+class _StagedSnapshot(StrictModel):
+    snapshot: InstalledOntologySnapshot
+    ontology: VerifiedCatalogOntology
+    destination: Path
+    created: bool
+
+
 class TrustPrompt(Protocol):
     """Pure injected I/O for decisions; trusted state remains manager-owned."""
 
@@ -220,6 +228,16 @@ def _matches(rule: TrustRule, context: TrustContext) -> bool:
         and rule.refs != "*"
         and rule.paths == "*"
         and rule.bundle_sha256 == "*"
+    )
+
+
+def _selector_matches(rule: TrustRule, context: TrustContext) -> bool:
+    """Match selectors without the dirty-ref allow exception."""
+    return (
+        rule.repository == context.repository
+        and (rule.refs == "*" or context.ref in rule.refs)
+        and (rule.paths == "*" or context.path in rule.paths)
+        and (rule.bundle_sha256 == "*" or context.bundle_sha256 in rule.bundle_sha256)
     )
 
 
@@ -266,7 +284,10 @@ def _fresh_catalog(catalog: ResolvedRepositoryCatalog) -> ResolvedRepositoryCata
     """Repeat integrity and repository metadata resolution before authorization."""
     if catalog.repository_root is None:
         raise ValueError("repository catalog has no repository root")
-    fresh = resolve_repository_catalog(catalog.repository_root)
+    discovery_scope = (
+        catalog.catalog_paths[-1].parent if catalog.catalog_paths else catalog.repository_root
+    )
+    fresh = resolve_repository_catalog(discovery_scope)
     if fresh != catalog:
         raise ValueError("repository catalog changed after integrity verification")
     return fresh
@@ -318,6 +339,44 @@ def _interactive_rule(
         created_at=utc_now(),
         created_via="interactive",
     )
+
+
+def _profile_with_effective_ref_denial(
+    profile: GeasProfile,
+    catalog: ResolvedRepositoryCatalog,
+) -> GeasProfile:
+    if catalog.active_ref is None:
+        raise ValueError("repository catalog has no active Git ref")
+    contexts = tuple(_context(catalog, ontology) for ontology in catalog.ontologies)
+    denial = _interactive_rule(
+        catalog,
+        decision="deny",
+        refs=(catalog.active_ref,),
+    )
+    denial_selectors = (
+        denial.repository,
+        denial.refs,
+        denial.paths,
+        denial.bundle_sha256,
+    )
+    retained: list[TrustRule] = []
+    for rule in profile.trust_rules:
+        selectors = (
+            rule.repository,
+            rule.refs,
+            rule.paths,
+            rule.bundle_sha256,
+        )
+        if selectors == denial_selectors:
+            continue
+        if (
+            rule.decision == "allow"
+            and _specificity(rule) >= _specificity(denial)
+            and any(_selector_matches(rule, context) for context in contexts)
+        ):
+            continue
+        retained.append(rule)
+    return profile.model_copy(update={"trust_rules": (*retained, denial)})
 
 
 def authorize_repository_catalog(
@@ -392,48 +451,55 @@ def authorize_repository_catalog(
                 )
         _append_rules(manager, profile_name, rules)
     elif action == "3":
-        if catalog.active_ref is None:
-            raise ValueError("repository catalog has no active Git ref")
-        for ontology in unresolved:
-            if not prompt.select_ontology(ontology, action="3"):
-                continue
-            snapshot = install_snapshot(ontology, manager=manager, profile_name=profile_name)
-            installed = ontology.model_copy(
-                update={
-                    "ontology_path": manager.root / snapshot.path,
-                    "dirty": False,
-                }
+        selected = tuple(
+            ontology for ontology in unresolved if prompt.select_ontology(ontology, action="3")
+        )
+        staged: list[_StagedSnapshot] = []
+        try:
+            for ontology in selected:
+                staged.append(_stage_snapshot(ontology, manager=manager))
+            registrations = list(profile.installed_ontologies)
+            for item in staged:
+                existing = next(
+                    (
+                        registered
+                        for registered in registrations
+                        if (registered.name, registered.bundle_sha256)
+                        == (item.snapshot.name, item.snapshot.bundle_sha256)
+                    ),
+                    None,
+                )
+                if existing is not None:
+                    if existing != item.snapshot:
+                        raise ValueError("registered ontology snapshot metadata mismatch")
+                    continue
+                registrations.append(item.snapshot)
+            registered_profile = profile.model_copy(
+                update={"installed_ontologies": tuple(registrations)}
             )
-            authorized[ontology.name] = AuthorizedOntology(
-                ontology=installed,
+            _profile_update(
+                manager,
+                profile_name,
+                _profile_with_effective_ref_denial(registered_profile, catalog),
+            )
+        except BaseException:
+            _rollback_staged_snapshots(staged)
+            raise
+        authorized = {
+            item.ontology.name: AuthorizedOntology(
+                ontology=item.ontology,
                 authorization="snapshot",
-                snapshot=snapshot,
+                snapshot=item.snapshot,
             )
-        _append_rules(
-            manager,
-            profile_name,
-            (
-                _interactive_rule(
-                    catalog,
-                    decision="deny",
-                    refs=(catalog.active_ref,),
-                ),
-            ),
-        )
+            for item in staged
+        }
     elif action == "4":
-        if catalog.active_ref is None:
-            raise ValueError("repository catalog has no active Git ref")
-        _append_rules(
+        _profile_update(
             manager,
             profile_name,
-            (
-                _interactive_rule(
-                    catalog,
-                    decision="deny",
-                    refs=(catalog.active_ref,),
-                ),
-            ),
+            _profile_with_effective_ref_denial(profile, catalog),
         )
+        authorized.clear()
     else:  # Defensive for runtime implementations not checked by static typing.
         raise ValueError("invalid repository trust prompt choice")
 
@@ -469,6 +535,39 @@ def _verify_snapshot_directory(directory: Path, ontology: VerifiedCatalogOntolog
     )
     if ontology_bundle_sha256(entry) != ontology.bundle_sha256:
         raise ValueError("snapshot bundle digest mismatch")
+    expected_files = {item.path.as_posix() for item in ontology.files}
+    expected_directories = {
+        parent.as_posix()
+        for item in ontology.files
+        for parent in item.path.parents
+        if parent != Path(".")
+    }
+    actual_files: set[str] = set()
+    actual_directories: set[str] = set()
+    pending = [directory]
+    while pending:
+        current = pending.pop()
+        with os.scandir(current) as entries:
+            for item in entries:
+                candidate = Path(item.path)
+                relative = candidate.relative_to(directory).as_posix()
+                if item.is_symlink():
+                    raise ValueError(
+                        f"symbolic link is not allowed in snapshot inventory: {relative}"
+                    )
+                if item.is_dir(follow_symlinks=False):
+                    actual_directories.add(relative)
+                    pending.append(candidate)
+                elif item.is_file(follow_symlinks=False):
+                    actual_files.add(relative)
+                else:
+                    raise ValueError(f"unsupported snapshot inventory entry: {relative}")
+    undeclared_files = sorted(actual_files.difference(expected_files))
+    if undeclared_files:
+        raise ValueError(f"undeclared snapshot inventory file: {undeclared_files[0]}")
+    undeclared_directories = sorted(actual_directories.difference(expected_directories))
+    if undeclared_directories:
+        raise ValueError(f"undeclared snapshot inventory directory: {undeclared_directories[0]}")
     for item in ontology.files:
         candidate = directory / item.path
         _reject_symlink_ancestry(candidate)
@@ -482,6 +581,7 @@ def _verify_snapshot_directory(directory: Path, ontology: VerifiedCatalogOntolog
             raise ValueError(f"snapshot inventory size mismatch: {item.path}")
         if hashlib.sha256(content).hexdigest() != item.sha256:
             raise ValueError(f"snapshot inventory sha256 mismatch: {item.path}")
+    _verify_transitive_inputs(directory, ontology.files, workspace=directory)
 
 
 def _remove_exact_directory(path: Path) -> None:
@@ -492,20 +592,27 @@ def _remove_exact_directory(path: Path) -> None:
         shutil.rmtree(path)
 
 
-def install_snapshot(
+def _remove_empty_snapshot_parents(destination: Path) -> None:
+    for empty_parent in (destination.parent, destination.parent.parent):
+        try:
+            empty_parent.rmdir()
+        except OSError:
+            break
+
+
+def _rollback_staged_snapshots(staged: Sequence[_StagedSnapshot]) -> None:
+    for item in reversed(staged):
+        if item.created:
+            _remove_exact_directory(item.destination)
+            _remove_empty_snapshot_parents(item.destination)
+
+
+def _stage_snapshot(
     ontology: VerifiedCatalogOntology,
     *,
     manager: UserConfigManager,
-    profile_name: str,
-) -> InstalledOntologySnapshot:
-    """Copy and register one exact verified inventory transactionally."""
+) -> _StagedSnapshot:
     ontology = _verified_source(ontology)
-    config = manager.load()
-    try:
-        profile = config.profiles[profile_name]
-    except KeyError:
-        raise ValueError(f"unknown Geas profile: {profile_name}") from None
-
     relative = Path("snapshots") / ontology.name / ontology.bundle_sha256
     destination = manager.root / relative
     _reject_symlink_ancestry(destination)
@@ -541,35 +648,68 @@ def install_snapshot(
             path=relative,
             files=ontology.files,
         )
-        existing = next(
-            (
-                item
-                for item in profile.installed_ontologies
-                if (item.name, item.bundle_sha256) == (snapshot.name, snapshot.bundle_sha256)
-            ),
-            None,
+        installed = ontology.model_copy(
+            update={
+                "ontology_path": destination,
+                "dirty": False,
+            }
         )
-        if existing is not None:
-            if existing != snapshot:
-                raise ValueError("registered ontology snapshot metadata mismatch")
-            return existing
-        updated = profile.model_copy(
-            update={"installed_ontologies": (*profile.installed_ontologies, snapshot)}
+        return _StagedSnapshot(
+            snapshot=snapshot,
+            ontology=installed,
+            destination=destination,
+            created=created,
         )
-        _profile_update(manager, profile_name, updated)
-        return snapshot
     except BaseException:
         if created:
             _remove_exact_directory(destination)
         _remove_exact_directory(temporary)
-        for empty_parent in (parent, parent.parent):
-            try:
-                empty_parent.rmdir()
-            except OSError:
-                break
+        _remove_empty_snapshot_parents(destination)
         raise
     finally:
         _remove_exact_directory(temporary)
+
+
+def install_snapshot(
+    ontology: VerifiedCatalogOntology,
+    *,
+    manager: UserConfigManager,
+    profile_name: str,
+) -> InstalledOntologySnapshot:
+    """Copy and register one exact verified inventory transactionally."""
+    config = manager.load()
+    try:
+        profile = config.profiles[profile_name]
+    except KeyError:
+        raise ValueError(f"unknown Geas profile: {profile_name}") from None
+    staged = _stage_snapshot(ontology, manager=manager)
+    try:
+        existing = next(
+            (
+                item
+                for item in profile.installed_ontologies
+                if (item.name, item.bundle_sha256)
+                == (staged.snapshot.name, staged.snapshot.bundle_sha256)
+            ),
+            None,
+        )
+        if existing is not None:
+            if existing != staged.snapshot:
+                raise ValueError("registered ontology snapshot metadata mismatch")
+            return existing
+        updated = profile.model_copy(
+            update={
+                "installed_ontologies": (
+                    *profile.installed_ontologies,
+                    staged.snapshot,
+                )
+            }
+        )
+        _profile_update(manager, profile_name, updated)
+        return staged.snapshot
+    except BaseException:
+        _rollback_staged_snapshots((staged,))
+        raise
 
 
 def remove_snapshot(
@@ -593,16 +733,32 @@ def remove_snapshot(
     _reject_symlink_ancestry(destination)
     if not destination.is_dir():
         raise ValueError("registered ontology snapshot directory is missing")
+    remaining = tuple(item for item in profile.installed_ontologies if item != snapshot)
+    updated_profile = profile.model_copy(update={"installed_ontologies": remaining})
+    updated_config = config.model_copy(
+        update={"profiles": {**config.profiles, profile_name: updated_profile}}
+    )
+    shared = any(
+        snapshot in candidate.installed_ontologies for candidate in updated_config.profiles.values()
+    )
+    manager.replace(updated_config)
+    if shared:
+        return SnapshotRemovalReceipt(
+            name=snapshot.name,
+            bundle_sha256=snapshot.bundle_sha256,
+            path=snapshot.path,
+            removed=False,
+        )
+
     moved = destination.with_name(f".{destination.name}.remove-{uuid4().hex}")
-    os.replace(destination, moved)
     try:
-        remaining = tuple(item for item in profile.installed_ontologies if item != snapshot)
-        updated = profile.model_copy(update={"installed_ontologies": remaining})
-        _profile_update(manager, profile_name, updated)
+        os.replace(destination, moved)
+        _remove_exact_directory(moved)
     except BaseException:
-        os.replace(moved, destination)
+        if moved.exists() and not destination.exists():
+            os.replace(moved, destination)
+        manager.replace(config)
         raise
-    _remove_exact_directory(moved)
     for parent in (destination.parent, destination.parent.parent):
         try:
             parent.rmdir()
