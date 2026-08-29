@@ -7,7 +7,9 @@ import os
 import re
 import shutil
 from collections.abc import Sequence
+from contextlib import suppress
 from datetime import datetime
+from enum import StrEnum
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Literal, Protocol
 from uuid import uuid4
@@ -27,7 +29,7 @@ from research_agent.repository_catalog import (
 )
 
 if TYPE_CHECKING:
-    from research_agent.user_config import GeasProfile, UserConfigManager
+    from research_agent.user_config import GeasProfile, GeasUserConfig, UserConfigManager
 
 
 _DIGEST = re.compile(r"[0-9a-f]{64}")
@@ -193,6 +195,12 @@ class _StagedSnapshot(StrictModel):
     ontology: VerifiedCatalogOntology
     destination: Path
     created: bool
+
+
+class _SnapshotRemovalPhase(StrEnum):
+    VALIDATED = "validated"
+    QUARANTINED = "quarantined"
+    CONFIG_COMMITTED = "config_committed"
 
 
 class TrustPrompt(Protocol):
@@ -367,7 +375,53 @@ def _profile_with_effective_ref_denial(
                     continue
                 rule = rule.model_copy(update={"refs": remaining_refs})
         retained.append(rule)
-    return profile.model_copy(update={"trust_rules": (*retained, denial)})
+    return profile.model_copy(update={"trust_rules": _normalized_trust_rules((*retained, denial))})
+
+
+def _normalized_trust_rules(rules: Sequence[TrustRule]) -> tuple[TrustRule, ...]:
+    """Return one deterministic, fail-closed rule per effective selector.
+
+    Deny wins any decision collision.  Otherwise the earliest audit timestamp
+    wins, followed by creation method and canonical JSON as stable tie-breakers.
+    """
+    grouped: dict[
+        tuple[
+            str,
+            Literal["*"] | tuple[str, ...],
+            Literal["*"] | tuple[Path, ...],
+            Literal["*"] | tuple[str, ...],
+        ],
+        list[TrustRule],
+    ] = {}
+    for rule in rules:
+        selector = (
+            rule.repository,
+            rule.refs,
+            rule.paths,
+            rule.bundle_sha256,
+        )
+        grouped.setdefault(selector, []).append(rule)
+
+    normalized: list[TrustRule] = []
+    for candidates in grouped.values():
+        denied = [rule for rule in candidates if rule.decision == "deny"]
+        eligible = denied or candidates
+        normalized.append(
+            min(
+                eligible,
+                key=lambda rule: (
+                    rule.created_at,
+                    rule.created_via,
+                    canonical_json(rule.model_dump(mode="json")),
+                ),
+            )
+        )
+    return tuple(
+        sorted(
+            normalized,
+            key=lambda rule: canonical_json(rule.model_dump(mode="json")),
+        )
+    )
 
 
 def authorize_repository_catalog(
@@ -612,6 +666,62 @@ def _physical_snapshot_identity(
     return snapshot.name, snapshot.bundle_sha256, destination
 
 
+def _config_references_physical_snapshot(
+    config: GeasUserConfig,
+    identity: tuple[str, str, Path],
+    *,
+    manager: UserConfigManager,
+) -> bool:
+    for profile in config.profiles.values():
+        for candidate in profile.installed_ontologies:
+            try:
+                candidate_identity = _physical_snapshot_identity(
+                    candidate,
+                    manager=manager,
+                )
+            except ValueError:
+                continue
+            if candidate_identity == identity:
+                return True
+    return False
+
+
+def _validated_snapshot_quarantine(
+    quarantine: Path,
+    *,
+    snapshot: InstalledOntologySnapshot,
+    manager: UserConfigManager,
+) -> Path:
+    _, _, destination = _physical_snapshot_identity(snapshot, manager=manager)
+    candidate = Path(os.path.abspath(quarantine))
+    expected_name = re.compile(rf"\.{re.escape(destination.name)}\.remove-[0-9a-f]{{32}}")
+    if candidate.parent != destination.parent or not expected_name.fullmatch(candidate.name):
+        raise ValueError("snapshot quarantine path is invalid")
+    _reject_symlink_ancestry(candidate)
+    return candidate
+
+
+def _cleanup_snapshot_quarantine(
+    quarantine: Path,
+    *,
+    snapshot: InstalledOntologySnapshot,
+    manager: UserConfigManager,
+) -> bool:
+    """Confine and idempotently collect an unregistered snapshot quarantine."""
+    candidate = _validated_snapshot_quarantine(
+        quarantine,
+        snapshot=snapshot,
+        manager=manager,
+    )
+    identity = _physical_snapshot_identity(snapshot, manager=manager)
+    if _config_references_physical_snapshot(manager.load(), identity, manager=manager):
+        raise ValueError("registered snapshot quarantine cannot be removed")
+    if not candidate.exists():
+        return False
+    _remove_exact_directory(candidate)
+    return True
+
+
 def _stage_snapshot(
     ontology: VerifiedCatalogOntology,
     *,
@@ -741,22 +851,11 @@ def remove_snapshot(
     updated_config = config.model_copy(
         update={"profiles": {**config.profiles, profile_name: updated_profile}}
     )
-    shared = False
-    for candidate_profile in updated_config.profiles.values():
-        for candidate in candidate_profile.installed_ontologies:
-            try:
-                candidate_identity = _physical_snapshot_identity(
-                    candidate,
-                    manager=manager,
-                )
-            except ValueError:
-                continue
-            if candidate_identity == physical_identity:
-                shared = True
-                break
-        if shared:
-            break
-    if shared:
+    if _config_references_physical_snapshot(
+        updated_config,
+        physical_identity,
+        manager=manager,
+    ):
         manager.replace(updated_config)
         return SnapshotRemovalReceipt(
             name=snapshot.name,
@@ -766,25 +865,45 @@ def remove_snapshot(
         )
 
     moved = destination.with_name(f".{destination.name}.remove-{uuid4().hex}")
-    os.replace(destination, moved)
+    phase = _SnapshotRemovalPhase.VALIDATED
     try:
+        os.replace(destination, moved)
+        phase = _SnapshotRemovalPhase.QUARANTINED
         manager.replace(updated_config)
+        phase = _SnapshotRemovalPhase.CONFIG_COMMITTED
     except BaseException:
-        if moved.exists() and not destination.exists():
-            os.replace(moved, destination)
+        if phase is _SnapshotRemovalPhase.VALIDATED and moved.exists():
+            phase = _SnapshotRemovalPhase.QUARANTINED
+        if phase is _SnapshotRemovalPhase.QUARANTINED:
+            try:
+                committed = not _config_references_physical_snapshot(
+                    manager.load(),
+                    physical_identity,
+                    manager=manager,
+                )
+            except BaseException:
+                committed = False
+            if committed:
+                phase = _SnapshotRemovalPhase.CONFIG_COMMITTED
+                with suppress(BaseException):
+                    _cleanup_snapshot_quarantine(
+                        moved,
+                        snapshot=snapshot,
+                        manager=manager,
+                    )
+            elif moved.exists() and not destination.exists():
+                os.replace(moved, destination)
         raise
     try:
-        _remove_exact_directory(moved)
+        _cleanup_snapshot_quarantine(
+            moved,
+            snapshot=snapshot,
+            manager=manager,
+        )
     except BaseException:
-        if moved.exists() and not destination.exists():
-            os.replace(moved, destination)
-        manager.replace(config)
+        # Configuration is authoritative now; quarantine cleanup is only GC.
         raise
-    for parent in (destination.parent, destination.parent.parent):
-        try:
-            parent.rmdir()
-        except OSError:
-            break
+    _remove_empty_snapshot_parents(destination)
     return SnapshotRemovalReceipt(
         name=snapshot.name,
         bundle_sha256=snapshot.bundle_sha256,

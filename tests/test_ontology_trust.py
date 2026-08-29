@@ -996,12 +996,12 @@ def test_last_snapshot_removal_quarantines_before_config_write_and_restores_on_f
     assert not tuple(destination.parent.glob(f".{destination.name}.remove-*"))
 
 
-def test_last_snapshot_removal_restores_registration_if_quarantine_delete_is_interrupted(
+def test_last_snapshot_removal_keeps_committed_state_after_partial_quarantine_delete(
     tmp_path: Path,
     resolved_catalog: ResolvedRepositoryCatalog,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Post-config interruption must roll both registration and bytes back coherently."""
+    """Partial garbage collection must never restore corrupted authoritative bytes."""
     manager = _manager(tmp_path)
     snapshot = install_snapshot(
         resolved_catalog.by_name("alpha"), manager=manager, profile_name="default"
@@ -1013,16 +1013,185 @@ def test_last_snapshot_removal_restores_registration_if_quarantine_delete_is_int
 
     def interrupt_quarantine(path: Path) -> None:
         if ".remove-" in path.name:
-            raise KeyboardInterrupt("injected quarantine deletion interruption")
+            path.joinpath("build.yaml").unlink()
+            raise KeyboardInterrupt("injected partial quarantine deletion")
         original_remove(path)
 
     monkeypatch.setattr(
         "research_agent.ontology_trust._remove_exact_directory",
         interrupt_quarantine,
     )
-    with pytest.raises(KeyboardInterrupt, match="quarantine deletion"):
+    with pytest.raises(KeyboardInterrupt, match="partial quarantine deletion"):
+        remove_snapshot(snapshot, manager=manager, profile_name="default")
+
+    assert not destination.exists()
+    assert snapshot not in manager.load().profiles["default"].installed_ontologies
+    quarantines = tuple(destination.parent.glob(f".{destination.name}.remove-*"))
+    assert len(quarantines) == 1
+    assert not quarantines[0].joinpath("build.yaml").exists()
+
+    module = __import__(
+        "research_agent.ontology_trust",
+        fromlist=["_cleanup_snapshot_quarantine"],
+    )
+    monkeypatch.setattr(
+        "research_agent.ontology_trust._remove_exact_directory",
+        original_remove,
+    )
+    assert module._cleanup_snapshot_quarantine(quarantines[0], snapshot=snapshot, manager=manager)
+    assert not module._cleanup_snapshot_quarantine(
+        quarantines[0], snapshot=snapshot, manager=manager
+    )
+    outside = tmp_path / "outside-quarantine"
+    outside.mkdir()
+    with pytest.raises(ValueError, match="quarantine path"):
+        module._cleanup_snapshot_quarantine(outside, snapshot=snapshot, manager=manager)
+
+
+@pytest.mark.parametrize("action", ["3", "4"])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_denial_ref_trimming_deduplicates_rules_with_permutation_stability(
+    tmp_path: Path,
+    resolved_catalog: ResolvedRepositoryCatalog,
+    action: Literal["3", "4"],
+    reverse: bool,
+) -> None:
+    """Trimming main from a ref set must deterministically merge the release rule."""
+    manager = _manager(tmp_path)
+    broad = _rule(
+        True,
+        refs=("refs/heads/main", "refs/heads/release"),
+        paths=("ontology/future",),
+    ).model_copy(update={"created_at": datetime(2026, 8, 29, tzinfo=UTC)})
+    stable = _rule(
+        True,
+        refs=("refs/heads/release",),
+        paths=("ontology/future",),
+    ).model_copy(update={"created_at": datetime(2026, 8, 27, tzinfo=UTC)})
+    rules = (stable, broad) if reverse else (broad, stable)
+    profile = manager.load().profiles["default"].model_copy(update={"trust_rules": rules})
+    _replace_profile(manager, "default", profile)
+
+    authorized = authorize_repository_catalog(
+        resolved_catalog,
+        manager=manager,
+        profile_name="default",
+        yolo=False,
+        prompt=FakePrompt(action),
+    )
+
+    assert authorized == ()
+    rewritten = manager.load().profiles["default"].trust_rules
+    release_rules = tuple(
+        rule
+        for rule in rewritten
+        if rule.paths == (Path("ontology/future"),) and rule.refs == ("refs/heads/release",)
+    )
+    assert release_rules == (stable,)
+    main_denials = tuple(
+        rule
+        for rule in rewritten
+        if rule.decision == "deny"
+        and rule.refs == ("refs/heads/main",)
+        and rule.paths == "*"
+        and rule.bundle_sha256 == "*"
+    )
+    assert len(main_denials) == 1
+
+
+def test_denial_ref_trimming_resolves_rewritten_decision_collision_to_deny(
+    tmp_path: Path, resolved_catalog: ResolvedRepositoryCatalog
+) -> None:
+    """A rewritten allow colliding with a deny must resolve fail-closed."""
+    manager = _manager(tmp_path)
+    broad_allow = _rule(
+        True,
+        refs=("refs/heads/main", "refs/heads/release"),
+        paths=("ontology/future",),
+    )
+    release_deny = _rule(
+        False,
+        refs=("refs/heads/release",),
+        paths=("ontology/future",),
+    )
+    profile = (
+        manager.load()
+        .profiles["default"]
+        .model_copy(update={"trust_rules": (broad_allow, release_deny)})
+    )
+    _replace_profile(manager, "default", profile)
+
+    authorize_repository_catalog(
+        resolved_catalog,
+        manager=manager,
+        profile_name="default",
+        yolo=False,
+        prompt=FakePrompt("4"),
+    )
+
+    rewritten = manager.load().profiles["default"].trust_rules
+    collision = tuple(
+        rule
+        for rule in rewritten
+        if rule.refs == ("refs/heads/release",) and rule.paths == (Path("ontology/future"),)
+    )
+    assert collision == (release_deny,)
+
+
+def test_last_snapshot_removal_restores_if_rename_raises_after_committing(
+    tmp_path: Path,
+    resolved_catalog: ResolvedRepositoryCatalog,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An interruption after atomic quarantine rename must restore prior state."""
+    manager = _manager(tmp_path)
+    snapshot = install_snapshot(
+        resolved_catalog.by_name("alpha"), manager=manager, profile_name="default"
+    )
+    destination = manager.root / snapshot.path
+    original_replace = __import__("research_agent.ontology_trust", fromlist=["os"]).os.replace
+    interrupted = False
+
+    def interrupt_after_rename(source: object, target: object) -> None:
+        nonlocal interrupted
+        original_replace(source, target)
+        if Path(source) == destination and not interrupted:
+            interrupted = True
+            raise KeyboardInterrupt("injected after quarantine rename")
+
+    monkeypatch.setattr(
+        "research_agent.ontology_trust.os.replace",
+        interrupt_after_rename,
+    )
+    with pytest.raises(KeyboardInterrupt, match="after quarantine rename"):
         remove_snapshot(snapshot, manager=manager, profile_name="default")
 
     assert destination.is_dir()
     assert snapshot in manager.load().profiles["default"].installed_ontologies
+    assert not tuple(destination.parent.glob(f".{destination.name}.remove-*"))
+
+
+def test_last_snapshot_removal_detects_config_commit_when_replace_raises_after_write(
+    tmp_path: Path,
+    resolved_catalog: ResolvedRepositoryCatalog,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A post-commit manager error must retain committed removal authority."""
+    manager = _manager(tmp_path)
+    snapshot = install_snapshot(
+        resolved_catalog.by_name("alpha"), manager=manager, profile_name="default"
+    )
+    destination = manager.root / snapshot.path
+    original_replace = manager.replace
+
+    def commit_then_raise(config: GeasUserConfig) -> None:
+        original_replace(config)
+        raise OSError("injected after config commit")
+
+    monkeypatch.setattr(manager, "replace", commit_then_raise)
+    with pytest.raises(OSError, match="after config commit"):
+        remove_snapshot(snapshot, manager=manager, profile_name="default")
+
+    assert not destination.exists()
+    assert snapshot not in manager.load().profiles["default"].installed_ontologies
     assert not tuple(destination.parent.glob(f".{destination.name}.remove-*"))
