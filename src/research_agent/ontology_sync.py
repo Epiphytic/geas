@@ -100,7 +100,11 @@ class OntologyRepositoryManager:
                 "ontology checkout has local changes; commit/push or restore them before pull"
             )
         fetched_ref = self._fetched_ref()
-        expected_object = self._advertised_object()
+        expected_object = (
+            self._active_ref()
+            if _GIT_ID.fullmatch(self._active_ref())
+            else self._advertised_object()
+        )
         if expected_object is None and not self._is_branch_ref():
             raise OntologySyncError(
                 f"configured ontology ref {self._active_ref()!r} does not exist on the remote"
@@ -312,7 +316,7 @@ class OntologyRepositoryManager:
         if not (self.checkout / ".git").is_dir():
             raise OntologySyncError("subscription checkout is not a Git repository")
         self._assert_checkout_root()
-        self._assert_remote()
+        self._assert_remote(create_missing=False)
         self._assert_active_checkout()
         changes = self._status(ignore_generated_gitignore=True)
         if changes:
@@ -353,14 +357,16 @@ class OntologyRepositoryManager:
         if top != self.checkout:
             raise OntologySyncError("configured ontology directory is not the Git checkout root")
 
-    def _assert_remote(self) -> None:
+    def _assert_remote(self, *, create_missing: bool = True) -> None:
         result = self._run(
             ("git", "remote", "get-url", self.config.remote),
             check=False,
         )
         if result.returncode != 0:
-            self._run(("git", "remote", "add", self.config.remote, self.config.url))
-            return
+            if create_missing:
+                self._run(("git", "remote", "add", self.config.remote, self.config.url))
+                return
+            raise OntologySyncError(f"ontology remote identity {self.config.remote!r} is missing")
         if _normalized_url(result.stdout.strip()) != _normalized_url(self.config.url):
             raise OntologySyncError(
                 f"ontology remote {self.config.remote!r} does not match the configured URL"

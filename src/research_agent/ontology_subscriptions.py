@@ -8,7 +8,7 @@ import shutil
 from collections.abc import Callable, Mapping
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Protocol
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 from uuid import uuid4
 
 from pydantic import Field, field_validator, model_validator
@@ -37,11 +37,17 @@ def normalize_active_ref(value: str) -> str:
         raise ValueError("active_ref must use full branch/tag refs or commit IDs")
     if (
         any(ord(character) < 32 or ord(character) == 127 for character in raw)
-        or "\\" in raw
+        or any(character in raw for character in (" ", "~", "^", ":", "?", "*", "[", "\\"))
         or ".." in raw
         or "@{" in raw
         or "//" in raw
         or raw.endswith(("/", "."))
+    ):
+        raise ValueError("active_ref is invalid")
+    components = raw.split("/")
+    if any(
+        not component or component.startswith(".") or component.endswith(".lock")
+        for component in components
     ):
         raise ValueError("active_ref is invalid")
     return raw
@@ -64,12 +70,45 @@ def _relative_path(value: object, *, label: str) -> Path:
 def _validate_remote_url(value: str) -> str:
     if not value or any(ord(character) < 32 or ord(character) == 127 for character in value):
         raise ValueError("ontology Git URL contains control characters or is empty")
+    scp = re.fullmatch(
+        r"git@(?P<host>[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?):"
+        r"(?P<path>[^/?#][^?#]*)",
+        value,
+    )
+    if scp is not None:
+        _validate_url_path(scp.group("path"))
+        return value
     parsed = urlsplit(value)
-    if parsed.username is not None or parsed.password is not None:
+    if parsed.scheme not in {"https", "ssh"}:
+        raise ValueError("ontology Git URL uses an unsupported remote transport")
+    if parsed.password is not None or (
+        parsed.username is not None and not (parsed.scheme == "ssh" and parsed.username == "git")
+    ):
         raise ValueError("ontology Git URLs cannot embed credentials")
-    if value.startswith(("file:", "/", "./", "../")):
-        raise ValueError("ontology Git URL must be a remote repository")
+    if not parsed.hostname or parsed.query or parsed.fragment:
+        raise ValueError("ontology Git URL must be a credential-free remote URL")
+    try:
+        _ = parsed.port
+    except ValueError as error:
+        raise ValueError("ontology Git URL port is invalid") from error
+    _validate_url_path(parsed.path)
     return value
+
+
+def _validate_url_path(value: str) -> None:
+    decoded = unquote(value)
+    if not decoded or any(ord(character) < 32 or ord(character) == 127 for character in decoded):
+        raise ValueError("ontology Git remote path is invalid")
+    pure = PurePosixPath(decoded)
+    parts = pure.parts
+    if any(part in {"", ".", ".."} for part in parts) or pure.as_posix() != decoded:
+        raise ValueError("ontology Git remote path contains traversal")
+
+
+class OntologyFreshnessConfig(StrictModel):
+    check_before_use: bool = True
+    max_age_seconds: int = Field(default=3600, ge=60, le=604_800)
+    hydrate_artifacts_before_use: bool = False
 
 
 class OntologySubscription(StrictModel):
@@ -80,6 +119,7 @@ class OntologySubscription(StrictModel):
     remote: str = Field(default="origin", pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
     pull_before_update: bool = False
     push_on_update: bool = False
+    freshness: OntologyFreshnessConfig = Field(default_factory=OntologyFreshnessConfig)
 
     @field_validator("url")
     @classmethod
@@ -122,9 +162,15 @@ class NormalizedProfile(StrictModel):
         )
         if invalid:
             raise ValueError(f"invalid subscription names: {', '.join(invalid)}")
-        checkouts = tuple(item.checkout for item in self.subscriptions.values())
-        if len(checkouts) != len(set(checkouts)):
-            raise ValueError("subscription checkouts must be unique")
+        checkouts = tuple((name, item.checkout) for name, item in self.subscriptions.items())
+        for index, (left_name, left) in enumerate(checkouts):
+            for right_name, right in checkouts[index + 1 :]:
+                if left == right or left.is_relative_to(right) or right.is_relative_to(left):
+                    raise ValueError(
+                        "subscription checkouts overlap: "
+                        f"{left_name!r}={left.as_posix()!r}, "
+                        f"{right_name!r}={right.as_posix()!r}"
+                    )
         return self
 
 
@@ -193,9 +239,17 @@ class SubscriptionManager:
         original = self.config_manager.load()
         _, profile = original.profile(self.profile_name)
         destination = self.config_manager.subscription_checkout(validated)
-        for sibling_name, sibling in profile.normalized_subscriptions().items():
-            if sibling_name != name and sibling.checkout == validated.checkout:
-                raise ValueError(f"subscription checkout is already used by {sibling_name!r}")
+        for sibling_name, sibling in profile.normalized_subscriptions(
+            freshness=original.ontology_freshness
+        ).items():
+            if sibling_name != name and (
+                sibling.checkout == validated.checkout
+                or sibling.checkout.is_relative_to(validated.checkout)
+                or validated.checkout.is_relative_to(sibling.checkout)
+            ):
+                raise ValueError(
+                    f"subscription checkout overlaps checkout used by {sibling_name!r}"
+                )
         before = self.config_manager.path.read_bytes()
         created = not destination.exists()
         staging = (
@@ -263,9 +317,12 @@ class SubscriptionManager:
         """Remove one declaration, preserving checkout bytes unless explicitly requested."""
         validate_subscription_name(name)
         config = self.config_manager.load()
+        original_config_bytes = self.config_manager.path.read_bytes()
         _, profile = config.profile(self.profile_name)
         try:
-            subscription = profile.normalized_subscriptions()[name]
+            subscription = profile.normalized_subscriptions(freshness=config.ontology_freshness)[
+                name
+            ]
         except KeyError:
             raise ValueError(f"unknown ontology subscription: {name}") from None
         checkout = self.config_manager.subscription_checkout(subscription)
@@ -293,15 +350,32 @@ class SubscriptionManager:
 
         if checkout.is_symlink():
             raise RuntimeError("subscription checkout cannot be a symbolic link")
-        for sibling_name, sibling in updated_profile.normalized_subscriptions().items():
+        for sibling_name, sibling in updated_profile.normalized_subscriptions(
+            freshness=config.ontology_freshness
+        ).items():
             if sibling.checkout == subscription.checkout:
                 raise RuntimeError(f"subscription checkout is still used by {sibling_name!r}")
         repository = self._repository(checkout, subscription)
         repository.assert_removable()
-        before = self.config_manager.path.read_bytes()
+        if self.config_manager.path.read_bytes() != original_config_bytes:
+            raise RuntimeError("Geas user config changed during subscription removal")
+        current_config = self.config_manager.load()
+        if current_config != config:
+            raise RuntimeError("Geas user config changed during subscription removal")
+        self.config_manager.validate_subscription_layout(current_config)
+        rechecked = self.config_manager.subscription_checkout(subscription)
+        if rechecked != checkout:
+            raise RuntimeError("subscription checkout identity changed before removal")
+        verified_identity = checkout.stat(follow_symlinks=False)
+        before = original_config_bytes
         quarantine = checkout.with_name(f".{checkout.name}.remove-{uuid4().hex}")
+        if quarantine.exists() or quarantine.is_symlink():
+            raise RuntimeError("subscription removal quarantine already exists")
         moved = False
         try:
+            current_identity = checkout.stat(follow_symlinks=False)
+            if not os.path.samestat(verified_identity, current_identity):
+                raise RuntimeError("subscription checkout identity changed before removal")
             os.replace(checkout, quarantine)
             moved = True
             self.config_manager.replace(updated)
@@ -346,8 +420,9 @@ class SubscriptionManager:
         pull: bool = True,
         push: bool = False,
     ) -> tuple[SubscriptionSyncReceipt, ...]:
-        profile = self.config_manager.load().profile(self.profile_name)[1]
-        configured = profile.normalized_subscriptions()
+        config = self.config_manager.load()
+        profile = config.profile(self.profile_name)[1]
+        configured = profile.normalized_subscriptions(freshness=config.ontology_freshness)
         selected = tuple(sorted(set(names))) if names else tuple(configured)
         receipts: list[SubscriptionSyncReceipt] = []
         for name in selected:
@@ -368,6 +443,6 @@ class SubscriptionManager:
                         push=push_receipt,
                     )
                 )
-            except (KeyError, OSError, ValueError, RuntimeError) as error:
+            except Exception as error:
                 receipts.append(SubscriptionSyncReceipt(name=name, success=False, error=str(error)))
         return tuple(receipts)

@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 
 from research_agent.ontology_subscriptions import (
+    OntologyFreshnessConfig,
     OntologySubscription,
     SubscriptionManager,
 )
@@ -73,6 +74,7 @@ def test_explicit_subscriptions_are_strict_sorted_and_override_legacy_primary() 
         ({"active_ref": "main"}, "full branch/tag refs or commit IDs"),
         ({"active_ref": "refs/pull/1/head"}, "full branch/tag refs or commit IDs"),
         ({"checkout": Path("../outside")}, "config-relative"),
+        ({"checkout": "subscriptions//alias"}, "normalized"),
         ({"catalog": Path("nested/../geas.yaml")}, "normalized"),
         ({"url": "https://token@example.invalid/repo.git"}, "embed credentials"),
     ],
@@ -98,6 +100,185 @@ def test_subscription_accepts_sha1_and_sha256_commit_ids() -> None:
             checkout=Path("subscriptions/example"),
         )
         assert subscription.active_ref == object_id
+
+
+@pytest.mark.parametrize(
+    "url",
+    (
+        "https://example.invalid/repository.git",
+        "ssh://git@example.invalid/owner/repository.git",
+        "git@example.invalid:owner/repository.git",
+    ),
+)
+def test_subscription_accepts_explicit_supported_remote_transports(url: str) -> None:
+    assert (
+        OntologySubscription(
+            url=url,
+            checkout=Path("subscriptions/example"),
+        ).url
+        == url
+    )
+
+
+@pytest.mark.parametrize(
+    "active_ref",
+    (
+        "refs/heads/topic.lock",
+        "refs/heads/has space",
+        "refs/heads/control\x01",
+        "refs/heads/a..b",
+        "refs/heads/a@{b",
+        "refs/heads/trailing.",
+        "refs/heads/trailing/",
+        "refs/heads/.hidden",
+        "refs/tags/question?mark",
+    ),
+)
+def test_subscribe_revalidates_git_refs_before_any_write(tmp_path: Path, active_ref: str) -> None:
+    manager = _configured_manager(tmp_path)
+    before = manager.path.read_bytes()
+    calls: list[str] = []
+    invalid = OntologySubscription.model_construct(
+        url=URL,
+        active_ref=active_ref,
+        checkout=Path("subscriptions/invalid"),
+        catalog=Path("geas.yaml"),
+        remote="origin",
+        pull_before_update=False,
+        push_on_update=False,
+        freshness=OntologyFreshnessConfig(),
+    )
+    subscriptions = SubscriptionManager(
+        config_manager=manager,
+        profile_name="default",
+        catalog_verifier=lambda path: calls.append("verify"),
+        authorizer=lambda verified: calls.append("authorize"),
+        repository_factory=lambda checkout, subscription: calls.append("repository"),
+    )
+
+    with pytest.raises(ValueError, match="active_ref"):
+        subscriptions.subscribe("invalid", invalid)
+
+    assert manager.path.read_bytes() == before
+    assert calls == []
+    assert not (manager.root / "subscriptions").exists()
+
+
+@pytest.mark.parametrize(
+    "url",
+    (
+        "http://example.invalid/repository.git",
+        "file:///tmp/repository.git",
+        "ftp://example.invalid/repository.git",
+        "../repository.git",
+        "repository.git",
+        "https://token@example.invalid/repository.git",
+        "https://example.invalid/repository.git?token=secret",
+        "https://example.invalid/repository.git#token=secret",
+        "https://example.invalid/a/../repository.git",
+        "https://example.invalid/a/%2e%2e/repository.git",
+    ),
+)
+def test_subscribe_revalidates_supported_credential_free_remote_before_writes(
+    tmp_path: Path, url: str
+) -> None:
+    manager = _configured_manager(tmp_path)
+    before = manager.path.read_bytes()
+    calls: list[str] = []
+    invalid = OntologySubscription.model_construct(
+        url=url,
+        active_ref="refs/heads/main",
+        checkout=Path("subscriptions/invalid"),
+        catalog=Path("geas.yaml"),
+        remote="origin",
+        pull_before_update=False,
+        push_on_update=False,
+        freshness=OntologyFreshnessConfig(),
+    )
+    subscriptions = SubscriptionManager(
+        config_manager=manager,
+        profile_name="default",
+        catalog_verifier=lambda path: calls.append("verify"),
+        authorizer=lambda verified: calls.append("authorize"),
+        repository_factory=lambda checkout, subscription: calls.append("repository"),
+    )
+
+    with pytest.raises(ValueError, match="URL|remote|transport|credentials"):
+        subscriptions.subscribe("invalid", invalid)
+
+    assert manager.path.read_bytes() == before
+    assert calls == []
+    assert not (manager.root / "subscriptions").exists()
+
+
+def test_profile_rejects_ancestor_and_descendant_subscription_checkouts() -> None:
+    with pytest.raises(ValueError, match="overlap"):
+        GeasProfile(
+            ontology_git=None,
+            subscriptions={
+                "outer": _subscription(checkout="repositories/outer"),
+                "ignored-nested": _subscription(checkout="repositories/outer/vendor/nested"),
+            },
+        )
+
+
+def test_subscribe_rejects_new_nested_checkout_before_repository_work(
+    tmp_path: Path,
+) -> None:
+    manager = _configured_manager(tmp_path)
+    profile = GeasProfile(
+        ontology_git=None,
+        subscriptions={"outer": _subscription(checkout="repositories/outer")},
+    )
+    manager.replace(GeasUserConfig(profiles={"default": profile}))
+    before = manager.path.read_bytes()
+    calls: list[str] = []
+    subscriptions = SubscriptionManager(
+        config_manager=manager,
+        profile_name="default",
+        catalog_verifier=lambda path: calls.append("verify"),
+        authorizer=lambda verified: calls.append("authorize"),
+        repository_factory=lambda checkout, configured: calls.append("repository"),
+    )
+
+    with pytest.raises(ValueError, match="overlap"):
+        subscriptions.subscribe(
+            "nested",
+            _subscription(checkout="repositories/outer/vendor/nested"),
+        )
+
+    assert calls == []
+    assert manager.path.read_bytes() == before
+    assert not (manager.root / "repositories").exists()
+
+
+def test_config_rejects_in_root_symlink_alias_without_rewriting_config(
+    tmp_path: Path,
+) -> None:
+    manager = _configured_manager(tmp_path)
+    before = manager.path.read_bytes()
+    actual = manager.root / "repositories" / "actual"
+    actual.mkdir(parents=True)
+    alias = manager.root / "repositories" / "alias"
+    alias.symlink_to(actual, target_is_directory=True)
+    candidate = GeasUserConfig(
+        profiles={
+            "default": GeasProfile(
+                ontology_git=None,
+                subscriptions={
+                    "actual": _subscription(checkout="repositories/actual"),
+                    "alias": _subscription(checkout="repositories/alias"),
+                },
+            )
+        }
+    )
+
+    with pytest.raises(ValueError, match="symbolic link|same checkout"):
+        manager.replace(candidate)
+
+    assert manager.path.read_bytes() == before
+    assert alias.is_symlink()
+    assert actual.is_dir()
 
 
 def test_sync_processes_requested_subscriptions_in_sorted_order_and_keeps_successes(
@@ -150,6 +331,90 @@ def test_sync_processes_requested_subscriptions_in_sorted_order_and_keeps_succes
     assert receipts[1].success is False
     assert receipts[1].error is not None
     assert (manager.root / "alpha" / ".git").is_dir()
+
+
+def test_sync_catches_arbitrary_exception_and_continues_to_later_sibling(
+    tmp_path: Path,
+) -> None:
+    manager = _configured_manager(tmp_path)
+    profile = GeasProfile(
+        ontology_git=None,
+        subscriptions={
+            "alpha": _subscription(checkout="alpha"),
+            "beta": _subscription(checkout="beta"),
+        },
+    )
+    manager.replace(GeasUserConfig(profiles={"default": profile}))
+
+    class Repository:
+        def __init__(self, checkout: Path, subscription: OntologySubscription) -> None:
+            self.checkout = checkout
+
+        def pull(self) -> dict[str, object]:
+            self.checkout.mkdir()
+            return {"commit": "a" * 40}
+
+        def push(self) -> dict[str, object]:
+            return {"pushed": False}
+
+        def assert_removable(self) -> None:
+            return None
+
+    def verify(path: Path) -> object:
+        if path.parent.name == "alpha":
+            raise ArithmeticError("arbitrary verifier failure")
+        return path
+
+    subscriptions = SubscriptionManager(
+        config_manager=manager,
+        profile_name="default",
+        catalog_verifier=verify,
+        authorizer=lambda verified: verified,
+        repository_factory=Repository,
+    )
+
+    receipts = subscriptions.sync()
+
+    assert [(item.name, item.success) for item in receipts] == [
+        ("alpha", False),
+        ("beta", True),
+    ]
+    assert receipts[0].error == "arbitrary verifier failure"
+
+
+def test_sync_propagates_process_control_base_exception(tmp_path: Path) -> None:
+    manager = _configured_manager(tmp_path)
+    manager.replace(
+        GeasUserConfig(
+            profiles={
+                "default": GeasProfile(
+                    ontology_git=None,
+                    subscriptions={"sample": _subscription(checkout="sample")},
+                )
+            }
+        )
+    )
+
+    class Repository:
+        def pull(self) -> dict[str, object]:
+            raise KeyboardInterrupt
+
+        def push(self) -> dict[str, object]:
+            return {}
+
+        def assert_removable(self) -> None:
+            return None
+
+    subscriptions = SubscriptionManager(
+        config_manager=manager,
+        profile_name="default",
+        catalog_verifier=lambda path: path,
+        authorizer=lambda verified: verified,
+        repository_factory=lambda checkout, configured: Repository(),
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        subscriptions.sync()
 
 
 def _configured_manager(tmp_path: Path) -> UserConfigManager:
@@ -420,3 +685,130 @@ def test_unsubscribe_preserves_config_and_checkout_when_removal_is_unsafe(
 
     assert manager.path.read_bytes() == before
     assert checkout.is_dir()
+
+
+def test_unsubscribe_missing_remote_is_read_only_and_preserves_everything(
+    tmp_path: Path,
+) -> None:
+    manager, _, checkout = _manager_with_subscription(tmp_path)
+    _git("remote", "remove", "origin", cwd=checkout)
+    before_config = manager.path.read_bytes()
+    before_git_config = (checkout / ".git" / "config").read_bytes()
+    before_remotes = _git("remote", cwd=checkout).stdout
+    subscriptions = SubscriptionManager(
+        config_manager=manager,
+        profile_name="default",
+        catalog_verifier=lambda path: (),
+        authorizer=lambda verified: verified,
+    )
+
+    with pytest.raises(RuntimeError, match="remote.*identity|missing"):
+        subscriptions.unsubscribe("sample", remove_checkout=True)
+
+    assert manager.path.read_bytes() == before_config
+    assert (checkout / ".git" / "config").read_bytes() == before_git_config
+    assert _git("remote", cwd=checkout).stdout == before_remotes
+    assert checkout.is_dir()
+
+
+def test_unsubscribe_rechecks_symlink_race_before_quarantine_or_config_write(
+    tmp_path: Path,
+) -> None:
+    manager, subscription, checkout = _manager_with_subscription(tmp_path)
+    before = manager.path.read_bytes()
+    original = checkout.with_name("original-preserved")
+    target = checkout.with_name("race-target")
+    target.mkdir()
+    (target / "must-remain.txt").write_text("preserve\n")
+    replace_calls: list[str] = []
+
+    class RacingRepository:
+        def pull(self) -> dict[str, object]:
+            return {}
+
+        def push(self) -> dict[str, object]:
+            return {}
+
+        def assert_removable(self) -> None:
+            checkout.rename(original)
+            checkout.symlink_to(target, target_is_directory=True)
+
+    subscriptions = SubscriptionManager(
+        config_manager=manager,
+        profile_name="default",
+        catalog_verifier=lambda path: (),
+        authorizer=lambda verified: verified,
+        repository_factory=lambda path, configured: RacingRepository(),
+    )
+    real_replace = manager.replace
+
+    def record_replace(config: GeasUserConfig) -> None:
+        replace_calls.append("config")
+        real_replace(config)
+
+    manager.replace = record_replace  # type: ignore[method-assign]
+
+    with pytest.raises((RuntimeError, ValueError), match="symbolic link"):
+        subscriptions.unsubscribe("sample", remove_checkout=True)
+
+    assert replace_calls == []
+    assert manager.path.read_bytes() == before
+    assert checkout.is_symlink()
+    assert original.is_dir()
+    assert (target / "must-remain.txt").read_text() == "preserve\n"
+    assert subscription.checkout == Path("subscriptions/sample")
+
+
+def test_legacy_primary_inherits_global_freshness_without_moving_checkout() -> None:
+    freshness = OntologyFreshnessConfig(
+        check_before_use=False,
+        max_age_seconds=7200,
+        hydrate_artifacts_before_use=True,
+    )
+    profile = GeasProfile(ontology_git=OntologyGitConfig(url=URL))
+    config = GeasUserConfig(
+        ontology_freshness=freshness,
+        profiles={"default": profile},
+    )
+
+    primary = config.normalized_profile().subscriptions["primary"]
+
+    assert primary.freshness == freshness
+    assert primary.checkout == Path("ontologies")
+
+
+def test_explicit_subscription_serializes_strict_freshness(tmp_path: Path) -> None:
+    manager = _configured_manager(tmp_path)
+    subscription = _subscription().model_copy(
+        update={
+            "freshness": OntologyFreshnessConfig(
+                check_before_use=False,
+                max_age_seconds=900,
+                hydrate_artifacts_before_use=True,
+            )
+        }
+    )
+    manager.replace(
+        GeasUserConfig(
+            profiles={
+                "default": GeasProfile(
+                    ontology_git=None,
+                    subscriptions={"sample": subscription},
+                )
+            }
+        )
+    )
+
+    serialized = __import__("yaml").safe_load(manager.path.read_text())
+
+    assert serialized["profiles"]["default"]["subscriptions"]["sample"]["freshness"] == {
+        "check_before_use": False,
+        "max_age_seconds": 900,
+        "hydrate_artifacts_before_use": True,
+    }
+    with pytest.raises(ValueError, match="greater than or equal to 60"):
+        OntologySubscription(
+            url=URL,
+            checkout=Path("subscriptions/invalid"),
+            freshness={"max_age_seconds": 1},
+        )

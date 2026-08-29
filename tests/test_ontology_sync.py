@@ -150,6 +150,28 @@ def test_pull_accepts_exact_advertised_commit_id_and_detaches(tmp_path: Path) ->
     assert _git("branch", "--show-current", cwd=manager.checkout).stdout.strip() == ""
 
 
+def test_historical_commit_pin_remains_fetchable_after_branch_advances(
+    tmp_path: Path,
+) -> None:
+    remote = tmp_path / "remote.git"
+    remote.mkdir()
+    _git("init", "--bare", "--initial-branch=main", cwd=remote)
+    seed = _manager(remote, tmp_path / "seed")
+    seed.pull()
+    (seed.checkout / "ontology.yaml").write_text("version: 1\n")
+    seed.push(relative_paths=(Path("ontology.yaml"),), message="first")
+    historical = _git("rev-parse", "HEAD", cwd=seed.checkout).stdout.strip()
+    (seed.checkout / "ontology.yaml").write_text("version: 2\n")
+    seed.push(relative_paths=(Path("ontology.yaml"),), message="advance")
+    assert _git("rev-parse", "HEAD", cwd=seed.checkout).stdout.strip() != historical
+    pinned = _subscription_manager(remote, tmp_path / "pinned", active_ref=historical)
+
+    receipt = pinned.pull()
+
+    assert receipt["new_commit"] == historical
+    assert _git("rev-parse", "HEAD", cwd=pinned.checkout).stdout.strip() == historical
+
+
 @pytest.mark.parametrize("active_ref", ("refs/tags/release/v1", "a" * 40, "b" * 64))
 def test_push_rejects_read_only_tag_and_commit_refs_before_staging(
     tmp_path: Path, active_ref: str
