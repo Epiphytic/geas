@@ -2,7 +2,7 @@
 set -euo pipefail
 
 workspace_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
-bundle_path="$workspace_root/ontology/open-source-research-agents/bundle.yaml"
+ontology_path="$workspace_root/ontology/open-source-research-agents"
 demo_root=${1:-$(mktemp -d /tmp/geas-open-source-agents.XXXXXX)}
 
 if [[ -e "$demo_root/records" || -e "$demo_root/blobs" || -e "$demo_root/query.sqlite" ]]; then
@@ -14,15 +14,53 @@ demo_root=$(cd "$demo_root" && pwd -P)
 
 cd "$workspace_root"
 
-uv run geas bundle-import \
-  "$bundle_path" \
-  --root "$demo_root" \
-  --imported-by operator:demo \
-  > "$demo_root/import.json"
+uv run python - "$workspace_root" "$demo_root/seed-bundles.txt" <<'PY'
+import sys
+from pathlib import Path
+
+from research_agent.ontology_build import OntologyBuildConfig
+from research_agent.repository_catalog import verify_catalog
+
+workspace = Path(sys.argv[1]).resolve()
+destination = Path(sys.argv[2])
+ontology = workspace / "ontology" / "open-source-research-agents"
+config = OntologyBuildConfig.from_yaml(ontology / "build.yaml")
+catalog = verify_catalog(workspace / "geas.yaml", names=(ontology.name,))[0]
+catalog_paths = {
+    (catalog.ontology_path / item.path).resolve()
+    for item in catalog.files
+}
+seeds = {workspace / path for path in config.seed_bundles}
+for pattern in config.seed_bundle_globs:
+    matches = tuple(sorted(workspace.glob(pattern)))
+    if not matches:
+        raise SystemExit(f"seed bundle glob matched no files: {pattern}")
+    seeds.update(matches)
+resolved = tuple(sorted(path.resolve() for path in seeds))
+for path in resolved:
+    if not path.is_file() or path.is_symlink() or not path.is_relative_to(ontology):
+        raise SystemExit(f"invalid maintained seed bundle path: {path}")
+    if path not in catalog_paths:
+        raise SystemExit(f"maintained seed bundle is absent from the verified catalog: {path}")
+destination.write_text(
+    "".join(f"{path.relative_to(workspace).as_posix()}\n" for path in resolved)
+)
+PY
+
+seed_index=0
+while IFS= read -r seed_bundle; do
+  uv run geas bundle-import \
+    "$seed_bundle" \
+    --root "$demo_root" \
+    --imported-by operator:demo \
+    > "$demo_root/import-$seed_index.json"
+  seed_index=$((seed_index + 1))
+done < "$demo_root/seed-bundles.txt"
+jq -s '.' "$demo_root"/import-*.json > "$demo_root/imports.json"
 
 uv run geas knowledge-audit \
   --root "$demo_root" \
-  --as-of 2026-08-03T16:00:00+00:00 \
+  --as-of 2026-08-29T17:00:00+00:00 \
   --fail-on-error \
   > "$demo_root/audit.json"
 
@@ -39,6 +77,25 @@ uv run geas projection-build \
   --root "$demo_root" \
   --workspace "$workspace_root" \
   > "$demo_root/projection.json"
+
+uv run python - "$demo_root/snapshot.json" "$demo_root/query.sqlite" <<'PY'
+import sys
+from datetime import UTC, datetime
+from pathlib import Path
+
+from research_agent.projection import SQLiteKnowledgeProjection
+from research_agent.truth import SQLiteProjectionGuard, TruthSnapshot
+
+snapshot = TruthSnapshot.model_validate_json(Path(sys.argv[1]).read_text())
+SQLiteProjectionGuard(
+    clock=lambda: datetime(2026, 8, 29, 17, 0, tzinfo=UTC)
+).stamp(
+    Path(sys.argv[2]),
+    snapshot,
+    schema_version=SQLiteKnowledgeProjection.schema_version,
+    builder_version=SQLiteKnowledgeProjection.builder_version,
+)
+PY
 
 uv run geas knowledge-query \
   "persistent ontology exact evidence and deterministic retrieval" \
@@ -132,7 +189,8 @@ published = artifact_manager.publish(
     store=artifact_store,
     published_by="operator:demo",
     storage_rights_basis=(
-        "Offline deterministic demo projection over accepted project-authored source cards."
+        "Offline deterministic demo projection over accepted project-authored source "
+        "cards and accepted, license-recorded official-repository source extracts."
     ),
     knowledge_projection=root / "query.sqlite",
 )
@@ -243,7 +301,8 @@ uv run geas projection-check \
 
 jq -n \
   --arg root "$demo_root" \
-  --slurpfile imported "$demo_root/import.json" \
+  --slurpfile imported "$demo_root/imports.json" \
+  --rawfile seed_bundles "$demo_root/seed-bundles.txt" \
   --slurpfile projection "$demo_root/projection.json" \
   --slurpfile persistent "$demo_root/query-persistent-knowledge.json" \
   --slurpfile threats "$demo_root/query-threats.json" \
@@ -253,13 +312,14 @@ jq -n \
   --slurpfile skill "$demo_root/skill-export-second.json" \
   '{
     demo_root: $root,
-    topic: $imported[0].topic,
-    sources: ($imported[0].parse_receipts | length),
-    claims: ($imported[0].knowledge_receipt.claim_ids | length),
-    controversies: ($imported[0].knowledge_receipt.controversy_ids | length),
-    gaps: ($imported[0].knowledge_receipt.gap_ids | length),
-    threat_observations: ($imported[0].knowledge_receipt.threat_observation_ids | length),
-    references: ([$imported[0].parse_receipts[].bibliographic_reference_ids[]] | length),
+    topic: $imported[0][0].topic,
+    seed_bundles: ($seed_bundles | split("\n") | map(select(length > 0) | sub("^ontology/open-source-research-agents/"; ""))),
+    sources: ([$imported[0][].parse_receipts[]] | length),
+    claims: ([$imported[0][].knowledge_receipt.claim_ids[]] | unique | length),
+    controversies: ([$imported[0][].knowledge_receipt.controversy_ids[]] | unique | length),
+    gaps: ([$imported[0][].knowledge_receipt.gap_ids[]] | unique | length),
+    threat_observations: ([$imported[0][].knowledge_receipt.threat_observation_ids[]] | unique | length),
+    references: ([$imported[0][].parse_receipts[].bibliographic_reference_ids[]] | unique | length),
     projection_schema: $projection[0].schema_version,
     persistent_query_hits: ($persistent[0].hits | length),
     threat_query_hits: ($threats[0].hits | length),

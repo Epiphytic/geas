@@ -12,29 +12,45 @@ from research_agent.render import render_topic_markdown
 from research_agent.store import ImmutableStore
 from research_agent.truth import SQLiteProjectionGuard, TruthManager, TruthPolicy
 
-BUNDLE = Path("ontology/open-source-research-agents/bundle.yaml")
-INSTANT = datetime(2026, 8, 3, 16, tzinfo=UTC)
+BUNDLES = (
+    Path("ontology/open-source-research-agents/bundle.yaml"),
+    Path(
+        "ontology/open-source-research-agents/generated/"
+        "alibaba-nlp-deepresearch/bundle.yaml"
+    ),
+    Path(
+        "ontology/open-source-research-agents/generated/"
+        "dzhng-deep-research/bundle.yaml"
+    ),
+)
+INSTANT = datetime(2026, 8, 29, 17, tzinfo=UTC)
 
 
 def test_maintained_open_source_research_agent_ontology_end_to_end(
     tmp_path: Path,
 ) -> None:
     store = ImmutableStore(tmp_path / "data")
-    receipt = KnowledgeBundleImporter(store=store).import_bundle(
-        BUNDLE,
-        imported_by="operator:test",
+    receipts = tuple(
+        KnowledgeBundleImporter(store=store).import_bundle(
+            bundle,
+            imported_by="operator:test",
+        )
+        for bundle in BUNDLES
     )
     audit = DeterministicKnowledgeAuditor().audit(store, as_of=INSTANT)
 
-    assert len(receipt.parse_receipts) == 9
-    assert len(receipt.knowledge_receipt.claim_ids) == 46
-    assert len(receipt.knowledge_receipt.controversy_ids) == 5
-    assert len(receipt.knowledge_receipt.gap_ids) == 7
-    assert len(receipt.knowledge_receipt.threat_observation_ids) == 4
+    assert sum(len(receipt.parse_receipts) for receipt in receipts) == 11
+    assert sum(len(receipt.knowledge_receipt.claim_ids) for receipt in receipts) == 69
+    assert sum(len(receipt.knowledge_receipt.controversy_ids) for receipt in receipts) == 5
+    assert sum(len(receipt.knowledge_receipt.gap_ids) for receipt in receipts) == 13
+    assert sum(
+        len(receipt.knowledge_receipt.threat_observation_ids) for receipt in receipts
+    ) == 4
     assert sum(
         len(item.bibliographic_reference_ids)
+        for receipt in receipts
         for item in receipt.parse_receipts
-    ) == 27
+    ) == 82
     assert audit.clean
     assert audit.findings == ()
 
@@ -70,16 +86,16 @@ def test_maintained_open_source_research_agent_ontology_end_to_end(
         record_types=(QueryRecordType.CLAIM, QueryRecordType.REFERENCE),
     )
 
-    assert build.counts["source_metadata"] == 9
-    assert build.counts["claims"] == 46
-    assert build.counts["bibliographic_references"] == 27
-    assert len(topic.descendant_concept_ids) == 14
-    assert len(topic.sources) == 9
-    assert len({item["id"] for item in topic.claims}) == 46
+    assert build.counts["source_metadata"] == 11
+    assert build.counts["claims"] == 69
+    assert build.counts["bibliographic_references"] == 82
+    assert len(topic.descendant_concept_ids) == 26
+    assert len(topic.sources) == 11
+    assert len({item["id"] for item in topic.claims}) == 69
     assert len(topic.controversies) == 5
-    assert len(topic.gaps) == 7
+    assert len(topic.gaps) == 13
     assert len(topic.threats) == 4
-    assert len(topic.references) == 27
+    assert len(topic.references) == 82
     assert persistent.hits
     assert len(poisoned.hits) == 4
     assert references.hits

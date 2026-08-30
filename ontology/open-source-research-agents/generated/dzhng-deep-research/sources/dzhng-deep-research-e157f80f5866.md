@@ -95,11 +95,11 @@ npm install
 3. Set up environment variables in a `.env.local` file:
 
 ```bash
-FIRECRAWL_KEY="your_firecrawl_key"
+FIRECRAWL_KEY="unset             "
 # If you want to use your self-hosted Firecrawl, add the following below:
 # FIRECRAWL_BASE_URL="http://localhost:3002"
 
-OPENAI_KEY="your_openai_key"
+OPENAI_KEY="unset          "
 ```
 
 To use local LLM, comment out `OPENAI_KEY` and instead uncomment `OPENAI_ENDPOINT` and `OPENAI_MODEL`:

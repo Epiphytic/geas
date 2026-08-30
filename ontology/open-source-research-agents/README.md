@@ -4,11 +4,14 @@ This directory is a maintained, executable example of the repository's durable
 research product. It compares open-source research agents and adjacent
 knowledge-curation systems without treating a generated report as canonical.
 
-`bundle.yaml` is the reviewed ontology bundle. `sources/` contains concise
-project-authored source cards pinned to official repository commits or local
-project documentation. Each card is SHA-256 pinned in the bundle, parsed as
-inert data, structurally anchored, citation-indexed, and linked to exact claim
-evidence. The synthetic poisoned source is deliberately inspected but is never
+`bundle.yaml` and the two accepted `generated/*/bundle.yaml` seeds declared by
+`build.yaml` form the reviewed ontology. `sources/` contains concise
+project-authored source cards; the generated seeds contain license-recorded
+extracts pinned to official repository commits. Each source is SHA-256 pinned,
+parsed as inert data, structurally anchored, citation-indexed, and linked to
+exact claim evidence. Credential-like example assignments in one upstream
+README extract are explicitly replaced with equal-width unset values before
+archival. The synthetic poisoned source is deliberately inspected but is never
 used as claim evidence.
 
 ## Install the catalog sample
@@ -48,8 +51,9 @@ demo_root=$(mktemp -d /tmp/geas-demo.XXXXXX)
 ./ontology/open-source-research-agents/demo.sh "$demo_root"
 ```
 
-The script imports and audits the bundle, captures canonical truth, builds and
-checks the SQLite projection, runs representative natural-language queries,
+The script deterministically resolves and imports all three accepted seed
+bundles through the verified catalog, audits them, captures canonical truth,
+builds and checks the SQLite projection, runs representative natural-language queries,
 preseeds and hydrates an offline content-addressed artifact, and exports the
 same catalog-provenance Agent Skill twice. It refuses a root that already
 contains canonical or projected state.
@@ -66,8 +70,8 @@ Maintenance is evidence-first:
 The maintained `artifacts.yaml` describes a rebuildable current-schema
 knowledge projection published as a content-addressed prerelease asset. It is a
 query projection, not canonical truth, and it contains attributed excerpts
-from the project-authored source cards rather than downloaded upstream
-documents.
+from project-authored source cards plus the accepted license-recorded
+official-repository extracts. It contains no private source material.
 
 Absence claims are deliberately narrow: “not verified in this source card” is
 not equivalent to proving that a project lacks a capability.

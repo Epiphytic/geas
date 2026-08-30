@@ -5,7 +5,7 @@ recorded_at: '2026-08-04T18:26:46.073536Z'
 sources:
 - key: dzhng-deep-research-e157f80f5866
   path: sources/dzhng-deep-research-e157f80f5866.md
-  expected_sha256: e157f80f58668649c2d0b528dbad422de671d52a551cf2160156be685c7947fd
+  expected_sha256: cfe7320499bfac38ba3c16f388e50c246dff0387c6d817216b204b04ee6b775f
   acquired_at: '2026-08-04T18:25:35.445054Z'
   original_locator: https://github.com/dzhng/deep-research/tree/1f8f3e285bbc23e80b98a66a64effab9069f3ad4/README.md
   title: dzhng/deep-research README at 1f8f3e285bbc
@@ -18,6 +18,8 @@ sources:
   rights_basis: 'SPDX license reported by the official repository API: MIT'
   provenance_note: Resolved through the official GitHub API, pinned to immutable commit
     1f8f3e285bbc23e80b98a66a64effab9069f3ad4, and verified against Git blob 78d7dcaad5524e630b5c106f46bf4782a56b7ce5.
+    Credential-like example assignments were replaced with equal-width unset values
+    before archival so evidence offsets remain stable.
 concepts:
 - id: concept:dzhng:deep-research:concurrent-processing
   label: Concurrent Processing

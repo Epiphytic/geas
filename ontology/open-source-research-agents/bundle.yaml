@@ -1,7 +1,7 @@
 version: 1
 topic: State of available open-source research agents
 topic_concept_id: concept:open-source-research-agents
-recorded_at: 2026-08-03T16:00:00Z
+recorded_at: 2026-08-29T16:30:00Z
 
 sources:
   - key: gpt-researcher

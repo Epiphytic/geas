@@ -2,14 +2,25 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
 import subprocess
+import sys
+from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
+import yaml
+
+import research_agent.cli as cli
+from research_agent.agent_skills import validate_snapshot
+from research_agent.bundles import KnowledgeBundleImporter
+from research_agent.geas_update import GeasUpdateReceipt
 from research_agent.ontology_artifacts import (
     ArtifactRole,
+    OntologyArtifact,
     OntologyArtifactManifest,
 )
 from research_agent.ontology_resolution import resolve_ontology_catalog, select_ontology
@@ -17,7 +28,11 @@ from research_agent.ontology_subscriptions import (
     OntologyFreshnessConfig,
     OntologySubscription,
 )
+from research_agent.ontology_trust import TrustRule
+from research_agent.projection import SQLiteKnowledgeProjection
 from research_agent.repository_catalog import verify_catalog
+from research_agent.store import ImmutableStore
+from research_agent.truth import SQLiteProjectionGuard, TruthManager, TruthPolicy
 from research_agent.user_config import GeasProfile, GeasUserConfig, UserConfigManager
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -45,6 +60,15 @@ EXPECTED_INVENTORY = (
     "sources/storm.md",
     "tainted-sources.yaml",
 )
+EXPECTED_SEED_BUNDLES = (
+    "bundle.yaml",
+    "generated/alibaba-nlp-deepresearch/bundle.yaml",
+    "generated/dzhng-deep-research/bundle.yaml",
+)
+REVISION_INSTANT = datetime(2026, 8, 29, 16, 30, tzinfo=UTC)
+AUDIT_INSTANT = datetime(2026, 8, 29, 17, 0, tzinfo=UTC)
+GEAS_OLD_COMMIT = "a" * 40
+GEAS_NEW_COMMIT = "b" * 40
 
 
 def test_root_catalog_verifies_the_exact_maintained_sample_inventory() -> None:
@@ -90,12 +114,33 @@ def _committed_sample_checkout(destination: Path) -> Path:
         capture_output=True,
         check=True,
     )
+    _git(destination, "checkout", "-B", "main")
     target = destination / "ontology" / ONTOLOGY_NAME
     shutil.rmtree(target)
     shutil.copytree(REPOSITORY_ROOT / "ontology" / ONTOLOGY_NAME, target)
     shutil.copyfile(CATALOG, destination / "geas.yaml")
+    shutil.copyfile(
+        REPOSITORY_ROOT / "config" / "truth-policy.yaml",
+        destination / "config" / "truth-policy.yaml",
+    )
+    shutil.copyfile(
+        REPOSITORY_ROOT / "src" / "research_agent" / "truth.py",
+        destination / "src" / "research_agent" / "truth.py",
+    )
+    shutil.copyfile(
+        REPOSITORY_ROOT / "src" / "research_agent" / "default_config" / "truth-policy.yaml",
+        destination / "src" / "research_agent" / "default_config" / "truth-policy.yaml",
+    )
     _git(destination, "remote", "set-url", "origin", "https://github.com/Epiphytic/geas.git")
-    _git(destination, "add", "geas.yaml", f"ontology/{ONTOLOGY_NAME}")
+    _git(
+        destination,
+        "add",
+        "geas.yaml",
+        f"ontology/{ONTOLOGY_NAME}",
+        "config/truth-policy.yaml",
+        "src/research_agent/truth.py",
+        "src/research_agent/default_config/truth-policy.yaml",
+    )
     if _git(destination, "status", "--porcelain"):
         _git(destination, "commit", "-m", "maintained sample fixture")
     return destination
@@ -151,6 +196,20 @@ def test_maintained_projection_artifact_uses_the_current_strict_schema() -> None
     assert len(artifact.input_revision) == 64
 
 
+def test_maintained_bundle_revision_follows_every_source_observation() -> None:
+    bundle = yaml.safe_load(
+        (REPOSITORY_ROOT / "ontology" / ONTOLOGY_NAME / "bundle.yaml").read_text()
+    )
+    recorded_at = datetime.fromisoformat(str(bundle["recorded_at"]).replace("Z", "+00:00"))
+    acquired_at = tuple(
+        datetime.fromisoformat(str(source["acquired_at"]).replace("Z", "+00:00"))
+        for source in bundle["sources"]
+    )
+
+    assert recorded_at == REVISION_INSTANT
+    assert recorded_at >= max(acquired_at)
+
+
 def test_demo_hydrates_a_preseeded_artifact_and_exports_the_same_skill_twice(
     tmp_path: Path,
 ) -> None:
@@ -177,3 +236,197 @@ def test_demo_hydrates_a_preseeded_artifact_and_exports_the_same_skill_twice(
     assert first_skill["unchanged"] is False
     assert second_skill["unchanged"] is True
     assert first_skill["snapshot_sha256"] == second_skill["snapshot_sha256"]
+    assert summary["seed_bundles"] == list(EXPECTED_SEED_BUNDLES)
+    assert summary["sources"] == 11
+    assert summary["claims"] == 69
+
+
+def _build_maintained_projection(checkout: Path, root: Path) -> Path:
+    store = ImmutableStore(root / "data")
+    original_directory = Path.cwd()
+    try:
+        os.chdir(checkout)
+        for relative in EXPECTED_SEED_BUNDLES:
+            KnowledgeBundleImporter(store=store).import_bundle(
+                Path("ontology") / ONTOLOGY_NAME / relative,
+                imported_by="operator:maintained-artifact-test",
+            )
+    finally:
+        os.chdir(original_directory)
+    truth = TruthManager(
+        workspace_root=checkout,
+        store_root=store.root,
+        policy=TruthPolicy.from_yaml(checkout / "config" / "truth-policy.yaml"),
+        clock=lambda: AUDIT_INSTANT,
+    )
+    snapshot = truth.capture(created_by="operator:maintained-artifact-test")
+    database = root / "query.sqlite"
+    SQLiteKnowledgeProjection(store=store, workspace_root=checkout).build(
+        database,
+        snapshot=snapshot,
+        truth_manager=truth,
+    )
+    SQLiteProjectionGuard(clock=lambda: AUDIT_INSTANT).stamp(
+        database,
+        snapshot,
+        schema_version=SQLiteKnowledgeProjection.schema_version,
+        builder_version=SQLiteKnowledgeProjection.builder_version,
+    )
+    assert truth.verify(snapshot).clean
+    return database
+
+
+class _PreseededArtifactStore:
+    def __init__(
+        self,
+        source: Path,
+        expected: OntologyArtifact,
+    ) -> None:
+        self.source = source
+        self.expected = expected
+        self.downloads = 0
+
+    def ensure(self, _artifact: OntologyArtifact, _source: Path) -> bool:
+        raise AssertionError("offline hydration must not publish")
+
+    def available(self, artifact: OntologyArtifact) -> bool:
+        return artifact == self.expected
+
+    def download(self, artifact: OntologyArtifact, destination: Path) -> None:
+        assert artifact == self.expected
+        assert hashlib.sha256(self.source.read_bytes()).hexdigest() == artifact.content_sha256
+        assert self.source.stat().st_size == artifact.size_bytes
+        self.downloads += 1
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(self.source, destination)
+
+
+def _run_cli(monkeypatch: pytest.MonkeyPatch, *arguments: str) -> None:
+    monkeypatch.setattr(sys, "argv", ["geas", *arguments])
+    cli.main()
+
+
+def test_committed_artifact_drives_repeatable_catalog_cli_export_and_update_offline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    manager = UserConfigManager(tmp_path / "config" / "config.yaml")
+    checkout = manager.root / "subscriptions" / "default" / "geas-samples"
+    _committed_sample_checkout(checkout)
+    commit = _git(checkout, "rev-parse", "HEAD")
+    catalog_bundle = verify_catalog(checkout / "geas.yaml")[0].bundle_sha256
+    artifact_manifest = OntologyArtifactManifest.from_yaml(
+        checkout / "ontology" / ONTOLOGY_NAME / "artifacts.yaml"
+    )
+    artifact = artifact_manifest.artifacts[0]
+    projection = _build_maintained_projection(checkout, tmp_path / "projection")
+    assert hashlib.sha256(projection.read_bytes()).hexdigest() == artifact.content_sha256
+
+    subscription = OntologySubscription(
+        url="https://github.com/Epiphytic/geas.git",
+        active_ref="refs/heads/main",
+        checkout=Path("subscriptions/default/geas-samples"),
+        freshness=OntologyFreshnessConfig(check_before_use=False),
+    )
+    manager.replace(
+        GeasUserConfig(
+            ontology_freshness=OntologyFreshnessConfig(check_before_use=False),
+            profiles={
+                "default": GeasProfile(
+                    ontology_git=None,
+                    subscriptions={"geas-samples": subscription},
+                    trust_rules=(
+                        TrustRule(
+                            decision="allow",
+                            repository="https://github.com/Epiphytic/geas",
+                            created_at=AUDIT_INSTANT,
+                            created_via="manual",
+                        ),
+                    ),
+                )
+            },
+        )
+    )
+    store = _PreseededArtifactStore(projection, artifact)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "GitHubReleaseArtifactStore", lambda *_args, **_kwargs: store)
+    monkeypatch.setattr(cli, "_current_geas_identity", lambda: ("0.1.0", GEAS_OLD_COMMIT))
+    monkeypatch.setattr(cli.shutil, "which", lambda _name: None)
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: home))
+
+    export_payloads = []
+    for _ in range(2):
+        _run_cli(
+            monkeypatch,
+            "--geas-config",
+            str(manager.path),
+            "--yolo",
+            "skill-export",
+            ONTOLOGY_NAME,
+        )
+        export_payloads.append(json.loads(capsys.readouterr().out))
+    snapshot = Path(export_payloads[-1]["path"])
+    exported = validate_snapshot(snapshot)
+    assert tuple(item["unchanged"] for item in export_payloads) == (False, True)
+    assert exported.ontology.bundle_sha256 == catalog_bundle
+    assert exported.ontology.ontology_commit == commit
+    assert exported.ontology.subscription_name == "geas-samples"
+    assert exported.ontology.repository_url == subscription.url
+    assert exported.ontology.active_ref == subscription.active_ref
+    assert exported.ontology.catalog_path == subscription.catalog.as_posix()
+    assert exported.artifact is not None
+    assert exported.artifact.content_sha256 == artifact.content_sha256
+    assert exported.artifact.input_revision == artifact.input_revision
+    assert store.downloads == 1
+
+    class _StatefulUpdater:
+        calls = 0
+
+        def update_and_reexec(
+            self, _argv: tuple[str, ...], *, continuation: str | None
+        ) -> GeasUpdateReceipt:
+            assert continuation == "maintained-sample-test"
+            old = GEAS_OLD_COMMIT if self.calls == 0 else GEAS_NEW_COMMIT
+            type(self).calls += 1
+            return GeasUpdateReceipt(
+                installer="git-development",
+                directory=REPOSITORY_ROOT,
+                executable=REPOSITORY_ROOT / ".venv" / "bin" / "geas",
+                old_commit=old,
+                new_commit=GEAS_NEW_COMMIT,
+                old_version="0.1.0",
+                new_version="0.1.0",
+                reinstalled=old != GEAS_NEW_COMMIT,
+                reexec_depth=1,
+            )
+
+    class _NoWriteRepository:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def pull(self) -> dict[str, object]:
+            return {"commit": commit}
+
+    monkeypatch.setattr(cli, "GeasUpdater", _StatefulUpdater)
+    monkeypatch.setattr(cli, "OntologyRepositoryManager", _NoWriteRepository)
+    update_payloads = []
+    for _ in range(2):
+        _run_cli(
+            monkeypatch,
+            "--geas-config",
+            str(manager.path),
+            "--yolo",
+            "skill-update",
+            str(snapshot),
+            "--geas-update-continuation",
+            "maintained-sample-test",
+        )
+        update_payloads.append(json.loads(capsys.readouterr().out))
+    updated = validate_snapshot(snapshot)
+    assert tuple(item["unchanged"] for item in update_payloads) == (False, True)
+    assert updated.ontology.bundle_sha256 == catalog_bundle
+    assert updated.artifact == exported.artifact
+    assert store.downloads == 1

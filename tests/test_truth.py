@@ -90,9 +90,20 @@ def test_required_git_tracking_excludes_unreviewed_ontology_candidates(
     tmp_path: Path,
 ) -> None:
     workspace, store = _workspace(tmp_path)
+    artifact_manifest = workspace / "ontology" / "sample" / "artifacts.yaml"
+    artifact_manifest.parent.mkdir()
+    artifact_manifest.write_text("version: 1\nartifacts: []\n")
     subprocess.run(("git", "init", "-q", str(workspace)), check=True)
     subprocess.run(
-        ("git", "-C", str(workspace), "add", "ontology/knowledge.yaml", "schema.py"),
+        (
+            "git",
+            "-C",
+            str(workspace),
+            "add",
+            "ontology/knowledge.yaml",
+            "ontology/sample/artifacts.yaml",
+            "schema.py",
+        ),
         check=True,
     )
     subprocess.run(
@@ -113,7 +124,12 @@ def test_required_git_tracking_excludes_unreviewed_ontology_candidates(
     candidate = workspace / "ontology" / "generated" / "candidate.yaml"
     candidate.parent.mkdir()
     candidate.write_text("claims:\n  - unreviewed\n")
-    policy = _policy().model_copy(update={"ontology_git_tracking": "required"})
+    policy = _policy().model_copy(
+        update={
+            "ontology_exclude_globs": ("ontology/**/artifacts.yaml",),
+            "ontology_git_tracking": "required",
+        }
+    )
     manager = TruthManager(
         workspace_root=workspace,
         store_root=store.root,
@@ -125,6 +141,7 @@ def test_required_git_tracking_excludes_unreviewed_ontology_candidates(
 
     locators = {item.locator for item in snapshot.artifacts}
     assert "workspace:ontology/knowledge.yaml" in locators
+    assert "workspace:ontology/sample/artifacts.yaml" not in locators
     assert "workspace:ontology/generated/candidate.yaml" not in locators
 
     (workspace / "ontology" / "knowledge.yaml").write_text(
@@ -273,3 +290,36 @@ def test_git_ontology_glob_matches_zero_or_many_directories() -> None:
         pattern,
     )
     assert not TruthManager._glob_matches("ontology/topic/source.md", pattern)
+
+
+def test_truth_inventory_excludes_rebuildable_artifact_manifests(tmp_path: Path) -> None:
+    workspace, store = _workspace(tmp_path)
+    artifact_manifest = workspace / "ontology" / "sample" / "artifacts.yaml"
+    artifact_manifest.parent.mkdir()
+    artifact_manifest.write_text("version: 1\nartifacts: []\n")
+    policy = _policy().model_copy(
+        update={"ontology_exclude_globs": ("ontology/**/artifacts.yaml",)}
+    )
+    manager = TruthManager(
+        workspace_root=workspace,
+        store_root=store.root,
+        policy=policy,
+        clock=lambda: datetime(2026, 8, 29, 17, 0, tzinfo=UTC),
+    )
+
+    snapshot = manager.capture(created_by="operator:test")
+
+    locators = {item.locator for item in snapshot.artifacts}
+    assert "workspace:ontology/knowledge.yaml" in locators
+    assert "workspace:ontology/sample/artifacts.yaml" not in locators
+
+
+def test_checked_and_packaged_truth_policies_exclude_artifact_manifests() -> None:
+    repository = Path(__file__).resolve().parents[1]
+    checked = TruthPolicy.from_yaml(repository / "config" / "truth-policy.yaml")
+    packaged = TruthPolicy.from_yaml(
+        repository / "src" / "research_agent" / "default_config" / "truth-policy.yaml"
+    )
+
+    assert checked == packaged
+    assert checked.ontology_exclude_globs == ("ontology/**/artifacts.yaml",)

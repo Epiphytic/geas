@@ -7,6 +7,10 @@ ontology_globs:
   - ontology/**/*.md
   - config/query-vocabulary.yaml
   - intelligence/sources.yaml
+ontology_exclude_globs:
+  # Portable release manifests describe rebuildable projections and therefore
+  # cannot be inputs to the truth snapshot embedded in those projections.
+  - ontology/**/artifacts.yaml
 ontology_git_tracking: required
 
 # Trusted policies affect ingestion, routing, and projection semantics.

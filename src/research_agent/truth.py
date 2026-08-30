@@ -37,6 +37,7 @@ class TruthArtifact(StrictModel):
 class TruthPolicy(StrictModel):
     version: int = Field(ge=1)
     ontology_globs: tuple[str, ...] = Field(min_length=1)
+    ontology_exclude_globs: tuple[str, ...] = ()
     ontology_git_tracking: Literal["required", "not_required"] = "not_required"
     operational_policy_paths: tuple[str, ...] = ()
     record_schema_paths: tuple[str, ...] = Field(min_length=1)
@@ -48,6 +49,7 @@ class TruthPolicy(StrictModel):
 
     @field_validator(
         "ontology_globs",
+        "ontology_exclude_globs",
         "operational_policy_paths",
         "record_schema_paths",
         "record_directory",
@@ -215,6 +217,13 @@ class TruthManager:
                 ontology_paths.update(
                     path for path in self.workspace_root.glob(pattern) if path.is_file()
                 )
+            ontology_paths = {
+                path
+                for path in ontology_paths
+                if not self._is_excluded_ontology_path(
+                    path.relative_to(self.workspace_root).as_posix()
+                )
+            }
             if not ontology_paths:
                 raise ValueError("truth policy did not resolve any canonical ontology files")
             for path in sorted(ontology_paths):
@@ -281,6 +290,13 @@ class TruthManager:
                 self._glob_matches(relative, pattern)
                 for pattern in self.policy.ontology_globs
             )
+            and not self._is_excluded_ontology_path(relative)
+        )
+
+    def _is_excluded_ontology_path(self, relative: str) -> bool:
+        return any(
+            self._glob_matches(relative, pattern)
+            for pattern in self.policy.ontology_exclude_globs
         )
 
     @staticmethod
