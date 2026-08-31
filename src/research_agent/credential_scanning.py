@@ -11,21 +11,49 @@ _FIXED_CREDENTIAL_PATTERNS = (
 )
 _CREDENTIAL_ASSIGNMENT = re.compile(
     rb"(?im)^\s*(?P<name>[A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD))\s*[:=]"
-    rb"\s*['\"]?(?P<value>[^\s'\"]{12,})"
+    rb"(?P<rhs>[^\r\n]*)\r?$"
 )
+_CREDENTIAL_VALUE_PREFIX = re.compile(rb"^[ \t]*['\"]?[^\s'\"]{12,}")
 
 
 def contains_possible_credential(content: Buffer) -> bool:
     """Return whether inert content contains a credential-like value.
 
-    The sole assignment exception is the explicit public-documentation form
-    ``NAME=your_name``. It is derived from the variable name rather than a
-    general placeholder allowlist, so similar-looking operator values remain
-    credential findings.
+    The sole assignment exception is the complete public-documentation RHS
+    ``NAME=your_name``, optionally quoted and followed only by whitespace or a
+    whitespace-delimited ``#`` comment. It is derived from the variable name
+    rather than a general placeholder allowlist, so concatenated or
+    similar-looking operator values remain credential findings.
     """
-    if any(pattern.search(content) for pattern in _FIXED_CREDENTIAL_PATTERNS):
+    if contains_fixed_credential(content):
         return True
-    return any(
-        match.group("value") != b"your_" + match.group("name").lower()
-        for match in _CREDENTIAL_ASSIGNMENT.finditer(content)
-    )
+    for match in _CREDENTIAL_ASSIGNMENT.finditer(content):
+        if _is_documented_placeholder(match.group("name"), match.group("rhs")):
+            continue
+        if _CREDENTIAL_VALUE_PREFIX.match(match.group("rhs")):
+            return True
+    return False
+
+
+def contains_fixed_credential(content: Buffer) -> bool:
+    """Return whether content contains a fixed-format credential signature."""
+    return any(pattern.search(content) for pattern in _FIXED_CREDENTIAL_PATTERNS)
+
+
+def _is_documented_placeholder(name: bytes, rhs: bytes) -> bool:
+    expected = b"your_" + name.lower()
+    value = rhs.lstrip(b" \t")
+    if value.startswith(b'"'):
+        literal = b'"' + expected + b'"'
+    elif value.startswith(b"'"):
+        literal = b"'" + expected + b"'"
+    else:
+        literal = expected
+    if not value.startswith(literal):
+        return False
+    remainder = value[len(literal) :]
+    if not remainder or not remainder.strip(b" \t"):
+        return True
+    if remainder[:1] not in {b" ", b"\t"}:
+        return False
+    return remainder.lstrip(b" \t").startswith(b"#")

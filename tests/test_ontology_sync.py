@@ -317,6 +317,48 @@ def test_git_sync_accepts_documented_public_placeholders(
     assert receipt["pushed"] is True
 
 
+def test_git_sync_rejects_placeholder_concatenation_without_remote_write(
+    tmp_path: Path,
+) -> None:
+    remote = tmp_path / "remote.git"
+    remote.mkdir()
+    _git("init", "--bare", "--initial-branch=main", cwd=remote)
+    manager = _manager(remote, tmp_path / "checkout")
+    manager.pull()
+    ontology = manager.checkout / "routing"
+    ontology.mkdir()
+    (ontology / "example.md").write_text(
+        'FIRECRAWL_KEY="your_firecrawl_key"operator-secret-value-123\n'
+    )
+
+    with pytest.raises(OntologySyncError, match="possible credential"):
+        manager.push(relative_paths=(Path("routing"),), message="must fail")
+
+    remote_head = subprocess.run(
+        (
+            "git",
+            "--git-dir",
+            str(remote),
+            "show-ref",
+            "--verify",
+            "--quiet",
+            "refs/heads/main",
+        ),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert remote_head.returncode == 1
+    local_head = subprocess.run(
+        ("git", "rev-parse", "--verify", "HEAD"),
+        cwd=manager.checkout,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert local_head.returncode != 0
+
+
 def test_freshness_check_fetches_at_most_once_per_window(
     tmp_path: Path,
 ) -> None:

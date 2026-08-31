@@ -20,7 +20,10 @@ from uuid import uuid4
 import yaml
 from pydantic import Field, field_validator, model_validator
 
-from research_agent.credential_scanning import contains_possible_credential
+from research_agent.credential_scanning import (
+    contains_fixed_credential,
+    contains_possible_credential,
+)
 from research_agent.models import StrictModel, canonical_json, utc_now
 from research_agent.truth import ProjectionStamp, SQLiteProjectionGuard
 
@@ -670,10 +673,55 @@ def _scan_sensitive_content(path: Path) -> None:
         0,
         access=mmap.ACCESS_READ,
     ) as content:
-        if contains_possible_credential(content):
+        sqlite_database = content[:16] == b"SQLite format 3\x00"
+        sensitive = (
+            contains_fixed_credential(content)
+            if sqlite_database
+            else contains_possible_credential(content)
+        )
+        if sensitive:
             raise OntologyArtifactError(
                 f"possible credential detected in ontology artifact: {path}"
             )
+    if sqlite_database:
+        _scan_sqlite_values(path)
+
+
+def _scan_sqlite_values(path: Path) -> None:
+    try:
+        with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as connection:
+            tables = tuple(
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name"
+                )
+            )
+            for table in tables:
+                quoted_table = _quoted_sqlite_identifier(table)
+                columns = tuple(
+                    row[1]
+                    for row in connection.execute(f"PRAGMA table_info({quoted_table})")
+                )
+                for column in columns:
+                    quoted_column = _quoted_sqlite_identifier(column)
+                    values = connection.execute(
+                        f"SELECT {quoted_column} FROM {quoted_table} "
+                        f"WHERE typeof({quoted_column}) IN ('text', 'blob')"
+                    )
+                    for (value,) in values:
+                        content = value.encode("utf-8") if isinstance(value, str) else bytes(value)
+                        if contains_possible_credential(content):
+                            raise OntologyArtifactError(
+                                f"possible credential detected in ontology artifact: {path}"
+                            )
+    except sqlite3.Error as error:
+        raise OntologyArtifactError(
+            f"could not scan SQLite ontology artifact for credentials: {path}"
+        ) from error
+
+
+def _quoted_sqlite_identifier(value: str) -> str:
+    return '"' + value.replace('"', '""') + '"'
 
 
 def _sha256_file(path: Path) -> str:

@@ -178,3 +178,56 @@ def test_artifact_publication_still_rejects_nonplaceholder_assignments(
             storage_rights_basis="operator-confirmed private storage",
             generated_content=generated,
         )
+
+
+def test_artifact_publication_rejects_placeholder_concatenation_without_upload(
+    tmp_path: Path,
+) -> None:
+    ontology = tmp_path / "routing"
+    ontology.mkdir()
+    generated = tmp_path / "generated"
+    generated.mkdir()
+    (generated / "instructions.md").write_text(
+        'FIRECRAWL_KEY="your_firecrawl_key"operator-secret-value-123\n'
+    )
+    store = MemoryArtifactStore().use_root(tmp_path / "remote-assets")
+
+    with pytest.raises(OntologyArtifactError, match="possible credential"):
+        OntologyArtifactManager(ontology).publish(
+            store=store,
+            published_by="test:operator",
+            storage_rights_basis="operator-confirmed private storage",
+            generated_content=generated,
+        )
+
+    assert store.values == {}
+    assert tuple((tmp_path / "remote-assets").iterdir()) == ()
+    assert not (ontology / "artifacts.yaml").exists()
+
+
+def test_sqlite_artifact_rejects_placeholder_concatenation_without_upload(
+    tmp_path: Path,
+) -> None:
+    ontology = tmp_path / "routing"
+    ontology.mkdir()
+    database = tmp_path / "library.sqlite"
+    _library_database(database)
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE TABLE source_text(content TEXT NOT NULL)")
+        connection.execute(
+            "INSERT INTO source_text VALUES (?)",
+            ('FIRECRAWL_KEY="your_firecrawl_key"operator-secret-value-123\n',),
+        )
+    store = MemoryArtifactStore().use_root(tmp_path / "remote-assets")
+
+    with pytest.raises(OntologyArtifactError, match="possible credential"):
+        OntologyArtifactManager(ontology).publish(
+            store=store,
+            published_by="test:operator",
+            storage_rights_basis="operator-confirmed private storage",
+            source_library=database,
+        )
+
+    assert store.values == {}
+    assert tuple((tmp_path / "remote-assets").iterdir()) == ()
+    assert not (ontology / "artifacts.yaml").exists()
