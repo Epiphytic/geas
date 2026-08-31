@@ -134,6 +134,16 @@ def test_generic_scp_identity_matches_explicit_git_ssh_without_conflating_user()
     ) != scp
 
 
+def test_repository_identity_preserves_explicit_github_port_authority() -> None:
+    """GitHub shorthand equivalence must not erase a distinct network authority."""
+    assert normalized_repository_identity(
+        "ssh://git@github.com:2222/owner/repository.git"
+    ) == "ssh://git@github.com:2222/owner/repository"
+    assert normalized_repository_identity(
+        "https://github.com:444/owner/repository.git"
+    ) == "https://github.com:444/owner/repository"
+
+
 @pytest.mark.parametrize(
     "active_ref",
     (

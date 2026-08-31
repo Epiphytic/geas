@@ -85,10 +85,11 @@ def normalized_repository_identity(value: str) -> str:
     assert parsed.hostname is not None  # Established by _validate_remote_url.
     host = parsed.hostname.lower()
     path = parsed.path.rstrip("/").removesuffix(".git")
-    if host == "github.com":
+    port_number = parsed.port
+    if host == "github.com" and port_number is None:
         return f"https://github.com/{path.lstrip('/')}"
     rendered_host = f"[{host}]" if ":" in host else host
-    port = f":{parsed.port}" if parsed.port is not None else ""
+    port = f":{port_number}" if port_number is not None else ""
     username = "git@" if parsed.username == "git" else ""
     return f"{parsed.scheme.lower()}://{username}{rendered_host}{port}{path}"
 
