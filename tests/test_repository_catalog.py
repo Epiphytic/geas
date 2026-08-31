@@ -4,7 +4,7 @@ import hashlib
 import json
 import shutil
 import subprocess
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 import pytest
 import yaml
@@ -14,6 +14,8 @@ from research_agent.repository_catalog import (
     CatalogFile,
     CatalogOntology,
     RepositoryCatalog,
+    VerifiedCatalogOntology,
+    _workspace_ontology_path,
     discover_catalogs,
     load_catalog,
     refresh_catalog,
@@ -150,6 +152,52 @@ def test_catalog_digest_is_portable_and_metadata_sensitive(tmp_path: Path) -> No
     _write_catalog(moved / "geas.yaml", ontology)
     with pytest.raises(ValueError, match="bundle digest"):
         verify_catalog(moved / "geas.yaml")
+
+
+def test_verified_workspace_path_is_portable_from_windows_path_flavor() -> None:
+    """Serializing an OS-native Windows path must not leak backslashes into receipts."""
+
+    class SimulatedWindowsWorkspace:
+        def resolve(self, *, strict: bool) -> SimulatedWindowsWorkspace:
+            assert strict is True
+            return self
+
+    class SimulatedWindowsOntology:
+        def is_relative_to(self, workspace: object) -> bool:
+            return isinstance(workspace, SimulatedWindowsWorkspace)
+
+        def relative_to(self, workspace: object) -> PureWindowsPath:
+            assert isinstance(workspace, SimulatedWindowsWorkspace)
+            return PureWindowsPath("ontology", "nested", "example")
+
+    class SimulatedRootOntology(SimulatedWindowsOntology):
+        def relative_to(self, workspace: object) -> PureWindowsPath:
+            assert isinstance(workspace, SimulatedWindowsWorkspace)
+            return PureWindowsPath(".")
+
+    workspace_path = _workspace_ontology_path(  # type: ignore[arg-type]
+        SimulatedWindowsOntology(),  # type: ignore[arg-type]
+        SimulatedWindowsWorkspace(),  # type: ignore[arg-type]
+    )
+    verified = VerifiedCatalogOntology(
+        name="example",
+        description="Portable path fixture.",
+        catalog_path=Path("geas.yaml"),
+        ontology_path=Path("ontology/nested/example"),
+        workspace_path=workspace_path,
+        files=(CatalogFile(path=Path("build.yaml"), sha256="0" * 64, size_bytes=0),),
+        bundle_sha256="1" * 64,
+    )
+
+    assert verified.workspace_path == PurePosixPath("ontology/nested/example")
+    assert verified.model_dump(mode="json")["workspace_path"] == "ontology/nested/example"
+    assert json.loads(verified.model_dump_json())["workspace_path"] == (
+        "ontology/nested/example"
+    )
+    assert _workspace_ontology_path(  # type: ignore[arg-type]
+        SimulatedRootOntology(),  # type: ignore[arg-type]
+        SimulatedWindowsWorkspace(),  # type: ignore[arg-type]
+    ) == PurePosixPath(".")
 
 
 @pytest.mark.parametrize(

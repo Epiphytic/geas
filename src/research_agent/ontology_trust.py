@@ -6,7 +6,7 @@ import hashlib
 import os
 import re
 import shutil
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from contextlib import suppress
 from datetime import datetime
 from enum import StrEnum
@@ -731,6 +731,7 @@ def _stage_snapshot(
     ontology: VerifiedCatalogOntology,
     *,
     manager: UserConfigManager,
+    _after_copy: Callable[[Path], None] | None = None,
 ) -> _StagedSnapshot:
     ontology = _verified_source(ontology)
     relative = Path("snapshots") / ontology.name / ontology.bundle_sha256
@@ -757,6 +758,8 @@ def _stage_snapshot(
                 target = temporary / item.path
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(resolved, target)
+            if _after_copy is not None:
+                _after_copy(temporary)
             _verify_snapshot_directory(temporary, ontology)
             os.replace(temporary, destination)
             created = True

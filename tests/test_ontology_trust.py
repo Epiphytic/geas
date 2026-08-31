@@ -16,6 +16,7 @@ from research_agent.ontology_resolution import resolve_ontology_catalog
 from research_agent.ontology_trust import (
     TrustContext,
     TrustRule,
+    _stage_snapshot,
     authorize_repository_catalog,
     evaluate_trust,
     install_snapshot,
@@ -525,6 +526,39 @@ def test_snapshot_install_rolls_back_new_directory_when_registration_fails(
     expected = manager.root / "snapshots" / "alpha" / alpha.bundle_sha256
     assert not expected.exists()
     assert not (manager.root / "snapshots").exists()
+
+
+@pytest.mark.parametrize("mutation", ["bytes", "symlink"])
+def test_staged_snapshot_corruption_fails_before_rename_or_registration(
+    tmp_path: Path,
+    resolved_catalog: ResolvedRepositoryCatalog,
+    mutation: str,
+) -> None:
+    """A copy-stage mutation must be rejected and its entire temporary tree collected."""
+    manager = _manager(tmp_path)
+    before = manager.path.read_bytes()
+    alpha = resolved_catalog.by_name("alpha")
+
+    def corrupt_staged_copy(directory: Path) -> None:
+        copied = directory / "build.yaml"
+        if mutation == "bytes":
+            copied.write_bytes(b"corrupt staged bytes")
+        else:
+            copied.unlink()
+            copied.symlink_to(alpha.ontology_path / "build.yaml")
+
+    with pytest.raises(ValueError, match="size|sha256|symbolic link"):
+        _stage_snapshot(
+            alpha,
+            manager=manager,
+            _after_copy=corrupt_staged_copy,
+        )
+
+    destination = manager.root / "snapshots" / alpha.name / alpha.bundle_sha256
+    assert not destination.exists()
+    assert not (manager.root / "snapshots").exists()
+    assert manager.path.read_bytes() == before
+    assert manager.load().profiles["default"].installed_ontologies == ()
 
 
 def test_snapshot_removal_is_exact_and_cleans_only_empty_direct_parents(

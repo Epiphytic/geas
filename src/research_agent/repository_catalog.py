@@ -8,7 +8,7 @@ import re
 import subprocess
 import tempfile
 from collections.abc import Iterable, Sequence
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePath, PurePosixPath
 from typing import Literal
 from urllib.parse import urlsplit, urlunsplit
 
@@ -120,10 +120,19 @@ class VerifiedCatalogOntology(StrictModel):
     description: str
     catalog_path: Path
     ontology_path: Path
-    workspace_path: Path
+    workspace_path: PurePosixPath
     files: tuple[CatalogFile, ...]
     bundle_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     dirty: bool = False
+
+    @field_validator("workspace_path", mode="before")
+    @classmethod
+    def workspace_path_is_portable(cls, value: object) -> PurePosixPath:
+        return _portable_relative_path(
+            value,
+            label="workspace ontology path",
+            allow_root=True,
+        )
 
 
 class ResolvedRepositoryCatalog(StrictModel):
@@ -365,7 +374,7 @@ def _verify_transitive_inputs(
     files: Sequence[CatalogFile],
     *,
     workspace: Path | None,
-    workspace_path: Path,
+    workspace_path: PurePosixPath,
 ) -> None:
     declared = {item.path.as_posix() for item in files}
     for item in files:
@@ -418,16 +427,36 @@ def _verify_transitive_inputs(
                 )
 
 
-def _workspace_ontology_path(ontology_path: Path, workspace: Path) -> Path:
+def _workspace_ontology_path(ontology_path: Path, workspace: Path) -> PurePosixPath:
     resolved_workspace = workspace.resolve(strict=True)
     if not ontology_path.is_relative_to(resolved_workspace):
         raise ValueError("ontology directory escapes workspace")
     relative = ontology_path.relative_to(resolved_workspace)
-    return _relative_path(relative, label="workspace ontology path")
+    return _portable_relative_path(
+        relative,
+        label="workspace ontology path",
+        allow_root=True,
+    )
 
 
-def _workspace_input_path(reference: str, *, workspace_path: Path) -> Path:
-    reference_path = _relative_path(reference, label="workspace seed bundle path")
+def _portable_relative_path(
+    value: object,
+    *,
+    label: str,
+    allow_root: bool = False,
+) -> PurePosixPath:
+    raw = value.as_posix() if isinstance(value, PurePath) else str(value)
+    if allow_root and raw == ".":
+        return PurePosixPath(".")
+    validated = _relative_path(raw, label=label)
+    return PurePosixPath(validated.as_posix())
+
+
+def _workspace_input_path(reference: str, *, workspace_path: PurePosixPath) -> Path:
+    reference_path = _portable_relative_path(
+        reference,
+        label="workspace seed bundle path",
+    )
     try:
         relative = reference_path.relative_to(workspace_path)
     except ValueError as error:
@@ -439,7 +468,7 @@ def _relocated_seed_glob_paths(
     ontology_path: Path,
     pattern: str,
     *,
-    workspace_path: Path,
+    workspace_path: PurePosixPath,
 ) -> tuple[Path, ...]:
     relative_pattern = _workspace_glob_path(pattern, workspace_path=workspace_path)
     try:
@@ -454,8 +483,15 @@ def _relocated_seed_glob_paths(
     )
 
 
-def _workspace_glob_path(pattern: str, *, workspace_path: Path) -> Path:
-    workspace_pattern = _relative_path(pattern, label="workspace seed bundle glob")
+def _workspace_glob_path(
+    pattern: str,
+    *,
+    workspace_path: PurePosixPath,
+) -> PurePosixPath:
+    workspace_pattern = _portable_relative_path(
+        pattern,
+        label="workspace seed bundle glob",
+    )
     try:
         return workspace_pattern.relative_to(workspace_path)
     except ValueError as error:
