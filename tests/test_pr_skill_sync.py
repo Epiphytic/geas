@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+import research_agent.pr_skill_sync as pr_skill_sync
 from research_agent.agent_skills import (
     GeasIdentity,
     OntologyIdentity,
@@ -36,9 +37,13 @@ from research_agent.pr_skill_sync import (
     verify_pull_request,
     verify_skill_artifact,
 )
+from research_agent.repository_catalog import load_catalog, refresh_catalog
 
 REPOSITORY = "Epiphytic/geas"
 REPOSITORY_ID = "1320458746"
+IMMUTABLE_SUBJECT = (
+    "repo:Epiphytic@228616596/geas@1320458746:ref:refs/heads/main"
+)
 HEAD_SHA = "1" * 40
 RUN_ID = 731
 PR_NUMBER = 42
@@ -68,6 +73,16 @@ def _git(repository: Path, *arguments: str, check: bool = True) -> subprocess.Co
         capture_output=True,
         check=check,
     )
+
+
+def _git_blob(repository: Path, revision_path: str) -> bytes:
+    return subprocess.run(
+        ("git", "show", revision_path),
+        cwd=repository,
+        env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+        capture_output=True,
+        check=True,
+    ).stdout
 
 
 def _source(*, head_repository: str = REPOSITORY, head_sha: str = HEAD_SHA) -> ArtifactSource:
@@ -287,6 +302,43 @@ def test_artifact_verification_rejects_symlinks_without_reading_their_target(
         verify_skill_artifact(artifact, expected=_source())
 
 
+@pytest.mark.parametrize(
+    ("limit_name", "limit", "sizes", "message"),
+    [
+        ("_MAX_FILES", 2, (1, 1, 1), "too many files"),
+        ("_MAX_FILE_BYTES", 3, (4, 1), "file size"),
+        ("_MAX_TOTAL_BYTES", 5, (3, 3), "total size"),
+    ],
+)
+def test_actual_artifact_limits_fail_before_any_payload_hashing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    limit_name: str,
+    limit: int,
+    sizes: tuple[int, ...],
+    message: str,
+) -> None:
+    """Catches hashing attacker-sized or attacker-cardinality payloads before bounds."""
+    payload = tmp_path / "payload"
+    roots = tuple(payload / root for root in ALLOWED_SKILL_ROOTS)
+    for root in roots:
+        root.mkdir(parents=True)
+    for index, size in enumerate(sizes):
+        path = roots[index % len(roots)] / f"file-{index}.md"
+        with path.open("wb") as stream:
+            stream.truncate(size)
+    hashed: list[Path] = []
+    monkeypatch.setattr(pr_skill_sync, limit_name, limit)
+
+    with pytest.raises(ValueError, match=message):
+        pr_skill_sync._artifact_inventory(
+            payload,
+            hash_file=lambda path: hashed.append(path) or "0" * 64,
+        )
+
+    assert hashed == []
+
+
 def test_manifest_rejects_noncanonical_json_and_source_mismatch(tmp_path: Path) -> None:
     """Catches malleable encodings and replay against another run or head."""
     artifact, _manifest = _artifact(tmp_path)
@@ -503,6 +555,142 @@ def test_pre_token_git_comparison_rejects_symlinks_and_detects_changed_bytes(
         )
 
 
+def test_pre_token_comparison_treats_executable_git_mode_as_changed(
+    tmp_path: Path,
+) -> None:
+    """Catches accepting a 100755 PR tree when the verified manifest requires 100644."""
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    _git(repository, "init", "--initial-branch=main")
+    _snapshots(repository)
+    executable = Path(ALLOWED_SKILL_ROOTS[0]) / "SKILL.md"
+    _git(repository, "add", *ALLOWED_SKILL_ROOTS)
+    _git(repository, "update-index", "--chmod=+x", executable.as_posix())
+    _git(repository, "commit", "-m", "executable snapshot")
+    head = _git(repository, "rev-parse", "HEAD").stdout.strip()
+    artifact = tmp_path / "artifact"
+    source = _source(head_sha=head)
+    build_skill_artifact(repository, artifact, source=source)
+
+    assert artifact_changed_against_commit(
+        artifact,
+        repository=repository,
+        source=source,
+    ) is True
+
+
+def test_writeback_corrects_executable_mode_drift(tmp_path: Path) -> None:
+    """Catches byte-only convergence leaving an executable generated skill committed."""
+    _remote, worktree, _initial = _bare_remote(tmp_path)
+    snapshots = _snapshots(worktree)
+    executable = Path(ALLOWED_SKILL_ROOTS[0]) / "SKILL.md"
+    _git(worktree, "add", *ALLOWED_SKILL_ROOTS)
+    _git(worktree, "update-index", "--chmod=+x", executable.as_posix())
+    (worktree / executable).chmod(0o755)
+    _git(worktree, "commit", "-m", "executable snapshots")
+    _git(worktree, "push")
+    head = _git(worktree, "rev-parse", "HEAD").stdout.strip()
+    artifact = tmp_path / "artifact"
+    source = _source(head_sha=head)
+    build_skill_artifact(snapshots, artifact, source=source)
+
+    receipt = apply_verified_writeback(
+        artifact,
+        repository=worktree,
+        source=source,
+        pull_request=_pull_request(head_sha=head),
+    )
+
+    assert receipt.changed is True
+    tree = _git(worktree, "ls-tree", "HEAD", executable.as_posix()).stdout
+    assert tree.startswith("100644 blob ")
+
+
+def test_writeback_commits_manifest_bytes_despite_pr_git_attributes(
+    tmp_path: Path,
+) -> None:
+    """Catches PR-controlled clean/ident/text attributes rewriting verified bytes."""
+    _remote, worktree, _initial = _bare_remote(tmp_path)
+    (worktree / ".gitattributes").write_text(
+        "/.agents/skills/** filter=hostile ident text eol=crlf\n"
+    )
+    _git(worktree, "config", "filter.hostile.clean", "sed s/Generic/Filtered/")
+    _git(worktree, "config", "filter.hostile.smudge", "cat")
+    _git(worktree, "config", "filter.hostile.required", "true")
+    _git(worktree, "add", ".gitattributes")
+    _git(worktree, "commit", "-m", "hostile attributes")
+    _git(worktree, "push")
+    head = _git(worktree, "rev-parse", "HEAD").stdout.strip()
+    snapshots = tmp_path / "snapshots"
+    _snapshot(snapshots, "geas", b"Generic Geas operations $Id$\n")
+    _snapshot(
+        snapshots,
+        "open-source-research-agents",
+        b"Accepted research-agent knowledge.\n",
+    )
+    artifact = tmp_path / "artifact"
+    source = _source(head_sha=head)
+    manifest = build_skill_artifact(snapshots, artifact, source=source)
+
+    receipt = apply_verified_writeback(
+        artifact,
+        repository=worktree,
+        source=source,
+        pull_request=_pull_request(head_sha=head),
+    )
+
+    assert receipt.pushed is True
+    for item in manifest.files:
+        assert _git_blob(worktree, f"HEAD:{item.path}") == (
+            artifact / "payload" / item.path
+        ).read_bytes()
+        assert _git(worktree, "ls-tree", "HEAD", item.path).stdout.startswith(
+            "100644 blob "
+        )
+
+
+def test_writeback_rejects_staged_blob_mismatch_before_push(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches a staged index mismatch reaching commit or remote mutation."""
+    remote, worktree, head = _bare_remote(tmp_path)
+    artifact = tmp_path / "artifact"
+    source = _source(head_sha=head)
+    build_skill_artifact(_snapshots(tmp_path / "snapshots"), artifact, source=source)
+    original = pr_skill_sync._write_manifest_index
+
+    def corrupt_index(
+        repository: Path,
+        payload: Path,
+        manifest: PullRequestSnapshotManifest,
+    ) -> None:
+        original(repository, payload, manifest)
+        item = manifest.files[0]
+        blob = subprocess.run(
+            ("git", "hash-object", "-w", "--stdin"),
+            cwd=repository,
+            input=b"corrupt staged bytes\n",
+            capture_output=True,
+            check=True,
+        ).stdout.decode().strip()
+        _git(repository, "update-index", "--add", "--cacheinfo", f"100644,{blob},{item.path}")
+
+    monkeypatch.setattr(pr_skill_sync, "_write_manifest_index", corrupt_index)
+    before = _git(remote, "rev-parse", "refs/heads/feature/skill-sync").stdout.strip()
+
+    with pytest.raises(RuntimeError, match="staged index"):
+        apply_verified_writeback(
+            artifact,
+            repository=worktree,
+            source=source,
+            pull_request=_pull_request(head_sha=head),
+        )
+
+    after = _git(remote, "rev-parse", "refs/heads/feature/skill-sync").stdout.strip()
+    assert after == before
+
+
 def test_workflows_pin_actions_and_keep_token_exchange_after_all_gates() -> None:
     """Catches action-tag drift, early OIDC exchange, or privileged PR execution."""
     root = Path(__file__).resolve().parents[1]
@@ -549,6 +737,18 @@ def test_workflows_pin_actions_and_keep_token_exchange_after_all_gates() -> None
     assert checkout["with"]["persist-credentials"] == "false"
     assert "id-token" not in regeneration["permissions"]
     assert all("secrets." not in str(step) for step in regeneration_steps)
+    upload = next(
+        step
+        for step in regeneration_steps
+        if step.get("uses", "").startswith("actions/upload-artifact@")
+    )
+    assert upload["with"] == {
+        "name": "geas-pr-skills",
+        "path": "pr-skill-artifact",
+        "if-no-files-found": "error",
+        "include-hidden-files": "true",
+        "retention-days": "1",
+    }
 
     steps = writeback["jobs"]["writeback"]["steps"]
     token_index = next(
@@ -577,7 +777,7 @@ def test_org_policy_contract_is_exact_and_rejects_broader_permissions(tmp_path: 
     policy = tmp_path / "geas-pr-skill-sync.sts.yaml"
     policy.write_text(
         "issuer: https://token.actions.githubusercontent.com\n"
-        "subject: repo:Epiphytic/geas:ref:refs/heads/main\n"
+        f"subject: {IMMUTABLE_SUBJECT}\n"
         "claim_patterns:\n"
         "  repository_id: '1320458746'\n"
         "  event_name: workflow_run\n"
@@ -590,6 +790,7 @@ def test_org_policy_contract_is_exact_and_rejects_broader_permissions(tmp_path: 
     )
 
     parsed = validate_org_sts_policy(policy)
+    assert parsed.subject == IMMUTABLE_SUBJECT
     assert parsed.permissions == {"contents": "write"}
     assert parsed.repositories == ("geas",)
 
@@ -622,7 +823,6 @@ def test_production_generation_uses_catalog_and_preseeded_verified_projection(
     source_repository = Path(__file__).resolve().parents[1]
     checkout = tmp_path / "checkout"
     _git(tmp_path, "clone", "--quiet", "--no-hardlinks", str(source_repository), str(checkout))
-    head = _git(checkout, "rev-parse", "HEAD").stdout.strip()
     demo = tmp_path / "demo"
     subprocess.run(
         (
@@ -641,6 +841,14 @@ def test_production_generation_uses_catalog_and_preseeded_verified_projection(
         capture_output=True,
         check=True,
     )
+    build_path = checkout / "ontology" / "open-source-research-agents" / "build.yaml"
+    build = yaml.safe_load(build_path.read_text())
+    build["topic_concept_id"] = "concept:ontology"
+    build_path.write_text(yaml.safe_dump(build, sort_keys=False))
+    refresh_catalog(checkout / "geas.yaml", names=("open-source-research-agents",))
+    _git(checkout, "add", "geas.yaml", build_path.relative_to(checkout).as_posix())
+    _git(checkout, "commit", "-m", "mutate catalog-declared export topic")
+    head = _git(checkout, "rev-parse", "HEAD").stdout.strip()
     source = _source(head_sha=head)
     first = tmp_path / "first"
     second = tmp_path / "second"
@@ -683,6 +891,10 @@ def test_production_generation_uses_catalog_and_preseeded_verified_projection(
     assert ontology.ontology.ontology_path == "ontology/open-source-research-agents"
     assert ontology.ontology.subscription_name == "geas-pr-skill-sync"
     assert ontology.ontology.ontology_commit == effective_source_commit(checkout, head)
+    assert ontology.ontology.bundle_sha256 == (
+        load_catalog(checkout / "geas.yaml").ontologies[0].bundle_sha256
+    )
+    assert ontology.projection.topic_concept_id == "concept:ontology"
     assert ontology.artifact is not None
     assert ontology.artifact.content_sha256 == hashlib.sha256(
         (demo / "query.sqlite").read_bytes()

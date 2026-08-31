@@ -11,7 +11,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path, PurePosixPath
 from typing import Literal
@@ -20,24 +20,24 @@ import yaml
 from pydantic import Field, field_validator, model_validator
 
 from research_agent.agent_skills import (
-    OntologyIdentity,
-    PortableArtifactIdentity,
-    bind_catalog_skill_provenance,
     install_builtin_geas_skill,
     install_snapshot,
     validate_snapshot,
 )
+from research_agent.catalog_skill_export import (
+    export_catalog_skill,
+    selection_from_repository_catalog,
+)
 from research_agent.models import StrictModel
 from research_agent.ontology_artifacts import (
-    ArtifactRole,
     OntologyArtifact,
-    OntologyArtifactManager,
     _sqlite_input_revision,
 )
-from research_agent.ontology_subscriptions import normalize_active_ref
-from research_agent.projection import KnowledgeQueryEngine
-from research_agent.render import render_ontology_skill
-from research_agent.repository_catalog import verify_catalog
+from research_agent.ontology_subscriptions import (
+    OntologyFreshnessConfig,
+    OntologySubscription,
+    normalize_active_ref,
+)
 
 REPOSITORY = "Epiphytic/geas"
 REPOSITORY_ID = "1320458746"
@@ -56,6 +56,7 @@ _GIT_ID = re.compile(r"[0-9a-f]{40}")
 _REPOSITORY_NAME = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 _MAX_MANIFEST_BYTES = 1024 * 1024
 _MAX_FILES = 1024
+_MAX_DIRECTORIES = 2048
 _MAX_FILE_BYTES = 10 * 1024 * 1024
 _MAX_TOTAL_BYTES = 100 * 1024 * 1024
 
@@ -164,7 +165,9 @@ class WritebackReceipt(StrictModel):
 
 class OrgStsPolicy(StrictModel):
     issuer: Literal["https://token.actions.githubusercontent.com"]
-    subject: Literal["repo:Epiphytic/geas:ref:refs/heads/main"]
+    subject: Literal[
+        "repo:Epiphytic@228616596/geas@1320458746:ref:refs/heads/main"
+    ]
     claim_patterns: dict[str, str]
     permissions: dict[str, str]
     repositories: tuple[str, ...]
@@ -247,33 +250,28 @@ def generate_repository_skill_snapshots(
         raise ValueError("skill generation worktree is not at the source head SHA")
     if _git(root, "status", "--porcelain", "--untracked-files=all").stdout:
         raise ValueError("skill generation worktree has local changes")
-    catalog = verify_catalog(
-        root / "geas.yaml",
-        names=("open-source-research-agents",),
-    )[0]
-    ontology_directory = root / "ontology" / "open-source-research-agents"
-    artifact_manifest = OntologyArtifactManager(ontology_directory).load()
-    artifacts = tuple(
-        item
-        for item in artifact_manifest.artifacts
-        if item.role is ArtifactRole.KNOWLEDGE_PROJECTION
-    )
-    if len(artifacts) != 1:
-        raise ValueError("maintained ontology must declare one knowledge projection")
-    artifact = artifacts[0]
     projection = projection.resolve()
     if projection.is_symlink() or not projection.is_file():
         raise ValueError("preseeded knowledge projection is missing or unsafe")
-    if projection.stat().st_size != artifact.size_bytes or _sha256_file(projection) != (
-        artifact.content_sha256
-    ):
-        raise ValueError("preseeded knowledge projection does not match its content address")
-    if _sqlite_input_revision(projection, artifact.role) != artifact.input_revision:
-        raise ValueError("preseeded knowledge projection input revision does not match")
     destination = destination.absolute()
     if destination.exists() or destination.is_symlink():
         raise ValueError("snapshot generation destination must not already exist")
     effective_commit = effective_source_commit(root, source.head_sha)
+    ontology_name = PurePosixPath(ALLOWED_SKILL_ROOTS[1]).name
+    subscription = OntologySubscription(
+        url=f"https://github.com/{source.repository}.git",
+        active_ref=f"refs/heads/{source.head_ref}",
+        checkout=Path("ci-pr-skill-sync"),
+        catalog=Path("geas.yaml"),
+        freshness=OntologyFreshnessConfig(check_before_use=False),
+    )
+    selection = selection_from_repository_catalog(
+        root / subscription.catalog,
+        ontology_name=ontology_name,
+        subscription_name="geas-pr-skill-sync",
+        subscription=subscription,
+        commit=effective_commit,
+    )
     try:
         destination.mkdir(parents=True)
         with tempfile.TemporaryDirectory(
@@ -295,51 +293,15 @@ def generate_repository_skill_snapshots(
             prefix="geas-pr-skill-artifact-",
             dir=destination.parent,
         ) as temporary:
-            portable = Path(temporary) / "open-source-research-agents"
-            portable.mkdir()
-            shutil.copyfile(ontology_directory / "artifacts.yaml", portable / "artifacts.yaml")
-            cached = portable / ".geas-artifacts" / "query.sqlite"
-            cached.parent.mkdir()
-            shutil.copyfile(projection, cached)
-            hydration = OntologyArtifactManager(portable).hydrate(
-                store=_NoDownloadArtifactStore(),
-                roles=(ArtifactRole.KNOWLEDGE_PROJECTION,),
-            )
-            hydrated = hydration.hydrated[0]
-            topic = KnowledgeQueryEngine(Path(hydrated.path)).topic(
-                "concept:open-source-research-agents"
-            )
-            rendered = render_ontology_skill(
-                topic,
-                skill_name="open-source-research-agents",
-                ontology_name="open-source-research-agents",
-                repository_url="https://github.com/Epiphytic/geas.git",
-                branch=source.head_ref,
-                ontology_commit=effective_commit,
+            exported = export_catalog_skill(
+                selection,
+                artifact_store=_PreseededProjectionStore(projection),
+                skill_name=ontology_name,
                 geas_version=_installed_version(),
                 geas_commit=effective_commit,
+                artifact_workspace=Path(temporary) / "artifacts",
             )
-            rendered = bind_catalog_skill_provenance(
-                rendered,
-                ontology=OntologyIdentity(
-                    name="open-source-research-agents",
-                    repository_url="https://github.com/Epiphytic/geas.git",
-                    branch=source.head_ref,
-                    commit=effective_commit,
-                    active_ref=f"refs/heads/{source.head_ref}",
-                    ontology_commit=effective_commit,
-                    subscription_name="geas-pr-skill-sync",
-                    catalog_path="geas.yaml",
-                    ontology_path="ontology/open-source-research-agents",
-                    bundle_sha256=catalog.bundle_sha256,
-                ),
-                artifact=PortableArtifactIdentity(
-                    role="knowledge-projection",
-                    content_sha256=hydrated.content_sha256,
-                    input_revision=hydrated.input_revision,
-                ),
-            )
-            install_snapshot(rendered, destination / ALLOWED_SKILL_ROOTS[1])
+            install_snapshot(exported.files, destination / ALLOWED_SKILL_ROOTS[1])
         return tuple(
             _snapshot_identity(destination / root_value) for root_value in ALLOWED_SKILL_ROOTS
         )
@@ -348,8 +310,11 @@ def generate_repository_skill_snapshots(
         raise
 
 
-class _NoDownloadArtifactStore:
-    """Fail if a supposedly preseeded immutable projection attempts network hydration."""
+class _PreseededProjectionStore:
+    """Hydrate from one verified local projection without network or publication."""
+
+    def __init__(self, projection: Path) -> None:
+        self.projection = projection
 
     def available(self, _artifact: OntologyArtifact) -> bool:
         return True
@@ -357,8 +322,19 @@ class _NoDownloadArtifactStore:
     def ensure(self, _artifact: OntologyArtifact, _source: Path) -> bool:
         raise AssertionError("PR skill generation must not publish ontology artifacts")
 
-    def download(self, _artifact: OntologyArtifact, _destination: Path) -> None:
-        raise AssertionError("PR skill generation must not download ontology artifacts")
+    def download(self, artifact: OntologyArtifact, destination: Path) -> None:
+        source = self.projection
+        if source.is_symlink() or not source.is_file():
+            raise ValueError("preseeded knowledge projection is missing or unsafe")
+        if source.stat().st_size != artifact.size_bytes:
+            raise ValueError("preseeded knowledge projection has the wrong size")
+        if _sha256_file(source) != artifact.content_sha256:
+            raise ValueError("preseeded knowledge projection has the wrong content address")
+        if _sqlite_input_revision(source, artifact.role) != artifact.input_revision:
+            raise ValueError("preseeded knowledge projection has the wrong input revision")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, destination)
+        destination.chmod(0o644)
 
 
 def generate_pull_request_artifact(
@@ -444,11 +420,9 @@ def verify_skill_artifact(
     if manifest.source != expected:
         raise ValueError("skill artifact source metadata does not match the workflow run")
     payload = root / _PAYLOAD_NAME
-    _assert_regular_tree(payload, label="skill artifact payload")
-    actual = _artifact_inventory(payload)
+    actual, actual_directories = _artifact_state(payload)
     if actual != manifest.files:
         _raise_inventory_mismatch(actual, manifest.files)
-    actual_directories = _directory_inventory(payload)
     expected_directories = _expected_directories(manifest.files)
     if actual_directories != expected_directories:
         raise ValueError("skill artifact directory inventory is not closed")
@@ -610,7 +584,8 @@ def apply_verified_writeback(
         if target.exists():
             shutil.rmtree(target)
         _copy_regular_tree(payload / root_value, target)
-    _git(root, "add", "-A", "--", *ALLOWED_SKILL_ROOTS)
+    _write_manifest_index(root, payload, manifest)
+    _verify_staged_index(root, payload, manifest)
     staged = tuple(
         path
         for path in _git(
@@ -637,6 +612,8 @@ def apply_verified_writeback(
         "ci: refresh generated skill snapshots",
     )
     commit = _git(root, "rev-parse", "HEAD").stdout.strip()
+    if not _git_tree_matches(root, commit, payload, manifest):
+        raise RuntimeError("committed skill tree does not match the verified manifest")
     lease = f"refs/heads/{source.head_ref}:{source.head_sha}"
     pushed = _git(
         root,
@@ -715,22 +692,76 @@ def _installed_version() -> str:
         return "0.1.0"
 
 
-def _artifact_inventory(root: Path) -> tuple[ArtifactFile, ...]:
+def _artifact_inventory(
+    root: Path,
+    *,
+    hash_file: Callable[[Path], str] | None = None,
+) -> tuple[ArtifactFile, ...]:
+    return _artifact_state(root, hash_file=hash_file)[0]
+
+
+def _artifact_state(
+    root: Path,
+    *,
+    hash_file: Callable[[Path], str] | None = None,
+) -> tuple[tuple[ArtifactFile, ...], set[str]]:
+    paths, directories = _bounded_artifact_tree(root)
+    hasher = hash_file or _sha256_file
     files: list[ArtifactFile] = []
-    for path in _regular_files(root, label="skill artifact payload"):
+    for path, size_bytes in paths:
         relative = path.relative_to(root).as_posix()
         _validate_payload_path(relative)
-        mode = stat.S_IMODE(path.stat().st_mode)
-        if mode != 0o644:
-            raise ValueError("skill artifact file mode must be 100644")
         files.append(
             ArtifactFile(
                 path=relative,
-                size_bytes=path.stat().st_size,
-                sha256=_sha256_file(path),
+                size_bytes=size_bytes,
+                sha256=hasher(path),
             )
         )
-    return tuple(sorted(files, key=lambda item: item.path.encode("utf-8")))
+    return (
+        tuple(sorted(files, key=lambda item: item.path.encode("utf-8"))),
+        directories,
+    )
+
+
+def _bounded_artifact_tree(root: Path) -> tuple[tuple[tuple[Path, int], ...], set[str]]:
+    if root.is_symlink() or not root.is_dir():
+        raise ValueError("skill artifact payload root is missing or a symbolic link")
+    files: list[tuple[Path, int]] = []
+    directories: set[str] = set()
+    total_bytes = 0
+    pending = [root]
+    while pending:
+        current = pending.pop()
+        with os.scandir(current) as entries:
+            for entry in entries:
+                path = Path(entry.path)
+                if entry.is_symlink():
+                    raise ValueError("skill artifact payload contains a symbolic link")
+                metadata = entry.stat(follow_symlinks=False)
+                if stat.S_ISDIR(metadata.st_mode):
+                    relative = path.relative_to(root).as_posix()
+                    directories.add(relative)
+                    if len(directories) > _MAX_DIRECTORIES:
+                        raise ValueError("skill artifact payload contains too many directories")
+                    pending.append(path)
+                    continue
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise ValueError("skill artifact payload contains a non-regular entry")
+                if len(files) >= _MAX_FILES:
+                    raise ValueError("skill artifact payload contains too many files")
+                if metadata.st_size > _MAX_FILE_BYTES:
+                    raise ValueError("skill artifact payload file size exceeds the limit")
+                total_bytes += metadata.st_size
+                if total_bytes > _MAX_TOTAL_BYTES:
+                    raise ValueError("skill artifact payload total size exceeds the limit")
+                if stat.S_IMODE(metadata.st_mode) != 0o644:
+                    raise ValueError("skill artifact file mode must be 100644")
+                files.append((path, metadata.st_size))
+    return (
+        tuple(sorted(files, key=lambda item: item[0].relative_to(root).as_posix().encode())),
+        directories,
+    )
 
 
 def _regular_files(root: Path, *, label: str) -> tuple[Path, ...]:
@@ -771,15 +802,6 @@ def _copy_regular_tree(source: Path, destination: Path) -> None:
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(path, target)
         target.chmod(0o644)
-
-
-def _directory_inventory(root: Path) -> set[str]:
-    result: set[str] = set()
-    for current, directories, _filenames in os.walk(root, followlinks=False):
-        current_path = Path(current)
-        for name in directories:
-            result.add((current_path / name).relative_to(root).as_posix())
-    return result
 
 
 def _expected_directories(files: Sequence[ArtifactFile]) -> set[str]:
@@ -828,9 +850,110 @@ def _worktree_matches(
     if actual_paths != expected_paths:
         return False
     return all(
-        (repository / item.path).read_bytes() == (payload / item.path).read_bytes()
+        stat.S_IMODE((repository / item.path).stat().st_mode) == 0o644
+        and (repository / item.path).read_bytes() == (payload / item.path).read_bytes()
         for item in files
     )
+
+
+def _write_manifest_index(
+    repository: Path,
+    payload: Path,
+    manifest: PullRequestSnapshotManifest,
+) -> None:
+    """Write exact verified blobs to the index without consulting Git attributes."""
+    tracked = tuple(
+        path
+        for path in _git(
+            repository,
+            "ls-files",
+            "-z",
+            "--",
+            *ALLOWED_SKILL_ROOTS,
+        ).stdout.split("\x00")
+        if path
+    )
+    for path in tracked:
+        if not _path_is_allowed(path):
+            raise RuntimeError("tracked skill path escaped the two managed roots")
+        _git(repository, "update-index", "--force-remove", "--", path)
+    for item in manifest.files:
+        source = payload / item.path
+        data = source.read_bytes()
+        if (
+            len(data) != item.size_bytes
+            or hashlib.sha256(data).hexdigest() != item.sha256
+            or stat.S_IMODE(source.stat().st_mode) != 0o644
+        ):
+            raise RuntimeError("verified artifact changed before index construction")
+        blob = _git_hash_object(repository, data, write=True)
+        _git(
+            repository,
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            f"{item.mode},{blob},{item.path}",
+        )
+
+
+def _verify_staged_index(
+    repository: Path,
+    payload: Path,
+    manifest: PullRequestSnapshotManifest,
+) -> None:
+    """Require the complete stage-zero index to equal manifest bytes and modes."""
+    actual: dict[str, tuple[str, str]] = {}
+    entries = _git(
+        repository,
+        "ls-files",
+        "--stage",
+        "-z",
+        "--",
+        *ALLOWED_SKILL_ROOTS,
+    ).stdout
+    for entry in entries.split("\x00"):
+        if not entry:
+            continue
+        metadata, separator, path = entry.partition("\t")
+        if not separator or not _path_is_allowed(path):
+            raise RuntimeError("staged index contains an unsafe skill entry")
+        mode, object_id, stage = metadata.split()
+        if stage != "0" or path in actual:
+            raise RuntimeError("staged index contains a non-canonical skill entry")
+        actual[path] = (mode, object_id)
+    expected_paths = {item.path for item in manifest.files}
+    if set(actual) != expected_paths:
+        raise RuntimeError("staged index inventory does not match the verified manifest")
+    for item in manifest.files:
+        expected_blob = _git_hash_object(
+            repository,
+            (payload / item.path).read_bytes(),
+            write=False,
+        )
+        if actual[item.path] != (item.mode, expected_blob):
+            raise RuntimeError("staged index bytes or mode do not match the verified manifest")
+
+
+def _git_hash_object(repository: Path, data: bytes, *, write: bool) -> str:
+    arguments = ["hash-object"]
+    if write:
+        arguments.append("-w")
+    arguments.append("--stdin")
+    try:
+        result = subprocess.run(
+            ("git", *arguments),
+            cwd=repository,
+            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+            input=data,
+            capture_output=True,
+            check=True,
+        )
+    except subprocess.CalledProcessError as error:
+        raise RuntimeError("bounded Git object operation failed") from error
+    object_id = result.stdout.decode("ascii").strip()
+    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", object_id):
+        raise RuntimeError("Git object operation returned an invalid identity")
+    return object_id
 
 
 def _assert_no_symlink_path(root: Path, relative: Path) -> None:
@@ -1038,7 +1161,7 @@ def _git_tree_matches(
 ) -> bool:
     """Compare blobs without checking out or executing the untrusted PR tree."""
     _assert_git_tree_roots_safe(repository, commit)
-    listed: set[str] = set()
+    listed: dict[str, str] = {}
     for root_value in ALLOWED_SKILL_ROOTS:
         result = _git(
             repository,
@@ -1060,11 +1183,13 @@ def _git_tree_matches(
                 raise ValueError("pull-request skill tree contains a symbolic link")
             if mode not in {"100644", "100755"} or not _path_is_allowed(path):
                 raise ValueError("pull-request skill tree contains an unsafe entry")
-            listed.add(path)
+            listed[path] = mode
     expected = {item.path for item in manifest.files}
-    if listed != expected:
+    if set(listed) != expected:
         return False
     for item in manifest.files:
+        if listed[item.path] != item.mode:
+            return False
         blob = _git_bytes(repository, "show", f"{commit}:{item.path}")
         if blob != (payload / item.path).read_bytes():
             return False
