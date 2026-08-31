@@ -30,6 +30,35 @@ def test_placeholder_must_be_the_complete_assignment_rhs(assignment: bytes) -> N
 
 
 @pytest.mark.parametrize(
+    "content",
+    (
+        b"FIRECRAWL_KEY=operator-secret-value-123\r",
+        b"FIRECRAWL_KEY=operator-secret-value-123\rNEXT=value\n",
+        b"FIRECRAWL_KEY=operator-secret-value-123\r\rNEXT=value\n",
+        b"FIRECRAWL_KEY=operator-secret-value-123\r\nNEXT=value\n",
+        b"prefix=value\nFIRECRAWL_KEY=operator-secret-value-123\nNEXT=value",
+        b"prefix=value\r\nFIRECRAWL_KEY=operator-secret-value-123\rNEXT=value\n",
+        b"prefix=\x00\rFIRECRAWL_KEY=operator-secret-value-123\r\x01NEXT=value\n",
+        b"FIRECRAWL_KEY=operator-secret-value-123\x00\rNEXT=value\n",
+    ),
+    ids=(
+        "terminal-cr",
+        "interior-cr",
+        "repeated-cr",
+        "crlf",
+        "lf",
+        "mixed-separators",
+        "controls-around-separators",
+        "nul-before-separator",
+    ),
+)
+def test_line_separator_variants_cannot_hide_sensitive_assignment(
+    content: bytes,
+) -> None:
+    assert contains_possible_credential(content) is True
+
+
+@pytest.mark.parametrize(
     "assignment",
     (
         b"FIRECRAWL_KEY=your_firecrawl_key\n",
@@ -38,6 +67,8 @@ def test_placeholder_must_be_the_complete_assignment_rhs(assignment: bytes) -> N
         b"FIRECRAWL_KEY=your_firecrawl_key # public documentation\n",
         b'FIRECRAWL_KEY="your_firecrawl_key"  # public documentation\n',
         b'FIRECRAWL_KEY="your_firecrawl_key"  \r\n',
+        b"FIRECRAWL_KEY=your_firecrawl_key\rNEXT=value\n",
+        b"FIRECRAWL_KEY=your_firecrawl_key\r\rNEXT=value\n",
         b'FIREWORKS_KEY="api_key"\n',
     ),
 )

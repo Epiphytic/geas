@@ -21,6 +21,7 @@ import yaml
 from pydantic import Field, field_validator, model_validator
 
 from research_agent.credential_scanning import (
+    contains_credential_assignment_marker,
     contains_fixed_credential,
     contains_possible_credential,
 )
@@ -695,9 +696,7 @@ def _scan_sqlite_values(path: Path) -> None:
                 "ORDER BY type, name, tbl_name, rootpage, sql"
             )
             for (value,) in schema_values:
-                _raise_for_sqlite_credential(path, value)
-                for fragment in _sqlite_quoted_fragments(value):
-                    _raise_for_sqlite_credential(path, fragment)
+                _raise_for_sqlite_schema_credential(path, value)
             tables = tuple(
                 row[0]
                 for row in connection.execute(
@@ -732,35 +731,14 @@ def _raise_for_sqlite_credential(path: Path, value: str | bytes) -> None:
         )
 
 
-def _sqlite_quoted_fragments(value: str) -> tuple[str, ...]:
-    """Return inert SQLite string and quoted-identifier contents."""
-    fragments: list[str] = []
-    index = 0
-    while index < len(value):
-        opener = value[index]
-        if opener not in {'"', "'", "`", "["}:
-            index += 1
-            continue
-        closer = "]" if opener == "[" else opener
-        index += 1
-        parts: list[str] = []
-        start = index
-        while index < len(value):
-            if value[index] != closer:
-                index += 1
-                continue
-            parts.append(value[start:index])
-            if opener != "[" and index + 1 < len(value) and value[index + 1] == closer:
-                parts.append(closer)
-                index += 2
-                start = index
-                continue
-            fragments.append("".join(parts))
-            index += 1
-            break
-        else:
-            raise ValueError("unterminated quoted SQLite schema text")
-    return tuple(fragments)
+def _raise_for_sqlite_schema_credential(path: Path, value: str) -> None:
+    content = value.encode("utf-8")
+    if contains_fixed_credential(content) or contains_credential_assignment_marker(
+        content
+    ):
+        raise OntologyArtifactError(
+            f"possible credential detected in ontology artifact: {path}"
+        )
 
 
 def _quoted_sqlite_identifier(value: str) -> str:

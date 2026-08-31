@@ -9,9 +9,13 @@ _FIXED_CREDENTIAL_PATTERNS = (
     re.compile(rb"\bAKIA[0-9A-Z]{16}\b"),
     re.compile(rb"\bsk-[A-Za-z0-9_-]{20,}\b"),
 )
+_CREDENTIAL_NAME = rb"[A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD)"
+_CREDENTIAL_ASSIGNMENT_MARKER = re.compile(
+    rb"(?i)" + _CREDENTIAL_NAME + rb"\s*[:=]"
+)
 _CREDENTIAL_ASSIGNMENT = re.compile(
-    rb"(?im)^\s*(?P<name>[A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD))\s*[:=]"
-    rb"(?P<rhs>[^\r\n]*)\r?$"
+    rb"(?im)^[ \t]*(?P<name>" + _CREDENTIAL_NAME + rb")[ \t]*[:=]"
+    rb"(?P<rhs>[^\n]*)$"
 )
 _INERT_LITERAL = re.compile(rb"[A-Za-z0-9._/-]*")
 _MIN_CREDENTIAL_LENGTH = 12
@@ -28,7 +32,8 @@ def contains_possible_credential(content: Buffer) -> bool:
     """
     if contains_fixed_credential(content):
         return True
-    for match in _CREDENTIAL_ASSIGNMENT.finditer(content):
+    normalized = _normalize_line_separators(content)
+    for match in _CREDENTIAL_ASSIGNMENT.finditer(normalized):
         if _assignment_rhs_is_sensitive(match.group("name"), match.group("rhs")):
             return True
     return False
@@ -37,6 +42,16 @@ def contains_possible_credential(content: Buffer) -> bool:
 def contains_fixed_credential(content: Buffer) -> bool:
     """Return whether content contains a fixed-format credential signature."""
     return any(pattern.search(content) for pattern in _FIXED_CREDENTIAL_PATTERNS)
+
+
+def contains_credential_assignment_marker(content: Buffer) -> bool:
+    """Return whether inert bytes contain a credential-like assignment marker."""
+    return _CREDENTIAL_ASSIGNMENT_MARKER.search(content) is not None
+
+
+def _normalize_line_separators(content: Buffer) -> bytes:
+    """Represent CRLF, lone CR, and LF separators uniformly without decoding."""
+    return bytes(content).replace(b"\r\n", b"\n").replace(b"\r", b"\n")
 
 
 def _assignment_rhs_is_sensitive(name: bytes, rhs: bytes) -> bool:

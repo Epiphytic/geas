@@ -324,6 +324,9 @@ def test_git_sync_accepts_documented_public_placeholders(
         "FIRECRAWL_KEY=your_${K}\n",
         "FIRECRAWL_KEY=your_$(x)\n",
         "FIRECRAWL_KEY=your_;id\n",
+        "FIRECRAWL_KEY=operator-secret-value-123\rNEXT=value\n",
+        "FIRECRAWL_KEY=operator-secret-value-123\r\rNEXT=value\n",
+        "prefix=\x0b\rFIRECRAWL_KEY=operator-secret-value-123\r\x0cNEXT=value\n",
     ),
 )
 def test_git_sync_rejects_ambiguous_assignment_without_commit_or_remote_write(

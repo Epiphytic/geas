@@ -212,9 +212,12 @@ def test_artifact_publication_rejects_placeholder_concatenation_without_upload(
         b"FIRECRAWL_KEY=your_${K}\n",
         b"FIRECRAWL_KEY=your_$(x)\n",
         b"FIRECRAWL_KEY=your_;id\n",
+        b"FIRECRAWL_KEY=operator-secret-value-123\rNEXT=value\n",
+        b"FIRECRAWL_KEY=operator-secret-value-123\r\rNEXT=value\n",
+        b"prefix=\x00\rFIRECRAWL_KEY=operator-secret-value-123\r\x01NEXT=value\n",
     ),
 )
-def test_raw_artifact_rejects_ambiguous_short_assignment_without_upload(
+def test_raw_artifact_rejects_credential_bypass_without_upload(
     tmp_path: Path,
     assignment: bytes,
 ) -> None:
@@ -270,6 +273,11 @@ def test_sqlite_artifact_rejects_placeholder_concatenation_without_upload(
     (
         ("TEXT", "FIRECRAWL_KEY=your_${K}\n"),
         ("BLOB", b"FIRECRAWL_KEY=your_$(x)\n"),
+        ("TEXT", "FIRECRAWL_KEY=operator-secret-value-123\rNEXT=value\n"),
+        (
+            "BLOB",
+            b"prefix=\x00\rFIRECRAWL_KEY=operator-secret-value-123\r\r\x01NEXT=value\n",
+        ),
     ),
 )
 def test_sqlite_artifact_scans_every_text_and_blob_value_without_upload(
@@ -300,6 +308,39 @@ def test_sqlite_artifact_scans_every_text_and_blob_value_without_upload(
 
 
 @pytest.mark.parametrize(
+    ("column_type", "assignment"),
+    (
+        ("TEXT", "FIRECRAWL_KEY=your_firecrawl_key\rNEXT=value\n"),
+        ("BLOB", b"FIRECRAWL_KEY=your_firecrawl_key\r\rNEXT=value\n"),
+    ),
+)
+def test_sqlite_stored_values_keep_normal_placeholder_classification(
+    tmp_path: Path,
+    column_type: str,
+    assignment: str | bytes,
+) -> None:
+    ontology = tmp_path / "routing"
+    ontology.mkdir()
+    database = tmp_path / "library.sqlite"
+    _library_database(database)
+    with sqlite3.connect(database) as connection:
+        connection.execute(f"CREATE TABLE source_text(content {column_type} NOT NULL)")
+        connection.execute("INSERT INTO source_text VALUES (?)", (assignment,))
+    store = MemoryArtifactStore().use_root(tmp_path / "remote-assets")
+
+    receipt = OntologyArtifactManager(ontology).publish(
+        store=store,
+        published_by="test:operator",
+        storage_rights_basis="public documentation fixture",
+        source_library=database,
+    )
+
+    assert receipt.published == (ArtifactRole.SOURCE_LIBRARY,)
+    assert len(store.values) == 1
+    assert (ontology / "artifacts.yaml").is_file()
+
+
+@pytest.mark.parametrize(
     "schema_sql",
     (
         """CREATE TABLE leaked_default(
@@ -325,6 +366,60 @@ def test_sqlite_artifact_scans_every_schema_sql_surface_without_upload(
     _library_database(database)
     with sqlite3.connect(database) as connection:
         connection.execute("CREATE TABLE source_text(content TEXT NOT NULL)")
+        connection.execute(schema_sql)
+    store = MemoryArtifactStore().use_root(tmp_path / "remote-assets")
+
+    with pytest.raises(OntologyArtifactError, match="possible credential"):
+        OntologyArtifactManager(ontology).publish(
+            store=store,
+            published_by="test:operator",
+            storage_rights_basis="operator-confirmed private storage",
+            source_library=database,
+        )
+
+    assert store.values == {}
+    assert tuple((tmp_path / "remote-assets").iterdir()) == ()
+    assert not (ontology / "artifacts.yaml").exists()
+
+
+@pytest.mark.parametrize(
+    "schema_sql",
+    (
+        """CREATE TABLE split_default(
+            content TEXT DEFAULT ('FIRECRAWL_KEY=operator-' || 'secret-value-123')
+        )""",
+        """CREATE VIEW split_view AS
+            SELECT 'FIRECRAWL_KEY=' || 'operator-' || 'secret-value-123' AS content""",
+        """CREATE VIEW printf_view AS
+            SELECT printf('FIRECRAWL_KEY=%s', 'operator-secret-value-123') AS content""",
+        """CREATE VIEW char_view AS
+            SELECT 'FIRECRAWL_KEY=' || char(111, 112, 101, 114, 97, 116, 111, 114)
+            AS content""",
+        """CREATE TABLE comment_marker(
+            content TEXT /* FIRECRAWL_KEY=operator-secret-value-123 */
+        )""",
+        """CREATE TABLE placeholder_default(
+            content TEXT DEFAULT 'FIRECRAWL_KEY=your_firecrawl_key'
+        )""",
+    ),
+    ids=(
+        "concatenated-default",
+        "multiple-view-literals",
+        "printf-view",
+        "char-view",
+        "comment",
+        "placeholder",
+    ),
+)
+def test_sqlite_schema_rejects_assignment_marker_without_evaluating_sql(
+    tmp_path: Path,
+    schema_sql: str,
+) -> None:
+    ontology = tmp_path / "routing"
+    ontology.mkdir()
+    database = tmp_path / "library.sqlite"
+    _library_database(database)
+    with sqlite3.connect(database) as connection:
         connection.execute(schema_sql)
     store = MemoryArtifactStore().use_root(tmp_path / "remote-assets")
 
