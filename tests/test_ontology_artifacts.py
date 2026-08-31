@@ -483,6 +483,8 @@ def test_sqlite_text_and_blob_reject_every_forbidden_control_position(
 @pytest.mark.parametrize(
     ("column_type", "assignment"),
     (
+        ("TEXT", "FIRECRAWL_KEY=your_firecrawl_key"),
+        ("BLOB", b"FIRECRAWL_KEY=your_firecrawl_key"),
         ("TEXT", "FIRECRAWL_KEY=your_firecrawl_key\rNEXT=value\n"),
         ("BLOB", b"FIRECRAWL_KEY=your_firecrawl_key\r\rNEXT=value\n"),
     ),

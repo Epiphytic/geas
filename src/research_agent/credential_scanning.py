@@ -130,6 +130,12 @@ def _iter_binary_assignment_markers(
 
     for index in range(len(content)):
         value = content[index]
+        if value in {0x0A, 0x0D}:
+            token_start = None
+            suffix.clear()
+            after_name = False
+            obfuscated = False
+            continue
         if value < 0x20 or value == 0x7F:
             if token_start is not None:
                 obfuscated = True
@@ -186,26 +192,27 @@ def _is_live_sqlite_record_placeholder(
 ) -> bool:
     if len(candidate) < 2:
         return False
-    serial_type_byte = candidate[0]
-    assignment = candidate[1:]
     for value, is_text in live_values:
+        if _live_value_contains_candidate(value, candidate):
+            return True
         serial_type = 2 * len(value) + (13 if is_text else 12)
-        if serial_type >= 0x80 or serial_type_byte != serial_type:
+        if serial_type >= 0x80 or candidate[0] != serial_type:
             continue
-        if assignment == value:
-            return True
-        if value.startswith(assignment) and value[len(assignment) : len(assignment) + 1] in {
-            b"\n",
-            b"\r",
-        }:
-            return True
-        if (
-            assignment[:-1] == value
-            and assignment[-1] < 0x20
-            and assignment[-1] not in {0x0A, 0x0D}
-        ):
+        if _live_value_contains_candidate(value, candidate[1:]):
             return True
     return False
+
+
+def _live_value_contains_candidate(value: bytes, candidate: bytes) -> bool:
+    if candidate in value:
+        return True
+    return bool(
+        candidate
+        and candidate[-1] != 0x09
+        and not 0x20 <= candidate[-1] < 0x7F
+        and candidate[-1] not in {0x0A, 0x0D}
+        and candidate[:-1] in value
+    )
 
 
 def contains_credential_assignment_marker(content: Buffer) -> bool:
