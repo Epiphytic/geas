@@ -33,6 +33,7 @@ from research_agent.ontology_artifacts import (
     OntologyArtifact,
     _sqlite_input_revision,
 )
+from research_agent.ontology_resolution import OntologySelection
 from research_agent.ontology_subscriptions import (
     OntologyFreshnessConfig,
     OntologySubscription,
@@ -257,21 +258,12 @@ def generate_repository_skill_snapshots(
     if destination.exists() or destination.is_symlink():
         raise ValueError("snapshot generation destination must not already exist")
     effective_commit = effective_source_commit(root, source.head_sha)
-    ontology_name = PurePosixPath(ALLOWED_SKILL_ROOTS[1]).name
-    subscription = OntologySubscription(
-        url=f"https://github.com/{source.repository}.git",
-        active_ref=f"refs/heads/{source.head_ref}",
-        checkout=Path("ci-pr-skill-sync"),
-        catalog=Path("geas.yaml"),
-        freshness=OntologyFreshnessConfig(check_before_use=False),
-    )
-    selection = selection_from_repository_catalog(
-        root / subscription.catalog,
-        ontology_name=ontology_name,
-        subscription_name="geas-pr-skill-sync",
-        subscription=subscription,
+    selection = _pull_request_catalog_selection(
+        root,
+        source=source,
         commit=effective_commit,
     )
+    ontology_name = selection.name
     try:
         destination.mkdir(parents=True)
         with tempfile.TemporaryDirectory(
@@ -359,7 +351,12 @@ def generate_pull_request_artifact(
     ) as temporary:
         temporary_root = Path(temporary)
         demo_root = temporary_root / "demo"
-        demo = root / "ontology" / "open-source-research-agents" / "demo.sh"
+        selection = _pull_request_catalog_selection(
+            root,
+            source=source,
+            commit=effective_source_commit(root, source.head_sha),
+        )
+        demo = selection.verified_ontology_directory / "demo.sh"
         try:
             subprocess.run(
                 (str(demo), str(demo_root)),
@@ -391,6 +388,29 @@ def generate_pull_request_artifact(
         if _snapshot_state(first) != _snapshot_state(second):
             raise ValueError("independent skill generations produced different bytes")
         return build_skill_artifact(first, artifact_root, source=source)
+
+
+def _pull_request_catalog_selection(
+    repository: Path,
+    *,
+    source: ArtifactSource,
+    commit: str,
+) -> OntologySelection:
+    ontology_name = PurePosixPath(ALLOWED_SKILL_ROOTS[1]).name
+    subscription = OntologySubscription(
+        url=f"https://github.com/{source.repository}.git",
+        active_ref=f"refs/heads/{source.head_ref}",
+        checkout=Path("ci-pr-skill-sync"),
+        catalog=Path("geas.yaml"),
+        freshness=OntologyFreshnessConfig(check_before_use=False),
+    )
+    return selection_from_repository_catalog(
+        repository / subscription.catalog,
+        ontology_name=ontology_name,
+        subscription_name="geas-pr-skill-sync",
+        subscription=subscription,
+        commit=commit,
+    )
 
 
 def verify_skill_artifact(
