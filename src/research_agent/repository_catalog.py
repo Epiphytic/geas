@@ -120,6 +120,7 @@ class VerifiedCatalogOntology(StrictModel):
     description: str
     catalog_path: Path
     ontology_path: Path
+    workspace_path: Path
     files: tuple[CatalogFile, ...]
     bundle_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     dirty: bool = False
@@ -214,7 +215,12 @@ def refresh_catalog(path: Path, *, names: Sequence[str] = ()) -> RepositoryCatal
         candidate = candidate.model_copy(
             update={"bundle_sha256": ontology_bundle_sha256(candidate)}
         )
-        _verify_transitive_inputs(ontology_path, candidate.files, workspace=workspace)
+        _verify_transitive_inputs(
+            ontology_path,
+            candidate.files,
+            workspace=workspace,
+            workspace_path=_workspace_ontology_path(ontology_path, workspace),
+        )
         refreshed.append(candidate)
     result = RepositoryCatalog(version=1, ontologies=tuple(refreshed))
     _atomic_yaml_replace(catalog_path, result)
@@ -326,6 +332,7 @@ def _verify_entry(
     catalog_path: Path, entry: CatalogOntology, *, workspace: Path
 ) -> VerifiedCatalogOntology:
     ontology_path = _ontology_directory(catalog_path, entry)
+    workspace_path = _workspace_ontology_path(ontology_path, workspace)
     for item in entry.files:
         file_path = _regular_file(ontology_path, item.path)
         content = file_path.read_bytes()
@@ -333,7 +340,12 @@ def _verify_entry(
             raise ValueError(f"declared inventory size mismatch: {item.path.as_posix()}")
         if hashlib.sha256(content).hexdigest() != item.sha256:
             raise ValueError(f"declared inventory sha256 mismatch: {item.path.as_posix()}")
-    _verify_transitive_inputs(ontology_path, entry.files, workspace=workspace)
+    _verify_transitive_inputs(
+        ontology_path,
+        entry.files,
+        workspace=workspace,
+        workspace_path=workspace_path,
+    )
     digest = ontology_bundle_sha256(entry)
     if digest != entry.bundle_sha256:
         raise ValueError("catalog bundle digest mismatch")
@@ -342,13 +354,18 @@ def _verify_entry(
         description=entry.description,
         catalog_path=catalog_path,
         ontology_path=ontology_path,
+        workspace_path=workspace_path,
         files=entry.files,
         bundle_sha256=digest,
     )
 
 
 def _verify_transitive_inputs(
-    ontology_path: Path, files: Sequence[CatalogFile], *, workspace: Path
+    ontology_path: Path,
+    files: Sequence[CatalogFile],
+    *,
+    workspace: Path | None,
+    workspace_path: Path,
 ) -> None:
     declared = {item.path.as_posix() for item in files}
     for item in files:
@@ -370,15 +387,28 @@ def _verify_transitive_inputs(
         if not isinstance(value, dict):
             continue
         for reference in _path_strings(value.get("seed_bundles")):
+            relative = _workspace_input_path(reference, workspace_path=workspace_path)
             _require_declared_input(
-                workspace / _relative_path(reference, label="workspace seed bundle path"),
+                (workspace / _relative_path(reference, label="workspace seed bundle path"))
+                if workspace is not None
+                else ontology_path / relative,
                 ontology_path=ontology_path,
                 declared=declared,
                 label="workspace seed bundle",
                 required=True,
             )
         for pattern in _path_strings(value.get("seed_bundle_globs")):
-            for bundle_path in _seed_glob_paths(workspace, pattern):
+            _workspace_glob_path(pattern, workspace_path=workspace_path)
+            bundle_paths = (
+                _seed_glob_paths(workspace, pattern)
+                if workspace is not None
+                else _relocated_seed_glob_paths(
+                    ontology_path,
+                    pattern,
+                    workspace_path=workspace_path,
+                )
+            )
+            for bundle_path in bundle_paths:
                 _require_declared_input(
                     bundle_path,
                     ontology_path=ontology_path,
@@ -386,6 +416,50 @@ def _verify_transitive_inputs(
                     label="workspace seed bundle",
                     required=True,
                 )
+
+
+def _workspace_ontology_path(ontology_path: Path, workspace: Path) -> Path:
+    resolved_workspace = workspace.resolve(strict=True)
+    if not ontology_path.is_relative_to(resolved_workspace):
+        raise ValueError("ontology directory escapes workspace")
+    relative = ontology_path.relative_to(resolved_workspace)
+    return _relative_path(relative, label="workspace ontology path")
+
+
+def _workspace_input_path(reference: str, *, workspace_path: Path) -> Path:
+    reference_path = _relative_path(reference, label="workspace seed bundle path")
+    try:
+        relative = reference_path.relative_to(workspace_path)
+    except ValueError as error:
+        raise ValueError("workspace seed bundle escapes ontology directory") from error
+    return relative
+
+
+def _relocated_seed_glob_paths(
+    ontology_path: Path,
+    pattern: str,
+    *,
+    workspace_path: Path,
+) -> tuple[Path, ...]:
+    relative_pattern = _workspace_glob_path(pattern, workspace_path=workspace_path)
+    try:
+        matches = tuple(ontology_path.glob(relative_pattern.as_posix()))
+    except ValueError as error:
+        raise ValueError("workspace seed bundle glob is invalid") from error
+    return tuple(
+        sorted(
+            (path for path in matches if path.is_file()),
+            key=lambda path: path.relative_to(ontology_path).as_posix().encode("utf-8"),
+        )
+    )
+
+
+def _workspace_glob_path(pattern: str, *, workspace_path: Path) -> Path:
+    workspace_pattern = _relative_path(pattern, label="workspace seed bundle glob")
+    try:
+        return workspace_pattern.relative_to(workspace_path)
+    except ValueError as error:
+        raise ValueError("workspace seed bundle glob escapes ontology directory") from error
 
 
 def _require_declared_input(

@@ -264,6 +264,29 @@ def test_verify_catalog_rejects_undeclared_workspace_relative_seed_bundle(
         verify_catalog(tmp_path / "geas.yaml")
 
 
+@pytest.mark.parametrize(
+    ("seed_path", "message"),
+    [
+        ("ontology/example/missing.yaml", "workspace seed bundle is missing"),
+        ("ontology/example/../outside.yaml", "normalized"),
+    ],
+)
+def test_verify_catalog_rejects_missing_or_traversing_workspace_seed_bundle(
+    tmp_path: Path,
+    seed_path: str,
+    message: str,
+) -> None:
+    """A declared seed path must resolve to one confined inventory file."""
+    entry = _entry(
+        tmp_path,
+        files={"build.yaml": f"seed_bundles:\n  - {seed_path}\n".encode()},
+    )
+    _write_catalog(tmp_path / "geas.yaml", entry)
+
+    with pytest.raises(ValueError, match=message):
+        verify_catalog(tmp_path / "geas.yaml")
+
+
 def test_verify_catalog_rejects_undeclared_tracked_seed_bundle_glob(git_repo: Path) -> None:
     """Ignoring seed_bundle_globs would let a tracked bundle bypass the inventory."""
     entry = _entry(
@@ -280,6 +303,22 @@ def test_verify_catalog_rejects_undeclared_tracked_seed_bundle_glob(git_repo: Pa
     _git(git_repo, "commit", "-m", "seed glob fixture")
 
     with pytest.raises(ValueError, match="undeclared"):
+        verify_catalog(git_repo / "geas.yaml")
+
+
+def test_verify_catalog_rejects_workspace_glob_outside_ontology_without_matches(
+    git_repo: Path,
+) -> None:
+    """A currently empty sibling glob must not become authority after relocation or update."""
+    entry = _entry(
+        git_repo,
+        files={"build.yaml": b"seed_bundle_globs:\n  - ontology/other/*.yaml\n"},
+    )
+    _write_catalog(git_repo / "geas.yaml", entry)
+    _git(git_repo, "add", ".")
+    _git(git_repo, "commit", "-m", "outside seed glob fixture")
+
+    with pytest.raises(ValueError, match="escapes ontology directory"):
         verify_catalog(git_repo / "geas.yaml")
 
 

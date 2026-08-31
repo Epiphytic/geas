@@ -12,6 +12,7 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
+from research_agent.ontology_resolution import resolve_ontology_catalog
 from research_agent.ontology_trust import (
     TrustContext,
     TrustRule,
@@ -706,19 +707,26 @@ def test_snapshot_removal_preserves_bytes_referenced_by_another_profile(
     assert not destination.exists()
 
 
-def test_snapshot_install_rejects_workspace_reference_invalid_after_relocation(
+def test_snapshot_install_preserves_workspace_reference_after_relocation(
     tmp_path: Path, resolved_catalog: ResolvedRepositoryCatalog
 ) -> None:
-    """A source-valid workspace path must remain valid in the installed layout."""
+    """Reinterpreting a workspace path at snapshot root would reject valid source bytes."""
     alpha = resolved_catalog.by_name("alpha")
     alpha.ontology_path.joinpath("build.yaml").write_text(
-        "seed_bundles:\n  - ontology/alpha/seed.yaml\n"
+        "seed_bundles:\n"
+        "  - ontology/alpha/seed.yaml\n"
+        "seed_bundle_globs:\n"
+        "  - ontology/alpha/generated/*/bundle.yaml\n"
     )
     alpha.ontology_path.joinpath("seed.yaml").write_text("version: 1\n")
+    generated = alpha.ontology_path / "generated/example/bundle.yaml"
+    generated.parent.mkdir(parents=True)
+    generated.write_text("version: 1\nkind: generated\n")
     catalog_value = yaml.safe_load(alpha.catalog_path.read_text())
     alpha_value = next(item for item in catalog_value["ontologies"] if item["name"] == "alpha")
     contents = {
         "build.yaml": alpha.ontology_path.joinpath("build.yaml").read_bytes(),
+        "generated/example/bundle.yaml": generated.read_bytes(),
         "seed.yaml": alpha.ontology_path.joinpath("seed.yaml").read_bytes(),
     }
     inventory = [
@@ -735,34 +743,58 @@ def test_snapshot_install_rejects_workspace_reference_invalid_after_relocation(
     )
     alpha.catalog_path.write_text(yaml.safe_dump(catalog_value, sort_keys=False))
     assert resolved_catalog.repository_root is not None
+    _git(resolved_catalog.repository_root, "add", ".")
+    _git(resolved_catalog.repository_root, "commit", "-m", "workspace seed fixture")
     relocated = resolve_repository_catalog(resolved_catalog.repository_root).by_name("alpha")
     manager = _manager(tmp_path)
 
-    with pytest.raises(ValueError, match="workspace seed bundle.*missing"):
-        install_snapshot(relocated, manager=manager, profile_name="default")
+    installed = install_snapshot(relocated, manager=manager, profile_name="default")
+    repeated = install_snapshot(relocated, manager=manager, profile_name="default")
 
-    assert not (manager.root / "snapshots").exists()
-    assert manager.load().profiles["default"].installed_ontologies == ()
+    assert repeated == installed
+    assert (manager.root / installed.path / "seed.yaml").read_text() == "version: 1\n"
+    assert (manager.root / installed.path / "generated/example/bundle.yaml").is_file()
+    assert manager.load().profiles["default"].installed_ontologies == (installed,)
+
+    repository = resolved_catalog.repository_root
+    assert repository is not None
+    repository.rename(repository.with_name("removed-source-repository"))
+    catalog = resolve_ontology_catalog(
+        user_config=manager.load(),
+        manager=manager,
+        cwd=tmp_path,
+        yolo=False,
+        prompt=None,
+    )
+
+    assert [(item.name, item.source_kind) for item in catalog.candidates] == [
+        ("alpha", "snapshot")
+    ]
+    removed = remove_snapshot(installed, manager=manager, profile_name="default")
+    assert removed.removed is True
+    assert not (manager.root / installed.path).exists()
 
 
-@pytest.mark.parametrize("extra_kind", ["file", "symlink"])
-def test_existing_snapshot_rejects_undeclared_file_or_symlink(
+@pytest.mark.parametrize("mutation", ["file", "symlink", "bytes"])
+def test_existing_snapshot_rejects_undeclared_symlink_or_byte_mutation(
     tmp_path: Path,
     resolved_catalog: ResolvedRepositoryCatalog,
-    extra_kind: str,
+    mutation: str,
 ) -> None:
-    """Idempotent reuse requires an exact closed-world installed tree."""
+    """Idempotent reuse requires the exact closed-world installed bytes and ancestry."""
     manager = _manager(tmp_path)
     alpha = resolved_catalog.by_name("alpha")
     snapshot = install_snapshot(alpha, manager=manager, profile_name="default")
     destination = manager.root / snapshot.path
     unexpected = destination / "unexpected"
-    if extra_kind == "file":
+    if mutation == "file":
         unexpected.write_text("undeclared")
-    else:
+    elif mutation == "symlink":
         unexpected.symlink_to(destination / "build.yaml")
+    else:
+        destination.joinpath("build.yaml").write_bytes(b"corrupt-copy")
 
-    with pytest.raises(ValueError, match="undeclared|symbolic link"):
+    with pytest.raises(ValueError, match="undeclared|symbolic link|size|sha256"):
         install_snapshot(alpha, manager=manager, profile_name="default")
 
 

@@ -626,7 +626,12 @@ def _verify_snapshot_directory(directory: Path, ontology: VerifiedCatalogOntolog
             raise ValueError(f"snapshot inventory size mismatch: {item.path}")
         if hashlib.sha256(content).hexdigest() != item.sha256:
             raise ValueError(f"snapshot inventory sha256 mismatch: {item.path}")
-    _verify_transitive_inputs(directory, ontology.files, workspace=directory)
+    _verify_transitive_inputs(
+        directory,
+        ontology.files,
+        workspace=None,
+        workspace_path=ontology.workspace_path,
+    )
 
 
 def _remove_exact_directory(path: Path) -> None:
