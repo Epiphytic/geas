@@ -27,6 +27,14 @@ an explicit legacy override.
 The project and its installed CLI are both named Geas; invoke the CLI as
 `geas`.
 
+Repository-local ontologies may instead be selected from strict `geas.yaml`
+catalogs. These catalogs are discovered from the Git root through the current
+directory, merged cumulatively, and trusted separately from their integrity
+checks. The maintained sample subscription and the four-choice trust flow are
+documented in [User configuration](USER_CONFIG.md#repository-catalogs-trust-and-subscriptions).
+`--yolo` is a one-invocation override only; it never persists trust or relaxes
+catalog hashes and path confinement.
+
 Once an accepted ontology has a verified portable projection artifact, give an
 agent an optional deterministic snapshot without bundling the full acquired
 source library:

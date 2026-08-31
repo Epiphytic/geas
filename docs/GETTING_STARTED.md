@@ -90,6 +90,25 @@ reviewable repository additions, `skill-update` for trusted refresh,
 delete the exact managed snapshot. See [Portable Agent Skills](AGENT_SKILLS.md)
 for the complete workflow.
 
+### Use the maintained Git-connected sample
+
+The Geas repository publishes a strict root `geas.yaml` for its maintained
+open-source research-agent ontology. From any neutral directory, subscribe and
+then export it through the same workflow used for a third-party catalog:
+
+```bash
+geas ontology-subscribe geas-samples https://github.com/Epiphytic/geas.git \
+  --ref refs/heads/main
+geas list
+geas skill-export open-source-research-agents --link
+```
+
+Subscribe announces its synchronization and asks for trust unless an existing
+rule applies. The one-command `--yolo` override is not a durable decision; see
+[User configuration](USER_CONFIG.md#repository-catalogs-trust-and-subscriptions)
+for trust choices, nested `geas.yaml` merging, immutable snapshots, exact
+removal, and subscription cleanup.
+
 ## 3. Configure APIs and LLMs
 
 List configured model routes without exposing credentials:

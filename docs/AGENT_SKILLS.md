@@ -54,6 +54,14 @@ managed links for available agents. The JSON receipt reports the path,
 paths, and phase receipts. The same trusted Git and projection identities
 produce byte-identical files and an `unchanged: true` receipt.
 
+For a catalog-backed ontology, the manifest also records the subscription URL,
+active ref and resolved commit, catalog and ontology paths, and the exact
+bundle SHA-256. This is enough to locate the source with Geas later, but does
+not make it trusted automatically. Skill references generally preserve original
+source URLs and bounded evidence/provenance; they are not a download of every
+acquired document. The portable projection artifact is a verified cache, not
+canonical truth.
+
 For a project-local snapshot:
 
 ```bash
@@ -123,3 +131,14 @@ intentional operator choice. Reinstall with the original `skill-export` command,
 or rerun `geas config-init` for the generic skill. Without Geas, continue using
 the static snapshot and install it later from the project URL above when a
 trusted refresh is needed.
+
+## Pull-request skill regeneration
+
+This repository's PR verification can regenerate the generic `geas` skill and
+the maintained sample export twice, checking byte-identical results before
+uploading a path-confined artifact. A separate protected workflow may verify
+the originating same-repository PR and write only those generated paths back to
+its head with a short-lived GitHub App token. It never executes the artifact.
+Fork PRs receive verification and the artifact but no write-back. Write-back
+is enabled only after the matching organization STS policy is deployed; do not
+assume that policy is active merely because these workflow files exist.

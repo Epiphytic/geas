@@ -33,6 +33,9 @@ jobs:
       - name: Full test suite
         run: uv run pytest -q
 
+      - name: Offline repository subscription integration
+        run: uv run pytest tests/test_repository_subscription_end_to_end.py -v
+
       - name: Check formatting-only diff errors
         run: git diff --check
 
