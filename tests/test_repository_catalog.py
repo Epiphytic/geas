@@ -188,8 +188,23 @@ def test_verified_workspace_path_is_portable_from_windows_path_flavor() -> None:
         files=(CatalogFile(path=Path("build.yaml"), sha256="0" * 64, size_bytes=0),),
         bundle_sha256="1" * 64,
     )
+    direct_windows = VerifiedCatalogOntology.model_validate(
+        {
+            **verified.model_dump(),
+            "workspace_path": PureWindowsPath("ontology", "nested", "example"),
+        }
+    )
+    direct_string = VerifiedCatalogOntology.model_validate(
+        {**verified.model_dump(), "workspace_path": "ontology/nested/example"}
+    )
+    root_scoped = VerifiedCatalogOntology.model_validate(
+        {**verified.model_dump(), "workspace_path": PureWindowsPath(".")}
+    )
 
     assert verified.workspace_path == PurePosixPath("ontology/nested/example")
+    assert direct_windows.workspace_path == PurePosixPath("ontology/nested/example")
+    assert direct_string.workspace_path == PurePosixPath("ontology/nested/example")
+    assert root_scoped.workspace_path == PurePosixPath(".")
     assert verified.model_dump(mode="json")["workspace_path"] == "ontology/nested/example"
     assert json.loads(verified.model_dump_json())["workspace_path"] == (
         "ontology/nested/example"
@@ -198,6 +213,46 @@ def test_verified_workspace_path_is_portable_from_windows_path_flavor() -> None:
         SimulatedRootOntology(),  # type: ignore[arg-type]
         SimulatedWindowsWorkspace(),  # type: ignore[arg-type]
     ) == PurePosixPath(".")
+
+
+@pytest.mark.parametrize(
+    "workspace_path",
+    [
+        pytest.param(123, id="integer"),
+        pytest.param(object(), id="opaque-object"),
+        pytest.param(PureWindowsPath("C:/ontology/example"), id="windows-drive-absolute"),
+        pytest.param(PureWindowsPath("C:ontology/example"), id="windows-drive-relative"),
+        pytest.param(
+            PureWindowsPath("//server/share/ontology/example"),
+            id="windows-unc",
+        ),
+        pytest.param(PureWindowsPath("/ontology/example"), id="windows-rooted"),
+        pytest.param(PurePosixPath("/ontology/example"), id="posix-absolute"),
+        pytest.param(PurePosixPath("C:ontology/example"), id="posix-drive-shaped"),
+        pytest.param("C:/ontology/example", id="string-drive-absolute"),
+        pytest.param("C:ontology/example", id="string-drive-relative"),
+        pytest.param(r"\\server\share\ontology\example", id="string-unc"),
+        pytest.param(r"\ontology\example", id="string-rooted"),
+        pytest.param(r"ontology\nested/example", id="mixed-separators"),
+        pytest.param("ontology/\x00example", id="control-character"),
+    ],
+)
+def test_verified_workspace_path_rejects_nonportable_values(workspace_path: object) -> None:
+    """Coercion or drive conversion would turn unsafe metadata into trusted relative paths."""
+    payload = {
+        "name": "example",
+        "description": "Portable path fixture.",
+        "catalog_path": Path("geas.yaml"),
+        "ontology_path": Path("ontology/example"),
+        "workspace_path": workspace_path,
+        "files": (
+            CatalogFile(path=Path("build.yaml"), sha256="0" * 64, size_bytes=0),
+        ),
+        "bundle_sha256": "1" * 64,
+    }
+
+    with pytest.raises(ValidationError, match="workspace ontology path"):
+        VerifiedCatalogOntology.model_validate(payload)
 
 
 @pytest.mark.parametrize(

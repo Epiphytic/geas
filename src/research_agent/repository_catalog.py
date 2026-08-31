@@ -8,7 +8,7 @@ import re
 import subprocess
 import tempfile
 from collections.abc import Iterable, Sequence
-from pathlib import Path, PurePath, PurePosixPath
+from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
 from typing import Literal
 from urllib.parse import urlsplit, urlunsplit
 
@@ -445,7 +445,17 @@ def _portable_relative_path(
     label: str,
     allow_root: bool = False,
 ) -> PurePosixPath:
-    raw = value.as_posix() if isinstance(value, PurePath) else str(value)
+    if not isinstance(value, (str, PurePath)):
+        raise ValueError(f"{label} must be a string or path")
+    if isinstance(value, PurePath):
+        if value.drive or value.root:
+            raise ValueError(f"{label} must not be drive-qualified or rooted")
+        raw = value.as_posix()
+    else:
+        raw = value
+    windows = PureWindowsPath(raw)
+    if windows.drive or windows.root:
+        raise ValueError(f"{label} must not be drive-qualified or rooted")
     if allow_root and raw == ".":
         return PurePosixPath(".")
     validated = _relative_path(raw, label=label)
