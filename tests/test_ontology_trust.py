@@ -330,6 +330,41 @@ def test_interactive_choice_one_persists_repository_allow(
     assert prompt.selections == []
 
 
+def test_generic_scp_origin_resolves_to_stable_identity_and_authorizes_before_prompt(
+    tmp_path: Path,
+    resolved_catalog: ResolvedRepositoryCatalog,
+) -> None:
+    assert resolved_catalog.repository_root is not None
+    _git(
+        resolved_catalog.repository_root,
+        "remote",
+        "set-url",
+        "origin",
+        "git@example.invalid:Owner/Example.git",
+    )
+    catalog = resolve_repository_catalog(resolved_catalog.repository_root)
+    expected_identity = "ssh://git@example.invalid/Owner/Example"
+    assert catalog.repository_identity == expected_identity
+    manager = _manager(tmp_path)
+    profile = manager.load().profiles["default"].model_copy(
+        update={"trust_rules": (_rule(True, repository=expected_identity),)}
+    )
+    _replace_profile(manager, "default", profile)
+    prompt = FakePrompt("4")
+
+    authorized = authorize_repository_catalog(
+        catalog,
+        manager=manager,
+        profile_name="default",
+        yolo=False,
+        prompt=prompt,
+    )
+
+    assert [item.ontology.name for item in authorized] == ["alpha", "beta"]
+    assert prompt.actions == 0
+    assert prompt.selections == []
+
+
 def test_interactive_choice_two_persists_exact_per_ontology_answers(
     tmp_path: Path, resolved_catalog: ResolvedRepositoryCatalog
 ) -> None:
@@ -410,6 +445,47 @@ def test_interactive_choice_four_persists_ref_deny(
     assert rules[0].decision == "deny"
     assert rules[0].refs == ("refs/heads/main",)
     assert rules[0].paths == rules[0].bundle_sha256 == "*"
+
+
+def test_current_ref_denial_preserves_scoped_wildcard_allow_for_unrelated_ref(
+    tmp_path: Path,
+    resolved_catalog: ResolvedRepositoryCatalog,
+) -> None:
+    manager = _manager(tmp_path)
+    scoped = _rule(True, paths=("ontology/future",))
+    profile = manager.load().profiles["default"].model_copy(
+        update={"trust_rules": (scoped,)}
+    )
+    _replace_profile(manager, "default", profile)
+
+    assert authorize_repository_catalog(
+        resolved_catalog,
+        manager=manager,
+        profile_name="default",
+        yolo=False,
+        prompt=FakePrompt("4"),
+    ) == ()
+
+    rules = manager.load().profiles["default"].trust_rules
+    assert scoped in rules
+    assert evaluate_trust(
+        TrustContext(
+            repository=REPOSITORY,
+            ref="refs/heads/main",
+            path=Path("ontology/future"),
+            bundle_sha256=DIGEST,
+        ),
+        rules,
+    ).allowed is False
+    assert evaluate_trust(
+        TrustContext(
+            repository=REPOSITORY,
+            ref="refs/heads/release",
+            path=Path("ontology/future"),
+            bundle_sha256=DIGEST,
+        ),
+        rules,
+    ).allowed is True
 
 
 def test_unresolved_noninteractive_trust_fails_without_writing(
@@ -928,7 +1004,7 @@ def test_authorization_rejects_new_catalog_below_previous_deepest_catalog(
         )
 
 
-def test_source_denial_removes_future_path_and_old_digest_allows_on_denied_ref(
+def test_source_denial_overrides_future_path_and_old_digest_allows_on_denied_ref(
     tmp_path: Path, resolved_catalog: ResolvedRepositoryCatalog
 ) -> None:
     """A later path addition or digest reversion must remain denied on the ref."""
@@ -982,8 +1058,8 @@ def test_source_denial_removes_future_path_and_old_digest_allows_on_denied_ref(
     denied_rules = manager.load().profiles["default"].trust_rules
     assert other_ref_allow in denied_rules
     assert other_repository_allow in denied_rules
-    assert future_allow not in denied_rules
-    assert old_digest_allow not in denied_rules
+    assert future_allow in denied_rules
+    assert old_digest_allow in denied_rules
 
     old_alpha.ontology_path.joinpath("build.yaml").write_text("topic: alpha\n")
     refresh_catalog(resolved_catalog.catalog_paths[0], names=("alpha",))

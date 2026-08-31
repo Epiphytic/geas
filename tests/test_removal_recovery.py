@@ -1,0 +1,331 @@
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+from research_agent.ontology_subscriptions import OntologySubscription, SubscriptionManager
+from research_agent.ontology_trust import (
+    InstalledOntologySnapshot,
+    recover_snapshot_removals,
+    remove_snapshot,
+)
+from research_agent.user_config import GeasProfile, GeasUserConfig, UserConfigManager
+
+_DIGEST = "a" * 64
+_HARD_EXIT = 91
+_SNAPSHOT_CHILD = r"""
+import os
+import sys
+from pathlib import Path
+
+import research_agent.ontology_trust as trust
+from research_agent.user_config import UserConfigManager
+
+manager = UserConfigManager(Path(sys.argv[1]))
+phase = sys.argv[2]
+snapshot = manager.load().profiles["default"].installed_ontologies[0]
+if phase == "prepared":
+    original = trust._write_snapshot_removal_journal
+    def write(manager, journal):
+        original(manager, journal)
+        if journal.phase.value == "validated":
+            os._exit(91)
+    trust._write_snapshot_removal_journal = write
+elif phase == "quarantined":
+    original = trust.os.replace
+    def replace(source, destination):
+        original(source, destination)
+        if Path(source) == manager.root / snapshot.path:
+            os._exit(91)
+    trust.os.replace = replace
+else:
+    original = manager.replace
+    def replace(config):
+        original(config)
+        if snapshot not in config.profiles["default"].installed_ontologies:
+            os._exit(91)
+    manager.replace = replace
+trust.remove_snapshot(snapshot, manager=manager, profile_name="default")
+"""
+
+_SUBSCRIPTION_CHILD = r"""
+import os
+import sys
+from pathlib import Path
+
+import research_agent.ontology_subscriptions as subscriptions
+from research_agent.ontology_subscriptions import SubscriptionManager
+from research_agent.user_config import UserConfigManager
+
+class Removable:
+    def assert_removable(self):
+        return None
+
+manager = UserConfigManager(Path(sys.argv[1]))
+phase = sys.argv[2]
+service = SubscriptionManager(
+    config_manager=manager,
+    profile_name="default",
+    catalog_verifier=lambda path: (),
+    authorizer=lambda value: value,
+    repository_factory=lambda checkout, subscription: Removable(),
+)
+if phase == "prepared":
+    original = subscriptions._write_subscription_removal_journal
+    def write(manager, journal):
+        original(manager, journal)
+        if journal.phase.value == "validated":
+            os._exit(91)
+    subscriptions._write_subscription_removal_journal = write
+elif phase == "quarantined":
+    original = subscriptions.os.replace
+    def replace(source, destination):
+        original(source, destination)
+        if ".remove-" in Path(destination).name:
+            os._exit(91)
+    subscriptions.os.replace = replace
+else:
+    original = manager.replace
+    def replace(config):
+        original(config)
+        if "example" not in config.profiles["default"].subscriptions:
+            os._exit(91)
+    manager.replace = replace
+service.unsubscribe("example", remove_checkout=True)
+"""
+
+
+def _snapshot_manager(tmp_path: Path) -> tuple[UserConfigManager, InstalledOntologySnapshot]:
+    manager = UserConfigManager(tmp_path / "config" / "config.yaml")
+    manager.root.mkdir(parents=True)
+    snapshot = InstalledOntologySnapshot(
+        name="example",
+        description="Exact test snapshot.",
+        bundle_sha256=_DIGEST,
+        path=Path("snapshots/example") / _DIGEST,
+        files=(),
+    )
+    destination = manager.root / snapshot.path
+    destination.mkdir(parents=True)
+    destination.joinpath("sentinel").write_text("authoritative snapshot\n")
+    manager.replace(
+        GeasUserConfig(
+            profiles={
+                "default": GeasProfile(
+                    ontology_git=None,
+                    installed_ontologies=(snapshot,),
+                )
+            }
+        )
+    )
+    return manager, snapshot
+
+
+class _Removable:
+    def assert_removable(self) -> None:
+        return None
+
+
+def _subscription_manager(tmp_path: Path) -> tuple[UserConfigManager, SubscriptionManager]:
+    manager = UserConfigManager(tmp_path / "config" / "config.yaml")
+    manager.root.mkdir(parents=True)
+    subscription = OntologySubscription(
+        url="https://example.invalid/ontology.git",
+        checkout=Path("subscriptions/example"),
+    )
+    checkout = manager.root / subscription.checkout
+    checkout.mkdir(parents=True)
+    checkout.joinpath("sentinel").write_text("authoritative checkout\n")
+    manager.replace(
+        GeasUserConfig(
+            profiles={
+                "default": GeasProfile(
+                    ontology_git=None,
+                    subscriptions={"example": subscription},
+                )
+            }
+        )
+    )
+    service = SubscriptionManager(
+        config_manager=manager,
+        profile_name="default",
+        catalog_verifier=lambda path: (),
+        authorizer=lambda value: value,
+        repository_factory=lambda checkout, configured: _Removable(),
+    )
+    return manager, service
+
+
+def _run_hard_exit(script: str, manager: UserConfigManager, phase: str) -> None:
+    completed = subprocess.run(
+        (sys.executable, "-c", script, str(manager.path), phase),
+        env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src")},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert completed.returncode == _HARD_EXIT, completed.stderr
+
+
+def _assert_no_removal_state(manager: UserConfigManager) -> None:
+    journal_root = manager.root / "state" / "removal-transactions"
+    assert not tuple(journal_root.rglob("*.json")) if journal_root.exists() else True
+    assert not tuple(manager.root.rglob("*.remove-*"))
+
+
+@pytest.mark.parametrize("phase", ("prepared", "quarantined", "config-committed"))
+def test_snapshot_removal_recovers_deterministically_after_hard_exit(
+    tmp_path: Path,
+    phase: str,
+) -> None:
+    manager, snapshot = _snapshot_manager(tmp_path)
+    _run_hard_exit(_SNAPSHOT_CHILD, manager, phase)
+
+    if phase == "config-committed":
+        with pytest.raises(ValueError, match="not registered"):
+            remove_snapshot(snapshot, manager=manager, profile_name="default")
+    else:
+        receipt = remove_snapshot(snapshot, manager=manager, profile_name="default")
+        assert receipt.removed is True
+
+    assert snapshot not in manager.load().profiles["default"].installed_ontologies
+    assert not (manager.root / snapshot.path).exists()
+    _assert_no_removal_state(manager)
+
+
+@pytest.mark.parametrize("phase", ("prepared", "quarantined", "config-committed"))
+def test_subscription_removal_recovers_deterministically_after_hard_exit(
+    tmp_path: Path,
+    phase: str,
+) -> None:
+    manager, service = _subscription_manager(tmp_path)
+    _run_hard_exit(_SUBSCRIPTION_CHILD, manager, phase)
+
+    if phase == "config-committed":
+        with pytest.raises(ValueError, match="unknown ontology subscription"):
+            service.unsubscribe("example", remove_checkout=True)
+    else:
+        receipt = service.unsubscribe("example", remove_checkout=True)
+        assert receipt.checkout_removed is True
+
+    assert "example" not in manager.load().profiles["default"].subscriptions
+    assert not (manager.root / "subscriptions/example").exists()
+    _assert_no_removal_state(manager)
+
+
+def test_snapshot_cleanup_failure_leaves_recoverable_committed_journal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, snapshot = _snapshot_manager(tmp_path)
+    import research_agent.ontology_trust as trust
+
+    original = trust._remove_exact_directory
+
+    def fail_quarantine(path: Path) -> None:
+        if ".remove-" in path.name:
+            raise OSError("persistent quarantine cleanup failure")
+        original(path)
+
+    monkeypatch.setattr(trust, "_remove_exact_directory", fail_quarantine)
+    with pytest.raises(OSError, match="persistent quarantine cleanup failure"):
+        remove_snapshot(snapshot, manager=manager, profile_name="default")
+
+    assert snapshot not in manager.load().profiles["default"].installed_ontologies
+    assert tuple((manager.root / "state/removal-transactions/snapshots").glob("*.json"))
+    assert tuple(manager.root.rglob("*.remove-*"))
+
+    monkeypatch.setattr(trust, "_remove_exact_directory", original)
+    recover_snapshot_removals(manager)
+    recover_snapshot_removals(manager)
+    _assert_no_removal_state(manager)
+
+
+def test_subscription_cleanup_failure_leaves_recoverable_committed_journal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, service = _subscription_manager(tmp_path)
+    import research_agent.ontology_subscriptions as subscriptions
+
+    original = subscriptions.shutil.rmtree
+
+    def fail_quarantine(path: Path) -> None:
+        if ".remove-" in Path(path).name:
+            raise OSError("persistent checkout cleanup failure")
+        original(path)
+
+    monkeypatch.setattr(subscriptions.shutil, "rmtree", fail_quarantine)
+    with pytest.raises(OSError, match="persistent checkout cleanup failure"):
+        service.unsubscribe("example", remove_checkout=True)
+
+    assert "example" not in manager.load().profiles["default"].subscriptions
+    assert tuple((manager.root / "state/removal-transactions/subscriptions").glob("*.json"))
+    assert tuple(manager.root.rglob("*.remove-*"))
+
+    monkeypatch.setattr(subscriptions.shutil, "rmtree", original)
+    service.recover_removals()
+    service.recover_removals()
+    _assert_no_removal_state(manager)
+
+
+@pytest.mark.parametrize("tamper", ("noncanonical", "unknown-field"))
+def test_snapshot_recovery_rejects_noncanonical_or_nonstrict_journal_before_mutation(
+    tmp_path: Path,
+    tamper: str,
+) -> None:
+    manager, snapshot = _snapshot_manager(tmp_path)
+    _run_hard_exit(_SNAPSHOT_CHILD, manager, "prepared")
+    journal = next((manager.root / "state/removal-transactions/snapshots").glob("*.json"))
+    if tamper == "noncanonical":
+        journal.write_bytes(b" " + journal.read_bytes())
+        expected = "canonical"
+    else:
+        payload = json.loads(journal.read_bytes())
+        payload["unexpected"] = True
+        journal.write_text(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+        expected = "invalid"
+
+    with pytest.raises(ValueError, match=expected):
+        remove_snapshot(snapshot, manager=manager, profile_name="default")
+
+    assert snapshot in manager.load().profiles["default"].installed_ontologies
+    assert (manager.root / snapshot.path).is_dir()
+
+
+def test_snapshot_recovery_rejects_symlinked_quarantine_without_following_it(
+    tmp_path: Path,
+) -> None:
+    manager, snapshot = _snapshot_manager(tmp_path)
+    _run_hard_exit(_SNAPSHOT_CHILD, manager, "quarantined")
+    quarantine = next(manager.root.rglob("*.remove-*"))
+    outside = tmp_path / "outside-preserved"
+    quarantine.rename(outside)
+    quarantine.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="symbolic link"):
+        remove_snapshot(snapshot, manager=manager, profile_name="default")
+
+    assert outside.joinpath("sentinel").read_text() == "authoritative snapshot\n"
+    assert snapshot in manager.load().profiles["default"].installed_ontologies
+
+
+def test_snapshot_recovery_rejects_replaced_quarantine_inode(
+    tmp_path: Path,
+) -> None:
+    manager, snapshot = _snapshot_manager(tmp_path)
+    _run_hard_exit(_SNAPSHOT_CHILD, manager, "quarantined")
+    quarantine = next(manager.root.rglob("*.remove-*"))
+    shutil.rmtree(quarantine)
+    quarantine.mkdir()
+
+    with pytest.raises(ValueError, match="identity changed"):
+        remove_snapshot(snapshot, manager=manager, profile_name="default")
+
+    assert snapshot in manager.load().profiles["default"].installed_ontologies

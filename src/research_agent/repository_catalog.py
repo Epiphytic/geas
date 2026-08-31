@@ -10,10 +10,16 @@ import tempfile
 from collections.abc import Iterable, Sequence
 from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
 from typing import Literal
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import unquote, urlsplit
 
 import yaml
 from pydantic import Field, ValidationError, field_validator, model_validator
+from yaml.events import (
+    MappingEndEvent,
+    MappingStartEvent,
+    SequenceEndEvent,
+    SequenceStartEvent,
+)
 
 from research_agent.models import StrictModel, canonical_json
 
@@ -21,6 +27,10 @@ _CATALOG_NAME = "geas.yaml"
 _ONTOLOGY_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 _DIGEST = re.compile(r"[0-9a-f]{64}")
 _GIT_OBJECT_ID = re.compile(r"[0-9a-f]{40,64}")
+_SCP_REMOTE = re.compile(
+    r"git@(?P<host>[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?):"
+    r"(?P<path>[^/?#][^?#]*)"
+)
 _REFERENCE_KEYS = frozenset(
     {
         "artifact_manifest",
@@ -41,6 +51,9 @@ _REFERENCE_KEYS = frozenset(
     }
 )
 _PATH_COLLECTION_KEYS = frozenset({"artifacts", "sources"})
+_MAX_YAML_FILE_BYTES = 1024 * 1024
+_MAX_YAML_DEPTH = 64
+_MAX_YAML_NODES = 100_000
 
 
 def validate_ontology_name(value: str) -> str:
@@ -55,6 +68,63 @@ def validate_bundle_sha256(value: str) -> str:
     if not isinstance(value, str) or not _DIGEST.fullmatch(value):
         raise ValueError("bundle SHA-256 is invalid")
     return value
+
+
+def normalized_repository_identity(value: str) -> str:
+    """Canonicalize every accepted remote syntax without expanding authority."""
+    raw = _validate_remote_url(value)
+    scp = _SCP_REMOTE.fullmatch(raw)
+    if scp is not None:
+        host = scp.group("host").lower()
+        path = scp.group("path").rstrip("/").removesuffix(".git")
+        if host == "github.com":
+            return f"https://github.com/{path}"
+        return f"ssh://git@{host}/{path}"
+
+    parsed = urlsplit(raw)
+    assert parsed.hostname is not None  # Established by _validate_remote_url.
+    host = parsed.hostname.lower()
+    path = parsed.path.rstrip("/").removesuffix(".git")
+    if host == "github.com":
+        return f"https://github.com/{path.lstrip('/')}"
+    rendered_host = f"[{host}]" if ":" in host else host
+    port = f":{parsed.port}" if parsed.port is not None else ""
+    username = "git@" if parsed.username == "git" else ""
+    return f"{parsed.scheme.lower()}://{username}{rendered_host}{port}{path}"
+
+
+def _validate_remote_url(value: str) -> str:
+    if not value or any(ord(character) < 32 or ord(character) == 127 for character in value):
+        raise ValueError("ontology Git URL contains control characters or is empty")
+    scp = _SCP_REMOTE.fullmatch(value)
+    if scp is not None:
+        _validate_url_path(scp.group("path"))
+        return value
+    parsed = urlsplit(value)
+    if parsed.scheme not in {"https", "ssh"}:
+        raise ValueError("ontology Git URL uses an unsupported remote transport")
+    if parsed.password is not None or (
+        parsed.username is not None and not (parsed.scheme == "ssh" and parsed.username == "git")
+    ):
+        raise ValueError("ontology Git URLs cannot embed credentials")
+    if not parsed.hostname or parsed.query or parsed.fragment:
+        raise ValueError("ontology Git URL must be a credential-free remote URL")
+    try:
+        _ = parsed.port
+    except ValueError as error:
+        raise ValueError("ontology Git URL port is invalid") from error
+    _validate_url_path(parsed.path)
+    return value
+
+
+def _validate_url_path(value: str) -> None:
+    decoded = unquote(value)
+    if not decoded or any(ord(character) < 32 or ord(character) == 127 for character in decoded):
+        raise ValueError("ontology Git remote path is invalid")
+    pure = PurePosixPath(decoded)
+    parts = pure.parts
+    if any(part in {"", ".", ".."} for part in parts) or pure.as_posix() != decoded:
+        raise ValueError("ontology Git remote path contains traversal")
 
 
 def _relative_path(value: object, *, label: str) -> Path:
@@ -211,10 +281,7 @@ def ontology_bundle_sha256(entry: CatalogOntology) -> str:
 def load_catalog(path: Path) -> RepositoryCatalog:
     """Load one strict catalog without resolving or trusting any ontology input."""
     catalog_path = _catalog_path(path)
-    try:
-        value = yaml.safe_load(catalog_path.read_text())
-    except (OSError, yaml.YAMLError) as error:
-        raise ValueError(f"invalid catalog: {catalog_path}") from error
+    value = _load_bounded_yaml(catalog_path, label=f"catalog: {catalog_path}")
     try:
         return RepositoryCatalog.model_validate(value)
     except ValidationError as error:
@@ -309,7 +376,7 @@ def resolve_repository_catalog(start: Path) -> ResolvedRepositoryCatalog:
     )
     origin = _git(worktree, "remote", "get-url", "origin", required=False)
     if origin:
-        identity = _normalized_repository_identity(origin)
+        identity = normalized_repository_identity(origin)
         identity_kind: Literal["remote", "machine_local"] = "remote"
     else:
         identity = str(worktree)
@@ -413,10 +480,10 @@ def _verify_transitive_inputs(
         yaml_path = _regular_file(ontology_path, item.path)
         if yaml_path.suffix not in {".yaml", ".yml"}:
             continue
-        try:
-            value = yaml.safe_load(yaml_path.read_text())
-        except (OSError, yaml.YAMLError) as error:
-            raise ValueError(f"invalid declared YAML input: {item.path.as_posix()}") from error
+        value = _load_bounded_yaml(
+            yaml_path,
+            label=f"declared YAML input: {item.path.as_posix()}",
+        )
         for reference in _yaml_references(value):
             _require_declared_input(
                 yaml_path.parent / _relative_path(reference, label="transitive YAML input path"),
@@ -604,6 +671,74 @@ def _yaml_references(value: object, *, parent_key: str | None = None) -> Iterabl
             yield from _yaml_references(nested, parent_key=parent_key)
 
 
+def _load_bounded_yaml(path: Path, *, label: str) -> object:
+    try:
+        encoded = path.read_bytes()
+    except OSError as error:
+        raise ValueError(f"invalid {label}") from error
+    if len(encoded) > _MAX_YAML_FILE_BYTES:
+        raise ValueError(f"invalid {label}: YAML file size exceeds the limit")
+    try:
+        rendered = encoded.decode("utf-8")
+        _validate_yaml_events(rendered, label=label)
+        value = yaml.safe_load(rendered)
+    except (UnicodeDecodeError, yaml.YAMLError, RecursionError) as error:
+        raise ValueError(f"invalid {label}: bounded safe YAML parsing failed") from error
+    _validate_yaml_graph(value, label=label)
+    return value
+
+
+def _validate_yaml_events(rendered: str, *, label: str) -> None:
+    depth = 0
+    for events, event in enumerate(
+        yaml.parse(rendered, Loader=yaml.SafeLoader),
+        start=1,
+    ):
+        if events > _MAX_YAML_NODES:
+            raise ValueError(f"invalid {label}: YAML node limit exceeded")
+        if isinstance(event, (MappingStartEvent, SequenceStartEvent)):
+            depth += 1
+            if depth > _MAX_YAML_DEPTH:
+                raise ValueError(f"invalid {label}: YAML depth limit exceeded")
+        elif isinstance(event, (MappingEndEvent, SequenceEndEvent)):
+            depth -= 1
+
+
+def _validate_yaml_graph(value: object, *, label: str) -> None:
+    nodes = 0
+    active: set[int] = set()
+
+    def visit(candidate: object, depth: int) -> None:
+        nonlocal nodes
+        nodes += 1
+        if nodes > _MAX_YAML_NODES:
+            raise ValueError(f"invalid {label}: YAML node expansion limit exceeded")
+        if depth > _MAX_YAML_DEPTH:
+            raise ValueError(f"invalid {label}: YAML depth limit exceeded")
+        if not isinstance(candidate, (dict, list, tuple, set)):
+            return
+        identity = id(candidate)
+        if identity in active:
+            raise ValueError(f"invalid {label}: YAML alias cycle is not allowed")
+        active.add(identity)
+        try:
+            nested_values: Iterable[object]
+            if isinstance(candidate, dict):
+                nested_values = (
+                    nested
+                    for item in candidate.items()
+                    for nested in item
+                )
+            else:
+                nested_values = candidate
+            for nested in nested_values:
+                visit(nested, depth + 1)
+        finally:
+            active.remove(identity)
+
+    visit(value, 0)
+
+
 def _path_strings(value: object) -> Iterable[str]:
     if isinstance(value, str):
         yield value
@@ -683,22 +818,6 @@ def _git(directory: Path, *arguments: str, required: bool = True) -> str:
             raise ValueError("Git command failed while resolving repository catalog")
         return ""
     return completed.stdout.strip()
-
-
-def _normalized_repository_identity(value: str) -> str:
-    raw = value.strip()
-    github_ssh = re.fullmatch(r"(?:[^@/]+@)?github\.com:/*(.+)", raw, re.IGNORECASE)
-    if github_ssh:
-        return f"https://github.com/{github_ssh.group(1).rstrip('/').removesuffix('.git')}"
-    parsed = urlsplit(raw)
-    if not parsed.scheme or not parsed.hostname:
-        raise ValueError("repository origin URL is invalid")
-    host = parsed.hostname.lower()
-    path = parsed.path.rstrip("/").removesuffix(".git")
-    if host == "github.com":
-        return f"https://github.com/{path.lstrip('/')}"
-    port = f":{parsed.port}" if parsed.port is not None else ""
-    return urlunsplit((parsed.scheme.lower(), f"{host}{port}", path, "", ""))
 
 
 def _verified_with_dirtiness(

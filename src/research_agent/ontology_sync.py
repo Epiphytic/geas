@@ -275,21 +275,16 @@ class OntologyRepositoryManager:
         self._run(("git", "add", "-A", "--", *(item.as_posix() for item in targets)))
         all_staged = tuple(
             Path(line)
-            for line in self._run(("git", "diff", "--cached", "--name-only")).stdout.splitlines()
+            for line in self._run(
+                ("git", "diff", "--cached", "--name-only", "-z")
+            ).stdout.split("\x00")
             if line
         )
         unexpected = tuple(path for path in all_staged if not self._within_targets(path, targets))
         if unexpected:
             names = ", ".join(path.as_posix() for path in unexpected)
             raise OntologySyncError(f"refusing to include previously staged paths: {names}")
-        scanned = tuple(
-            Path(line)
-            for line in self._run(
-                ("git", "diff", "--cached", "--name-only", "--diff-filter=ACMR")
-            ).stdout.splitlines()
-            if line
-        )
-        self._scan_staged(scanned)
+        self._scan_staged(all_staged)
         changed = bool(self._run(("git", "diff", "--cached", "--quiet"), check=False).returncode)
         if changed:
             self._run(("git", "commit", "-m", message))
@@ -532,22 +527,62 @@ class OntologyRepositoryManager:
         return lines
 
     def _scan_staged(self, paths: tuple[Path, ...]) -> None:
+        requested = {relative.as_posix(): relative for relative in paths}
+        entries: dict[str, tuple[str, str]] = {}
+        if requested:
+            raw = self._run(
+                (
+                    "git",
+                    "ls-files",
+                    "--stage",
+                    "-z",
+                    "--",
+                    *requested,
+                )
+            ).stdout
+            for entry in raw.split("\x00"):
+                if not entry:
+                    continue
+                metadata, separator, name = entry.partition("\t")
+                if not separator or name not in requested:
+                    raise OntologySyncError("staged ontology index contains an unsafe path")
+                fields = metadata.split()
+                if len(fields) != 3:
+                    raise OntologySyncError("staged ontology index metadata is invalid")
+                mode, object_id, stage = fields
+                if stage != "0" or name in entries or not _GIT_ID.fullmatch(object_id):
+                    raise OntologySyncError("staged ontology index is not canonical")
+                entries[name] = (mode, object_id)
         for relative in paths:
             name = relative.as_posix()
+            staged = entries.get(name)
+            if staged is None:
+                # A deletion has no stage-zero blob to publish or scan.
+                continue
             if _SENSITIVE_NAME.search(name):
                 raise OntologySyncError(f"refusing to push credential-like path: {name}")
-            path = self.checkout / relative
-            if path.is_symlink():
-                raise OntologySyncError(f"refusing to push symbolic link: {name}")
-            if not path.exists():
-                continue
-            if path.stat().st_size > 10_000_000:
+            mode, object_id = staged
+            if mode not in {"100644", "100755"}:
+                raise OntologySyncError(f"refusing to push unsafe staged mode {mode}: {name}")
+            content = self._read_staged_blob(object_id)
+            if len(content) > 10_000_000:
                 raise OntologySyncError(f"refusing to scan oversized ontology file: {name}")
-            content = path.read_bytes()
             if b"\x00" in content:
                 raise OntologySyncError(f"refusing to push binary ontology file: {name}")
             if contains_possible_credential(content):
                 raise OntologySyncError(f"possible credential detected; refusing to push: {name}")
+
+    def _read_staged_blob(self, object_id: str) -> bytes:
+        completed = subprocess.run(
+            ("git", "cat-file", "blob", object_id),
+            cwd=self.checkout,
+            env=self._git_environment(),
+            capture_output=True,
+            check=False,
+        )
+        if completed.returncode != 0:
+            raise OntologySyncError("could not read a staged ontology blob")
+        return completed.stdout
 
     @staticmethod
     def _within_targets(path: Path, targets: tuple[Path, ...]) -> bool:
@@ -571,13 +606,7 @@ class OntologyRepositoryManager:
         cwd: Path,
         check: bool,
     ) -> subprocess.CompletedProcess[str]:
-        environment = {
-            **os.environ,
-            "GIT_TERMINAL_PROMPT": "0",
-            "GIT_CONFIG_COUNT": "1",
-            "GIT_CONFIG_KEY_0": "core.hooksPath",
-            "GIT_CONFIG_VALUE_0": os.devnull,
-        }
+        environment = OntologyRepositoryManager._git_environment()
         completed = subprocess.run(
             command,
             cwd=cwd,
@@ -590,6 +619,16 @@ class OntologyRepositoryManager:
             detail = completed.stderr.strip()[-2000:]
             raise OntologySyncError(f"Git command failed ({command[0]} {command[1]}): {detail}")
         return completed
+
+    @staticmethod
+    def _git_environment() -> dict[str, str]:
+        return {
+            **os.environ,
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "core.hooksPath",
+            "GIT_CONFIG_VALUE_0": os.devnull,
+        }
 
 
 def _normalized_url(value: str) -> str:

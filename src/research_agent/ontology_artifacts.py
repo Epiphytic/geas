@@ -21,6 +21,7 @@ import yaml
 from pydantic import Field, field_validator, model_validator
 
 from research_agent.credential_scanning import (
+    contains_binary_credential_residue,
     contains_credential_assignment_marker,
     contains_fixed_credential,
     contains_possible_credential,
@@ -417,6 +418,11 @@ class OntologyArtifactManager:
                 "artifact manifest does not provide roles: "
                 + ", ".join(sorted(item.value for item in unknown))
             )
+        _validate_cache_path(self.cache, ontology_directory=self.ontology_directory)
+        if self.cache.exists() and not self.cache.is_dir():
+            raise OntologyArtifactError("ontology artifact cache root is unsafe")
+        self.cache.mkdir(exist_ok=True)
+        _validate_cache_path(self.cache, ontology_directory=self.ontology_directory)
         hydrated: list[ArtifactHydrationItem] = []
         for artifact in manifest.artifacts:
             if artifact.role not in selected:
@@ -425,11 +431,18 @@ class OntologyArtifactManager:
             downloaded = not _cached_artifact_is_valid(destination, artifact)
             if downloaded:
                 store.download(artifact, destination)
+            _validate_cache_path(destination, ontology_directory=self.ontology_directory)
             _verify_file(destination, artifact)
             if artifact.format is ArtifactFormat.SQLITE:
                 _sqlite_input_revision(destination, artifact.role)
             else:
-                _extract_generated_zip(destination, self.cache / "generated")
+                generated = self.cache / "generated"
+                _validate_cache_path(generated, ontology_directory=self.ontology_directory)
+                _extract_generated_zip(
+                    destination,
+                    generated,
+                    ontology_directory=self.ontology_directory,
+                )
             hydrated.append(
                 ArtifactHydrationItem(
                     role=artifact.role,
@@ -501,8 +514,7 @@ class OntologyArtifactManager:
             ArtifactRole.GENERATED_CONTENT: "generated.zip",
         }
         path = self.cache / names[artifact.role]
-        if not path.resolve().is_relative_to(self.ontology_directory):
-            raise OntologyArtifactError("ontology artifact cache escapes its ontology")
+        _validate_cache_path(path, ontology_directory=self.ontology_directory)
         return path
 
 
@@ -619,9 +631,18 @@ def _safe_generated_files(root: Path) -> Iterable[Path]:
         yield path
 
 
-def _extract_generated_zip(archive_path: Path, destination: Path) -> None:
+def _extract_generated_zip(
+    archive_path: Path,
+    destination: Path,
+    *,
+    ontology_directory: Path,
+) -> None:
+    _validate_cache_path(archive_path, ontology_directory=ontology_directory)
+    _validate_cache_path(destination, ontology_directory=ontology_directory)
     temporary = destination.with_name(f".{destination.name}.tmp-{uuid4().hex}")
     previous = destination.with_name(f".{destination.name}.previous-{uuid4().hex}")
+    _validate_cache_path(temporary, ontology_directory=ontology_directory)
+    _validate_cache_path(previous, ontology_directory=ontology_directory)
     temporary.mkdir(parents=True)
     try:
         with zipfile.ZipFile(archive_path) as archive:
@@ -645,6 +666,27 @@ def _extract_generated_zip(archive_path: Path, destination: Path) -> None:
         shutil.rmtree(temporary, ignore_errors=True)
         if previous.exists() and not destination.exists():
             os.replace(previous, destination)
+
+
+def _validate_cache_path(path: Path, *, ontology_directory: Path) -> None:
+    """Reject lexical cache aliases before any cache I/O can follow them."""
+    root = Path(os.path.abspath(ontology_directory))
+    candidate = Path(os.path.abspath(path))
+    try:
+        relative = candidate.relative_to(root)
+    except ValueError as error:
+        raise OntologyArtifactError("ontology artifact cache escapes its ontology") from error
+    current = root
+    for component in relative.parts:
+        current /= component
+        if current.is_symlink():
+            raise OntologyArtifactError(
+                f"ontology artifact cache contains a symbolic link: {current}"
+            )
+        if current != candidate and current.exists() and not current.is_dir():
+            raise OntologyArtifactError(
+                f"ontology artifact cache ancestor is not a directory: {current}"
+            )
 
 
 def _cached_artifact_is_valid(path: Path, artifact: OntologyArtifact) -> bool:
@@ -676,7 +718,7 @@ def _scan_sensitive_content(path: Path) -> None:
     ) as content:
         sqlite_database = content[:16] == b"SQLite format 3\x00"
         sensitive = (
-            contains_fixed_credential(content)
+            contains_binary_credential_residue(content)
             if sqlite_database
             else contains_possible_credential(content)
         )

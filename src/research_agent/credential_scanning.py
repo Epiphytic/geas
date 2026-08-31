@@ -11,7 +11,7 @@ _FIXED_CREDENTIAL_PATTERNS = (
 )
 _CREDENTIAL_NAME = rb"[A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD)"
 _CREDENTIAL_ASSIGNMENT_MARKER = re.compile(
-    rb"(?i)" + _CREDENTIAL_NAME + rb"\s*[:=]"
+    rb"(?i)(?P<name>" + _CREDENTIAL_NAME + rb")\s*[:=]"
 )
 _CREDENTIAL_ASSIGNMENT = re.compile(
     rb"(?i)[ \t]*(?P<name>" + _CREDENTIAL_NAME + rb")[ \t]*[:=]"
@@ -20,6 +20,7 @@ _CREDENTIAL_ASSIGNMENT = re.compile(
 _CREDENTIAL_MARKER_CONTROL_BYTES = bytes(range(0x20)) + b"\x7f"
 _INERT_LITERAL = re.compile(rb"[A-Za-z0-9._/-]*")
 _MIN_CREDENTIAL_LENGTH = 12
+_MAX_BINARY_ASSIGNMENT_BYTES = 4096
 
 
 def contains_possible_credential(content: Buffer) -> bool:
@@ -49,6 +50,52 @@ def contains_possible_credential(content: Buffer) -> bool:
 def contains_fixed_credential(content: Buffer) -> bool:
     """Return whether content contains a fixed-format credential signature."""
     return any(pattern.search(content) for pattern in _FIXED_CREDENTIAL_PATTERNS)
+
+
+def contains_binary_credential_residue(content: Buffer) -> bool:
+    """Scan assignment-shaped ASCII fragments embedded in arbitrary binary bytes.
+
+    SQLite record headers and page metadata are not line syntax.  Start each
+    bounded candidate at the credential marker and stop at the first binary
+    delimiter so those bytes cannot turn an inert placeholder into a false
+    finding.  A candidate that exceeds the bound fails closed.
+    """
+    if contains_fixed_credential(content):
+        return True
+    size = len(content)
+    for marker in _CREDENTIAL_ASSIGNMENT_MARKER.finditer(content):
+        start = marker.start()
+        end = marker.end()
+        limit = min(size, start + _MAX_BINARY_ASSIGNMENT_BYTES)
+        while end < limit:
+            value = content[end]
+            if value != 0x09 and not 0x20 <= value < 0x7F:
+                break
+            end += 1
+        if end == limit and end < size:
+            next_value = content[end]
+            if next_value == 0x09 or 0x20 <= next_value < 0x7F:
+                return True
+        candidate = content[start:end]
+        if contains_possible_credential(candidate) and not _binary_placeholder_with_record_prefix(
+            marker.group("name"),
+            content[marker.end() : end],
+        ):
+            return True
+    return False
+
+
+def _binary_placeholder_with_record_prefix(name: bytes, rhs: Buffer) -> bool:
+    """Recognize an exact public placeholder despite printable record-header bytes."""
+    literal = _parse_inert_literal(bytes(rhs))
+    if literal is None or not literal.startswith(b"your_"):
+        return False
+    placeholder_name = literal.removeprefix(b"your_")
+    return bool(
+        placeholder_name
+        and name.lower().endswith(placeholder_name)
+        and re.fullmatch(rb"(?i)" + _CREDENTIAL_NAME, placeholder_name)
+    )
 
 
 def contains_credential_assignment_marker(content: Buffer) -> bool:

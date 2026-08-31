@@ -12,6 +12,7 @@ from research_agent.ontology_subscriptions import (
     OntologyFreshnessConfig,
     OntologySubscription,
     SubscriptionManager,
+    normalized_repository_identity,
 )
 from research_agent.user_config import (
     GeasProfile,
@@ -121,6 +122,18 @@ def test_subscription_accepts_explicit_supported_remote_transports(url: str) -> 
     )
 
 
+def test_generic_scp_identity_matches_explicit_git_ssh_without_conflating_user() -> None:
+    scp = normalized_repository_identity("git@example.invalid:owner/repository.git")
+    explicit = normalized_repository_identity(
+        "ssh://git@example.invalid/owner/repository.git"
+    )
+
+    assert scp == explicit == "ssh://git@example.invalid/owner/repository"
+    assert normalized_repository_identity(
+        "ssh://example.invalid/owner/repository.git"
+    ) != scp
+
+
 @pytest.mark.parametrize(
     "active_ref",
     (
@@ -223,6 +236,8 @@ def test_subscribe_rejects_boundary_whitespace_in_ref_before_any_work(
         "https://example.invalid/repository.git#token=secret",
         "https://example.invalid/a/../repository.git",
         "https://example.invalid/a/%2e%2e/repository.git",
+        "git@example.invalid:owner/../repository.git",
+        "git@example.invalid:owner/%2e%2e/repository.git",
     ),
 )
 def test_subscribe_revalidates_supported_credential_free_remote_before_writes(

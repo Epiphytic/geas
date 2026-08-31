@@ -2,18 +2,30 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import shutil
 from collections.abc import Callable, Mapping
+from contextlib import suppress
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Protocol
-from urllib.parse import unquote, urlsplit
 from uuid import uuid4
 
 from pydantic import Field, field_validator, model_validator
 
-from research_agent.models import StrictModel
+from research_agent.models import StrictModel, canonical_json
+from research_agent.removal_journal import (
+    RemovalJournal,
+    RemovalPhase,
+    confined_removal_path,
+    delete_removal_journal,
+    load_removal_journals,
+    sync_removal_parent,
+    verify_directory_identity,
+    write_removal_journal,
+)
+from research_agent.repository_catalog import normalized_repository_identity
 
 if TYPE_CHECKING:
     from research_agent.user_config import UserConfigManager
@@ -70,44 +82,6 @@ def _relative_path(value: object, *, label: str) -> Path:
     return Path(raw)
 
 
-def _validate_remote_url(value: str) -> str:
-    if not value or any(ord(character) < 32 or ord(character) == 127 for character in value):
-        raise ValueError("ontology Git URL contains control characters or is empty")
-    scp = re.fullmatch(
-        r"git@(?P<host>[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?):"
-        r"(?P<path>[^/?#][^?#]*)",
-        value,
-    )
-    if scp is not None:
-        _validate_url_path(scp.group("path"))
-        return value
-    parsed = urlsplit(value)
-    if parsed.scheme not in {"https", "ssh"}:
-        raise ValueError("ontology Git URL uses an unsupported remote transport")
-    if parsed.password is not None or (
-        parsed.username is not None and not (parsed.scheme == "ssh" and parsed.username == "git")
-    ):
-        raise ValueError("ontology Git URLs cannot embed credentials")
-    if not parsed.hostname or parsed.query or parsed.fragment:
-        raise ValueError("ontology Git URL must be a credential-free remote URL")
-    try:
-        _ = parsed.port
-    except ValueError as error:
-        raise ValueError("ontology Git URL port is invalid") from error
-    _validate_url_path(parsed.path)
-    return value
-
-
-def _validate_url_path(value: str) -> None:
-    decoded = unquote(value)
-    if not decoded or any(ord(character) < 32 or ord(character) == 127 for character in decoded):
-        raise ValueError("ontology Git remote path is invalid")
-    pure = PurePosixPath(decoded)
-    parts = pure.parts
-    if any(part in {"", ".", ".."} for part in parts) or pure.as_posix() != decoded:
-        raise ValueError("ontology Git remote path contains traversal")
-
-
 class OntologyFreshnessConfig(StrictModel):
     check_before_use: bool = True
     max_age_seconds: int = Field(default=3600, ge=60, le=604_800)
@@ -127,7 +101,8 @@ class OntologySubscription(StrictModel):
     @field_validator("url")
     @classmethod
     def url_is_credential_free_remote(cls, value: str) -> str:
-        return _validate_remote_url(value)
+        normalized_repository_identity(value)
+        return value
 
     @field_validator("active_ref", mode="before")
     @classmethod
@@ -195,6 +170,21 @@ class SubscriptionMutationReceipt(StrictModel):
     pull: dict[str, object] | None = None
 
 
+def _subscription_identity_sha256(subscription: OntologySubscription) -> str:
+    return hashlib.sha256(
+        canonical_json(subscription.model_dump(mode="json"))
+    ).hexdigest()
+
+
+def _write_subscription_removal_journal(
+    manager: UserConfigManager,
+    journal: RemovalJournal,
+) -> None:
+    if journal.kind != "subscription":
+        raise ValueError("subscription removal received the wrong journal kind")
+    write_removal_journal(manager.root, journal)
+
+
 class CatalogVerifier(Protocol):
     def __call__(self, catalog_path: Path) -> object: ...
 
@@ -237,6 +227,7 @@ class SubscriptionManager:
         subscription: OntologySubscription,
     ) -> SubscriptionMutationReceipt:
         """Verify and authorize a checkout before atomically recording it."""
+        self.recover_removals()
         validate_subscription_name(name)
         validated = OntologySubscription.model_validate(subscription.model_dump(mode="python"))
         original = self.config_manager.load()
@@ -319,6 +310,7 @@ class SubscriptionManager:
         remove_checkout: bool = False,
     ) -> SubscriptionMutationReceipt:
         """Remove one declaration, preserving checkout bytes unless explicitly requested."""
+        self.recover_removals()
         validate_subscription_name(name)
         config = self.config_manager.load()
         original_config_bytes = self.config_manager.path.read_bytes()
@@ -377,28 +369,40 @@ class SubscriptionManager:
         if rechecked != checkout:
             raise RuntimeError("subscription checkout identity changed before removal")
         verified_identity = checkout.stat(follow_symlinks=False)
-        before = original_config_bytes
-        quarantine = checkout.with_name(f".{checkout.name}.remove-{uuid4().hex}")
+        transaction_id = uuid4().hex
+        quarantine = checkout.with_name(f".{checkout.name}.remove-{transaction_id}")
         if quarantine.exists() or quarantine.is_symlink():
             raise RuntimeError("subscription removal quarantine already exists")
-        moved = False
+        relative_quarantine = subscription.checkout.with_name(quarantine.name)
+        journal = RemovalJournal(
+            kind="subscription",
+            transaction_id=transaction_id,
+            phase=RemovalPhase.VALIDATED,
+            profile_name=self.profile_name,
+            target=subscription.checkout,
+            quarantine=relative_quarantine,
+            device=verified_identity.st_dev,
+            inode=verified_identity.st_ino,
+            name=name,
+            subscription_sha256=_subscription_identity_sha256(subscription),
+        )
+        _write_subscription_removal_journal(self.config_manager, journal)
         try:
-            current_identity = checkout.stat(follow_symlinks=False)
-            if not os.path.samestat(verified_identity, current_identity):
-                raise RuntimeError("subscription checkout identity changed before removal")
+            verify_directory_identity(checkout, journal)
             os.replace(checkout, quarantine)
-            moved = True
+            sync_removal_parent(self.config_manager.root, relative_quarantine)
+            journal = journal.model_copy(update={"phase": RemovalPhase.QUARANTINED})
+            _write_subscription_removal_journal(self.config_manager, journal)
             self.config_manager.replace(updated)
+            journal = journal.model_copy(update={"phase": RemovalPhase.CONFIG_COMMITTED})
+            _write_subscription_removal_journal(self.config_manager, journal)
+            verify_directory_identity(quarantine, journal)
             shutil.rmtree(quarantine)
-            moved = False
+            sync_removal_parent(self.config_manager.root, relative_quarantine)
+            delete_removal_journal(self.config_manager.root, journal)
         except BaseException:
-            if (
-                not self.config_manager.path.exists()
-                or self.config_manager.path.read_bytes() != before
-            ):
-                self.config_manager.restore_bytes(before)
-            if moved and quarantine.exists() and not checkout.exists():
-                os.replace(quarantine, checkout)
+            with suppress(BaseException):
+                self.recover_removals()
             raise
         return SubscriptionMutationReceipt(
             name=name,
@@ -406,6 +410,75 @@ class SubscriptionManager:
             unsubscribed=True,
             checkout_removed=True,
         )
+
+    def recover_removals(self) -> None:
+        """Restore or finish exact checkout removals from durable journals."""
+        for journal in load_removal_journals(
+            self.config_manager.root,
+            kind="subscription",
+        ):
+            config = self.config_manager.load()
+            referenced = False
+            for profile in config.profiles.values():
+                normalized = profile.normalized_subscriptions(
+                    freshness=config.ontology_freshness
+                )
+                for subscription in normalized.values():
+                    candidate = subscription.checkout
+                    if (
+                        candidate != journal.target
+                        and not candidate.is_relative_to(journal.target)
+                        and not journal.target.is_relative_to(candidate)
+                    ):
+                        continue
+                    if candidate != journal.target:
+                        raise ValueError(
+                            "subscription removal journal overlaps configured checkout"
+                        )
+                    if _subscription_identity_sha256(subscription) != journal.subscription_sha256:
+                        raise ValueError(
+                            "subscription removal journal conflicts with configured identity"
+                        )
+                    referenced = True
+
+            target = confined_removal_path(self.config_manager.root, journal.target)
+            quarantine = confined_removal_path(
+                self.config_manager.root,
+                journal.quarantine,
+            )
+            target_exists = target.exists()
+            quarantine_exists = quarantine.exists()
+            if target_exists and quarantine_exists:
+                raise ValueError("subscription removal target and quarantine both exist")
+
+            if referenced:
+                if quarantine_exists:
+                    verify_directory_identity(quarantine, journal)
+                    os.replace(quarantine, target)
+                    sync_removal_parent(self.config_manager.root, journal.target)
+                    verify_directory_identity(target, journal)
+                elif target_exists:
+                    verify_directory_identity(target, journal)
+                else:
+                    raise ValueError("registered subscription checkout is missing")
+            else:
+                if target_exists:
+                    verify_directory_identity(target, journal)
+                    os.replace(target, quarantine)
+                    sync_removal_parent(
+                        self.config_manager.root,
+                        journal.quarantine,
+                    )
+                    verify_directory_identity(quarantine, journal)
+                    quarantine_exists = True
+                if quarantine_exists:
+                    verify_directory_identity(quarantine, journal)
+                    shutil.rmtree(quarantine)
+                    sync_removal_parent(
+                        self.config_manager.root,
+                        journal.quarantine,
+                    )
+            delete_removal_journal(self.config_manager.root, journal)
 
     def _repository(self, checkout: Path, subscription: OntologySubscription) -> RepositoryOperator:
         if self.repository_factory is not None:
@@ -430,6 +503,7 @@ class SubscriptionManager:
         pull: bool = True,
         push: bool = False,
     ) -> tuple[SubscriptionSyncReceipt, ...]:
+        self.recover_removals()
         config = self.config_manager.load()
         profile = config.profile(self.profile_name)[1]
         configured = profile.normalized_subscriptions(freshness=config.ontology_freshness)

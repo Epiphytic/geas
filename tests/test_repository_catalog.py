@@ -349,6 +349,44 @@ def test_verify_catalog_requires_known_transitive_yaml_inputs_in_inventory(
         verify_catalog(tmp_path / "geas.yaml")
 
 
+@pytest.mark.parametrize(
+    ("kind", "message"),
+    (
+        ("cycle", "cycle"),
+        ("depth", "depth"),
+        ("expansion", "node|expansion"),
+        ("size", "size"),
+    ),
+)
+def test_refresh_rejects_unbounded_declared_yaml_without_rewriting_catalog(
+    tmp_path: Path,
+    kind: str,
+    message: str,
+) -> None:
+    if kind == "cycle":
+        content = b"cycle: &cycle\n  - *cycle\n"
+    elif kind == "depth":
+        content = ("nested: " + "[" * 70 + "leaf" + "]" * 70 + "\n").encode()
+    elif kind == "expansion":
+        lines = ["a0: &a0 [leaf, leaf]"]
+        lines.extend(
+            f"a{index}: &a{index} [*a{index - 1}, *a{index - 1}]"
+            for index in range(1, 18)
+        )
+        content = ("\n".join(lines) + "\n").encode()
+    else:
+        content = b"#" + b"x" * (1024 * 1024) + b"\n"
+    entry = _entry(tmp_path, files={"build.yaml": content})
+    catalog = tmp_path / "geas.yaml"
+    _write_catalog(catalog, entry)
+    before = catalog.read_bytes()
+
+    with pytest.raises(ValueError, match=message):
+        refresh_catalog(catalog)
+
+    assert catalog.read_bytes() == before
+
+
 def test_verify_catalog_rejects_undeclared_workspace_relative_seed_bundle(
     tmp_path: Path,
 ) -> None:

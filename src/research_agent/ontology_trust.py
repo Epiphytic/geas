@@ -9,7 +9,6 @@ import shutil
 from collections.abc import Callable, Sequence
 from contextlib import suppress
 from datetime import datetime
-from enum import StrEnum
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Literal, Protocol
 from uuid import uuid4
@@ -17,6 +16,16 @@ from uuid import uuid4
 from pydantic import Field, field_validator
 
 from research_agent.models import StrictModel, canonical_json, utc_now
+from research_agent.removal_journal import (
+    RemovalJournal,
+    RemovalPhase,
+    confined_removal_path,
+    delete_removal_journal,
+    load_removal_journals,
+    sync_removal_parent,
+    verify_directory_identity,
+    write_removal_journal,
+)
 from research_agent.repository_catalog import (
     CatalogFile,
     CatalogOntology,
@@ -228,12 +237,6 @@ class _StagedSnapshot(StrictModel):
     created: bool
 
 
-class _SnapshotRemovalPhase(StrEnum):
-    VALIDATED = "validated"
-    QUARANTINED = "quarantined"
-    CONFIG_COMMITTED = "config_committed"
-
-
 class TrustPrompt(Protocol):
     """Pure injected I/O for decisions; trusted state remains manager-owned."""
 
@@ -375,38 +378,35 @@ def _profile_with_effective_ref_denial(
 ) -> GeasProfile:
     if catalog.active_ref is None:
         raise ValueError("repository catalog has no active Git ref")
-    denial = _interactive_rule(
+    broad_denial = _interactive_rule(
         catalog,
         decision="deny",
         refs=(catalog.active_ref,),
     )
-    denial_selectors = (
-        denial.repository,
-        denial.refs,
-        denial.paths,
-        denial.bundle_sha256,
-    )
-    retained: list[TrustRule] = []
+    denials = [broad_denial]
     for rule in profile.trust_rules:
-        selectors = (
-            rule.repository,
-            rule.refs,
-            rule.paths,
-            rule.bundle_sha256,
-        )
-        if selectors == denial_selectors:
+        if rule.decision != "allow" or rule.repository != broad_denial.repository:
             continue
-        if rule.decision == "allow" and rule.repository == denial.repository:
-            if rule.refs == "*":
-                if rule.paths != "*" or rule.bundle_sha256 != "*":
-                    continue
-            elif catalog.active_ref in rule.refs:
-                remaining_refs = tuple(ref for ref in rule.refs if ref != catalog.active_ref)
-                if not remaining_refs:
-                    continue
-                rule = rule.model_copy(update={"refs": remaining_refs})
-        retained.append(rule)
-    return profile.model_copy(update={"trust_rules": _normalized_trust_rules((*retained, denial))})
+        if rule.refs != "*" and catalog.active_ref not in rule.refs:
+            continue
+        if rule.paths == "*" and rule.bundle_sha256 == "*":
+            continue
+        denials.append(
+            _interactive_rule(
+                catalog,
+                decision="deny",
+                refs=(catalog.active_ref,),
+                paths=rule.paths,
+                digests=rule.bundle_sha256,
+            )
+        )
+    return profile.model_copy(
+        update={
+            "trust_rules": _normalized_trust_rules(
+                (*profile.trust_rules, *denials)
+            )
+        }
+    )
 
 
 def _normalized_trust_rules(rules: Sequence[TrustRule]) -> tuple[TrustRule, ...]:
@@ -465,6 +465,7 @@ def authorize_repository_catalog(
 ) -> tuple[AuthorizedOntology, ...]:
     """Authorize a freshly re-verified catalog through trusted profile state."""
     catalog = _fresh_catalog(catalog)
+    recover_snapshot_removals(manager)
     config = manager.load()
     try:
         profile = config.profiles[profile_name]
@@ -758,6 +759,69 @@ def _cleanup_snapshot_quarantine(
     return True
 
 
+def _write_snapshot_removal_journal(
+    manager: UserConfigManager,
+    journal: RemovalJournal,
+) -> None:
+    if journal.kind != "snapshot":
+        raise ValueError("snapshot removal received the wrong journal kind")
+    write_removal_journal(manager.root, journal)
+
+
+def _snapshot_journal_is_referenced(
+    config: GeasUserConfig,
+    journal: RemovalJournal,
+) -> bool:
+    referenced = False
+    for profile in config.profiles.values():
+        for candidate in profile.installed_ontologies:
+            same_path = candidate.path == journal.target
+            same_identity = (
+                candidate.name == journal.name
+                and candidate.bundle_sha256 == journal.bundle_sha256
+            )
+            if same_path != same_identity:
+                raise ValueError("snapshot removal journal conflicts with configured identity")
+            referenced = referenced or (same_path and same_identity)
+    return referenced
+
+
+def recover_snapshot_removals(manager: UserConfigManager) -> None:
+    """Restore or finish exact snapshot removals from durable journals."""
+    for journal in load_removal_journals(manager.root, kind="snapshot"):
+        config = manager.load()
+        referenced = _snapshot_journal_is_referenced(config, journal)
+        target = confined_removal_path(manager.root, journal.target)
+        quarantine = confined_removal_path(manager.root, journal.quarantine)
+        target_exists = target.exists()
+        quarantine_exists = quarantine.exists()
+        if target_exists and quarantine_exists:
+            raise ValueError("snapshot removal target and quarantine both exist")
+
+        if referenced:
+            if quarantine_exists:
+                verify_directory_identity(quarantine, journal)
+                os.replace(quarantine, target)
+                sync_removal_parent(manager.root, journal.target)
+                verify_directory_identity(target, journal)
+            elif target_exists:
+                verify_directory_identity(target, journal)
+            else:
+                raise ValueError("registered snapshot removal directory is missing")
+        else:
+            if target_exists:
+                verify_directory_identity(target, journal)
+                os.replace(target, quarantine)
+                sync_removal_parent(manager.root, journal.quarantine)
+                verify_directory_identity(quarantine, journal)
+                quarantine_exists = True
+            if quarantine_exists:
+                verify_directory_identity(quarantine, journal)
+                _remove_exact_directory(quarantine)
+                sync_removal_parent(manager.root, journal.quarantine)
+        delete_removal_journal(manager.root, journal)
+
+
 def _stage_snapshot(
     ontology: VerifiedCatalogOntology,
     *,
@@ -831,6 +895,7 @@ def install_snapshot(
     profile_name: str,
 ) -> InstalledOntologySnapshot:
     """Copy and register one exact verified inventory transactionally."""
+    recover_snapshot_removals(manager)
     config = manager.load()
     try:
         profile = config.profiles[profile_name]
@@ -873,6 +938,7 @@ def remove_snapshot(
     profile_name: str,
 ) -> SnapshotRemovalReceipt:
     """Atomically unregister and remove one exact managed digest directory."""
+    recover_snapshot_removals(manager)
     config = manager.load()
     try:
         profile = config.profiles[profile_name]
@@ -903,44 +969,39 @@ def remove_snapshot(
             removed=False,
         )
 
-    moved = destination.with_name(f".{destination.name}.remove-{uuid4().hex}")
-    phase = _SnapshotRemovalPhase.VALIDATED
+    transaction_id = uuid4().hex
+    moved = destination.with_name(f".{destination.name}.remove-{transaction_id}")
+    relative_moved = snapshot.path.with_name(moved.name)
+    verified_identity = destination.stat(follow_symlinks=False)
+    journal = RemovalJournal(
+        kind="snapshot",
+        transaction_id=transaction_id,
+        phase=RemovalPhase.VALIDATED,
+        profile_name=profile_name,
+        target=snapshot.path,
+        quarantine=relative_moved,
+        device=verified_identity.st_dev,
+        inode=verified_identity.st_ino,
+        name=snapshot.name,
+        bundle_sha256=snapshot.bundle_sha256,
+    )
+    _write_snapshot_removal_journal(manager, journal)
     try:
+        verify_directory_identity(destination, journal)
         os.replace(destination, moved)
-        phase = _SnapshotRemovalPhase.QUARANTINED
+        sync_removal_parent(manager.root, relative_moved)
+        journal = journal.model_copy(update={"phase": RemovalPhase.QUARANTINED})
+        _write_snapshot_removal_journal(manager, journal)
         manager.replace(updated_config)
-        phase = _SnapshotRemovalPhase.CONFIG_COMMITTED
+        journal = journal.model_copy(update={"phase": RemovalPhase.CONFIG_COMMITTED})
+        _write_snapshot_removal_journal(manager, journal)
+        verify_directory_identity(moved, journal)
+        _remove_exact_directory(moved)
+        sync_removal_parent(manager.root, relative_moved)
+        delete_removal_journal(manager.root, journal)
     except BaseException:
-        if phase is _SnapshotRemovalPhase.VALIDATED and moved.exists():
-            phase = _SnapshotRemovalPhase.QUARANTINED
-        if phase is _SnapshotRemovalPhase.QUARANTINED:
-            try:
-                committed = not _config_references_physical_snapshot(
-                    manager.load(),
-                    physical_identity,
-                    manager=manager,
-                )
-            except BaseException:
-                committed = False
-            if committed:
-                phase = _SnapshotRemovalPhase.CONFIG_COMMITTED
-                with suppress(BaseException):
-                    _cleanup_snapshot_quarantine(
-                        moved,
-                        snapshot=snapshot,
-                        manager=manager,
-                    )
-            elif moved.exists() and not destination.exists():
-                os.replace(moved, destination)
-        raise
-    try:
-        _cleanup_snapshot_quarantine(
-            moved,
-            snapshot=snapshot,
-            manager=manager,
-        )
-    except BaseException:
-        # Configuration is authoritative now; quarantine cleanup is only GC.
+        with suppress(BaseException):
+            recover_snapshot_removals(manager)
         raise
     _remove_empty_snapshot_parents(destination)
     return SnapshotRemovalReceipt(

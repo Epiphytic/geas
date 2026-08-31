@@ -25,7 +25,7 @@ from research_agent.ontology_subscriptions import OntologySubscription
 from research_agent.paths import resolve_selected_ontology_config
 from research_agent.projection import KnowledgeQueryEngine
 from research_agent.render import render_ontology_skill
-from research_agent.repository_catalog import verify_catalog
+from research_agent.repository_catalog import normalized_repository_identity, verify_catalog
 
 
 @dataclass(frozen=True)
@@ -57,7 +57,7 @@ def selection_from_repository_catalog(
         source_kind="subscription",
         ontology_directory=verified.ontology_path,
         verified_ontology_directory=verified.ontology_path,
-        repository_identity=subscription.url.removesuffix(".git"),
+        repository_identity=normalized_repository_identity(subscription.url),
         repository_root=repository_root,
         verified_repository_root=repository_root,
         identity_kind="remote",

@@ -985,7 +985,9 @@ def _assert_no_symlink_path(root: Path, relative: Path) -> None:
 
 
 def _validate_payload_path(value: str) -> None:
-    if not value or "\\" in value or any(ord(character) < 32 for character in value):
+    if not value or "\\" in value or any(
+        ord(character) < 32 or ord(character) == 127 for character in value
+    ):
         raise ValueError("artifact path is not normalized")
     path = PurePosixPath(value)
     if (

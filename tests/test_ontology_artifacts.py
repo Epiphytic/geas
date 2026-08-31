@@ -58,6 +58,7 @@ class MemoryArtifactStore:
     def __init__(self) -> None:
         self.values: dict[tuple[str, str], Path] = {}
         self.root: Path | None = None
+        self.download_calls = 0
 
     def use_root(self, root: Path) -> MemoryArtifactStore:
         self.root = root
@@ -78,6 +79,7 @@ class MemoryArtifactStore:
         return (artifact.release_tag, artifact.asset_name) in self.values
 
     def download(self, artifact: OntologyArtifact, destination: Path) -> None:
+        self.download_calls += 1
         source = self.values[(artifact.release_tag, artifact.asset_name)]
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source, destination)
@@ -154,6 +156,34 @@ def test_artifacts_publish_by_input_revision_and_hydrate_lazily(tmp_path: Path) 
 
     cached = manager.hydrate(store=store)
     assert all(not item.downloaded for item in cached.hydrated)
+
+
+def test_hydration_rejects_symlinked_cache_root_before_download_or_canonical_write(
+    tmp_path: Path,
+) -> None:
+    """A cache alias back into the ontology must not overwrite canonical bytes."""
+    ontology = tmp_path / "routing"
+    ontology.mkdir()
+    database = tmp_path / "library.sqlite"
+    _library_database(database)
+    store = MemoryArtifactStore().use_root(tmp_path / "remote-assets")
+    manager = OntologyArtifactManager(ontology)
+    manager.publish(
+        store=store,
+        published_by="test:operator",
+        storage_rights_basis="operator-confirmed private storage",
+        source_library=database,
+    )
+    canonical = ontology / "library.sqlite"
+    canonical.write_bytes(b"canonical ontology bytes\n")
+    (ontology / ".geas-artifacts").symlink_to(ontology, target_is_directory=True)
+    before = canonical.read_bytes()
+
+    with pytest.raises(OntologyArtifactError, match="symbolic link"):
+        manager.hydrate(store=store)
+
+    assert store.download_calls == 0
+    assert canonical.read_bytes() == before
 
 
 def test_artifact_publication_rejects_possible_credentials(tmp_path: Path) -> None:
@@ -419,6 +449,45 @@ def test_sqlite_stored_values_keep_normal_placeholder_classification(
     assert receipt.published == (ArtifactRole.SOURCE_LIBRARY,)
     assert len(store.values) == 1
     assert (ontology / "artifacts.yaml").is_file()
+
+
+@pytest.mark.parametrize("residue_kind", ("page-slack", "freelist"))
+def test_sqlite_artifact_rejects_deleted_assignment_residue_without_upload(
+    tmp_path: Path,
+    residue_kind: str,
+) -> None:
+    """Outgoing bytes remain sensitive after SQLite no longer exposes the row."""
+    ontology = tmp_path / "routing"
+    ontology.mkdir()
+    database = tmp_path / "library.sqlite"
+    _library_database(database)
+    secret = b"FIRECRAWL_KEY=operator-secret-value-123\n"
+    with sqlite3.connect(database) as connection:
+        connection.execute("PRAGMA secure_delete=OFF")
+        connection.execute("CREATE TABLE deleted_residue(content TEXT NOT NULL)")
+        if residue_kind == "page-slack":
+            connection.execute("INSERT INTO deleted_residue VALUES (?)", (secret.decode(),))
+            connection.execute("DELETE FROM deleted_residue")
+            assert connection.execute("PRAGMA freelist_count").fetchone() == (0,)
+        else:
+            padded = "x" * 5000 + secret.decode() + "y" * 5000
+            connection.execute("INSERT INTO deleted_residue VALUES (?)", (padded,))
+            connection.execute("DROP TABLE deleted_residue")
+            assert connection.execute("PRAGMA freelist_count").fetchone()[0] > 0
+    assert secret in database.read_bytes()
+    store = MemoryArtifactStore().use_root(tmp_path / "remote-assets")
+
+    with pytest.raises(OntologyArtifactError, match="possible credential"):
+        OntologyArtifactManager(ontology).publish(
+            store=store,
+            published_by="test:operator",
+            storage_rights_basis="operator-confirmed private storage",
+            source_library=database,
+        )
+
+    assert store.values == {}
+    assert tuple((tmp_path / "remote-assets").iterdir()) == ()
+    assert not (ontology / "artifacts.yaml").exists()
 
 
 @pytest.mark.parametrize(

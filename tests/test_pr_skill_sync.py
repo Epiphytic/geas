@@ -25,6 +25,7 @@ from research_agent.agent_skills import (
 )
 from research_agent.pr_skill_sync import (
     ALLOWED_SKILL_ROOTS,
+    ArtifactFile,
     ArtifactSource,
     PullRequestSnapshotManifest,
     apply_verified_writeback,
@@ -168,6 +169,15 @@ def _snapshot(root: Path, name: str, body: bytes) -> None:
     (directory / "geas-skill.json").write_bytes(canonical_manifest_bytes(manifest))
 
 
+def test_artifact_file_rejects_del_control_in_privileged_payload_path() -> None:
+    with pytest.raises(ValueError, match="normalized"):
+        ArtifactFile(
+            path=".agents/skills/geas/unsafe\x7f.md",
+            size_bytes=0,
+            sha256="0" * 64,
+        )
+
+
 def _snapshots(root: Path) -> Path:
     _snapshot(root, "geas", b"Generic Geas operations.\n")
     _snapshot(
@@ -243,6 +253,7 @@ def test_pull_request_must_remain_open_and_match_the_exact_head() -> None:
     [
         ("absolute", "invalid"),
         ("traversal", "invalid"),
+        ("del-control", "invalid"),
         ("duplicate", "invalid"),
         ("extra-field", "invalid"),
         ("extra-file", "inventory"),
@@ -264,6 +275,8 @@ def test_artifact_verification_fails_closed_for_manifest_and_inventory_tampering
         payload["files"][0]["path"] = "/tmp/escape"
     elif mutation == "traversal":
         payload["files"][0]["path"] = ".agents/skills/geas/../escape"
+    elif mutation == "del-control":
+        payload["files"][0]["path"] = ".agents/skills/geas/unsafe\x7f.md"
     elif mutation == "duplicate":
         payload["files"].append(dict(payload["files"][0]))
     elif mutation == "extra-field":

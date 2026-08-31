@@ -292,6 +292,24 @@ def test_git_sync_rejects_secret_content_and_unrelated_staging(
         manager.push(relative_paths=(Path("routing"),), message="must fail")
 
 
+def test_git_sync_rejects_staged_regular_file_to_symlink_type_change(
+    tmp_path: Path,
+) -> None:
+    """A Git `T` change must be inspected before any local or remote commit."""
+    remote = tmp_path / "remote.git"
+    original, _ = _seed_remote(remote, tmp_path / "seed")
+    manager = _manager(remote, tmp_path / "seed")
+    ontology = manager.checkout / "ontology.yaml"
+    ontology.unlink()
+    ontology.symlink_to(".gitignore")
+
+    with pytest.raises(OntologySyncError, match="symbolic link|mode"):
+        manager.push(relative_paths=(Path("ontology.yaml"),), message="must fail")
+
+    assert _git("rev-parse", "HEAD", cwd=manager.checkout).stdout.strip() == original
+    assert _git("rev-parse", "refs/heads/main", cwd=remote).stdout.strip() == original
+
+
 def test_git_sync_accepts_documented_public_placeholders(
     tmp_path: Path,
     monkeypatch,

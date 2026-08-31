@@ -1356,9 +1356,6 @@ def _replace_snapshot_and_links(
     candidate = transaction / "candidate"
     changed_links: list[tuple[_LinkPlan, Path]] = []
     receipts: list[LinkReceipt] = []
-    snapshot_moved = False
-    snapshot_installed = False
-    state_moved = False
     state_write_attempted = False
     committed = False
     try:
@@ -1372,9 +1369,7 @@ def _replace_snapshot_and_links(
         if not snapshot_unchanged:
             if snapshot.exists() or snapshot.is_symlink():
                 os.replace(snapshot, snapshot_backup)
-                snapshot_moved = True
             os.replace(candidate, snapshot)
-            snapshot_installed = True
         if state_path is not None:
             _prepare_builtin_skill_state_parent(state_path)
             if state_path.is_symlink():
@@ -1383,7 +1378,6 @@ def _replace_snapshot_and_links(
                 if not state_path.is_file():
                     raise ValueError("builtin skill state must be a regular file")
                 os.replace(state_path, state_backup)
-                state_moved = True
         for index, plan in enumerate(plans):
             _confined_link_parent(plan.destination.parent, root)
             if _path_signature(plan.destination) != plan.signature:
@@ -1392,9 +1386,9 @@ def _replace_snapshot_and_links(
                 receipts.append(LinkReceipt(path=plan.destination, target=snapshot, unchanged=True))
                 continue
             backup = transaction / f"link-{index}"
+            changed_links.append((plan, backup))
             if plan.destination.exists() or plan.destination.is_symlink():
                 os.replace(plan.destination, backup)
-            changed_links.append((plan, backup))
             plan.destination.symlink_to(plan.expected_target, target_is_directory=True)
             receipts.append(LinkReceipt(path=plan.destination, target=snapshot, unchanged=False))
         if state_path is not None:
@@ -1403,24 +1397,34 @@ def _replace_snapshot_and_links(
             _write_builtin_skill_state(state_path, builtin_state)
         # Commit point: every desired visible snapshot and link now exists.
         committed = True
-    except Exception:
+    except BaseException:
         if (
             state_write_attempted
             and state_path is not None
             and (state_path.exists() or state_path.is_symlink())
         ):
             _remove_exact_target(state_path)
-        if state_moved:
+        if state_path is not None and (state_backup.exists() or state_backup.is_symlink()):
+            if state_path.exists() or state_path.is_symlink():
+                _remove_exact_target(state_path)
             os.replace(state_backup, state_path)
         for plan, backup in reversed(changed_links):
-            if plan.destination.exists() or plan.destination.is_symlink():
-                _remove_exact_target(plan.destination)
             if backup.exists() or backup.is_symlink():
+                if plan.destination.exists() or plan.destination.is_symlink():
+                    _remove_exact_target(plan.destination)
                 os.replace(backup, plan.destination)
-        if snapshot_installed and (snapshot.exists() or snapshot.is_symlink()):
-            _remove_exact_target(snapshot)
-        if snapshot_moved:
+            elif plan.signature == ("absent",) and (
+                plan.destination.exists() or plan.destination.is_symlink()
+            ):
+                _remove_exact_target(plan.destination)
+        if snapshot_backup.exists() or snapshot_backup.is_symlink():
+            if snapshot.exists() or snapshot.is_symlink():
+                _remove_exact_target(snapshot)
             os.replace(snapshot_backup, snapshot)
+        elif snapshot_signature == ("absent",) and not candidate.exists() and (
+            snapshot.exists() or snapshot.is_symlink()
+        ):
+            _remove_exact_target(snapshot)
         _discard_transaction(transaction)
         raise
 
