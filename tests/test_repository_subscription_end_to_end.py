@@ -10,6 +10,7 @@ import subprocess
 import sys
 import sysconfig
 import venv
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -17,7 +18,7 @@ import pytest
 
 import research_agent.cli as cli
 from research_agent.agent_skills import validate_snapshot
-from research_agent.geas_update import GeasInstallProvenance, GeasUpdater
+from research_agent.geas_update import GeasInstallProvenance, GeasUpdateError, GeasUpdater
 from research_agent.ontology_artifacts import OntologyArtifact, OntologyArtifactManifest
 from research_agent.ontology_subscriptions import OntologyFreshnessConfig, SubscriptionManager
 from research_agent.ontology_trust import (
@@ -67,9 +68,15 @@ def _local_public_origin_checkout(destination: Path) -> Path:
     return destination
 
 
-def _inspected_checkout_provenance(checkout: Path) -> GeasInstallProvenance:
-    """Inspect the exact cloned checkout without adding a tracked test entrypoint."""
-    head = _git(checkout, "rev-parse", "--verify", "HEAD")
+@dataclass(frozen=True)
+class _IgnoredCheckoutEntrypoint:
+    executable: Path
+    executable_sha256: str
+    exclude_sha256: str
+
+
+def _setup_ignored_checkout_entrypoint(checkout: Path) -> _IgnoredCheckoutEntrypoint:
+    """Create the one ignored local executable needed for development inspection."""
     executable = checkout / "bin" / "geas"
     executable.parent.mkdir(exist_ok=True)
     exclude = checkout / ".git" / "info" / "exclude"
@@ -77,21 +84,36 @@ def _inspected_checkout_provenance(checkout: Path) -> GeasInstallProvenance:
     if "/bin/geas\n" not in excluded:
         exclude.write_text(f"{excluded.rstrip()}\n/bin/geas\n")
     executable.write_text("#!/bin/sh\n")
+    entrypoint = _IgnoredCheckoutEntrypoint(
+        executable=executable,
+        executable_sha256=hashlib.sha256(executable.read_bytes()).hexdigest(),
+        exclude_sha256=hashlib.sha256(exclude.read_bytes()).hexdigest(),
+    )
+    assert not _git(checkout, "status", "--porcelain", "--untracked-files=all")
+    return entrypoint
+
+
+def _inspect_checkout_provenance(
+    checkout: Path,
+    entrypoint: _IgnoredCheckoutEntrypoint,
+) -> GeasInstallProvenance:
+    """Read and verify the exact cloned checkout without modifying it."""
+    head = _git(checkout, "rev-parse", "--verify", "HEAD")
     provenance = GeasUpdater(
         source_directory=checkout / "src" / "research_agent",
-        executable=executable,
+        executable=entrypoint.executable,
         module_file=checkout / "src" / "research_agent" / "geas_update.py",
         installed_version=cli._installed_geas_version,
     ).inspect()
     tracked = subprocess.run(
-        ("git", "ls-files", "--error-unmatch", "bin/geas"),
+        ("git", "ls-files", "--error-unmatch", entrypoint.executable.relative_to(checkout)),
         cwd=checkout,
         text=True,
         capture_output=True,
         check=False,
     )
     ignored = subprocess.run(
-        ("git", "check-ignore", "--quiet", "bin/geas"),
+        ("git", "check-ignore", "--quiet", entrypoint.executable.relative_to(checkout)),
         cwd=checkout,
         text=True,
         capture_output=True,
@@ -101,6 +123,12 @@ def _inspected_checkout_provenance(checkout: Path) -> GeasInstallProvenance:
     assert provenance.repository_url == REPOSITORY_URL
     assert provenance.branch == "main"
     assert provenance.commit == head == _git(checkout, "rev-parse", "--verify", "HEAD")
+    executable_sha256 = hashlib.sha256(entrypoint.executable.read_bytes()).hexdigest()
+    if executable_sha256 != entrypoint.executable_sha256:
+        raise GeasUpdateError("ignored checkout entrypoint identity changed")
+    exclude = checkout / ".git" / "info" / "exclude"
+    if hashlib.sha256(exclude.read_bytes()).hexdigest() != entrypoint.exclude_sha256:
+        raise GeasUpdateError("ignored checkout exclusion identity changed")
     assert not _git(checkout, "status", "--porcelain", "--untracked-files=all")
     assert tracked.returncode == 1
     assert ignored.returncode == 0
@@ -255,10 +283,27 @@ def test_current_repository_subscription_is_deterministic_and_offline(
         manager.root / "subscriptions" / "default" / "geas-samples"
     )
     checkout_head = _git(checkout, "rev-parse", "--verify", "HEAD")
-    geas_provenance = _inspected_checkout_provenance(checkout)
+    entrypoint = _setup_ignored_checkout_entrypoint(checkout)
+    geas_provenance = _inspect_checkout_provenance(checkout, entrypoint)
     geas_version = geas_provenance.version
     geas_commit = geas_provenance.commit
     assert geas_commit == checkout_head
+    wrapper_bytes = entrypoint.executable.read_bytes()
+    entrypoint.executable.write_bytes(b"#!/bin/sh\n# adversarial mutation\n")
+    with pytest.raises(GeasUpdateError, match="identity changed"):
+        _inspect_checkout_provenance(checkout, entrypoint)
+    assert entrypoint.executable.read_bytes() != wrapper_bytes
+    entrypoint.executable.write_bytes(wrapper_bytes)
+    entrypoint.executable.unlink()
+    with pytest.raises(GeasUpdateError, match="entrypoint"):
+        _inspect_checkout_provenance(checkout, entrypoint)
+    assert not entrypoint.executable.exists()
+    entrypoint.executable.write_bytes(wrapper_bytes)
+    assert (
+        hashlib.sha256(entrypoint.executable.read_bytes()).hexdigest()
+        == entrypoint.executable_sha256
+    )
+    assert _inspect_checkout_provenance(checkout, entrypoint) == geas_provenance
     manager.replace(
         GeasUserConfig(
             ontology_freshness=OntologyFreshnessConfig(check_before_use=False),
@@ -465,8 +510,12 @@ def test_current_repository_subscription_is_deterministic_and_offline(
     monkeypatch.setattr(cli, "GitHubReleaseArtifactStore", lambda *_args, **_kwargs: store)
 
     def current_checkout_identity() -> tuple[str, str]:
-        current = _inspected_checkout_provenance(checkout)
+        wrapper_before = entrypoint.executable.read_bytes()
+        exclude_before = (checkout / ".git" / "info" / "exclude").read_bytes()
+        current = _inspect_checkout_provenance(checkout, entrypoint)
         assert current == geas_provenance
+        assert entrypoint.executable.read_bytes() == wrapper_before
+        assert (checkout / ".git" / "info" / "exclude").read_bytes() == exclude_before
         return current.version, current.commit
 
     monkeypatch.setattr(cli, "_current_geas_identity", current_checkout_identity)
@@ -479,6 +528,13 @@ def test_current_repository_subscription_is_deterministic_and_offline(
         ])
         cli.main()
         exports.append(_receipt(capsys))
+        assert hashlib.sha256(entrypoint.executable.read_bytes()).hexdigest() == (
+            entrypoint.executable_sha256
+        )
+        exclude_sha256 = hashlib.sha256(
+            (checkout / ".git" / "info" / "exclude").read_bytes()
+        ).hexdigest()
+        assert exclude_sha256 == entrypoint.exclude_sha256
         _remove_generated_artifact_cache(checkout)
     exported = validate_snapshot(Path(str(exports[-1]["path"])))
     assert [item["unchanged"] for item in exports] == [False, True]
