@@ -520,6 +520,8 @@ def test_workflows_pin_actions_and_keep_token_exchange_after_all_gates() -> None
     }
     assert writeback["permissions"]["contents"] == "read"
     assert writeback["permissions"]["id-token"] == "write"
+    job_gate = writeback["jobs"]["writeback"]["if"]
+    assert "head_repository.full_name == github.repository" in job_gate
 
     def uses(document: dict[str, object]) -> list[str]:
         jobs = document["jobs"]
