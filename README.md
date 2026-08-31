@@ -243,15 +243,19 @@ geas ontology-subscribe geas-samples https://github.com/Epiphytic/geas.git \
   --ref refs/heads/main
 geas list
 geas skill-export open-source-research-agents --link
+geas ontology-unsubscribe geas-samples
+geas ontology-snapshot-remove open-source-research-agents BUNDLE_SHA256
 ```
 
 The first command announces that it is synchronizing a subscription and asks
 whether to trust its catalog. `--yolo` is an invocation-only alternative for
 one command; it never records trust. See [repository catalogs, trust, and
 subscriptions](docs/USER_CONFIG.md#repository-catalogs-trust-and-subscriptions)
-for the four choices, snapshots, update and removal behavior. Installing Geas
-itself remains optional; use this repository's [installation instructions](#installation)
-when you want its CLI.
+for the four choices, snapshots, update and removal behavior. Replace
+`BUNDLE_SHA256` with the exact digest shown by the snapshot receipt;
+`ontology-unsubscribe` preserves the checkout unless `--remove-checkout` is
+requested. Installing Geas itself remains optional; use this repository's
+[installation instructions](#installation) when you want its CLI.
 
 Ontology acceptance defaults to `auto`: Git-backed profile ontologies use
 Git-mediated acceptance on `refs/heads/main`, while non-Git ontologies remain

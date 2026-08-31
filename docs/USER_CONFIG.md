@@ -259,8 +259,16 @@ discovery and presents these choices:
 
 Choice 3 copies only the verified inventory into the managed config root under
 the ontology name and exact digest; it does not trust later source changes.
-Its snapshot is independently registered and must be removed by that exact
-managed name/digest lifecycle—never by deleting a broad config directory.
+Its snapshot is independently registered and must be removed by its exact
+managed name/digest lifecycle—never by deleting a broad config directory:
+
+```bash
+geas ontology-snapshot-remove ONTOLOGY BUNDLE_SHA256
+```
+
+Use the digest from the installation receipt. This removes an immutable
+ontology snapshot; it is distinct from `geas skill-remove PATH`, which removes
+an exported agent-skill snapshot and its managed links.
 Choices 3 and 4 both deny future repository trust for the current ref context.
 No interactive terminal means unresolved trust fails closed, although `list`
 can display inert candidates.
@@ -271,7 +279,10 @@ SHA-256. The most-specific matching rule wins; an equal allow/deny resolves to
 deny. `geas --yolo …` supplies only an in-memory repository-wide allow for that
 one process. It does not write config, install snapshots, survive to another
 invocation, or bypass manifest hashes, path checks, Git identity, artifacts, or
-source/model policy.
+source/model policy. Ref-only trust covers committed bytes represented by that
+ref, not dirty declared files. Dirty bytes require an applicable exact-digest
+or broader content/path trust decision, or an invocation-only `--yolo` decision;
+integrity verification remains mandatory in every case.
 
 The maintained sample is available through the public catalog:
 

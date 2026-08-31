@@ -103,12 +103,14 @@ implicitly; use the project setup instructions as a separate operator action.
 Dirty state, remote mismatch, fetch or non-fast-forward failure, post-merge
 tampering, reinstall failure, version/provenance mismatch after reexec, and a
 repeated continuation marker all fail closed before ontology artifacts or skill
-rendering. Once that trusted Geas boundary succeeds, update validates the skill
-manifest, requires the active ontology profile URL/branch to match, fast-forwards
-only the configured ontology remote, verifies the new artifact, then atomically
-replaces the snapshot. Receipts expose completed phases and old/new software and
-ontology commits. Source links and excerpts are provenance, not authority or a
-guarantee that the linked source is safe, current, licensed, or complete.
+rendering. Once that trusted Geas boundary succeeds, a catalog-bound update
+selects the same named subscription and revalidates its URL, generic active ref
+(branch, tag, or exact commit), catalog and ontology paths, exact bundle digest,
+resolved commit, artifact identity and projection stamp, and the executing Geas
+identity before atomically replacing the snapshot. Receipts expose completed
+phases and old/new software and ontology commits. Source links and excerpts are
+provenance, not authority or a guarantee that the linked source is safe,
+current, licensed, or complete.
 
 ## Unlink, remove, and fallback
 
