@@ -13,24 +13,23 @@ _CREDENTIAL_ASSIGNMENT = re.compile(
     rb"(?im)^\s*(?P<name>[A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD))\s*[:=]"
     rb"(?P<rhs>[^\r\n]*)\r?$"
 )
-_CREDENTIAL_VALUE_PREFIX = re.compile(rb"^[ \t]*['\"]?[^\s'\"]{12,}")
+_INERT_LITERAL = re.compile(rb"[A-Za-z0-9._/-]*")
+_MIN_CREDENTIAL_LENGTH = 12
 
 
 def contains_possible_credential(content: Buffer) -> bool:
     """Return whether inert content contains a credential-like value.
 
-    The sole assignment exception is the complete public-documentation RHS
-    ``NAME=your_name``, optionally quoted and followed only by whitespace or a
-    whitespace-delimited ``#`` comment. It is derived from the variable name
-    rather than a general placeholder allowlist, so concatenated or
-    similar-looking operator values remain credential findings.
+    Assignment values must be complete inert literals. The exact
+    public-documentation RHS ``NAME=your_name`` bypasses the normal literal
+    length finding. Composition, operators, interpolation, substitution,
+    escapes, split quotes, and ambiguous trailing syntax are findings at any
+    length.
     """
     if contains_fixed_credential(content):
         return True
     for match in _CREDENTIAL_ASSIGNMENT.finditer(content):
-        if _is_documented_placeholder(match.group("name"), match.group("rhs")):
-            continue
-        if _CREDENTIAL_VALUE_PREFIX.match(match.group("rhs")):
+        if _assignment_rhs_is_sensitive(match.group("name"), match.group("rhs")):
             return True
     return False
 
@@ -40,20 +39,43 @@ def contains_fixed_credential(content: Buffer) -> bool:
     return any(pattern.search(content) for pattern in _FIXED_CREDENTIAL_PATTERNS)
 
 
-def _is_documented_placeholder(name: bytes, rhs: bytes) -> bool:
-    expected = b"your_" + name.lower()
-    value = rhs.lstrip(b" \t")
-    if value.startswith(b'"'):
-        literal = b'"' + expected + b'"'
-    elif value.startswith(b"'"):
-        literal = b"'" + expected + b"'"
-    else:
-        literal = expected
-    if not value.startswith(literal):
-        return False
-    remainder = value[len(literal) :]
-    if not remainder or not remainder.strip(b" \t"):
+def _assignment_rhs_is_sensitive(name: bytes, rhs: bytes) -> bool:
+    literal = _parse_inert_literal(rhs)
+    if literal is None:
         return True
+    expected = b"your_" + name.lower()
+    return literal != expected and len(literal) >= _MIN_CREDENTIAL_LENGTH
+
+
+def _parse_inert_literal(rhs: bytes) -> bytes | None:
+    """Parse one complete inert literal without interpreting shell syntax.
+
+    Literals contain only ASCII letters, digits, ``._/-`` and may use one pair
+    of matching quotes. Horizontal whitespace may surround the literal. A
+    trailing comment requires whitespace before ``#``. Any other byte or token
+    makes the RHS ambiguous and therefore sensitive.
+    """
+    value = rhs.lstrip(b" \t")
+    if not value:
+        return b""
+    if value[:1] in {b"'", b'"'}:
+        quote = value[:1]
+        end = value.find(quote, 1)
+        if end < 0:
+            return None
+        literal = value[1:end]
+        remainder = value[end + 1 :]
+    else:
+        match = _INERT_LITERAL.match(value)
+        assert match is not None
+        literal = match.group()
+        remainder = value[match.end() :]
+    if not _INERT_LITERAL.fullmatch(literal):
+        return None
+    if not remainder or not remainder.strip(b" \t"):
+        return literal
     if remainder[:1] not in {b" ", b"\t"}:
-        return False
-    return remainder.lstrip(b" \t").startswith(b"#")
+        return None
+    if not remainder.lstrip(b" \t").startswith(b"#"):
+        return None
+    return literal

@@ -317,8 +317,18 @@ def test_git_sync_accepts_documented_public_placeholders(
     assert receipt["pushed"] is True
 
 
-def test_git_sync_rejects_placeholder_concatenation_without_remote_write(
+@pytest.mark.parametrize(
+    "assignment",
+    (
+        "FIRECRAWL_KEY='your_''firecrawl_key''operator-secret-value-123'\n",
+        "FIRECRAWL_KEY=your_${K}\n",
+        "FIRECRAWL_KEY=your_$(x)\n",
+        "FIRECRAWL_KEY=your_;id\n",
+    ),
+)
+def test_git_sync_rejects_ambiguous_assignment_without_commit_or_remote_write(
     tmp_path: Path,
+    assignment: str,
 ) -> None:
     remote = tmp_path / "remote.git"
     remote.mkdir()
@@ -327,9 +337,7 @@ def test_git_sync_rejects_placeholder_concatenation_without_remote_write(
     manager.pull()
     ontology = manager.checkout / "routing"
     ontology.mkdir()
-    (ontology / "example.md").write_text(
-        'FIRECRAWL_KEY="your_firecrawl_key"operator-secret-value-123\n'
-    )
+    (ontology / "example.md").write_text(assignment)
 
     with pytest.raises(OntologySyncError, match="possible credential"):
         manager.push(relative_paths=(Path("routing"),), message="must fail")

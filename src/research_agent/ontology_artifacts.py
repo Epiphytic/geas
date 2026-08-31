@@ -690,6 +690,14 @@ def _scan_sensitive_content(path: Path) -> None:
 def _scan_sqlite_values(path: Path) -> None:
     try:
         with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as connection:
+            schema_values = connection.execute(
+                "SELECT sql FROM sqlite_schema WHERE sql IS NOT NULL "
+                "ORDER BY type, name, tbl_name, rootpage, sql"
+            )
+            for (value,) in schema_values:
+                _raise_for_sqlite_credential(path, value)
+                for fragment in _sqlite_quoted_fragments(value):
+                    _raise_for_sqlite_credential(path, fragment)
             tables = tuple(
                 row[0]
                 for row in connection.execute(
@@ -700,7 +708,7 @@ def _scan_sqlite_values(path: Path) -> None:
                 quoted_table = _quoted_sqlite_identifier(table)
                 columns = tuple(
                     row[1]
-                    for row in connection.execute(f"PRAGMA table_info({quoted_table})")
+                    for row in connection.execute(f"PRAGMA table_xinfo({quoted_table})")
                 )
                 for column in columns:
                     quoted_column = _quoted_sqlite_identifier(column)
@@ -709,15 +717,50 @@ def _scan_sqlite_values(path: Path) -> None:
                         f"WHERE typeof({quoted_column}) IN ('text', 'blob')"
                     )
                     for (value,) in values:
-                        content = value.encode("utf-8") if isinstance(value, str) else bytes(value)
-                        if contains_possible_credential(content):
-                            raise OntologyArtifactError(
-                                f"possible credential detected in ontology artifact: {path}"
-                            )
-    except sqlite3.Error as error:
+                        _raise_for_sqlite_credential(path, value)
+    except (sqlite3.Error, TypeError, UnicodeError, ValueError) as error:
         raise OntologyArtifactError(
             f"could not scan SQLite ontology artifact for credentials: {path}"
         ) from error
+
+
+def _raise_for_sqlite_credential(path: Path, value: str | bytes) -> None:
+    content = value.encode("utf-8") if isinstance(value, str) else bytes(value)
+    if contains_possible_credential(content):
+        raise OntologyArtifactError(
+            f"possible credential detected in ontology artifact: {path}"
+        )
+
+
+def _sqlite_quoted_fragments(value: str) -> tuple[str, ...]:
+    """Return inert SQLite string and quoted-identifier contents."""
+    fragments: list[str] = []
+    index = 0
+    while index < len(value):
+        opener = value[index]
+        if opener not in {'"', "'", "`", "["}:
+            index += 1
+            continue
+        closer = "]" if opener == "[" else opener
+        index += 1
+        parts: list[str] = []
+        start = index
+        while index < len(value):
+            if value[index] != closer:
+                index += 1
+                continue
+            parts.append(value[start:index])
+            if opener != "[" and index + 1 < len(value) and value[index + 1] == closer:
+                parts.append(closer)
+                index += 2
+                start = index
+                continue
+            fragments.append("".join(parts))
+            index += 1
+            break
+        else:
+            raise ValueError("unterminated quoted SQLite schema text")
+    return tuple(fragments)
 
 
 def _quoted_sqlite_identifier(value: str) -> str:

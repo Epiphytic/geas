@@ -9,13 +9,19 @@ from research_agent.credential_scanning import contains_possible_credential
     "assignment",
     (
         b'FIRECRAWL_KEY="your_firecrawl_key"operator-secret-value-123\n',
+        b"FIRECRAWL_KEY='your_''firecrawl_key''operator-secret-value-123'\n",
         b"FIRECRAWL_KEY=your_firecrawl_keyoperator-secret-value-123\n",
         b"FIRECRAWL_KEY=operator-prefix-your_firecrawl_key\n",
         b'FIRECRAWL_KEY="your_firecrawl_key" operator-secret-value-123\n',
         b'FIRECRAWL_KEY="your_firecrawl_key${OPERATOR_SECRET}"\n',
         b'FIRECRAWL_KEY="your_firecrawl_key$(printenv)"\n',
+        b"FIRECRAWL_KEY=your_${K}\n",
+        b"FIRECRAWL_KEY=your_$(x)\n",
+        b"FIRECRAWL_KEY=your_;id\n",
+        b"FIRECRAWL_KEY=your_\\x\n",
         b"FIRECRAWL_KEY=your_firecrawl_key;printenv\n",
         b"FIRECRAWL_KEY=your_firecrawl_key#not-a-shell-comment\n",
+        b"FIRECRAWL_KEY='your_firecrawl_key\"\n",
         b'FIRECRAWL_KEY="your_firecrawl_key"operator-secret-value-123\r\n',
     ),
 )
@@ -32,9 +38,10 @@ def test_placeholder_must_be_the_complete_assignment_rhs(assignment: bytes) -> N
         b"FIRECRAWL_KEY=your_firecrawl_key # public documentation\n",
         b'FIRECRAWL_KEY="your_firecrawl_key"  # public documentation\n',
         b'FIRECRAWL_KEY="your_firecrawl_key"  \r\n',
+        b'FIREWORKS_KEY="api_key"\n',
     ),
 )
-def test_literal_placeholder_allows_only_whitespace_eol_or_comment(
+def test_inert_literal_allows_only_whitespace_eol_or_comment(
     assignment: bytes,
 ) -> None:
     assert contains_possible_credential(assignment) is False

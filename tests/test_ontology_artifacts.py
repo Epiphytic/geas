@@ -205,6 +205,38 @@ def test_artifact_publication_rejects_placeholder_concatenation_without_upload(
     assert not (ontology / "artifacts.yaml").exists()
 
 
+@pytest.mark.parametrize(
+    "assignment",
+    (
+        b"FIRECRAWL_KEY='your_''firecrawl_key''operator-secret-value-123'\n",
+        b"FIRECRAWL_KEY=your_${K}\n",
+        b"FIRECRAWL_KEY=your_$(x)\n",
+        b"FIRECRAWL_KEY=your_;id\n",
+    ),
+)
+def test_raw_artifact_rejects_ambiguous_short_assignment_without_upload(
+    tmp_path: Path,
+    assignment: bytes,
+) -> None:
+    ontology = tmp_path / "routing"
+    ontology.mkdir()
+    generated = tmp_path / "instructions.md"
+    generated.write_bytes(assignment)
+    store = MemoryArtifactStore().use_root(tmp_path / "remote-assets")
+
+    with pytest.raises(OntologyArtifactError, match="possible credential"):
+        OntologyArtifactManager(ontology).publish(
+            store=store,
+            published_by="test:operator",
+            storage_rights_basis="operator-confirmed private storage",
+            generated_content=generated,
+        )
+
+    assert store.values == {}
+    assert tuple((tmp_path / "remote-assets").iterdir()) == ()
+    assert not (ontology / "artifacts.yaml").exists()
+
+
 def test_sqlite_artifact_rejects_placeholder_concatenation_without_upload(
     tmp_path: Path,
 ) -> None:
@@ -221,6 +253,102 @@ def test_sqlite_artifact_rejects_placeholder_concatenation_without_upload(
     store = MemoryArtifactStore().use_root(tmp_path / "remote-assets")
 
     with pytest.raises(OntologyArtifactError, match="possible credential"):
+        OntologyArtifactManager(ontology).publish(
+            store=store,
+            published_by="test:operator",
+            storage_rights_basis="operator-confirmed private storage",
+            source_library=database,
+        )
+
+    assert store.values == {}
+    assert tuple((tmp_path / "remote-assets").iterdir()) == ()
+    assert not (ontology / "artifacts.yaml").exists()
+
+
+@pytest.mark.parametrize(
+    ("column_type", "assignment"),
+    (
+        ("TEXT", "FIRECRAWL_KEY=your_${K}\n"),
+        ("BLOB", b"FIRECRAWL_KEY=your_$(x)\n"),
+    ),
+)
+def test_sqlite_artifact_scans_every_text_and_blob_value_without_upload(
+    tmp_path: Path,
+    column_type: str,
+    assignment: str | bytes,
+) -> None:
+    ontology = tmp_path / "routing"
+    ontology.mkdir()
+    database = tmp_path / "library.sqlite"
+    _library_database(database)
+    with sqlite3.connect(database) as connection:
+        connection.execute(f"CREATE TABLE source_text(content {column_type} NOT NULL)")
+        connection.execute("INSERT INTO source_text VALUES (?)", (assignment,))
+    store = MemoryArtifactStore().use_root(tmp_path / "remote-assets")
+
+    with pytest.raises(OntologyArtifactError, match="possible credential"):
+        OntologyArtifactManager(ontology).publish(
+            store=store,
+            published_by="test:operator",
+            storage_rights_basis="operator-confirmed private storage",
+            source_library=database,
+        )
+
+    assert store.values == {}
+    assert tuple((tmp_path / "remote-assets").iterdir()) == ()
+    assert not (ontology / "artifacts.yaml").exists()
+
+
+@pytest.mark.parametrize(
+    "schema_sql",
+    (
+        """CREATE TABLE leaked_default(
+            content TEXT DEFAULT 'FIRECRAWL_KEY=operator-secret-value-123'
+        )""",
+        """CREATE VIEW leaked_view AS
+            SELECT 'FIRECRAWL_KEY=operator-secret-value-123' AS content""",
+        """CREATE TRIGGER leaked_trigger AFTER INSERT ON source_text BEGIN
+            SELECT 'FIRECRAWL_KEY=operator-secret-value-123';
+        END""",
+        'CREATE INDEX "FIRECRAWL_KEY=operator-secret-value-123" '
+        "ON source_text(content)",
+    ),
+    ids=("default", "view", "trigger", "index"),
+)
+def test_sqlite_artifact_scans_every_schema_sql_surface_without_upload(
+    tmp_path: Path,
+    schema_sql: str,
+) -> None:
+    ontology = tmp_path / "routing"
+    ontology.mkdir()
+    database = tmp_path / "library.sqlite"
+    _library_database(database)
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE TABLE source_text(content TEXT NOT NULL)")
+        connection.execute(schema_sql)
+    store = MemoryArtifactStore().use_root(tmp_path / "remote-assets")
+
+    with pytest.raises(OntologyArtifactError, match="possible credential"):
+        OntologyArtifactManager(ontology).publish(
+            store=store,
+            published_by="test:operator",
+            storage_rights_basis="operator-confirmed private storage",
+            source_library=database,
+        )
+
+    assert store.values == {}
+    assert tuple((tmp_path / "remote-assets").iterdir()) == ()
+    assert not (ontology / "artifacts.yaml").exists()
+
+
+def test_malformed_sqlite_artifact_fails_without_upload(tmp_path: Path) -> None:
+    ontology = tmp_path / "routing"
+    ontology.mkdir()
+    database = tmp_path / "library.sqlite"
+    database.write_bytes(b"SQLite format 3\x00" + b"\x00" * 100)
+    store = MemoryArtifactStore().use_root(tmp_path / "remote-assets")
+
+    with pytest.raises(OntologyArtifactError, match="invalid SQLite"):
         OntologyArtifactManager(ontology).publish(
             store=store,
             published_by="test:operator",
