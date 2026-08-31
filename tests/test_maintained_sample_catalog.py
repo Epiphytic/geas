@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 from datetime import UTC, datetime
@@ -16,7 +17,6 @@ import yaml
 
 import research_agent.cli as cli
 from research_agent.agent_skills import validate_snapshot
-from research_agent.bundles import KnowledgeBundleImporter
 from research_agent.geas_update import GeasUpdateReceipt
 from research_agent.ontology_artifacts import (
     ArtifactRole,
@@ -29,10 +29,7 @@ from research_agent.ontology_subscriptions import (
     OntologySubscription,
 )
 from research_agent.ontology_trust import TrustRule
-from research_agent.projection import SQLiteKnowledgeProjection
 from research_agent.repository_catalog import verify_catalog
-from research_agent.store import ImmutableStore
-from research_agent.truth import SQLiteProjectionGuard, TruthManager, TruthPolicy
 from research_agent.user_config import GeasProfile, GeasUserConfig, UserConfigManager
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -46,7 +43,7 @@ EXPECTED_INVENTORY = (
     "generated/alibaba-nlp-deepresearch/bundle.yaml",
     "generated/alibaba-nlp-deepresearch/sources/alibaba-nlp-deepresearch-4b453a820810.md",
     "generated/dzhng-deep-research/bundle.yaml",
-    "generated/dzhng-deep-research/sources/dzhng-deep-research-e157f80f5866.md",
+    "generated/dzhng-deep-research/sources/dzhng-deep-research-7813045fe377.md",
     "library.yaml",
     "model-evaluation.yaml",
     "sources/deepresearchagent.md",
@@ -128,6 +125,18 @@ def _committed_sample_checkout(destination: Path) -> Path:
         destination / "src" / "research_agent" / "truth.py",
     )
     shutil.copyfile(
+        REPOSITORY_ROOT / "src" / "research_agent" / "cli.py",
+        destination / "src" / "research_agent" / "cli.py",
+    )
+    shutil.copyfile(
+        REPOSITORY_ROOT / "src" / "research_agent" / "ontology_artifacts.py",
+        destination / "src" / "research_agent" / "ontology_artifacts.py",
+    )
+    shutil.copyfile(
+        REPOSITORY_ROOT / "src" / "research_agent" / "credential_scanning.py",
+        destination / "src" / "research_agent" / "credential_scanning.py",
+    )
+    shutil.copyfile(
         REPOSITORY_ROOT / "src" / "research_agent" / "default_config" / "truth-policy.yaml",
         destination / "src" / "research_agent" / "default_config" / "truth-policy.yaml",
     )
@@ -139,6 +148,9 @@ def _committed_sample_checkout(destination: Path) -> Path:
         f"ontology/{ONTOLOGY_NAME}",
         "config/truth-policy.yaml",
         "src/research_agent/truth.py",
+        "src/research_agent/cli.py",
+        "src/research_agent/ontology_artifacts.py",
+        "src/research_agent/credential_scanning.py",
         "src/research_agent/default_config/truth-policy.yaml",
     )
     if _git(destination, "status", "--porcelain"):
@@ -210,6 +222,28 @@ def test_maintained_bundle_revision_follows_every_source_observation() -> None:
     assert recorded_at >= max(acquired_at)
 
 
+def test_dzhng_source_is_the_exact_pinned_official_git_blob() -> None:
+    source = (
+        REPOSITORY_ROOT
+        / "ontology"
+        / ONTOLOGY_NAME
+        / "generated"
+        / "dzhng-deep-research"
+        / "sources"
+        / "dzhng-deep-research-7813045fe377.md"
+    ).read_bytes()
+
+    assert hashlib.sha256(source).hexdigest() == (
+        "7813045fe3770dc540fc1b95aeb9f4f76d9dc848e0920d05fabdc7f041795259"
+    )
+    git_blob = b"blob " + str(len(source)).encode("ascii") + b"\0" + source
+    assert hashlib.sha1(git_blob, usedforsecurity=False).hexdigest() == (
+        "78d7dcaad5524e630b5c106f46bf4782a56b7ce5"
+    )
+    assert b'FIRECRAWL_KEY="your_firecrawl_key"' in source
+    assert b'OPENAI_KEY="your_openai_key"' in source
+
+
 def test_demo_hydrates_a_preseeded_artifact_and_exports_the_same_skill_twice(
     tmp_path: Path,
 ) -> None:
@@ -241,39 +275,61 @@ def test_demo_hydrates_a_preseeded_artifact_and_exports_the_same_skill_twice(
     assert summary["claims"] == 69
 
 
-def _build_maintained_projection(checkout: Path, root: Path) -> Path:
-    store = ImmutableStore(root / "data")
-    original_directory = Path.cwd()
-    try:
-        os.chdir(checkout)
-        for relative in EXPECTED_SEED_BUNDLES:
-            KnowledgeBundleImporter(store=store).import_bundle(
-                Path("ontology") / ONTOLOGY_NAME / relative,
-                imported_by="operator:maintained-artifact-test",
+def test_independent_demos_match_the_committed_artifact_exactly(tmp_path: Path) -> None:
+    checkout = _committed_sample_checkout(tmp_path / "checkout")
+    manifest = OntologyArtifactManifest.from_yaml(
+        checkout / "ontology" / ONTOLOGY_NAME / "artifacts.yaml"
+    )
+    committed = manifest.artifacts[0]
+    observed: list[tuple[str, str, str, str]] = []
+
+    for index in range(2):
+        demo_root = tmp_path / f"demo-{index}"
+        completed = subprocess.run(
+            (str(checkout / "ontology" / ONTOLOGY_NAME / "demo.sh"), str(demo_root)),
+            cwd=checkout,
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        json.loads(completed.stdout)
+        snapshot = json.loads((demo_root / "snapshot.json").read_text())
+        published = json.loads((demo_root / "artifact-publish.json").read_text())[
+            "artifacts"
+        ][0]
+        skill = json.loads((demo_root / "skill-export-second.json").read_text())
+        with sqlite3.connect(demo_root / "query.sqlite") as connection:
+            stamp = json.loads(
+                connection.execute(
+                    "SELECT payload FROM _research_projection_metadata WHERE singleton = 1"
+                ).fetchone()[0]
             )
-    finally:
-        os.chdir(original_directory)
-    truth = TruthManager(
-        workspace_root=checkout,
-        store_root=store.root,
-        policy=TruthPolicy.from_yaml(checkout / "config" / "truth-policy.yaml"),
-        clock=lambda: AUDIT_INSTANT,
+        observed.append(
+            (
+                hashlib.sha256((demo_root / "query.sqlite").read_bytes()).hexdigest(),
+                published["input_revision"],
+                snapshot["id"],
+                skill["projection_snapshot_id"],
+            )
+        )
+        assert snapshot["created_at"] == "2026-08-29T17:00:00Z"
+        assert stamp["snapshot_id"] == snapshot["id"]
+        assert published["content_sha256"] == observed[-1][0]
+
+    assert observed[0] == observed[1]
+    assert committed.content_sha256 == observed[0][0]
+    assert committed.input_revision == observed[0][1]
+
+
+def _build_maintained_projection(checkout: Path, root: Path) -> Path:
+    subprocess.run(
+        (str(checkout / "ontology" / ONTOLOGY_NAME / "demo.sh"), str(root)),
+        cwd=checkout,
+        text=True,
+        capture_output=True,
+        check=True,
     )
-    snapshot = truth.capture(created_by="operator:maintained-artifact-test")
-    database = root / "query.sqlite"
-    SQLiteKnowledgeProjection(store=store, workspace_root=checkout).build(
-        database,
-        snapshot=snapshot,
-        truth_manager=truth,
-    )
-    SQLiteProjectionGuard(clock=lambda: AUDIT_INSTANT).stamp(
-        database,
-        snapshot,
-        schema_version=SQLiteKnowledgeProjection.schema_version,
-        builder_version=SQLiteKnowledgeProjection.builder_version,
-    )
-    assert truth.verify(snapshot).clean
-    return database
+    return root / "query.sqlite"
 
 
 class _PreseededArtifactStore:

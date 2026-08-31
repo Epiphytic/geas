@@ -14,6 +14,7 @@ from uuid import uuid4
 
 from pydantic import Field
 
+from research_agent.credential_scanning import contains_possible_credential
 from research_agent.models import StrictModel, utc_now
 from research_agent.ontology_subscriptions import OntologySubscription
 from research_agent.user_config import OntologyGitConfig
@@ -45,16 +46,6 @@ ontology-build-state.json
 
 _SENSITIVE_NAME = re.compile(
     r"(?i)(^|/)(?:\.env(?:\..*)?|.*(?:credential|secret).*)$|\.(?:key|pem|p12|pfx)$"
-)
-_SENSITIVE_CONTENT = (
-    re.compile(rb"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----"),
-    re.compile(rb"\b(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]{20,}\b"),
-    re.compile(rb"\bAKIA[0-9A-Z]{16}\b"),
-    re.compile(rb"\bsk-[A-Za-z0-9_-]{20,}\b"),
-    re.compile(
-        rb"(?im)^\s*[A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD)\s*[:=]"
-        rb"\s*['\"]?[^\s'\"]{12,}"
-    ),
 )
 _GIT_ID = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 
@@ -555,7 +546,7 @@ class OntologyRepositoryManager:
             content = path.read_bytes()
             if b"\x00" in content:
                 raise OntologySyncError(f"refusing to push binary ontology file: {name}")
-            if any(pattern.search(content) for pattern in _SENSITIVE_CONTENT):
+            if contains_possible_credential(content):
                 raise OntologySyncError(f"possible credential detected; refusing to push: {name}")
 
     @staticmethod

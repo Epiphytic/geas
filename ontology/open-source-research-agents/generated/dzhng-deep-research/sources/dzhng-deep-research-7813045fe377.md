@@ -95,11 +95,11 @@ npm install
 3. Set up environment variables in a `.env.local` file:
 
 ```bash
-FIRECRAWL_KEY="unset             "
+FIRECRAWL_KEY="your_firecrawl_key"
 # If you want to use your self-hosted Firecrawl, add the following below:
 # FIRECRAWL_BASE_URL="http://localhost:3002"
 
-OPENAI_KEY="unset          "
+OPENAI_KEY="your_openai_key"
 ```
 
 To use local LLM, comment out `OPENAI_KEY` and instead uncomment `OPENAI_ENDPOINT` and `OPENAI_MODEL`:
@@ -198,7 +198,7 @@ CUSTOM_MODEL="custom_model"
    - Compiles all findings into a comprehensive markdown report
    - Includes all sources and references
    - Organizes information in a clear, readable format
-
+  
 ## Community implementations
 
 **Python**: https://github.com/Finance-LLMs/deep-research-python

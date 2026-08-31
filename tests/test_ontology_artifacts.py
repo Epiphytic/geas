@@ -134,3 +134,47 @@ def test_artifact_publication_rejects_possible_credentials(tmp_path: Path) -> No
             storage_rights_basis="operator-confirmed private storage",
             generated_content=generated,
         )
+
+
+def test_artifact_publication_accepts_documented_public_placeholders(
+    tmp_path: Path,
+) -> None:
+    ontology = tmp_path / "routing"
+    ontology.mkdir()
+    generated = tmp_path / "generated"
+    generated.mkdir()
+    (generated / "example.env.md").write_text(
+        'FIRECRAWL_KEY="your_firecrawl_key"\n'
+        'OPENAI_KEY="your_openai_key"\n'
+    )
+    store = MemoryArtifactStore().use_root(tmp_path / "remote-assets")
+
+    receipt = OntologyArtifactManager(ontology).publish(
+        store=store,
+        published_by="test:operator",
+        storage_rights_basis="public documentation fixture",
+        generated_content=generated,
+    )
+
+    assert receipt.published == (ArtifactRole.GENERATED_CONTENT,)
+
+
+def test_artifact_publication_still_rejects_nonplaceholder_assignments(
+    tmp_path: Path,
+) -> None:
+    ontology = tmp_path / "routing"
+    ontology.mkdir()
+    generated = tmp_path / "generated"
+    generated.mkdir()
+    (generated / "instructions.md").write_text(
+        'FIRECRAWL_KEY="operator-secret-value-123"\n'
+    )
+    store = MemoryArtifactStore().use_root(tmp_path / "remote-assets")
+
+    with pytest.raises(OntologyArtifactError, match="possible credential"):
+        OntologyArtifactManager(ontology).publish(
+            store=store,
+            published_by="test:operator",
+            storage_rights_basis="operator-confirmed private storage",
+            generated_content=generated,
+        )

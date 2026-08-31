@@ -9,10 +9,9 @@ knowledge-curation systems without treating a generated report as canonical.
 project-authored source cards; the generated seeds contain license-recorded
 extracts pinned to official repository commits. Each source is SHA-256 pinned,
 parsed as inert data, structurally anchored, citation-indexed, and linked to
-exact claim evidence. Credential-like example assignments in one upstream
-README extract are explicitly replaced with equal-width unset values before
-archival. The synthetic poisoned source is deliberately inspected but is never
-used as claim evidence.
+exact claim evidence. Documented public placeholder assignments remain exact
+upstream bytes and pass a narrow non-secret scanner exception. The synthetic
+poisoned source is deliberately inspected but is never used as claim evidence.
 
 ## Install the catalog sample
 

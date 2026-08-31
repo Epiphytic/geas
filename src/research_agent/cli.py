@@ -1685,6 +1685,11 @@ def _build_parser() -> argparse.ArgumentParser:
     truth_snapshot.add_argument("--root", type=Path, default=Path("data"))
     truth_snapshot.add_argument("--workspace", type=Path, default=Path("."))
     truth_snapshot.add_argument("--created-by", required=True)
+    truth_snapshot.add_argument(
+        "--created-at",
+        type=datetime.fromisoformat,
+        help="explicit timezone-aware snapshot time for reproducible builds",
+    )
     truth_snapshot.add_argument("--predecessor")
 
     truth_check = subparsers.add_parser(
@@ -3385,10 +3390,17 @@ def main() -> None:
     if args.command == "truth-snapshot":
         store = ImmutableStore(args.root)
         store.initialize()
+        if args.created_at is not None and args.created_at.tzinfo is None:
+            raise ValueError("truth snapshot --created-at must include a timezone")
         manager = TruthManager(
             workspace_root=args.workspace,
             store_root=store.root,
             policy=TruthPolicy.from_yaml(args.truth_policy),
+            clock=(
+                (lambda: args.created_at)
+                if args.created_at is not None
+                else (lambda: datetime.now(UTC))
+            ),
         )
         snapshot = manager.capture(
             created_by=args.created_by,

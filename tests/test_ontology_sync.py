@@ -292,6 +292,31 @@ def test_git_sync_rejects_secret_content_and_unrelated_staging(
         manager.push(relative_paths=(Path("routing"),), message="must fail")
 
 
+def test_git_sync_accepts_documented_public_placeholders(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("GIT_AUTHOR_NAME", "Geas Test")
+    monkeypatch.setenv("GIT_AUTHOR_EMAIL", "geas-test@example.invalid")
+    monkeypatch.setenv("GIT_COMMITTER_NAME", "Geas Test")
+    monkeypatch.setenv("GIT_COMMITTER_EMAIL", "geas-test@example.invalid")
+    remote = tmp_path / "remote.git"
+    remote.mkdir()
+    _git("init", "--bare", "--initial-branch=main", cwd=remote)
+    manager = _manager(remote, tmp_path / "checkout")
+    manager.pull()
+    ontology = manager.checkout / "routing"
+    ontology.mkdir()
+    (ontology / "example.md").write_text(
+        'FIRECRAWL_KEY="your_firecrawl_key"\n'
+        'OPENAI_KEY="your_openai_key"\n'
+    )
+
+    receipt = manager.push(relative_paths=(Path("routing"),), message="public examples")
+
+    assert receipt["pushed"] is True
+
+
 def test_freshness_check_fetches_at_most_once_per_window(
     tmp_path: Path,
 ) -> None:

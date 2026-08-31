@@ -64,14 +64,15 @@ uv run geas knowledge-audit \
   --fail-on-error \
   > "$demo_root/audit.json"
 
-uv run geas truth-snapshot \
+uv run geas --truth-policy "$workspace_root/config/truth-policy.yaml" truth-snapshot \
   --root "$demo_root" \
   --workspace "$workspace_root" \
   --created-by operator:demo \
+  --created-at 2026-08-29T17:00:00+00:00 \
   > "$demo_root/snapshot-envelope.json"
 jq '.snapshot' "$demo_root/snapshot-envelope.json" > "$demo_root/snapshot.json"
 
-uv run geas projection-build \
+uv run geas --truth-policy "$workspace_root/config/truth-policy.yaml" projection-build \
   "$demo_root/snapshot.json" \
   "$demo_root/query.sqlite" \
   --root "$demo_root" \
@@ -292,7 +293,7 @@ if first_artifact.content_sha256 != second_artifact.content_sha256:
     raise SystemExit("demo artifact hydration content addresses differ")
 PY
 
-uv run geas projection-check \
+uv run geas --truth-policy "$workspace_root/config/truth-policy.yaml" projection-check \
   "$demo_root/snapshot.json" \
   "$demo_root/query.sqlite" \
   --root "$demo_root" \

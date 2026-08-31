@@ -20,24 +20,13 @@ from uuid import uuid4
 import yaml
 from pydantic import Field, field_validator, model_validator
 
+from research_agent.credential_scanning import contains_possible_credential
 from research_agent.models import StrictModel, canonical_json, utc_now
 from research_agent.truth import ProjectionStamp, SQLiteProjectionGuard
 
 _ONTOLOGY_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 _ASSET_NAME = re.compile(r"geas-[a-z-]+-[0-9a-f]{64}\.(?:sqlite|zip)")
 _RELEASE_TAG = re.compile(r"geas-artifact-[0-9a-f]{64}")
-_SENSITIVE_CONTENT = (
-    re.compile(rb"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----"),
-    re.compile(rb"\b(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]{20,}\b"),
-    re.compile(rb"\bAKIA[0-9A-Z]{16}\b"),
-    re.compile(rb"\bsk-[A-Za-z0-9_-]{20,}\b"),
-    re.compile(
-        rb"(?im)^\s*[A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD)\s*[:=]"
-        rb"\s*['\"]?[^\s'\"]{12,}"
-    ),
-)
-
-
 class OntologyArtifactError(RuntimeError):
     pass
 
@@ -681,7 +670,7 @@ def _scan_sensitive_content(path: Path) -> None:
         0,
         access=mmap.ACCESS_READ,
     ) as content:
-        if any(pattern.search(content) for pattern in _SENSITIVE_CONTENT):
+        if contains_possible_credential(content):
             raise OntologyArtifactError(
                 f"possible credential detected in ontology artifact: {path}"
             )
