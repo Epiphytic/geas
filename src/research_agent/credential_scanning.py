@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Buffer, Iterator
+from dataclasses import dataclass
 
 _FIXED_CREDENTIAL_PATTERNS = (
     re.compile(rb"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----"),
@@ -21,6 +22,12 @@ _CREDENTIAL_MARKER_CONTROL_BYTES = bytes(range(0x20)) + b"\x7f"
 _INERT_LITERAL = re.compile(rb"[A-Za-z0-9._/-]*")
 _MIN_CREDENTIAL_LENGTH = 12
 _MAX_BINARY_ASSIGNMENT_BYTES = 4096
+
+
+@dataclass(frozen=True)
+class _BinaryCredentialFinding:
+    candidate: bytes
+    payload: bytes | None
 
 
 def contains_possible_credential(content: Buffer) -> bool:
@@ -76,10 +83,10 @@ def binary_residue_is_only_live_sqlite_placeholders(
     the classifier itself never weakens a canonical finding.
     """
     found = False
-    for candidate in _iter_binary_credential_findings(content):
+    for finding in _iter_binary_credential_findings(content):
         found = True
-        if not candidate or not _is_live_sqlite_record_placeholder(
-            candidate,
+        if finding.payload is None or not _is_live_sqlite_record_placeholder(
+            finding.payload,
             live_values,
         ):
             return False
@@ -88,15 +95,21 @@ def binary_residue_is_only_live_sqlite_placeholders(
 
 def _iter_binary_credential_findings(
     content: Buffer,
-) -> Iterator[bytes]:
+) -> Iterator[_BinaryCredentialFinding]:
     if contains_fixed_credential(content):
-        yield b""
+        yield _BinaryCredentialFinding(candidate=b"", payload=None)
         return
     size = len(content)
-    for start, marker_end, obfuscated in _iter_binary_assignment_markers(content):
+    for context_start, _marker_start, marker_end, obfuscated in (
+        _iter_binary_assignment_markers(content)
+    ):
         if obfuscated:
-            yield b""
+            yield _BinaryCredentialFinding(candidate=b"", payload=None)
             continue
+        if marker_end - context_start > _MAX_BINARY_ASSIGNMENT_BYTES:
+            yield _BinaryCredentialFinding(candidate=b"", payload=None)
+            continue
+        start = context_start
         end = marker_end
         limit = min(size, start + _MAX_BINARY_ASSIGNMENT_BYTES)
         while end < limit:
@@ -107,8 +120,9 @@ def _iter_binary_credential_findings(
         if end == limit and end < size:
             next_value = content[end]
             if next_value == 0x09 or 0x20 <= next_value < 0x7F:
-                yield b""
+                yield _BinaryCredentialFinding(candidate=b"", payload=None)
                 continue
+        payload = bytes(content[start:end])
         # Preserve CR/LF record boundaries, but include any other binary
         # delimiter. The canonical scanner must see a control adjacent to an
         # otherwise inert placeholder and reject it.
@@ -116,13 +130,14 @@ def _iter_binary_credential_findings(
             end += 1
         candidate = bytes(content[start:end])
         if contains_possible_credential(candidate):
-            yield candidate
+            yield _BinaryCredentialFinding(candidate=candidate, payload=payload)
 
 
 def _iter_binary_assignment_markers(
     content: Buffer,
-) -> Iterator[tuple[int, int, bool]]:
+) -> Iterator[tuple[int, int, int, bool]]:
     """Yield assignment marker spans in one bounded-memory forward pass."""
+    context_start = 0
     token_start: int | None = None
     suffix = bytearray()
     after_name = False
@@ -131,14 +146,23 @@ def _iter_binary_assignment_markers(
     for index in range(len(content)):
         value = content[index]
         if value in {0x0A, 0x0D}:
+            context_start = index + 1
             token_start = None
             suffix.clear()
             after_name = False
             obfuscated = False
             continue
         if value < 0x20 or value == 0x7F:
+            context_start = index + 1
             if token_start is not None:
                 obfuscated = True
+            continue
+        if value > 0x7E:
+            context_start = index + 1
+            token_start = None
+            suffix.clear()
+            after_name = False
+            obfuscated = False
             continue
 
         upper = value - 0x20 if 0x61 <= value <= 0x7A else value
@@ -162,7 +186,7 @@ def _iter_binary_assignment_markers(
 
         has_credential_suffix = _is_credential_name_suffix(suffix)
         if value in {0x3A, 0x3D} and has_credential_suffix:
-            yield token_start, index + 1, obfuscated
+            yield context_start, token_start, index + 1, obfuscated
             token_start = None
             suffix.clear()
             after_name = False
@@ -190,29 +214,20 @@ def _is_live_sqlite_record_placeholder(
     candidate: bytes,
     live_values: tuple[tuple[bytes, bool], ...],
 ) -> bool:
-    if len(candidate) < 2:
+    if not candidate:
         return False
     for value, is_text in live_values:
-        if _live_value_contains_candidate(value, candidate):
+        if contains_possible_credential(value):
+            continue
+        fragments = tuple(_normalize_line_separators(value).split(b"\n"))
+        if candidate in fragments:
             return True
         serial_type = 2 * len(value) + (13 if is_text else 12)
-        if serial_type >= 0x80 or candidate[0] != serial_type:
+        if serial_type >= 0x80:
             continue
-        if _live_value_contains_candidate(value, candidate[1:]):
+        if candidate == bytes((serial_type,)) + fragments[0]:
             return True
     return False
-
-
-def _live_value_contains_candidate(value: bytes, candidate: bytes) -> bool:
-    if candidate in value:
-        return True
-    return bool(
-        candidate
-        and candidate[-1] != 0x09
-        and not 0x20 <= candidate[-1] < 0x7F
-        and candidate[-1] not in {0x0A, 0x0D}
-        and candidate[:-1] in value
-    )
 
 
 def contains_credential_assignment_marker(content: Buffer) -> bool:

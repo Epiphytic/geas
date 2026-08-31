@@ -412,6 +412,11 @@ class OntologyArtifactManager:
         store: ArtifactStore,
         roles: tuple[ArtifactRole, ...] = (),
     ) -> ArtifactHydrationReceipt:
+        _validate_cache_path(
+            self.ontology_directory,
+            ontology_directory=self.ontology_directory,
+            expected_kind="directory",
+        )
         manifest = self.load()
         selected = set(roles) if roles else {item.role for item in manifest.artifacts}
         unknown = selected - {item.role for item in manifest.artifacts}
@@ -434,17 +439,25 @@ class OntologyArtifactManager:
             _validate_cache_path(
                 generated_output,
                 ontology_directory=self.ontology_directory,
+                expected_kind="directory",
             )
-        _validate_cache_path(self.cache, ontology_directory=self.ontology_directory)
-        if self.cache.exists() and not self.cache.is_dir():
-            raise OntologyArtifactError("ontology artifact cache root is unsafe")
-        self.cache.mkdir(exist_ok=True)
-        _validate_cache_path(self.cache, ontology_directory=self.ontology_directory)
+        _validate_cache_path(
+            self.cache,
+            ontology_directory=self.ontology_directory,
+            expected_kind="directory",
+        )
         for _, destination in destinations:
             _validate_cache_path(
                 destination,
                 ontology_directory=self.ontology_directory,
+                expected_kind="file",
             )
+        self.cache.mkdir(exist_ok=True)
+        _validate_cache_path(
+            self.cache,
+            ontology_directory=self.ontology_directory,
+            expected_kind="directory",
+        )
         if any(
             artifact.role is ArtifactRole.GENERATED_CONTENT
             for artifact in selected_artifacts
@@ -452,13 +465,18 @@ class OntologyArtifactManager:
             _validate_cache_path(
                 generated_output,
                 ontology_directory=self.ontology_directory,
+                expected_kind="directory",
             )
         hydrated: list[ArtifactHydrationItem] = []
         for artifact, destination in destinations:
             downloaded = not _cached_artifact_is_valid(destination, artifact)
             if downloaded:
                 store.download(artifact, destination)
-            _validate_cache_path(destination, ontology_directory=self.ontology_directory)
+            _validate_cache_path(
+                destination,
+                ontology_directory=self.ontology_directory,
+                expected_kind="file",
+            )
             _verify_file(destination, artifact)
             if artifact.format is ArtifactFormat.SQLITE:
                 _sqlite_input_revision(destination, artifact.role)
@@ -539,7 +557,11 @@ class OntologyArtifactManager:
             ArtifactRole.GENERATED_CONTENT: "generated.zip",
         }
         path = self.cache / names[artifact.role]
-        _validate_cache_path(path, ontology_directory=self.ontology_directory)
+        _validate_cache_path(
+            path,
+            ontology_directory=self.ontology_directory,
+            expected_kind="file",
+        )
         return path
 
 
@@ -662,12 +684,28 @@ def _extract_generated_zip(
     *,
     ontology_directory: Path,
 ) -> None:
-    _validate_cache_path(archive_path, ontology_directory=ontology_directory)
-    _validate_cache_path(destination, ontology_directory=ontology_directory)
+    _validate_cache_path(
+        archive_path,
+        ontology_directory=ontology_directory,
+        expected_kind="file",
+    )
+    _validate_cache_path(
+        destination,
+        ontology_directory=ontology_directory,
+        expected_kind="directory",
+    )
     temporary = destination.with_name(f".{destination.name}.tmp-{uuid4().hex}")
     previous = destination.with_name(f".{destination.name}.previous-{uuid4().hex}")
-    _validate_cache_path(temporary, ontology_directory=ontology_directory)
-    _validate_cache_path(previous, ontology_directory=ontology_directory)
+    _validate_cache_path(
+        temporary,
+        ontology_directory=ontology_directory,
+        expected_kind="directory",
+    )
+    _validate_cache_path(
+        previous,
+        ontology_directory=ontology_directory,
+        expected_kind="directory",
+    )
     temporary.mkdir(parents=True)
     try:
         with zipfile.ZipFile(archive_path) as archive:
@@ -693,9 +731,16 @@ def _extract_generated_zip(
             os.replace(previous, destination)
 
 
-def _validate_cache_path(path: Path, *, ontology_directory: Path) -> None:
+def _validate_cache_path(
+    path: Path,
+    *,
+    ontology_directory: Path,
+    expected_kind: Literal["file", "directory"] | None = None,
+) -> None:
     """Reject lexical cache aliases before any cache I/O can follow them."""
     root = Path(os.path.abspath(ontology_directory))
+    if root.is_symlink() or not root.is_dir():
+        raise OntologyArtifactError("ontology artifact ontology root is unsafe")
     candidate = Path(os.path.abspath(path))
     try:
         relative = candidate.relative_to(root)
@@ -712,6 +757,16 @@ def _validate_cache_path(path: Path, *, ontology_directory: Path) -> None:
             raise OntologyArtifactError(
                 f"ontology artifact cache ancestor is not a directory: {current}"
             )
+    if not candidate.exists() or expected_kind is None:
+        return
+    if expected_kind == "file" and not candidate.is_file():
+        raise OntologyArtifactError(
+            f"ontology artifact cache file target is unsafe: {candidate}"
+        )
+    if expected_kind == "directory" and not candidate.is_dir():
+        raise OntologyArtifactError(
+            f"ontology artifact cache directory target is unsafe: {candidate}"
+        )
 
 
 def _cached_artifact_is_valid(path: Path, artifact: OntologyArtifact) -> bool:

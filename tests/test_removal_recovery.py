@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from research_agent import cli
 from research_agent.ontology_resolution import resolve_ontology_catalog, select_ontology
 from research_agent.ontology_subscriptions import OntologySubscription, SubscriptionManager
 from research_agent.ontology_trust import (
@@ -22,7 +23,12 @@ from research_agent.repository_catalog import (
     CatalogOntology,
     ontology_bundle_sha256,
 )
-from research_agent.user_config import GeasProfile, GeasUserConfig, UserConfigManager
+from research_agent.user_config import (
+    GeasProfile,
+    GeasUserConfig,
+    OntologyGitConfig,
+    UserConfigManager,
+)
 
 _SNAPSHOT_CONTENT = b"authoritative snapshot\n"
 _SNAPSHOT_FILE = CatalogFile(
@@ -217,6 +223,40 @@ def _subscription_manager(tmp_path: Path) -> tuple[UserConfigManager, Subscripti
         repository_factory=lambda checkout, configured: _Removable(),
     )
     return manager, service
+
+
+def _implicit_primary_manager(
+    tmp_path: Path,
+) -> tuple[UserConfigManager, SubscriptionManager]:
+    manager = UserConfigManager(tmp_path / "config" / "config.yaml")
+    manager.root.mkdir(parents=True)
+    checkout = manager.root / "ontologies"
+    checkout.mkdir()
+    checkout.joinpath("sentinel").write_text("authoritative checkout\n")
+    manager.replace(
+        GeasUserConfig(
+            profiles={
+                "default": GeasProfile(
+                    ontology_git=OntologyGitConfig(
+                        url="https://example.invalid/ontology.git"
+                    )
+                )
+            }
+        )
+    )
+    service = SubscriptionManager(
+        config_manager=manager,
+        profile_name="default",
+        catalog_verifier=lambda path: (),
+        authorizer=lambda value: value,
+        repository_factory=lambda checkout, configured: _Removable(),
+    )
+    return manager, service
+
+
+def _run_cli(monkeypatch: pytest.MonkeyPatch, *arguments: str) -> None:
+    monkeypatch.setattr(sys, "argv", ["geas", *arguments])
+    cli.main()
 
 
 def _run_hard_exit(script: str, manager: UserConfigManager, phase: str) -> None:
@@ -433,6 +473,137 @@ def test_subscription_cleanup_failure_leaves_recoverable_committed_journal(
     service.recover_removals()
     service.recover_removals()
     _assert_no_removal_state(manager)
+
+
+def test_snapshot_remove_cli_retry_recovers_committed_crash_before_lookup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, snapshot = _snapshot_manager(tmp_path)
+    _run_hard_exit(_SNAPSHOT_CHILD, manager, "config-committed")
+
+    with pytest.raises(ValueError, match="not registered"):
+        _run_cli(
+            monkeypatch,
+            "--geas-config",
+            str(manager.path),
+            "ontology-snapshot-remove",
+            snapshot.name,
+            snapshot.bundle_sha256,
+        )
+
+    assert not (manager.root / snapshot.path).exists()
+    _assert_no_removal_state(manager)
+
+
+def test_skill_update_recovers_subscription_before_geas_updater(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, _service = _subscription_manager(tmp_path)
+    _run_hard_exit(_SUBSCRIPTION_CHILD, manager, "quarantined")
+    checkout = manager.root / "subscriptions/example"
+    assert not checkout.exists()
+    calls: list[str] = []
+
+    monkeypatch.setattr(
+        cli,
+        "resolve_skill_snapshot",
+        lambda *_args, **_kwargs: (tmp_path / "skill", object()),
+    )
+
+    class _StopUpdater:
+        def update_and_reexec(self, *_args: object, **_kwargs: object) -> object:
+            calls.append("updater")
+            assert checkout.joinpath("sentinel").is_file()
+            _assert_no_removal_state(manager)
+            raise RuntimeError("stop after recovery ordering check")
+
+    monkeypatch.setattr(cli, "GeasUpdater", _StopUpdater)
+
+    with pytest.raises(RuntimeError, match="ordering check"):
+        _run_cli(
+            monkeypatch,
+            "--geas-config",
+            str(manager.path),
+            "skill-update",
+            str(tmp_path / "skill"),
+        )
+
+    assert calls == ["updater"]
+
+
+def test_implicit_primary_skill_export_recovers_before_repository_io(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, _service = _implicit_primary_manager(tmp_path)
+    primary_child = _SUBSCRIPTION_CHILD.replace('"example"', '"primary"')
+    _run_hard_exit(primary_child, manager, "quarantined")
+    checkout = manager.root / "ontologies"
+    assert not checkout.exists()
+    repository_calls: list[Path] = []
+
+    class _NoRepositoryIO:
+        def __init__(self, *, checkout: Path, config: object) -> None:
+            repository_calls.append(checkout)
+
+        def pull(self) -> dict[str, object]:
+            raise AssertionError("repository pull ran before recovery")
+
+    monkeypatch.setattr(cli, "OntologyRepositoryManager", _NoRepositoryIO)
+
+    with pytest.raises(ValueError, match="unknown ontology"):
+        _run_cli(
+            monkeypatch,
+            "--geas-config",
+            str(manager.path),
+            "skill-export",
+            "missing",
+        )
+
+    assert checkout.joinpath("sentinel").is_file()
+    assert repository_calls == []
+    _assert_no_removal_state(manager)
+
+
+def test_ontology_init_recovers_implicit_primary_before_freshen(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager, _service = _implicit_primary_manager(tmp_path)
+    primary_child = _SUBSCRIPTION_CHILD.replace('"example"', '"primary"')
+    _run_hard_exit(primary_child, manager, "quarantined")
+    checkout = manager.root / "ontologies"
+    assert not checkout.exists()
+    calls: list[str] = []
+
+    class _StopRepository:
+        def __init__(self, *, checkout: Path, config: object) -> None:
+            assert checkout.joinpath("sentinel").is_file()
+            _assert_no_removal_state(manager)
+            calls.append("repository")
+
+        def freshen(self, **_kwargs: object) -> object:
+            calls.append("freshen")
+            raise RuntimeError("stop after recovery ordering check")
+
+    monkeypatch.setattr(cli, "OntologyRepositoryManager", _StopRepository)
+
+    with pytest.raises(RuntimeError, match="ordering check"):
+        _run_cli(
+            monkeypatch,
+            "--geas-config",
+            str(manager.path),
+            "ontology-init",
+            "--topic",
+            "Example ontology",
+            "--concept-id",
+            "concept:example",
+            "--pull",
+        )
+
+    assert calls == ["repository", "freshen"]
 
 
 @pytest.mark.parametrize("tamper", ("noncanonical", "unknown-field"))

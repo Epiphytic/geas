@@ -3,6 +3,7 @@ from time import monotonic
 
 import pytest
 
+import research_agent.credential_scanning as credential_scanning
 from research_agent.credential_scanning import (
     contains_binary_credential_residue,
     contains_possible_credential,
@@ -260,6 +261,24 @@ def test_binary_scanner_never_downgrades_canonical_sensitive_text(
     assert contains_binary_credential_residue(content) is True
 
 
+@pytest.mark.parametrize(
+    "prefix",
+    (
+        b"documentation: ",
+        b"prefix=public ",
+        b"[example] ",
+        b"x",
+    ),
+)
+def test_binary_scanner_preserves_ambiguous_same_line_prefix_context(
+    prefix: bytes,
+) -> None:
+    content = prefix + b"FIRECRAWL_KEY=your_firecrawl_key\n"
+
+    assert contains_possible_credential(content) is True
+    assert contains_binary_credential_residue(content) is True
+
+
 @pytest.mark.parametrize("encoding", ("utf-16-le", "utf-16-be", "utf-32-le", "utf-32-be"))
 def test_binary_scanner_rejects_common_non_ascii_credential_encodings(
     encoding: str,
@@ -280,3 +299,27 @@ def test_binary_scanner_work_is_linear_on_long_nonmatching_input() -> None:
     long = duration(20_000)
 
     assert long <= short * 3 + 0.05
+
+
+def test_oversized_credential_name_fails_closed_without_candidate_copy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: list[tuple[int, int | None]] = []
+    original = credential_scanning._BinaryCredentialFinding
+
+    def record_finding(
+        *, candidate: bytes, payload: bytes | None
+    ) -> credential_scanning._BinaryCredentialFinding:
+        observed.append((len(candidate), None if payload is None else len(payload)))
+        return original(candidate=candidate, payload=payload)
+
+    monkeypatch.setattr(
+        credential_scanning,
+        "_BinaryCredentialFinding",
+        record_finding,
+    )
+    content = b"A" * 5000 + b"_KEY=operator-secret-value\n"
+
+    assert contains_possible_credential(content) is True
+    assert contains_binary_credential_residue(content) is True
+    assert observed == [(0, None)]

@@ -107,6 +107,7 @@ from research_agent.ontology_build import (
     OntologyBuildReceipt,
 )
 from research_agent.ontology_catalog import inventory_catalog, inventory_ontologies
+from research_agent.ontology_recovery import recover_managed_removals
 from research_agent.ontology_resolution import (
     OntologyCatalog,
     OntologySelection,
@@ -1854,6 +1855,7 @@ def main() -> None:
     if args.command == "ontology-snapshot-remove":
         _validate_snapshot_removal_arguments(args.ontology, args.bundle_sha256)
     _resolve_cli_config_paths(args)
+    recover_managed_removals(_user_config_manager(args))
 
     if args.command == "skill-export":
         manager = _user_config_manager(args)

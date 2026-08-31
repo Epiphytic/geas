@@ -219,6 +219,95 @@ def test_hydration_prevalidates_every_selected_output_before_first_download(
     assert not (manager.cache / "generated").exists()
 
 
+def test_hydration_prevalidates_later_artifact_file_kind_before_any_download(
+    tmp_path: Path,
+) -> None:
+    ontology = tmp_path / "routing"
+    ontology.mkdir()
+    database = tmp_path / "library.sqlite"
+    _library_database(database)
+    generated = tmp_path / "generated"
+    generated.mkdir()
+    generated.joinpath("index.md").write_text("# Routing\n")
+    store = MemoryArtifactStore().use_root(tmp_path / "remote-assets")
+    manager = OntologyArtifactManager(ontology)
+    manager.publish(
+        store=store,
+        published_by="test:operator",
+        storage_rights_basis="public documentation fixture",
+        source_library=database,
+        generated_content=generated,
+    )
+    manager.cache.mkdir()
+    manager.cache.joinpath("library.sqlite").mkdir()
+
+    with pytest.raises(OntologyArtifactError, match="file target"):
+        manager.hydrate(store=store)
+
+    assert store.download_calls == 0
+    assert not manager.cache.joinpath("generated.zip").exists()
+    assert not manager.cache.joinpath("generated").exists()
+
+
+def test_hydration_prevalidates_generated_directory_kind_before_any_download(
+    tmp_path: Path,
+) -> None:
+    ontology = tmp_path / "routing"
+    ontology.mkdir()
+    database = tmp_path / "library.sqlite"
+    _library_database(database)
+    generated = tmp_path / "generated"
+    generated.mkdir()
+    generated.joinpath("index.md").write_text("# Routing\n")
+    store = MemoryArtifactStore().use_root(tmp_path / "remote-assets")
+    manager = OntologyArtifactManager(ontology)
+    manager.publish(
+        store=store,
+        published_by="test:operator",
+        storage_rights_basis="public documentation fixture",
+        source_library=database,
+        generated_content=generated,
+    )
+    manager.cache.mkdir()
+    manager.cache.joinpath("generated").write_text("wrong target kind\n")
+
+    with pytest.raises(OntologyArtifactError, match="directory target"):
+        manager.hydrate(store=store)
+
+    assert store.download_calls == 0
+    assert not manager.cache.joinpath("generated.zip").exists()
+    assert not manager.cache.joinpath("library.sqlite").exists()
+
+
+def test_hydration_revalidates_ontology_root_after_constructor(
+    tmp_path: Path,
+) -> None:
+    ontology = tmp_path / "routing"
+    ontology.mkdir()
+    database = tmp_path / "library.sqlite"
+    _library_database(database)
+    store = MemoryArtifactStore().use_root(tmp_path / "remote-assets")
+    manager = OntologyArtifactManager(ontology)
+    manager.publish(
+        store=store,
+        published_by="test:operator",
+        storage_rights_basis="public documentation fixture",
+        source_library=database,
+    )
+    canonical = tmp_path / "canonical-routing"
+    ontology.rename(canonical)
+    canonical.joinpath("sentinel").write_bytes(b"canonical bytes\n")
+    ontology.symlink_to(canonical, target_is_directory=True)
+    before = canonical.joinpath("sentinel").read_bytes()
+
+    with pytest.raises(OntologyArtifactError, match="ontology root"):
+        manager.hydrate(store=store)
+
+    assert store.download_calls == 0
+    assert canonical.joinpath("sentinel").read_bytes() == before
+    assert not canonical.joinpath(".geas-artifacts").exists()
+
+
 def test_artifact_publication_rejects_possible_credentials(tmp_path: Path) -> None:
     ontology = tmp_path / "routing"
     ontology.mkdir()
@@ -546,6 +635,74 @@ def test_sqlite_artifact_rejects_deleted_assignment_residue_without_upload(
             store=store,
             published_by="test:operator",
             storage_rights_basis="operator-confirmed private storage",
+            source_library=database,
+        )
+
+    assert store.values == {}
+    assert tuple((tmp_path / "remote-assets").iterdir()) == ()
+    assert not (ontology / "artifacts.yaml").exists()
+
+
+def test_live_placeholder_cannot_excuse_control_delimited_deleted_slack(
+    tmp_path: Path,
+) -> None:
+    """A live safe row cannot authorize a prefix-overlapping deleted row."""
+    ontology = tmp_path / "routing"
+    ontology.mkdir()
+    database = tmp_path / "library.sqlite"
+    _library_database(database)
+    live_placeholder = b"FIRECRAWL_KEY=your_firecrawl_key"
+    deleted_residue = live_placeholder[:-1] + b"\x01"
+    assert len(deleted_residue) == len(live_placeholder)
+    with sqlite3.connect(database) as connection:
+        connection.execute("PRAGMA secure_delete=OFF")
+        connection.execute(
+            "CREATE TABLE source_text(id INTEGER PRIMARY KEY, content BLOB NOT NULL)"
+        )
+        connection.execute("INSERT INTO source_text(content) VALUES (?)", (live_placeholder,))
+        cursor = connection.execute(
+            "INSERT INTO source_text(content) VALUES (?)", (deleted_residue,)
+        )
+        connection.execute("DELETE FROM source_text WHERE id = ?", (cursor.lastrowid,))
+    database_bytes = database.read_bytes()
+    assert live_placeholder in database_bytes
+    assert deleted_residue in database_bytes
+    store = MemoryArtifactStore().use_root(tmp_path / "remote-assets")
+
+    with pytest.raises(OntologyArtifactError, match="possible credential"):
+        OntologyArtifactManager(ontology).publish(
+            store=store,
+            published_by="test:operator",
+            storage_rights_basis="public documentation fixture",
+            source_library=database,
+        )
+
+    assert store.values == {}
+    assert tuple((tmp_path / "remote-assets").iterdir()) == ()
+    assert not (ontology / "artifacts.yaml").exists()
+
+
+def test_deleted_prefixed_placeholder_residue_rejects_without_upload(
+    tmp_path: Path,
+) -> None:
+    ontology = tmp_path / "routing"
+    ontology.mkdir()
+    database = tmp_path / "library.sqlite"
+    _library_database(database)
+    deleted_residue = b"documentation: FIRECRAWL_KEY=your_firecrawl_key\n"
+    with sqlite3.connect(database) as connection:
+        connection.execute("PRAGMA secure_delete=OFF")
+        connection.execute("CREATE TABLE source_text(content BLOB NOT NULL)")
+        connection.execute("INSERT INTO source_text VALUES (?)", (deleted_residue,))
+        connection.execute("DELETE FROM source_text")
+    assert deleted_residue in database.read_bytes()
+    store = MemoryArtifactStore().use_root(tmp_path / "remote-assets")
+
+    with pytest.raises(OntologyArtifactError, match="possible credential"):
+        OntologyArtifactManager(ontology).publish(
+            store=store,
+            published_by="test:operator",
+            storage_rights_basis="public documentation fixture",
             source_library=database,
         )
 
