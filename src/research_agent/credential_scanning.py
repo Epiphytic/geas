@@ -14,9 +14,10 @@ _CREDENTIAL_ASSIGNMENT_MARKER = re.compile(
     rb"(?i)" + _CREDENTIAL_NAME + rb"\s*[:=]"
 )
 _CREDENTIAL_ASSIGNMENT = re.compile(
-    rb"(?im)^[ \t]*(?P<name>" + _CREDENTIAL_NAME + rb")[ \t]*[:=]"
-    rb"(?P<rhs>[^\n]*)$"
+    rb"(?i)[ \t]*(?P<name>" + _CREDENTIAL_NAME + rb")[ \t]*[:=]"
+    rb"(?P<rhs>[^\n]*)"
 )
+_CREDENTIAL_MARKER_CONTROL_BYTES = bytes(range(0x20)) + b"\x7f"
 _INERT_LITERAL = re.compile(rb"[A-Za-z0-9._/-]*")
 _MIN_CREDENTIAL_LENGTH = 12
 
@@ -24,17 +25,23 @@ _MIN_CREDENTIAL_LENGTH = 12
 def contains_possible_credential(content: Buffer) -> bool:
     """Return whether inert content contains a credential-like value.
 
-    Assignment values must be complete inert literals. The exact
-    public-documentation RHS ``NAME=your_name`` bypasses the normal literal
-    length finding. Composition, operators, interpolation, substitution,
-    escapes, split quotes, and ambiguous trailing syntax are findings at any
-    length.
+    Credential-like assignment markers are found before the original line is
+    validated. Assignment values must then be complete inert literals. The
+    exact public-documentation RHS ``NAME=your_name`` bypasses the normal
+    literal length finding. Composition, controls, operators, interpolation,
+    substitution, escapes, split quotes, and ambiguous surrounding syntax are
+    findings at any length.
     """
     if contains_fixed_credential(content):
         return True
     normalized = _normalize_line_separators(content)
-    for match in _CREDENTIAL_ASSIGNMENT.finditer(normalized):
-        if _assignment_rhs_is_sensitive(match.group("name"), match.group("rhs")):
+    for line in normalized.split(b"\n"):
+        if not contains_credential_assignment_marker(line):
+            continue
+        match = _CREDENTIAL_ASSIGNMENT.fullmatch(line)
+        if match is None or _assignment_rhs_is_sensitive(
+            match.group("name"), match.group("rhs")
+        ):
             return True
     return False
 
@@ -45,8 +52,12 @@ def contains_fixed_credential(content: Buffer) -> bool:
 
 
 def contains_credential_assignment_marker(content: Buffer) -> bool:
-    """Return whether inert bytes contain a credential-like assignment marker."""
-    return _CREDENTIAL_ASSIGNMENT_MARKER.search(content) is not None
+    """Find a credential marker without letting control bytes split its name."""
+    comparison = bytes(content).translate(
+        None,
+        _CREDENTIAL_MARKER_CONTROL_BYTES,
+    )
+    return _CREDENTIAL_ASSIGNMENT_MARKER.search(comparison) is not None
 
 
 def _normalize_line_separators(content: Buffer) -> bytes:

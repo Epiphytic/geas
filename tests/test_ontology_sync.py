@@ -318,20 +318,40 @@ def test_git_sync_accepts_documented_public_placeholders(
 
 
 @pytest.mark.parametrize(
-    "assignment",
+    ("assignment", "error_pattern"),
     (
-        "FIRECRAWL_KEY='your_''firecrawl_key''operator-secret-value-123'\n",
-        "FIRECRAWL_KEY=your_${K}\n",
-        "FIRECRAWL_KEY=your_$(x)\n",
-        "FIRECRAWL_KEY=your_;id\n",
-        "FIRECRAWL_KEY=operator-secret-value-123\rNEXT=value\n",
-        "FIRECRAWL_KEY=operator-secret-value-123\r\rNEXT=value\n",
-        "prefix=\x0b\rFIRECRAWL_KEY=operator-secret-value-123\r\x0cNEXT=value\n",
+        (
+            "FIRECRAWL_KEY='your_''firecrawl_key''operator-secret-value-123'\n",
+            "possible credential",
+        ),
+        ("FIRECRAWL_KEY=your_${K}\n", "possible credential"),
+        ("FIRECRAWL_KEY=your_$(x)\n", "possible credential"),
+        ("FIRECRAWL_KEY=your_;id\n", "possible credential"),
+        (
+            "FIRECRAWL_KEY=operator-secret-value-123\rNEXT=value\n",
+            "possible credential",
+        ),
+        (
+            "FIRECRAWL_KEY=operator-secret-value-123\r\rNEXT=value\n",
+            "possible credential",
+        ),
+        (
+            "prefix=\x0b\rFIRECRAWL_KEY=operator-secret-value-123\r\x0cNEXT=value\n",
+            "possible credential",
+        ),
+        ("\x0bFIRECRAWL_KEY=your_firecrawl_key\n", "possible credential"),
+        ("FIRE\x0cCRAWL_KEY=your_firecrawl_key\n", "possible credential"),
+        ("FIRE\x00CRAWL_KEY=your_firecrawl_key\n", "binary ontology file"),
+        (
+            "FIRECRAWL_KEY=your_firecrawl_key\x7f\n",
+            "possible credential",
+        ),
     ),
 )
 def test_git_sync_rejects_ambiguous_assignment_without_commit_or_remote_write(
     tmp_path: Path,
     assignment: str,
+    error_pattern: str,
 ) -> None:
     remote = tmp_path / "remote.git"
     remote.mkdir()
@@ -342,7 +362,7 @@ def test_git_sync_rejects_ambiguous_assignment_without_commit_or_remote_write(
     ontology.mkdir()
     (ontology / "example.md").write_text(assignment)
 
-    with pytest.raises(OntologySyncError, match="possible credential"):
+    with pytest.raises(OntologySyncError, match=error_pattern):
         manager.push(relative_paths=(Path("routing"),), message="must fail")
 
     remote_head = subprocess.run(

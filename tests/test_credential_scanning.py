@@ -4,6 +4,45 @@ import pytest
 
 from research_agent.credential_scanning import contains_possible_credential
 
+_FORBIDDEN_CONTROL_VALUES = (
+    *range(0x00, 0x09),
+    0x0B,
+    0x0C,
+    *range(0x0E, 0x20),
+    0x7F,
+)
+_FORBIDDEN_CONTROL_PARAMS = tuple(
+    pytest.param(bytes((value,)), id=f"0x{value:02x}")
+    for value in _FORBIDDEN_CONTROL_VALUES
+)
+_CONTROL_POSITION_PARAMS = (
+    pytest.param(
+        b"",
+        b"FIRECRAWL_KEY=your_firecrawl_key\n",
+        id="prefix",
+    ),
+    pytest.param(
+        b"FIRE",
+        b"CRAWL_KEY=your_firecrawl_key\n",
+        id="inside-name",
+    ),
+    pytest.param(
+        b"FIRECRAWL_KEY",
+        b"=your_firecrawl_key\n",
+        id="before-operator",
+    ),
+    pytest.param(
+        b"FIRECRAWL_KEY=",
+        b"your_firecrawl_key\n",
+        id="before-rhs",
+    ),
+    pytest.param(
+        b"FIRECRAWL_KEY=your_firecrawl_key",
+        b"\n",
+        id="suffix",
+    ),
+)
+
 
 @pytest.mark.parametrize(
     "assignment",
@@ -56,6 +95,106 @@ def test_line_separator_variants_cannot_hide_sensitive_assignment(
     content: bytes,
 ) -> None:
     assert contains_possible_credential(content) is True
+
+
+@pytest.mark.parametrize(("before", "after"), _CONTROL_POSITION_PARAMS)
+@pytest.mark.parametrize("control", _FORBIDDEN_CONTROL_PARAMS)
+def test_forbidden_control_cannot_hide_or_enter_placeholder_assignment(
+    before: bytes,
+    after: bytes,
+    control: bytes,
+) -> None:
+    assert contains_possible_credential(before + control + after) is True
+
+
+@pytest.mark.parametrize(
+    "content",
+    (
+        b"\tFIRECRAWL_KEY=your_firecrawl_key\n",
+        b"FIRECRAWL_KEY\t=your_firecrawl_key\n",
+        b"FIRECRAWL_KEY=\tyour_firecrawl_key\n",
+        b"FIRECRAWL_KEY=your_firecrawl_key\t\n",
+    ),
+    ids=("prefix", "before-operator", "before-rhs", "suffix"),
+)
+def test_tab_remains_permitted_horizontal_assignment_syntax(content: bytes) -> None:
+    assert contains_possible_credential(content) is False
+
+
+def test_tab_cannot_split_credential_variable_name() -> None:
+    assert (
+        contains_possible_credential(
+            b"FIRE\tCRAWL_KEY=your_firecrawl_key\n"
+        )
+        is True
+    )
+
+
+@pytest.mark.parametrize(
+    ("before", "after"),
+    (
+        pytest.param(
+            b"",
+            b"FIRECRAWL_KEY=your_firecrawl_key\n",
+            id="prefix",
+        ),
+        pytest.param(
+            b"FIRECRAWL_KEY",
+            b"=your_firecrawl_key\n",
+            id="before-operator",
+        ),
+        pytest.param(
+            b"FIRECRAWL_KEY=",
+            b"your_firecrawl_key\n",
+            id="before-rhs",
+        ),
+        pytest.param(
+            b"FIRECRAWL_KEY=your_firecrawl_key",
+            b"\n",
+            id="suffix",
+        ),
+    ),
+)
+@pytest.mark.parametrize(
+    "separator",
+    (b"\n", b"\r", b"\r\n"),
+    ids=("lf", "cr", "crlf"),
+)
+def test_normalized_line_separators_keep_assignments_on_independent_lines(
+    before: bytes,
+    after: bytes,
+    separator: bytes,
+) -> None:
+    assert contains_possible_credential(before + separator + after) is False
+
+
+@pytest.mark.parametrize(
+    "separator",
+    (b"\n", b"\r", b"\r\n"),
+    ids=("lf", "cr", "crlf"),
+)
+def test_line_separator_inside_name_exposes_sensitive_credential_suffix(
+    separator: bytes,
+) -> None:
+    assert (
+        contains_possible_credential(
+            b"FIRE" + separator + b"CRAWL_KEY=your_firecrawl_key\n"
+        )
+        is True
+    )
+
+
+def test_marker_elsewhere_on_line_makes_nonassignment_line_sensitive() -> None:
+    assert (
+        contains_possible_credential(
+            b"documentation: FIRECRAWL_KEY=your_firecrawl_key\n"
+        )
+        is True
+    )
+
+
+def test_normal_utf8_inert_content_remains_nonsecret() -> None:
+    assert contains_possible_credential("Snowman ☃ and café.\n".encode()) is False
 
 
 @pytest.mark.parametrize(

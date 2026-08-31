@@ -14,6 +14,45 @@ from research_agent.ontology_artifacts import (
     OntologyArtifactManager,
 )
 
+_FORBIDDEN_CONTROL_VALUES = (
+    *range(0x00, 0x09),
+    0x0B,
+    0x0C,
+    *range(0x0E, 0x20),
+    0x7F,
+)
+_FORBIDDEN_CONTROL_PARAMS = tuple(
+    pytest.param(bytes((value,)), id=f"0x{value:02x}")
+    for value in _FORBIDDEN_CONTROL_VALUES
+)
+_CONTROL_POSITION_PARAMS = (
+    pytest.param(
+        b"",
+        b"FIRECRAWL_KEY=your_firecrawl_key\n",
+        id="prefix",
+    ),
+    pytest.param(
+        b"FIRE",
+        b"CRAWL_KEY=your_firecrawl_key\n",
+        id="inside-name",
+    ),
+    pytest.param(
+        b"FIRECRAWL_KEY",
+        b"=your_firecrawl_key\n",
+        id="before-operator",
+    ),
+    pytest.param(
+        b"FIRECRAWL_KEY=",
+        b"your_firecrawl_key\n",
+        id="before-rhs",
+    ),
+    pytest.param(
+        b"FIRECRAWL_KEY=your_firecrawl_key",
+        b"\n",
+        id="suffix",
+    ),
+)
+
 
 class MemoryArtifactStore:
     def __init__(self) -> None:
@@ -215,6 +254,10 @@ def test_artifact_publication_rejects_placeholder_concatenation_without_upload(
         b"FIRECRAWL_KEY=operator-secret-value-123\rNEXT=value\n",
         b"FIRECRAWL_KEY=operator-secret-value-123\r\rNEXT=value\n",
         b"prefix=\x00\rFIRECRAWL_KEY=operator-secret-value-123\r\x01NEXT=value\n",
+        b"\x0bFIRECRAWL_KEY=your_firecrawl_key\n",
+        b"FIRE\x0cCRAWL_KEY=your_firecrawl_key\n",
+        b"FIRE\x00CRAWL_KEY=your_firecrawl_key\n",
+        b"FIRECRAWL_KEY=your_firecrawl_key\x7f\n",
     ),
 )
 def test_raw_artifact_rejects_credential_bypass_without_upload(
@@ -289,6 +332,44 @@ def test_sqlite_artifact_scans_every_text_and_blob_value_without_upload(
     ontology.mkdir()
     database = tmp_path / "library.sqlite"
     _library_database(database)
+    with sqlite3.connect(database) as connection:
+        connection.execute(f"CREATE TABLE source_text(content {column_type} NOT NULL)")
+        connection.execute("INSERT INTO source_text VALUES (?)", (assignment,))
+    store = MemoryArtifactStore().use_root(tmp_path / "remote-assets")
+
+    with pytest.raises(OntologyArtifactError, match="possible credential"):
+        OntologyArtifactManager(ontology).publish(
+            store=store,
+            published_by="test:operator",
+            storage_rights_basis="operator-confirmed private storage",
+            source_library=database,
+        )
+
+    assert store.values == {}
+    assert tuple((tmp_path / "remote-assets").iterdir()) == ()
+    assert not (ontology / "artifacts.yaml").exists()
+
+
+@pytest.mark.parametrize("column_type", ("TEXT", "BLOB"))
+@pytest.mark.parametrize(("before", "after"), _CONTROL_POSITION_PARAMS)
+@pytest.mark.parametrize("control", _FORBIDDEN_CONTROL_PARAMS)
+def test_sqlite_text_and_blob_reject_every_forbidden_control_position(
+    tmp_path: Path,
+    column_type: str,
+    before: bytes,
+    after: bytes,
+    control: bytes,
+) -> None:
+    ontology = tmp_path / "routing"
+    ontology.mkdir()
+    database = tmp_path / "library.sqlite"
+    _library_database(database)
+    assignment_bytes = before + control + after
+    assignment = (
+        assignment_bytes.decode("ascii")
+        if column_type == "TEXT"
+        else assignment_bytes
+    )
     with sqlite3.connect(database) as connection:
         connection.execute(f"CREATE TABLE source_text(content {column_type} NOT NULL)")
         connection.execute("INSERT INTO source_text VALUES (?)", (assignment,))
