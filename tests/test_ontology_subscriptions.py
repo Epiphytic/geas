@@ -122,13 +122,15 @@ def test_subscription_accepts_explicit_supported_remote_transports(url: str) -> 
     )
 
 
-def test_generic_scp_identity_matches_explicit_git_ssh_without_conflating_user() -> None:
+def test_generic_scp_identity_preserves_user_relative_path_authority() -> None:
     scp = normalized_repository_identity("git@example.invalid:owner/repository.git")
     explicit = normalized_repository_identity(
         "ssh://git@example.invalid/owner/repository.git"
     )
 
-    assert scp == explicit == "ssh://git@example.invalid/owner/repository"
+    assert scp == "ssh://git@example.invalid/~/owner/repository"
+    assert explicit == "ssh://git@example.invalid/owner/repository"
+    assert scp != explicit
     assert normalized_repository_identity(
         "ssh://example.invalid/owner/repository.git"
     ) != scp
@@ -142,6 +144,22 @@ def test_repository_identity_preserves_explicit_github_port_authority() -> None:
     assert normalized_repository_identity(
         "https://github.com:444/owner/repository.git"
     ) == "https://github.com:444/owner/repository"
+
+
+def test_repository_identity_keeps_username_less_github_ssh_distinct() -> None:
+    https = normalized_repository_identity(
+        "https://github.com/owner/repository.git"
+    )
+    git_ssh = normalized_repository_identity(
+        "ssh://git@github.com/owner/repository.git"
+    )
+    username_less = normalized_repository_identity(
+        "ssh://github.com/owner/repository.git"
+    )
+
+    assert https == git_ssh == "https://github.com/owner/repository"
+    assert username_less == "ssh://github.com/owner/repository"
+    assert username_less != https
 
 
 @pytest.mark.parametrize(
@@ -631,6 +649,55 @@ def _subscription(*, checkout: str = "subscriptions/sample") -> OntologySubscrip
         url="https://example.invalid/repository.git",
         checkout=Path(checkout),
     )
+
+
+@pytest.mark.parametrize(
+    "checkout",
+    (
+        "state",
+        "state/removal-transactions",
+        "state/removal-transactions/subscriptions/owned",
+    ),
+    ids=("ancestor", "equal", "descendant"),
+)
+def test_subscribe_reserves_complete_removal_journal_namespace_before_repo_io(
+    tmp_path: Path,
+    checkout: str,
+) -> None:
+    manager = _configured_manager(tmp_path)
+    before = manager.path.read_bytes()
+    calls: list[str] = []
+    subscriptions = SubscriptionManager(
+        config_manager=manager,
+        profile_name="default",
+        catalog_verifier=lambda path: path,
+        authorizer=lambda verified: verified,
+        repository_factory=lambda checkout, configured: calls.append("repository"),
+    )
+
+    with pytest.raises(ValueError, match="removal.*journal|reserved"):
+        subscriptions.subscribe("reserved", _subscription(checkout=checkout))
+
+    assert calls == []
+    assert manager.path.read_bytes() == before
+    assert not (manager.root / checkout).exists()
+
+
+def test_config_rejects_reserved_removal_namespace_checkout_in_any_profile() -> None:
+    with pytest.raises(ValueError, match="removal.*journal|reserved"):
+        GeasUserConfig(
+            profiles={
+                "default": GeasProfile(ontology_git=None),
+                "other": GeasProfile(
+                    ontology_git=None,
+                    subscriptions={
+                        "reserved": _subscription(
+                            checkout="state/removal-transactions/snapshots/owned"
+                        )
+                    },
+                ),
+            }
+        )
 
 
 def test_subscribe_validates_constructed_input_before_any_write(tmp_path: Path) -> None:

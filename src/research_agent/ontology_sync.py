@@ -276,7 +276,7 @@ class OntologyRepositoryManager:
         all_staged = tuple(
             Path(line)
             for line in self._run(
-                ("git", "diff", "--cached", "--name-only", "-z")
+                ("git", "diff", "--cached", "--no-renames", "--name-only", "-z")
             ).stdout.split("\x00")
             if line
         )
@@ -564,9 +564,9 @@ class OntologyRepositoryManager:
             mode, object_id = staged
             if mode not in {"100644", "100755"}:
                 raise OntologySyncError(f"refusing to push unsafe staged mode {mode}: {name}")
-            content = self._read_staged_blob(object_id)
-            if len(content) > 10_000_000:
+            if self._staged_blob_size(object_id) > 10_000_000:
                 raise OntologySyncError(f"refusing to scan oversized ontology file: {name}")
+            content = self._read_staged_blob(object_id)
             if b"\x00" in content:
                 raise OntologySyncError(f"refusing to push binary ontology file: {name}")
             if contains_possible_credential(content):
@@ -583,6 +583,13 @@ class OntologyRepositoryManager:
         if completed.returncode != 0:
             raise OntologySyncError("could not read a staged ontology blob")
         return completed.stdout
+
+    def _staged_blob_size(self, object_id: str) -> int:
+        completed = self._run(("git", "cat-file", "-s", object_id))
+        value = completed.stdout.strip()
+        if not value.isascii() or not value.isdecimal():
+            raise OntologySyncError("staged ontology blob size is invalid")
+        return int(value)
 
     @staticmethod
     def _within_targets(path: Path, targets: tuple[Path, ...]) -> bool:
@@ -625,6 +632,7 @@ class OntologyRepositoryManager:
         return {
             **os.environ,
             "GIT_TERMINAL_PROMPT": "0",
+            "GIT_NO_REPLACE_OBJECTS": "1",
             "GIT_CONFIG_COUNT": "1",
             "GIT_CONFIG_KEY_0": "core.hooksPath",
             "GIT_CONFIG_VALUE_0": os.devnull,

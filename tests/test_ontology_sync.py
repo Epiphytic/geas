@@ -310,6 +310,88 @@ def test_git_sync_rejects_staged_regular_file_to_symlink_type_change(
     assert _git("rev-parse", "refs/heads/main", cwd=remote).stdout.strip() == original
 
 
+def test_git_sync_ignores_replacement_refs_when_inspecting_exact_index_blob(
+    tmp_path: Path,
+) -> None:
+    remote = tmp_path / "remote.git"
+    original, _ = _seed_remote(remote, tmp_path / "seed")
+    manager = _manager(remote, tmp_path / "seed")
+    ontology = manager.checkout / "ontology.yaml"
+    ontology.write_text("OPENAI_API_KEY=operator-secret-value-123\n")
+    _git("add", "ontology.yaml", cwd=manager.checkout)
+    staged = _git(
+        "rev-parse", ":ontology.yaml", cwd=manager.checkout
+    ).stdout.strip()
+    safe = _git(
+        "hash-object",
+        "-w",
+        "--stdin",
+        cwd=manager.checkout,
+    )
+    # hash-object --stdin received an empty payload, which is safe replacement
+    # content. The index still names the original sensitive object.
+    _git("replace", staged, safe.stdout.strip(), cwd=manager.checkout)
+
+    with pytest.raises(OntologySyncError, match="possible credential"):
+        manager.push(relative_paths=(Path("ontology.yaml"),), message="must fail")
+
+    assert _git("rev-parse", "HEAD", cwd=manager.checkout).stdout.strip() == original
+    assert _git("rev-parse", "refs/heads/main", cwd=remote).stdout.strip() == original
+
+
+def test_git_sync_disables_rename_hiding_for_outside_target_deletion(
+    tmp_path: Path,
+) -> None:
+    remote = tmp_path / "remote.git"
+    original, _ = _seed_remote(remote, tmp_path / "seed")
+    manager = _manager(remote, tmp_path / "seed")
+    outside = manager.checkout / "outside.yaml"
+    outside.write_text("same ontology bytes\n")
+    manager.push(relative_paths=(Path("outside.yaml"),), message="seed outside")
+    baseline = _git("rev-parse", "HEAD", cwd=manager.checkout).stdout.strip()
+    target = manager.checkout / "routing"
+    target.mkdir()
+    outside.rename(target / "inside.yaml")
+    _git("config", "diff.renames", "true", cwd=manager.checkout)
+    _git("add", "-A", "--", "outside.yaml", cwd=manager.checkout)
+
+    with pytest.raises(OntologySyncError, match="previously staged.*outside.yaml"):
+        manager.push(relative_paths=(Path("routing"),), message="must fail")
+
+    assert baseline != original
+    assert _git("rev-parse", "HEAD", cwd=manager.checkout).stdout.strip() == baseline
+    assert _git("rev-parse", "refs/heads/main", cwd=remote).stdout.strip() == baseline
+
+
+def test_git_sync_rejects_oversized_index_blob_before_materializing_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    remote = tmp_path / "remote.git"
+    original, _ = _seed_remote(remote, tmp_path / "seed")
+    manager = _manager(remote, tmp_path / "seed")
+    (manager.checkout / "ontology.yaml").write_bytes(b"x" * 10_000_001)
+    commands: list[tuple[str, ...]] = []
+    run = subprocess.run
+
+    def recording_run(command, *args, **kwargs):
+        normalized = tuple(str(item) for item in command)
+        commands.append(normalized)
+        return run(command, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", recording_run)
+
+    with pytest.raises(OntologySyncError, match="oversized ontology file"):
+        manager.push(relative_paths=(Path("ontology.yaml"),), message="must fail")
+
+    cat_file = [command for command in commands if command[:2] == ("git", "cat-file")]
+    assert cat_file
+    assert any("-s" in command for command in cat_file)
+    assert not any("blob" in command for command in cat_file)
+    assert _git("rev-parse", "HEAD", cwd=manager.checkout).stdout.strip() == original
+    assert _git("rev-parse", "refs/heads/main", cwd=remote).stdout.strip() == original
+
+
 def test_git_sync_accepts_documented_public_placeholders(
     tmp_path: Path,
     monkeypatch,

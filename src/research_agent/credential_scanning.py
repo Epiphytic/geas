@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Buffer
+from collections.abc import Buffer, Iterator
 
 _FIXED_CREDENTIAL_PATTERNS = (
     re.compile(rb"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----"),
@@ -53,19 +53,51 @@ def contains_fixed_credential(content: Buffer) -> bool:
 
 
 def contains_binary_credential_residue(content: Buffer) -> bool:
-    """Scan assignment-shaped ASCII fragments embedded in arbitrary binary bytes.
+    """Scan assignment fragments embedded in arbitrary binary bytes.
 
-    SQLite record headers and page metadata are not line syntax.  Start each
-    bounded candidate at the credential marker and stop at the first binary
-    delimiter so those bytes cannot turn an inert placeholder into a false
-    finding.  A candidate that exceeds the bound fails closed.
+    Marker discovery is one forward pass with constant state. It recognizes
+    controls interleaved by UTF-16/UTF-32 and fails closed on every such
+    obfuscated marker. Contiguous ASCII assignments are classified by the
+    canonical scanner over one bounded candidate; binary record bytes can
+    terminate an exact placeholder, but can never downgrade a canonical
+    finding.
     """
+    return next(_iter_binary_credential_findings(content), None) is not None
+
+
+def binary_residue_is_only_live_sqlite_placeholders(
+    content: Buffer,
+    live_values: tuple[tuple[bytes, bool], ...],
+) -> bool:
+    """Return whether every binary finding is one exact verified live value.
+
+    ``live_values`` must already have passed the canonical scanner. This
+    narrow SQLite record exception is kept outside the binary classifier, so
+    the classifier itself never weakens a canonical finding.
+    """
+    found = False
+    for candidate in _iter_binary_credential_findings(content):
+        found = True
+        if not candidate or not _is_live_sqlite_record_placeholder(
+            candidate,
+            live_values,
+        ):
+            return False
+    return found
+
+
+def _iter_binary_credential_findings(
+    content: Buffer,
+) -> Iterator[bytes]:
     if contains_fixed_credential(content):
-        return True
+        yield b""
+        return
     size = len(content)
-    for marker in _CREDENTIAL_ASSIGNMENT_MARKER.finditer(content):
-        start = marker.start()
-        end = marker.end()
+    for start, marker_end, obfuscated in _iter_binary_assignment_markers(content):
+        if obfuscated:
+            yield b""
+            continue
+        end = marker_end
         limit = min(size, start + _MAX_BINARY_ASSIGNMENT_BYTES)
         while end < limit:
             value = content[end]
@@ -75,27 +107,105 @@ def contains_binary_credential_residue(content: Buffer) -> bool:
         if end == limit and end < size:
             next_value = content[end]
             if next_value == 0x09 or 0x20 <= next_value < 0x7F:
-                return True
-        candidate = content[start:end]
-        if contains_possible_credential(candidate) and not _binary_placeholder_with_record_prefix(
-            marker.group("name"),
-            content[marker.end() : end],
+                yield b""
+                continue
+        # Preserve CR/LF record boundaries, but include any other binary
+        # delimiter. The canonical scanner must see a control adjacent to an
+        # otherwise inert placeholder and reject it.
+        if end < size and content[end] not in {0x0A, 0x0D}:
+            end += 1
+        candidate = bytes(content[start:end])
+        if contains_possible_credential(candidate):
+            yield candidate
+
+
+def _iter_binary_assignment_markers(
+    content: Buffer,
+) -> Iterator[tuple[int, int, bool]]:
+    """Yield assignment marker spans in one bounded-memory forward pass."""
+    token_start: int | None = None
+    suffix = bytearray()
+    after_name = False
+    obfuscated = False
+
+    for index in range(len(content)):
+        value = content[index]
+        if value < 0x20 or value == 0x7F:
+            if token_start is not None:
+                obfuscated = True
+            continue
+
+        upper = value - 0x20 if 0x61 <= value <= 0x7A else value
+        is_alpha = 0x41 <= upper <= 0x5A
+        is_name_byte = is_alpha or 0x30 <= value <= 0x39 or value == 0x5F
+
+        if token_start is None:
+            if is_alpha:
+                token_start = index
+                suffix.clear()
+                suffix.append(upper)
+                after_name = False
+                obfuscated = False
+            continue
+
+        if not after_name and is_name_byte:
+            suffix.append(upper)
+            if len(suffix) > len(b"PASSWORD"):
+                del suffix[0]
+            continue
+
+        has_credential_suffix = _is_credential_name_suffix(suffix)
+        if value in {0x3A, 0x3D} and has_credential_suffix:
+            yield token_start, index + 1, obfuscated
+            token_start = None
+            suffix.clear()
+            after_name = False
+            obfuscated = False
+            continue
+        if value in {0x20, 0x09} and (after_name or has_credential_suffix):
+            after_name = True
+            continue
+
+        token_start = None
+        suffix.clear()
+        after_name = False
+        obfuscated = False
+        if is_alpha:
+            token_start = index
+            suffix.append(upper)
+
+
+def _is_credential_name_suffix(suffix: bytearray) -> bool:
+    value = bytes(suffix)
+    return value.endswith((b"KEY", b"TOKEN", b"SECRET", b"PASSWORD"))
+
+
+def _is_live_sqlite_record_placeholder(
+    candidate: bytes,
+    live_values: tuple[tuple[bytes, bool], ...],
+) -> bool:
+    if len(candidate) < 2:
+        return False
+    serial_type_byte = candidate[0]
+    assignment = candidate[1:]
+    for value, is_text in live_values:
+        serial_type = 2 * len(value) + (13 if is_text else 12)
+        if serial_type >= 0x80 or serial_type_byte != serial_type:
+            continue
+        if assignment == value:
+            return True
+        if value.startswith(assignment) and value[len(assignment) : len(assignment) + 1] in {
+            b"\n",
+            b"\r",
+        }:
+            return True
+        if (
+            assignment[:-1] == value
+            and assignment[-1] < 0x20
+            and assignment[-1] not in {0x0A, 0x0D}
         ):
             return True
     return False
-
-
-def _binary_placeholder_with_record_prefix(name: bytes, rhs: Buffer) -> bool:
-    """Recognize an exact public placeholder despite printable record-header bytes."""
-    literal = _parse_inert_literal(bytes(rhs))
-    if literal is None or not literal.startswith(b"your_"):
-        return False
-    placeholder_name = literal.removeprefix(b"your_")
-    return bool(
-        placeholder_name
-        and name.lower().endswith(placeholder_name)
-        and re.fullmatch(rb"(?i)" + _CREDENTIAL_NAME, placeholder_name)
-    )
 
 
 def contains_credential_assignment_marker(content: Buffer) -> bool:

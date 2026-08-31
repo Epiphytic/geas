@@ -186,6 +186,39 @@ def test_hydration_rejects_symlinked_cache_root_before_download_or_canonical_wri
     assert canonical.read_bytes() == before
 
 
+def test_hydration_prevalidates_every_selected_output_before_first_download(
+    tmp_path: Path,
+) -> None:
+    ontology = tmp_path / "routing"
+    ontology.mkdir()
+    database = tmp_path / "library.sqlite"
+    _library_database(database)
+    generated = tmp_path / "generated"
+    generated.mkdir()
+    (generated / "index.md").write_text("# Routing\n")
+    store = MemoryArtifactStore().use_root(tmp_path / "remote-assets")
+    manager = OntologyArtifactManager(ontology)
+    manager.publish(
+        store=store,
+        published_by="test:operator",
+        storage_rights_basis="operator-confirmed private storage",
+        source_library=database,
+        generated_content=generated,
+    )
+    manager.cache.mkdir()
+    outside = tmp_path / "outside.sqlite"
+    outside.write_bytes(b"outside bytes\n")
+    (manager.cache / "library.sqlite").symlink_to(outside)
+
+    with pytest.raises(OntologyArtifactError, match="symbolic link"):
+        manager.hydrate(store=store)
+
+    assert store.download_calls == 0
+    assert outside.read_bytes() == b"outside bytes\n"
+    assert not (manager.cache / "generated.zip").exists()
+    assert not (manager.cache / "generated").exists()
+
+
 def test_artifact_publication_rejects_possible_credentials(tmp_path: Path) -> None:
     ontology = tmp_path / "routing"
     ontology.mkdir()
@@ -376,6 +409,35 @@ def test_sqlite_artifact_scans_every_text_and_blob_value_without_upload(
         )
 
     assert store.values == {}
+    assert tuple((tmp_path / "remote-assets").iterdir()) == ()
+    assert not (ontology / "artifacts.yaml").exists()
+
+
+@pytest.mark.parametrize("encoding", ("utf-16-le", "utf-16-be", "utf-32-le", "utf-32-be"))
+def test_sqlite_artifact_rejects_encoded_residue_without_upload(
+    tmp_path: Path,
+    encoding: str,
+) -> None:
+    ontology = tmp_path / "routing"
+    ontology.mkdir()
+    database = tmp_path / "library.sqlite"
+    _library_database(database)
+    assignment = "FIRECRAWL_KEY=operator-secret-value-123".encode(encoding)
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE TABLE source_text(content BLOB NOT NULL)")
+        connection.execute("INSERT INTO source_text VALUES (?)", (assignment,))
+    store = MemoryArtifactStore().use_root(tmp_path / "remote-assets")
+
+    with pytest.raises(OntologyArtifactError, match="possible credential"):
+        OntologyArtifactManager(ontology).publish(
+            store=store,
+            published_by="test:operator",
+            storage_rights_basis="operator-confirmed private storage",
+            source_library=database,
+        )
+
+    assert store.values == {}
+    assert store.download_calls == 0
     assert tuple((tmp_path / "remote-assets").iterdir()) == ()
     assert not (ontology / "artifacts.yaml").exists()
 

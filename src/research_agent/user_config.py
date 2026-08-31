@@ -23,6 +23,7 @@ from research_agent.ontology_subscriptions import (
 )
 from research_agent.ontology_trust import InstalledOntologySnapshot, TrustRule
 from research_agent.paths import geas_config_home
+from research_agent.removal_journal import validate_removal_journal_namespace
 
 DEFAULT_ONTOLOGY_REPOSITORY = "https://github.com/liamhelmer-bel/ontologies.git"
 DEFAULT_CONFIG_FILENAMES = (
@@ -176,6 +177,7 @@ class GeasUserConfig(StrictModel):
         for profile_name, profile in sorted(self.profiles.items()):
             normalized = profile.normalized_subscriptions(freshness=self.ontology_freshness)
             for subscription_name, subscription in normalized.items():
+                validate_removal_journal_namespace(subscription.checkout)
                 identity = f"{profile_name}/{subscription_name}"
                 for existing_identity, existing_checkout in checkouts:
                     if (
@@ -431,6 +433,7 @@ class UserConfigManager:
         for profile_name, profile in sorted(config.profiles.items()):
             normalized = profile.normalized_subscriptions(freshness=config.ontology_freshness)
             for name, subscription in normalized.items():
+                validate_removal_journal_namespace(subscription.checkout)
                 checkout = self._confined_subscription_path(subscription.checkout)
                 canonical = checkout.resolve()
                 self._confined_subscription_path(subscription.checkout)

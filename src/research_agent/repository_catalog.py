@@ -79,14 +79,21 @@ def normalized_repository_identity(value: str) -> str:
         path = scp.group("path").rstrip("/").removesuffix(".git")
         if host == "github.com":
             return f"https://github.com/{path}"
-        return f"ssh://git@{host}/{path}"
+        # SCP syntax is relative to the remote user's home; an explicit SSH
+        # URL beginning with '/' names an absolute remote path and therefore
+        # has different authority.
+        return f"ssh://git@{host}/~/{path}"
 
     parsed = urlsplit(raw)
     assert parsed.hostname is not None  # Established by _validate_remote_url.
     host = parsed.hostname.lower()
     path = parsed.path.rstrip("/").removesuffix(".git")
     port_number = parsed.port
-    if host == "github.com" and port_number is None:
+    if (
+        host == "github.com"
+        and port_number is None
+        and (parsed.scheme == "https" or parsed.username == "git")
+    ):
         return f"https://github.com/{path.lstrip('/')}"
     rendered_host = f"[{host}]" if ":" in host else host
     port = f":{port_number}" if port_number is not None else ""

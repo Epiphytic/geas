@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import stat
 from enum import StrEnum
 from pathlib import Path, PurePosixPath
@@ -12,6 +13,18 @@ from uuid import uuid4
 from pydantic import Field, field_validator, model_validator
 
 from research_agent.models import StrictModel, canonical_json
+
+REMOVAL_JOURNAL_NAMESPACE = Path("state/removal-transactions")
+
+
+def validate_removal_journal_namespace(checkout: Path) -> None:
+    """Reserve the journal root and every ancestor/descendant from checkouts."""
+    if (
+        checkout == REMOVAL_JOURNAL_NAMESPACE
+        or checkout.is_relative_to(REMOVAL_JOURNAL_NAMESPACE)
+        or REMOVAL_JOURNAL_NAMESPACE.is_relative_to(checkout)
+    ):
+        raise ValueError("subscription checkout overlaps the reserved removal journal namespace")
 
 
 class RemovalPhase(StrEnum):
@@ -77,6 +90,9 @@ class RemovalJournal(StrictModel):
 
 
 _MAX_JOURNAL_BYTES = 64 * 1024
+_JOURNAL_TEMP_NAME = re.compile(
+    r"^\.(?P<transaction>[0-9a-f]{32})\.json\.tmp-[0-9a-f]{32}$"
+)
 
 
 def write_removal_journal(root: Path, journal: RemovalJournal) -> None:
@@ -112,27 +128,77 @@ def load_removal_journals(
     if directory.is_symlink() or not directory.is_dir():
         raise ValueError("removal journal root is not a directory")
     journals: list[RemovalJournal] = []
+    removed_temporary = False
     with os.scandir(directory) as entries:
         for entry in sorted(entries, key=lambda item: item.name.encode("utf-8")):
             path = Path(entry.path)
             if entry.is_symlink() or not entry.is_file(follow_symlinks=False):
                 raise ValueError("removal journal directory contains an unsafe entry")
-            if not entry.name.endswith(".json"):
+            temporary_match = _JOURNAL_TEMP_NAME.fullmatch(entry.name)
+            if not entry.name.endswith(".json") and temporary_match is None:
                 raise ValueError("removal journal directory contains an unknown entry")
-            metadata = entry.stat(follow_symlinks=False)
-            if metadata.st_size > _MAX_JOURNAL_BYTES:
-                raise ValueError("removal journal exceeds the size limit")
-            encoded = path.read_bytes()
-            try:
-                journal = RemovalJournal.model_validate_json(encoded)
-            except ValueError as error:
-                raise ValueError("removal journal is invalid") from error
+            encoded, metadata = _read_bounded_regular_file(path)
+            journal = _parse_canonical_journal(encoded)
+            if temporary_match is not None:
+                if (
+                    journal.kind != kind
+                    or temporary_match.group("transaction") != journal.transaction_id
+                ):
+                    raise ValueError("removal journal temporary identity is invalid")
+                current = path.stat(follow_symlinks=False)
+                if (
+                    not stat.S_ISREG(current.st_mode)
+                    or current.st_dev != metadata.st_dev
+                    or current.st_ino != metadata.st_ino
+                ):
+                    raise ValueError("removal journal temporary changed during recovery")
+                path.unlink()
+                removed_temporary = True
+                continue
             if journal.kind != kind or entry.name != f"{journal.transaction_id}.json":
                 raise ValueError("removal journal identity does not match its path")
-            if encoded != canonical_json(journal.model_dump(mode="json")):
-                raise ValueError("removal journal is not canonical JSON")
             journals.append(journal)
+    if removed_temporary:
+        _fsync_directory(directory)
     return tuple(journals)
+
+
+def _read_bounded_regular_file(path: Path) -> tuple[bytes, os.stat_result]:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise ValueError("removal journal is not a safe regular file") from error
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ValueError("removal journal is not a regular file")
+        if metadata.st_size > _MAX_JOURNAL_BYTES:
+            raise ValueError("removal journal exceeds the size limit")
+        chunks: list[bytes] = []
+        remaining = _MAX_JOURNAL_BYTES + 1
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 8192))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        encoded = b"".join(chunks)
+        if len(encoded) > _MAX_JOURNAL_BYTES:
+            raise ValueError("removal journal exceeds the size limit")
+        return encoded, metadata
+    finally:
+        os.close(descriptor)
+
+
+def _parse_canonical_journal(encoded: bytes) -> RemovalJournal:
+    try:
+        journal = RemovalJournal.model_validate_json(encoded)
+    except ValueError as error:
+        raise ValueError("removal journal is invalid") from error
+    if encoded != canonical_json(journal.model_dump(mode="json")):
+        raise ValueError("removal journal is not canonical JSON")
+    return journal
 
 
 def delete_removal_journal(root: Path, journal: RemovalJournal) -> None:

@@ -21,6 +21,7 @@ import yaml
 from pydantic import Field, field_validator, model_validator
 
 from research_agent.credential_scanning import (
+    binary_residue_is_only_live_sqlite_placeholders,
     contains_binary_credential_residue,
     contains_credential_assignment_marker,
     contains_fixed_credential,
@@ -32,6 +33,7 @@ from research_agent.truth import ProjectionStamp, SQLiteProjectionGuard
 _ONTOLOGY_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 _ASSET_NAME = re.compile(r"geas-[a-z-]+-[0-9a-f]{64}\.(?:sqlite|zip)")
 _RELEASE_TAG = re.compile(r"geas-artifact-[0-9a-f]{64}")
+_MAX_LIVE_SQLITE_PLACEHOLDER_BYTES = 4096
 class OntologyArtifactError(RuntimeError):
     pass
 
@@ -418,16 +420,41 @@ class OntologyArtifactManager:
                 "artifact manifest does not provide roles: "
                 + ", ".join(sorted(item.value for item in unknown))
             )
+        selected_artifacts = tuple(
+            artifact for artifact in manifest.artifacts if artifact.role in selected
+        )
+        destinations = tuple(
+            (artifact, self._cache_path(artifact)) for artifact in selected_artifacts
+        )
+        generated_output = self.cache / "generated"
+        if any(
+            artifact.role is ArtifactRole.GENERATED_CONTENT
+            for artifact in selected_artifacts
+        ):
+            _validate_cache_path(
+                generated_output,
+                ontology_directory=self.ontology_directory,
+            )
         _validate_cache_path(self.cache, ontology_directory=self.ontology_directory)
         if self.cache.exists() and not self.cache.is_dir():
             raise OntologyArtifactError("ontology artifact cache root is unsafe")
         self.cache.mkdir(exist_ok=True)
         _validate_cache_path(self.cache, ontology_directory=self.ontology_directory)
+        for _, destination in destinations:
+            _validate_cache_path(
+                destination,
+                ontology_directory=self.ontology_directory,
+            )
+        if any(
+            artifact.role is ArtifactRole.GENERATED_CONTENT
+            for artifact in selected_artifacts
+        ):
+            _validate_cache_path(
+                generated_output,
+                ontology_directory=self.ontology_directory,
+            )
         hydrated: list[ArtifactHydrationItem] = []
-        for artifact in manifest.artifacts:
-            if artifact.role not in selected:
-                continue
-            destination = self._cache_path(artifact)
+        for artifact, destination in destinations:
             downloaded = not _cached_artifact_is_valid(destination, artifact)
             if downloaded:
                 store.download(artifact, destination)
@@ -436,18 +463,16 @@ class OntologyArtifactManager:
             if artifact.format is ArtifactFormat.SQLITE:
                 _sqlite_input_revision(destination, artifact.role)
             else:
-                generated = self.cache / "generated"
-                _validate_cache_path(generated, ontology_directory=self.ontology_directory)
                 _extract_generated_zip(
                     destination,
-                    generated,
+                    generated_output,
                     ontology_directory=self.ontology_directory,
                 )
             hydrated.append(
                 ArtifactHydrationItem(
                     role=artifact.role,
                     path=str(
-                        self.cache / "generated"
+                        generated_output
                         if artifact.role is ArtifactRole.GENERATED_CONTENT
                         else destination
                     ),
@@ -711,26 +736,33 @@ def _verify_file(path: Path, artifact: OntologyArtifact) -> None:
 def _scan_sensitive_content(path: Path) -> None:
     if path.stat().st_size == 0:
         return
+    with path.open("rb") as handle:
+        sqlite_database = handle.read(16) == b"SQLite format 3\x00"
+    live_values = _scan_sqlite_values(path) if sqlite_database else ()
     with path.open("rb") as handle, mmap.mmap(
         handle.fileno(),
         0,
         access=mmap.ACCESS_READ,
     ) as content:
-        sqlite_database = content[:16] == b"SQLite format 3\x00"
         sensitive = (
             contains_binary_credential_residue(content)
             if sqlite_database
             else contains_possible_credential(content)
         )
-        if sensitive:
+        if sensitive and not (
+            sqlite_database
+            and binary_residue_is_only_live_sqlite_placeholders(
+                content,
+                live_values,
+            )
+        ):
             raise OntologyArtifactError(
                 f"possible credential detected in ontology artifact: {path}"
             )
-    if sqlite_database:
-        _scan_sqlite_values(path)
 
 
-def _scan_sqlite_values(path: Path) -> None:
+def _scan_sqlite_values(path: Path) -> tuple[tuple[bytes, bool], ...]:
+    live_placeholders: set[tuple[bytes, bool]] = set()
     try:
         with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as connection:
             schema_values = connection.execute(
@@ -759,10 +791,18 @@ def _scan_sqlite_values(path: Path) -> None:
                     )
                     for (value,) in values:
                         _raise_for_sqlite_credential(path, value)
+                        content = value.encode("utf-8") if isinstance(value, str) else bytes(value)
+                        if (
+                            len(content) <= _MAX_LIVE_SQLITE_PLACEHOLDER_BYTES
+                            and contains_credential_assignment_marker(content)
+                            and len(live_placeholders) < 1024
+                        ):
+                            live_placeholders.add((content, isinstance(value, str)))
     except (sqlite3.Error, TypeError, UnicodeError, ValueError) as error:
         raise OntologyArtifactError(
             f"could not scan SQLite ontology artifact for credentials: {path}"
         ) from error
+    return tuple(sorted(live_placeholders, key=lambda item: (item[0], item[1])))
 
 
 def _raise_for_sqlite_credential(path: Path, value: str | bytes) -> None:

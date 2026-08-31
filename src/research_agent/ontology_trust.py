@@ -465,7 +465,7 @@ def authorize_repository_catalog(
 ) -> tuple[AuthorizedOntology, ...]:
     """Authorize a freshly re-verified catalog through trusted profile state."""
     catalog = _fresh_catalog(catalog)
-    recover_snapshot_removals(manager)
+    _recover_all_managed_removals(manager)
     config = manager.load()
     try:
         profile = config.profiles[profile_name]
@@ -822,6 +822,12 @@ def recover_snapshot_removals(manager: UserConfigManager) -> None:
         delete_removal_journal(manager.root, journal)
 
 
+def _recover_all_managed_removals(manager: UserConfigManager) -> None:
+    from research_agent.ontology_recovery import recover_managed_removals
+
+    recover_managed_removals(manager)
+
+
 def _stage_snapshot(
     ontology: VerifiedCatalogOntology,
     *,
@@ -895,7 +901,7 @@ def install_snapshot(
     profile_name: str,
 ) -> InstalledOntologySnapshot:
     """Copy and register one exact verified inventory transactionally."""
-    recover_snapshot_removals(manager)
+    _recover_all_managed_removals(manager)
     config = manager.load()
     try:
         profile = config.profiles[profile_name]
@@ -938,7 +944,7 @@ def remove_snapshot(
     profile_name: str,
 ) -> SnapshotRemovalReceipt:
     """Atomically unregister and remove one exact managed digest directory."""
-    recover_snapshot_removals(manager)
+    _recover_all_managed_removals(manager)
     config = manager.load()
     try:
         profile = config.profiles[profile_name]

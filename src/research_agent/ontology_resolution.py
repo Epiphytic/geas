@@ -9,6 +9,7 @@ from typing import Literal
 from pydantic import Field
 
 from research_agent.models import StrictModel
+from research_agent.ontology_recovery import recover_managed_removals
 from research_agent.ontology_subscriptions import OntologySubscription
 from research_agent.ontology_trust import (
     InstalledOntologySnapshot,
@@ -73,6 +74,7 @@ def resolve_ontology_catalog(
     prompt: TrustPrompt | None,
 ) -> OntologyCatalog:
     """Merge profile and repository candidates without parsing ontology inputs."""
+    recover_managed_removals(manager)
     profile_name, profile = user_config.profile()
     candidates: list[OntologyCandidate] = []
 

@@ -1,8 +1,12 @@
 from pathlib import Path
+from time import monotonic
 
 import pytest
 
-from research_agent.credential_scanning import contains_possible_credential
+from research_agent.credential_scanning import (
+    contains_binary_credential_residue,
+    contains_possible_credential,
+)
 
 _FORBIDDEN_CONTROL_VALUES = (
     *range(0x00, 0x09),
@@ -230,3 +234,49 @@ def test_exact_archived_public_placeholders_remain_nonsecret() -> None:
     ).read_bytes()
 
     assert contains_possible_credential(source) is False
+
+
+@pytest.mark.parametrize(
+    "content",
+    (
+        b"OPENAI_API_KEY=your_api_key",
+        b"FIRECRAWL_KEY=your_firecrawl_key\x00",
+        b"FIRE\x00CRAWL_KEY=your_firecrawl_key",
+        b"FIRECRAWL_KEY=\x00your_firecrawl_key",
+        b"SQLite format 3\x00" + b"\x00" * 32 + b"eFIRECRAWL_KEY=your_firecrawl_key",
+    ),
+    ids=(
+        "suffix-placeholder-is-not-exact",
+        "control-after-rhs",
+        "control-inside-name",
+        "control-before-rhs",
+        "sqlite-header-does-not-weaken-canonical-finding",
+    ),
+)
+def test_binary_scanner_never_downgrades_canonical_sensitive_text(
+    content: bytes,
+) -> None:
+    assert contains_possible_credential(content) is True
+    assert contains_binary_credential_residue(content) is True
+
+
+@pytest.mark.parametrize("encoding", ("utf-16-le", "utf-16-be", "utf-32-le", "utf-32-be"))
+def test_binary_scanner_rejects_common_non_ascii_credential_encodings(
+    encoding: str,
+) -> None:
+    assignment = "FIRECRAWL_KEY=operator-secret-value-123"
+
+    assert contains_binary_credential_residue(assignment.encode(encoding)) is True
+
+
+def test_binary_scanner_work_is_linear_on_long_nonmatching_input() -> None:
+    def duration(size: int) -> float:
+        content = b"A" * size
+        started = monotonic()
+        assert contains_binary_credential_residue(content) is False
+        return monotonic() - started
+
+    short = duration(10_000)
+    long = duration(20_000)
+
+    assert long <= short * 3 + 0.05

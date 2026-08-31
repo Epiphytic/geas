@@ -185,6 +185,67 @@ def _write_subscription_removal_journal(
     write_removal_journal(manager.root, journal)
 
 
+def recover_subscription_removals(config_manager: UserConfigManager) -> None:
+    """Restore or finish exact checkout removals from durable journals."""
+    for journal in load_removal_journals(
+        config_manager.root,
+        kind="subscription",
+    ):
+        config = config_manager.load()
+        referenced = False
+        for profile in config.profiles.values():
+            normalized = profile.normalized_subscriptions(
+                freshness=config.ontology_freshness
+            )
+            for subscription in normalized.values():
+                candidate = subscription.checkout
+                if (
+                    candidate != journal.target
+                    and not candidate.is_relative_to(journal.target)
+                    and not journal.target.is_relative_to(candidate)
+                ):
+                    continue
+                if candidate != journal.target:
+                    raise ValueError(
+                        "subscription removal journal overlaps configured checkout"
+                    )
+                if _subscription_identity_sha256(subscription) != journal.subscription_sha256:
+                    raise ValueError(
+                        "subscription removal journal conflicts with configured identity"
+                    )
+                referenced = True
+
+        target = confined_removal_path(config_manager.root, journal.target)
+        quarantine = confined_removal_path(config_manager.root, journal.quarantine)
+        target_exists = target.exists()
+        quarantine_exists = quarantine.exists()
+        if target_exists and quarantine_exists:
+            raise ValueError("subscription removal target and quarantine both exist")
+
+        if referenced:
+            if quarantine_exists:
+                verify_directory_identity(quarantine, journal)
+                os.replace(quarantine, target)
+                sync_removal_parent(config_manager.root, journal.target)
+                verify_directory_identity(target, journal)
+            elif target_exists:
+                verify_directory_identity(target, journal)
+            else:
+                raise ValueError("registered subscription checkout is missing")
+        else:
+            if target_exists:
+                verify_directory_identity(target, journal)
+                os.replace(target, quarantine)
+                sync_removal_parent(config_manager.root, journal.quarantine)
+                verify_directory_identity(quarantine, journal)
+                quarantine_exists = True
+            if quarantine_exists:
+                verify_directory_identity(quarantine, journal)
+                shutil.rmtree(quarantine)
+                sync_removal_parent(config_manager.root, journal.quarantine)
+        delete_removal_journal(config_manager.root, journal)
+
+
 class CatalogVerifier(Protocol):
     def __call__(self, catalog_path: Path) -> object: ...
 
@@ -227,7 +288,7 @@ class SubscriptionManager:
         subscription: OntologySubscription,
     ) -> SubscriptionMutationReceipt:
         """Verify and authorize a checkout before atomically recording it."""
-        self.recover_removals()
+        self._recover_all_removals()
         validate_subscription_name(name)
         validated = OntologySubscription.model_validate(subscription.model_dump(mode="python"))
         original = self.config_manager.load()
@@ -310,7 +371,7 @@ class SubscriptionManager:
         remove_checkout: bool = False,
     ) -> SubscriptionMutationReceipt:
         """Remove one declaration, preserving checkout bytes unless explicitly requested."""
-        self.recover_removals()
+        self._recover_all_removals()
         validate_subscription_name(name)
         config = self.config_manager.load()
         original_config_bytes = self.config_manager.path.read_bytes()
@@ -413,72 +474,12 @@ class SubscriptionManager:
 
     def recover_removals(self) -> None:
         """Restore or finish exact checkout removals from durable journals."""
-        for journal in load_removal_journals(
-            self.config_manager.root,
-            kind="subscription",
-        ):
-            config = self.config_manager.load()
-            referenced = False
-            for profile in config.profiles.values():
-                normalized = profile.normalized_subscriptions(
-                    freshness=config.ontology_freshness
-                )
-                for subscription in normalized.values():
-                    candidate = subscription.checkout
-                    if (
-                        candidate != journal.target
-                        and not candidate.is_relative_to(journal.target)
-                        and not journal.target.is_relative_to(candidate)
-                    ):
-                        continue
-                    if candidate != journal.target:
-                        raise ValueError(
-                            "subscription removal journal overlaps configured checkout"
-                        )
-                    if _subscription_identity_sha256(subscription) != journal.subscription_sha256:
-                        raise ValueError(
-                            "subscription removal journal conflicts with configured identity"
-                        )
-                    referenced = True
+        recover_subscription_removals(self.config_manager)
 
-            target = confined_removal_path(self.config_manager.root, journal.target)
-            quarantine = confined_removal_path(
-                self.config_manager.root,
-                journal.quarantine,
-            )
-            target_exists = target.exists()
-            quarantine_exists = quarantine.exists()
-            if target_exists and quarantine_exists:
-                raise ValueError("subscription removal target and quarantine both exist")
+    def _recover_all_removals(self) -> None:
+        from research_agent.ontology_recovery import recover_managed_removals
 
-            if referenced:
-                if quarantine_exists:
-                    verify_directory_identity(quarantine, journal)
-                    os.replace(quarantine, target)
-                    sync_removal_parent(self.config_manager.root, journal.target)
-                    verify_directory_identity(target, journal)
-                elif target_exists:
-                    verify_directory_identity(target, journal)
-                else:
-                    raise ValueError("registered subscription checkout is missing")
-            else:
-                if target_exists:
-                    verify_directory_identity(target, journal)
-                    os.replace(target, quarantine)
-                    sync_removal_parent(
-                        self.config_manager.root,
-                        journal.quarantine,
-                    )
-                    verify_directory_identity(quarantine, journal)
-                    quarantine_exists = True
-                if quarantine_exists:
-                    verify_directory_identity(quarantine, journal)
-                    shutil.rmtree(quarantine)
-                    sync_removal_parent(
-                        self.config_manager.root,
-                        journal.quarantine,
-                    )
-            delete_removal_journal(self.config_manager.root, journal)
+        recover_managed_removals(self.config_manager)
 
     def _repository(self, checkout: Path, subscription: OntologySubscription) -> RepositoryOperator:
         if self.repository_factory is not None:
@@ -503,7 +504,7 @@ class SubscriptionManager:
         pull: bool = True,
         push: bool = False,
     ) -> tuple[SubscriptionSyncReceipt, ...]:
-        self.recover_removals()
+        self._recover_all_removals()
         config = self.config_manager.load()
         profile = config.profile(self.profile_name)[1]
         configured = profile.normalized_subscriptions(freshness=config.ontology_freshness)

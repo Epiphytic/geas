@@ -343,7 +343,7 @@ def test_generic_scp_origin_resolves_to_stable_identity_and_authorizes_before_pr
         "git@example.invalid:Owner/Example.git",
     )
     catalog = resolve_repository_catalog(resolved_catalog.repository_root)
-    expected_identity = "ssh://git@example.invalid/Owner/Example"
+    expected_identity = "ssh://git@example.invalid/~/Owner/Example"
     assert catalog.repository_identity == expected_identity
     manager = _manager(tmp_path)
     profile = manager.load().profiles["default"].model_copy(
@@ -363,6 +363,46 @@ def test_generic_scp_origin_resolves_to_stable_identity_and_authorizes_before_pr
     assert [item.ontology.name for item in authorized] == ["alpha", "beta"]
     assert prompt.actions == 0
     assert prompt.selections == []
+
+
+def test_user_relative_scp_origin_does_not_inherit_absolute_ssh_trust(
+    tmp_path: Path,
+    resolved_catalog: ResolvedRepositoryCatalog,
+) -> None:
+    assert resolved_catalog.repository_root is not None
+    _git(
+        resolved_catalog.repository_root,
+        "remote",
+        "set-url",
+        "origin",
+        "git@example.invalid:Owner/Example.git",
+    )
+    catalog = resolve_repository_catalog(resolved_catalog.repository_root)
+    manager = _manager(tmp_path)
+    profile = manager.load().profiles["default"].model_copy(
+        update={
+            "trust_rules": (
+                _rule(
+                    True,
+                    repository="ssh://git@example.invalid/Owner/Example",
+                ),
+            )
+        }
+    )
+    _replace_profile(manager, "default", profile)
+    before = manager.path.read_bytes()
+
+    with pytest.raises(ValueError, match="not trusted"):
+        authorize_repository_catalog(
+            catalog,
+            manager=manager,
+            profile_name="default",
+            yolo=False,
+            prompt=None,
+        )
+
+    assert manager.path.read_bytes() == before
+    assert manager.load().profiles["default"].installed_ontologies == ()
 
 
 def test_interactive_choice_two_persists_exact_per_ontology_answers(
