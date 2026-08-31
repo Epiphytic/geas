@@ -682,7 +682,7 @@ def test_production_generation_uses_catalog_and_preseeded_verified_projection(
     assert ontology.ontology.catalog_path == "geas.yaml"
     assert ontology.ontology.ontology_path == "ontology/open-source-research-agents"
     assert ontology.ontology.subscription_name == "geas-pr-skill-sync"
-    assert ontology.ontology.ontology_commit == head
+    assert ontology.ontology.ontology_commit == effective_source_commit(checkout, head)
     assert ontology.artifact is not None
     assert ontology.artifact.content_sha256 == hashlib.sha256(
         (demo / "query.sqlite").read_bytes()
