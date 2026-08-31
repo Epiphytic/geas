@@ -43,6 +43,20 @@ _REFERENCE_KEYS = frozenset(
 _PATH_COLLECTION_KEYS = frozenset({"artifacts", "sources"})
 
 
+def validate_ontology_name(value: str) -> str:
+    """Accept only the shared safe ontology identifier grammar."""
+    if not isinstance(value, str) or not _ONTOLOGY_NAME.fullmatch(value):
+        raise ValueError("ontology name is invalid")
+    return value
+
+
+def validate_bundle_sha256(value: str) -> str:
+    """Accept only a canonical lowercase SHA-256 bundle identifier."""
+    if not isinstance(value, str) or not _DIGEST.fullmatch(value):
+        raise ValueError("bundle SHA-256 is invalid")
+    return value
+
+
 def _relative_path(value: object, *, label: str) -> Path:
     if not isinstance(value, (str, Path)):
         raise ValueError(f"{label} must be a relative path")
@@ -69,6 +83,11 @@ class CatalogFile(StrictModel):
     def path_is_confined(cls, value: object) -> Path:
         return _relative_path(value, label="catalog file path")
 
+    @field_validator("sha256", mode="before")
+    @classmethod
+    def sha256_is_canonical(cls, value: str) -> str:
+        return validate_bundle_sha256(value)
+
 
 class CatalogOntology(StrictModel):
     name: str
@@ -77,12 +96,15 @@ class CatalogOntology(StrictModel):
     files: tuple[CatalogFile, ...]
     bundle_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
-    @field_validator("name")
+    @field_validator("name", mode="before")
     @classmethod
     def name_is_safe(cls, value: str) -> str:
-        if not _ONTOLOGY_NAME.fullmatch(value):
-            raise ValueError("ontology name is invalid")
-        return value
+        return validate_ontology_name(value)
+
+    @field_validator("bundle_sha256", mode="before")
+    @classmethod
+    def bundle_sha256_is_canonical(cls, value: str) -> str:
+        return validate_bundle_sha256(value)
 
     @field_validator("path", mode="before")
     @classmethod
@@ -133,6 +155,16 @@ class VerifiedCatalogOntology(StrictModel):
             label="workspace ontology path",
             allow_root=True,
         )
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def name_is_safe(cls, value: str) -> str:
+        return validate_ontology_name(value)
+
+    @field_validator("bundle_sha256", mode="before")
+    @classmethod
+    def bundle_sha256_is_canonical(cls, value: str) -> str:
+        return validate_bundle_sha256(value)
 
 
 class ResolvedRepositoryCatalog(StrictModel):

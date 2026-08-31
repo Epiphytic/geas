@@ -129,6 +129,10 @@ def _committed_sample_checkout(destination: Path) -> Path:
         destination / "src" / "research_agent" / "cli.py",
     )
     shutil.copyfile(
+        REPOSITORY_ROOT / "src" / "research_agent" / "repository_catalog.py",
+        destination / "src" / "research_agent" / "repository_catalog.py",
+    )
+    shutil.copyfile(
         REPOSITORY_ROOT / "src" / "research_agent" / "ontology_artifacts.py",
         destination / "src" / "research_agent" / "ontology_artifacts.py",
     )
@@ -149,6 +153,7 @@ def _committed_sample_checkout(destination: Path) -> Path:
         "config/truth-policy.yaml",
         "src/research_agent/truth.py",
         "src/research_agent/cli.py",
+        "src/research_agent/repository_catalog.py",
         "src/research_agent/ontology_artifacts.py",
         "src/research_agent/credential_scanning.py",
         "src/research_agent/default_config/truth-policy.yaml",

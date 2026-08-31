@@ -123,6 +123,7 @@ from research_agent.ontology_sync import OntologyRepositoryManager
 from research_agent.ontology_trust import (
     TrustPrompt,
     authorize_repository_catalog,
+    remove_snapshot,
 )
 from research_agent.operator_policy import ResearchPolicy
 from research_agent.parsing import ParsedDocumentManager
@@ -161,6 +162,8 @@ from research_agent.repository_catalog import (
     VerifiedCatalogOntology,
     refresh_catalog,
     resolve_repository_catalog,
+    validate_bundle_sha256,
+    validate_ontology_name,
     verify_catalog,
 )
 from research_agent.research import DiscoveryExecutor, OfflineResearchRunner
@@ -224,6 +227,12 @@ def _local_approval_principal(root: Path) -> AuthenticatedPrincipal:
 
 def _user_config_manager(args: argparse.Namespace) -> UserConfigManager:
     return UserConfigManager(args.geas_config)
+
+
+def _validate_snapshot_removal_arguments(ontology: str, bundle_sha256: str) -> None:
+    """Validate untrusted CLI tokens before configuration-path resolution."""
+    validate_ontology_name(ontology)
+    validate_bundle_sha256(bundle_sha256)
 
 
 class _StderrTrustPrompt(TrustPrompt):
@@ -1127,6 +1136,13 @@ def _build_parser() -> argparse.ArgumentParser:
     ontology_unsubscribe.add_argument("name")
     ontology_unsubscribe.add_argument("--remove-checkout", action="store_true")
 
+    ontology_snapshot_remove = subparsers.add_parser(
+        "ontology-snapshot-remove",
+        help="remove one exact registered immutable ontology snapshot",
+    )
+    ontology_snapshot_remove.add_argument("ontology")
+    ontology_snapshot_remove.add_argument("bundle_sha256")
+
     artifact_publish = subparsers.add_parser(
         "ontology-artifact-publish",
         help=(
@@ -1835,6 +1851,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = _build_parser().parse_args()
+    if args.command == "ontology-snapshot-remove":
+        _validate_snapshot_removal_arguments(args.ontology, args.bundle_sha256)
     _resolve_cli_config_paths(args)
 
     if args.command == "skill-export":
@@ -2026,6 +2044,27 @@ def main() -> None:
                 "skills": skills,
             }
         )
+        return
+
+    if args.command == "ontology-snapshot-remove":
+        manager = _user_config_manager(args)
+        _config, profile_name, profile = _selected_user_config(args, manager)
+        snapshot = next(
+            (
+                item
+                for item in profile.installed_ontologies
+                if (item.name, item.bundle_sha256)
+                == (args.ontology, args.bundle_sha256)
+            ),
+            None,
+        )
+        if snapshot is None:
+            raise ValueError("ontology snapshot is not registered in the selected profile")
+        print(
+            f"Removing exact ontology snapshot {snapshot.name!r} ({snapshot.bundle_sha256}).",
+            file=sys.stderr,
+        )
+        _json(remove_snapshot(snapshot, manager=manager, profile_name=profile_name))
         return
 
     if args.command in {"ontology-subscribe", "ontology-unsubscribe", "ontology-sync"}:

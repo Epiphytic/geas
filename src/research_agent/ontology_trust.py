@@ -25,6 +25,8 @@ from research_agent.repository_catalog import (
     _verify_transitive_inputs,
     ontology_bundle_sha256,
     resolve_repository_catalog,
+    validate_bundle_sha256,
+    validate_ontology_name,
     verify_catalog,
 )
 
@@ -32,7 +34,6 @@ if TYPE_CHECKING:
     from research_agent.user_config import GeasProfile, GeasUserConfig, UserConfigManager
 
 
-_DIGEST = re.compile(r"[0-9a-f]{64}")
 _OBJECT_ID = re.compile(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}")
 
 
@@ -124,11 +125,16 @@ class TrustRule(StrictModel):
     def digests_are_normalized(cls, value: object) -> object:
         if value == "*":
             return value
-        if isinstance(value, str) or not isinstance(value, Sequence):
+        if isinstance(value, (str, bytes, bytearray)) or not isinstance(value, Sequence):
             raise ValueError("bundle digests must be '*' or a non-empty sequence")
-        normalized = tuple(str(item).lower() for item in value)
-        if any(not _DIGEST.fullmatch(item) for item in normalized):
-            raise ValueError("bundle digest must be a lowercase SHA-256")
+        if not all(isinstance(item, str) for item in value):
+            raise ValueError("bundle digests must contain only strings")
+        normalized = tuple(value)
+        try:
+            for item in normalized:
+                validate_bundle_sha256(item)
+        except ValueError:
+            raise ValueError("bundle digest must be a lowercase SHA-256") from None
         return _unique_sorted(normalized, label="bundle digest")
 
     @field_validator("created_at")
@@ -156,6 +162,11 @@ class TrustContext(StrictModel):
     def path_is_normalized(cls, value: object) -> Path:
         return _normalized_relative_path(value, label="trust context path")
 
+    @field_validator("bundle_sha256", mode="before")
+    @classmethod
+    def bundle_sha256_is_canonical(cls, value: object) -> str:
+        return validate_bundle_sha256(value)  # type: ignore[arg-type]
+
 
 class TrustDecision(StrictModel):
     matched: bool
@@ -170,6 +181,16 @@ class InstalledOntologySnapshot(StrictModel):
     bundle_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     path: Path
     files: tuple[CatalogFile, ...]
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def name_is_safe(cls, value: str) -> str:
+        return validate_ontology_name(value)
+
+    @field_validator("bundle_sha256", mode="before")
+    @classmethod
+    def bundle_sha256_is_canonical(cls, value: str) -> str:
+        return validate_bundle_sha256(value)
 
     @field_validator("path", mode="before")
     @classmethod
@@ -188,6 +209,16 @@ class SnapshotRemovalReceipt(StrictModel):
     bundle_sha256: str
     path: Path
     removed: bool
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def name_is_safe(cls, value: object) -> str:
+        return validate_ontology_name(value)  # type: ignore[arg-type]
+
+    @field_validator("bundle_sha256", mode="before")
+    @classmethod
+    def bundle_sha256_is_canonical(cls, value: object) -> str:
+        return validate_bundle_sha256(value)  # type: ignore[arg-type]
 
 
 class _StagedSnapshot(StrictModel):
