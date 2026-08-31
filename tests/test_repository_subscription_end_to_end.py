@@ -17,7 +17,7 @@ import pytest
 
 import research_agent.cli as cli
 from research_agent.agent_skills import validate_snapshot
-from research_agent.geas_update import GeasUpdater
+from research_agent.geas_update import GeasInstallProvenance, GeasUpdater
 from research_agent.ontology_artifacts import OntologyArtifact, OntologyArtifactManifest
 from research_agent.ontology_subscriptions import OntologyFreshnessConfig, SubscriptionManager
 from research_agent.ontology_trust import (
@@ -67,20 +67,54 @@ def _local_public_origin_checkout(destination: Path) -> Path:
     return destination
 
 
-def _inspected_checkout_provenance(checkout: Path) -> tuple[str, str]:
-    """Use the real Geas provenance verifier over the committed local checkout."""
+def _inspected_checkout_provenance(checkout: Path) -> GeasInstallProvenance:
+    """Inspect the exact cloned checkout without adding a tracked test entrypoint."""
+    head = _git(checkout, "rev-parse", "--verify", "HEAD")
     executable = checkout / "bin" / "geas"
-    executable.parent.mkdir()
+    executable.parent.mkdir(exist_ok=True)
+    exclude = checkout / ".git" / "info" / "exclude"
+    excluded = exclude.read_text()
+    if "/bin/geas\n" not in excluded:
+        exclude.write_text(f"{excluded.rstrip()}\n/bin/geas\n")
     executable.write_text("#!/bin/sh\n")
-    _git(checkout, "add", "bin/geas")
-    _git(checkout, "commit", "-m", "offline test Geas entrypoint")
     provenance = GeasUpdater(
         source_directory=checkout / "src" / "research_agent",
         executable=executable,
         module_file=checkout / "src" / "research_agent" / "geas_update.py",
         installed_version=cli._installed_geas_version,
     ).inspect()
-    return provenance.version, provenance.commit
+    tracked = subprocess.run(
+        ("git", "ls-files", "--error-unmatch", "bin/geas"),
+        cwd=checkout,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    ignored = subprocess.run(
+        ("git", "check-ignore", "--quiet", "bin/geas"),
+        cwd=checkout,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert provenance.directory == checkout.resolve()
+    assert provenance.repository_url == REPOSITORY_URL
+    assert provenance.branch == "main"
+    assert provenance.commit == head == _git(checkout, "rev-parse", "--verify", "HEAD")
+    assert not _git(checkout, "status", "--porcelain", "--untracked-files=all")
+    assert tracked.returncode == 1
+    assert ignored.returncode == 0
+    return provenance
+
+
+def _remove_generated_artifact_cache(checkout: Path) -> None:
+    """Remove only the known disposable cache before requiring a clean checkout."""
+    cache = checkout / "ontology" / ONTOLOGY / ".geas-artifacts" / "query.sqlite"
+    if cache.exists():
+        assert cache.is_file() and not cache.is_symlink()
+        cache.unlink()
+        cache.parent.rmdir()
+    assert not _git(checkout, "status", "--porcelain", "--untracked-files=all")
 
 
 def _offline_subprocess_env(tmp_path: Path, checkout: Path) -> dict[str, str]:
@@ -220,7 +254,11 @@ def test_current_repository_subscription_is_deterministic_and_offline(
     checkout = _local_public_origin_checkout(
         manager.root / "subscriptions" / "default" / "geas-samples"
     )
-    geas_version, geas_commit = _inspected_checkout_provenance(checkout)
+    checkout_head = _git(checkout, "rev-parse", "--verify", "HEAD")
+    geas_provenance = _inspected_checkout_provenance(checkout)
+    geas_version = geas_provenance.version
+    geas_commit = geas_provenance.commit
+    assert geas_commit == checkout_head
     manager.replace(
         GeasUserConfig(
             ontology_freshness=OntologyFreshnessConfig(check_before_use=False),
@@ -309,6 +347,10 @@ def test_current_repository_subscription_is_deterministic_and_offline(
     cli.main()
     subscribed = _receipt(capsys)
     assert subscribed["subscribed"] is True
+    assert subscribed["pull"] == {"commit": checkout_head, "offline": True}
+    configured_subscription = manager.load().profiles["default"].subscriptions["geas-samples"]
+    assert configured_subscription.url == REPOSITORY_URL
+    assert configured_subscription.active_ref == "refs/heads/main"
     assert calls == ["pull"]
 
     config_before_list = manager.path.read_bytes()
@@ -415,12 +457,19 @@ def test_current_repository_subscription_is_deterministic_and_offline(
         "socket denial active\n"
     )
     assert json.loads(completed.stdout)["projection_schema"] == 9
+    _remove_generated_artifact_cache(checkout)
     artifact = OntologyArtifactManifest.from_yaml(
         checkout / "ontology" / ONTOLOGY / "artifacts.yaml"
     ).artifacts[0]
     store = _PreseededArtifactStore(demo_root / "query.sqlite", artifact)
     monkeypatch.setattr(cli, "GitHubReleaseArtifactStore", lambda *_args, **_kwargs: store)
-    monkeypatch.setattr(cli, "_current_geas_identity", lambda: (geas_version, geas_commit))
+
+    def current_checkout_identity() -> tuple[str, str]:
+        current = _inspected_checkout_provenance(checkout)
+        assert current == geas_provenance
+        return current.version, current.commit
+
+    monkeypatch.setattr(cli, "_current_geas_identity", current_checkout_identity)
     monkeypatch.setattr(cli.shutil, "which", lambda _name: None)
 
     exports: list[dict[str, object]] = []
@@ -430,6 +479,7 @@ def test_current_repository_subscription_is_deterministic_and_offline(
         ])
         cli.main()
         exports.append(_receipt(capsys))
+        _remove_generated_artifact_cache(checkout)
     exported = validate_snapshot(Path(str(exports[-1]["path"])))
     assert [item["unchanged"] for item in exports] == [False, True]
     assert exports[0]["snapshot_sha256"] == exports[1]["snapshot_sha256"]
@@ -454,7 +504,7 @@ def test_current_repository_subscription_is_deterministic_and_offline(
         (demo_root / "snapshot.json").read_text()
     )["id"]
     assert exported.projection.topic_concept_id == "concept:open-source-research-agents"
-    assert store.downloads == 1
+    assert store.downloads == 2
 
     monkeypatch.setattr(sys, "argv", [
         "geas", "--geas-config", str(manager.path), "ontology-unsubscribe", "geas-samples",
