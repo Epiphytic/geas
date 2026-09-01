@@ -1027,13 +1027,16 @@ def _unlink_candidate_content_token(
             raise ValueError("projection validation candidate token is unsafe")
         os.close(descriptor)
         descriptor = -1
-        # The private transaction directory excludes other principals.  Close
-        # the Windows handle before the final bounded revalidation and unlink.
-        if quarantine.is_symlink() or not quarantine.is_file():
-            raise ValueError("projection validation candidate token is unsafe")
-        if quarantine.read_bytes() != token:
-            raise ValueError("projection validation candidate token is unsafe")
-        os.unlink(quarantine)
+        # No supported portable primitive unlinks a pathname only if it still
+        # names the inode authenticated by a now-closed descriptor.  This path
+        # is reached only when both descriptor identity probes failed during
+        # setup.  Retaining the bounded, authenticated token in the private
+        # quarantine is safer than a check-then-unlink that could delete a
+        # same-principal replacement.
+        raise RuntimeError(
+            "projection validation cleanup retained its authenticated token "
+            "in quarantine"
+        )
     finally:
         if descriptor >= 0:
             os.close(descriptor)

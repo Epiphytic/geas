@@ -2130,7 +2130,7 @@ def test_projection_reader_rejects_source_replacement_after_snapshot_validation(
         "connect",
     ),
 )
-def test_projection_reader_failure_cleans_private_validation_snapshot(
+def test_projection_reader_failure_cleans_or_safely_quarantines_validation_snapshot(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     failure: str,
@@ -2300,11 +2300,58 @@ def test_projection_reader_failure_cleans_private_validation_snapshot(
         truth_module._open_stable_projection_connection(database)
 
     assert created
-    assert tuple(validation_root.iterdir()) == ()
-    assert all(
-        str(directory) not in truth_module._WINDOWS_PRIVATE_DIRECTORY_IDENTITIES
-        for directory in created
-    )
+    retained_token = failure in {
+        "short-write",
+        "partial-write",
+        "short-read",
+        "descriptor-stats",
+    }
+    if retained_token:
+        assert tuple(validation_root.iterdir()) == tuple(created)
+        quarantine = created[0] / ".validation-token-cleanup"
+        assert quarantine.is_file()
+        assert 0 < quarantine.stat().st_size <= 32
+    else:
+        assert tuple(validation_root.iterdir()) == ()
+        assert all(
+            str(directory)
+            not in truth_module._WINDOWS_PRIVATE_DIRECTORY_IDENTITIES
+            for directory in created
+        )
+
+
+def test_projection_token_cleanup_never_path_unlinks_after_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transaction = tmp_path / "transaction"
+    transaction.mkdir(mode=0o700)
+    candidate = transaction / "projection.sqlite"
+    token = b"authenticated bounded token"
+    candidate.write_bytes(token)
+    unknown = tmp_path / "unknown.sqlite"
+    unknown.write_bytes(b"unknown replacement")
+    unlink = truth_module.os.unlink
+    unlink_calls = 0
+
+    def replace_if_path_unlinked(path: object, *args: object, **kwargs: object) -> None:
+        nonlocal unlink_calls
+        unlink_calls += 1
+        unknown.replace(Path(path))
+        unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(truth_module.os, "unlink", replace_if_path_unlinked)
+
+    with pytest.raises(RuntimeError, match="retained.*token.*quarantine"):
+        truth_module._unlink_candidate_content_token(
+            candidate,
+            token,
+            transaction,
+        )
+
+    assert unlink_calls == 0
+    assert (transaction / ".validation-token-cleanup").read_bytes() == token
+    assert unknown.read_bytes() == b"unknown replacement"
 
 
 def test_projection_reader_rejects_sidecar_created_after_snapshot_validation(
