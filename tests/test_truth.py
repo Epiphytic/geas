@@ -910,6 +910,91 @@ def test_windows_replace_file_uses_only_supported_flags(
     ]
 
 
+@pytest.mark.parametrize("winerror", (1175, 1176, 1177))
+def test_windows_documented_replace_failures_preserve_selected_destination(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    winerror: int,
+) -> None:
+    transaction = tmp_path / "transaction"
+    transaction.mkdir(mode=0o700)
+    candidate = transaction / "candidate.sqlite"
+    candidate.write_bytes(b"candidate bytes")
+    candidate_information = candidate.stat()
+    authority = truth_module._CandidateAuthority(
+        parent_directory=tmp_path,
+        parent_device=tmp_path.stat().st_dev,
+        parent_inode=tmp_path.stat().st_ino,
+        transaction_directory=transaction,
+        directory_device=transaction.stat().st_dev,
+        directory_inode=transaction.stat().st_ino,
+        candidate=candidate,
+        candidate_device=candidate_information.st_dev,
+        candidate_inode=candidate_information.st_ino,
+    )
+    database = tmp_path / "query.sqlite"
+    database.write_bytes(b"selected destination")
+    selected = database.read_bytes()
+    identity = truth_module._capture_projection_identity(database)
+    assert identity is not None
+
+    def fail_replace(
+        database_path: Path,
+        _candidate_path: Path,
+        backup_path: Path | None,
+    ) -> None:
+        assert backup_path is not None
+        if winerror == 1177:
+            database_path.replace(backup_path)
+        error = OSError(f"ReplaceFileW failed with {winerror}")
+        error.winerror = winerror  # type: ignore[attr-defined]
+        raise error
+
+    monkeypatch.setattr(truth_module, "_windows_flush_directory", lambda path: None)
+    monkeypatch.setattr(truth_module, "_windows_replace_file", fail_replace)
+
+    with pytest.raises(OSError, match=str(winerror)):
+        truth_module._replace_candidate_windows(
+            candidate,
+            database,
+            identity,
+            authority,
+        )
+
+    assert database.read_bytes() == selected
+    assert candidate.read_bytes() == b"candidate bytes"
+    assert not (transaction / "displaced.sqlite").exists()
+
+
+def test_windows_kernel32_prototypes_preserve_64_bit_handles() -> None:
+    class FakeFunction:
+        argtypes: object = None
+        restype: object = None
+
+    class Kernel32:
+        CreateFileW = FakeFunction()
+        FlushFileBuffers = FakeFunction()
+        CloseHandle = FakeFunction()
+        ReplaceFileW = FakeFunction()
+        MoveFileExW = FakeFunction()
+        GetFileInformationByHandleEx = FakeFunction()
+        SetFileInformationByHandle = FakeFunction()
+        CreateDirectoryW = FakeFunction()
+        LocalFree = FakeFunction()
+
+    kernel32 = truth_module._configure_windows_kernel32(Kernel32())
+
+    assert kernel32.CreateFileW.restype is truth_module.wintypes.HANDLE
+    assert kernel32.FlushFileBuffers.argtypes == [truth_module.wintypes.HANDLE]
+    assert kernel32.CloseHandle.argtypes == [truth_module.wintypes.HANDLE]
+    assert kernel32.GetFileInformationByHandleEx.argtypes[0] is (
+        truth_module.wintypes.HANDLE
+    )
+    assert kernel32.SetFileInformationByHandle.argtypes[0] is (
+        truth_module.wintypes.HANDLE
+    )
+
+
 def test_windows_directory_durability_uses_write_access(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1451,7 +1536,10 @@ def test_projection_reader_rejects_source_replacement_after_snapshot_validation(
     assert database.read_bytes() == concurrent_bytes
 
 
-@pytest.mark.parametrize("failure", ("missing", "copy", "connect"))
+@pytest.mark.parametrize(
+    "failure",
+    ("missing", "open", "fstat", "authority", "copy", "connect"),
+)
 def test_projection_reader_failure_cleans_private_validation_snapshot(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1472,7 +1560,36 @@ def test_projection_reader_failure_cleans_private_validation_snapshot(
     database = tmp_path / "query.sqlite"
     if failure != "missing":
         _write_projection_fixture(database)
-    if failure == "copy":
+    if failure == "open":
+        open_file = truth_module.os.open
+
+        def fail_candidate_open(path: object, *args: object, **kwargs: object) -> int:
+            if Path(path).name == "projection.sqlite":
+                raise OSError("candidate open failed")
+            return open_file(path, *args, **kwargs)
+
+        monkeypatch.setattr(truth_module.os, "open", fail_candidate_open)
+    elif failure == "fstat":
+        fstat = truth_module.os.fstat
+        failed = False
+
+        def fail_candidate_fstat(file_descriptor: int) -> object:
+            nonlocal failed
+            if not failed:
+                failed = True
+                raise OSError("candidate fstat failed")
+            return fstat(file_descriptor)
+
+        monkeypatch.setattr(truth_module.os, "fstat", fail_candidate_fstat)
+    elif failure == "authority":
+        monkeypatch.setattr(
+            truth_module,
+            "_CandidateAuthority",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                ValueError("authority construction failed")
+            ),
+        )
+    elif failure == "copy":
         monkeypatch.setattr(
             truth_module,
             "_copy_projection_candidate",
@@ -1487,9 +1604,14 @@ def test_projection_reader_failure_cleans_private_validation_snapshot(
             ),
         )
 
-    expected_error = ValueError if failure == "missing" else (
-        OSError if failure == "copy" else sqlite3.OperationalError
-    )
+    expected_error = {
+        "missing": ValueError,
+        "open": OSError,
+        "fstat": OSError,
+        "authority": ValueError,
+        "copy": OSError,
+        "connect": sqlite3.OperationalError,
+    }[failure]
     with pytest.raises(expected_error):
         truth_module._open_stable_projection_connection(database)
 

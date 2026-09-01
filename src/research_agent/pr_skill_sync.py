@@ -319,27 +319,34 @@ class _PreseededProjectionStore:
         source = self.projection
         if source.is_symlink() or not source.is_file():
             raise ValueError("preseeded knowledge projection is missing or unsafe")
-        reader = SQLiteProjectionGuard().open_stable_snapshot(source)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        reader = SQLiteProjectionGuard().open_stable_snapshot(
+            source,
+            transaction_parent=destination.parent,
+        )
         try:
             stable = reader.authority.candidate
-            if stable.stat().st_size != artifact.size_bytes:
+            if (
+                reader.source_identity.size != artifact.size_bytes
+                or stable.stat().st_size != artifact.size_bytes
+            ):
                 raise ValueError("preseeded knowledge projection has the wrong size")
-            if _sha256_file(stable) != artifact.content_sha256:
+            if (
+                reader.source_identity.sha256 != artifact.content_sha256
+                or _sha256_file(stable) != artifact.content_sha256
+            ):
                 raise ValueError(
                     "preseeded knowledge projection has the wrong content address"
                 )
             if _sqlite_input_revision(stable, artifact.role) != artifact.input_revision:
                 raise ValueError("preseeded knowledge projection has the wrong input revision")
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(stable, destination)
             if not reader.source_is_unchanged():
-                destination.unlink(missing_ok=True)
                 raise ValueError(
                     "preseeded knowledge projection changed while it was copied"
                 )
+            reader.install_copy_no_replace(destination)
         finally:
             reader.close()
-        destination.chmod(0o644)
 
 
 def generate_pull_request_artifact(

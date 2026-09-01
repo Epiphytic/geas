@@ -368,13 +368,25 @@ class OntologyArtifactManager:
                 if (
                     previous is not None
                     and previous.input_revision == prepared[0].input_revision
+                    and previous.content_sha256 == prepared[0].content_sha256
+                    and previous.size_bytes == prepared[0].size_bytes
                     and store.available(previous)
                 ):
                     by_role[role] = previous
                     reused.append(role)
+                    self._verify_stored_artifact(
+                        store,
+                        previous,
+                        temporary_root=temporary_root,
+                    )
                     continue
                 artifact, asset_path = prepared
                 uploaded = store.ensure(artifact, asset_path)
+                self._verify_stored_artifact(
+                    store,
+                    artifact,
+                    temporary_root=temporary_root,
+                )
                 by_role[role] = artifact
                 (published if uploaded else reused).append(role)
             artifacts = tuple(sorted(by_role.values(), key=lambda item: item.role.value))
@@ -484,6 +496,14 @@ class OntologyArtifactManager:
                     ) from error
                 try:
                     stable = reader.authority.candidate
+                    if (
+                        reader.source_identity.sha256 != artifact.content_sha256
+                        or reader.source_identity.size != artifact.size_bytes
+                    ):
+                        raise OntologyArtifactError(
+                            "SQLite ontology artifact source identity does not match "
+                            "its manifest"
+                        )
                     _verify_file(stable, artifact)
                     actual_input_revision = _sqlite_input_revision(
                         stable,
@@ -564,9 +584,28 @@ class OntologyArtifactManager:
             prepared = temporary_root / f"{role.value}.sqlite"
             try:
                 stable = reader.authority.candidate
+                expected_digest = reader.source_identity.sha256
+                expected_size = reader.source_identity.size
+                if (
+                    _sha256_file(stable) != expected_digest
+                    or stable.stat().st_size != expected_size
+                ):
+                    raise OntologyArtifactError(
+                        "SQLite ontology artifact stable content identity changed"
+                    )
                 input_revision = _sqlite_input_revision(stable, role)
                 _scan_sensitive_content(stable)
                 shutil.copyfile(stable, prepared)
+                if (
+                    _sha256_file(prepared) != expected_digest
+                    or prepared.stat().st_size != expected_size
+                    or _sha256_file(stable) != expected_digest
+                    or not reader.source_is_unchanged()
+                ):
+                    raise OntologyArtifactError(
+                        "SQLite ontology artifact changed while its content identity "
+                        "was prepared"
+                    )
             finally:
                 reader.close()
             format = ArtifactFormat.SQLITE
@@ -588,6 +627,52 @@ class OntologyArtifactManager:
             ),
             prepared,
         )
+
+    def _verify_stored_artifact(
+        self,
+        store: ArtifactStore,
+        artifact: OntologyArtifact,
+        *,
+        temporary_root: Path,
+    ) -> None:
+        verified = temporary_root / f"stored-{artifact.role.value}.{artifact.format.value}"
+        store.download(artifact, verified)
+        if artifact.format is not ArtifactFormat.SQLITE:
+            _verify_file(verified, artifact)
+            return
+        try:
+            reader = SQLiteProjectionGuard().open_stable_snapshot(
+                verified,
+                knowledge_projection=(
+                    artifact.role is ArtifactRole.KNOWLEDGE_PROJECTION
+                ),
+            )
+        except (OSError, sqlite3.Error, ValueError) as error:
+            raise OntologyArtifactError(
+                "stored SQLite ontology artifact is invalid"
+            ) from error
+        try:
+            if (
+                reader.source_identity.sha256 != artifact.content_sha256
+                or reader.source_identity.size != artifact.size_bytes
+            ):
+                raise OntologyArtifactError(
+                    "stored SQLite ontology artifact content identity does not match"
+                )
+            _verify_file(reader.authority.candidate, artifact)
+            if (
+                _sqlite_input_revision(reader.authority.candidate, artifact.role)
+                != artifact.input_revision
+            ):
+                raise OntologyArtifactError(
+                    "stored SQLite ontology artifact input revision does not match"
+                )
+            if not reader.source_is_unchanged():
+                raise OntologyArtifactError(
+                    "stored SQLite ontology artifact changed while it was verified"
+                )
+        finally:
+            reader.close()
 
     def _cache_path(self, artifact: OntologyArtifact) -> Path:
         names = {

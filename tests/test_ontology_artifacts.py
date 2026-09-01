@@ -9,13 +9,14 @@ from pathlib import Path
 import pytest
 
 import research_agent.ontology_artifacts as artifacts_module
+import research_agent.pr_skill_sync as pr_skill_sync_module
 from research_agent.ontology_artifacts import (
     ArtifactRole,
     OntologyArtifact,
     OntologyArtifactError,
     OntologyArtifactManager,
 )
-from research_agent.truth import SQLiteProjectionGuard, TruthSnapshot
+from research_agent.truth import SQLiteProjectionGuard, StableProjectionReader, TruthSnapshot
 
 _FORBIDDEN_CONTROL_VALUES = (
     *range(0x00, 0x09),
@@ -246,7 +247,7 @@ def test_knowledge_projection_publication_rejects_full_guard_failure_before_uplo
     assert not manager.manifest_path.exists()
 
 
-def test_projection_publication_binds_revision_scan_hash_and_upload_to_one_copy(
+def test_projection_publication_rejects_selected_source_replacement_after_revision(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -277,17 +278,144 @@ def test_projection_publication_binds_revision_scan_hash_and_upload_to_one_copy(
     )
     store = MemoryArtifactStore().use_root(tmp_path / "remote-assets")
 
-    receipt = OntologyArtifactManager(ontology).publish(
-        store=store,
+    with pytest.raises(OntologyArtifactError, match="changed"):
+        OntologyArtifactManager(ontology).publish(
+            store=store,
+            published_by="test:operator",
+            storage_rights_basis="operator-confirmed private storage",
+            knowledge_projection=database,
+        )
+
+    assert original != database.read_bytes()
+    assert store.values == {}
+    assert not (ontology / "artifacts.yaml").exists()
+
+
+def test_projection_publication_rejects_mutated_stable_copy_before_upload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ontology = tmp_path / "routing"
+    ontology.mkdir()
+    database = tmp_path / "knowledge.sqlite"
+    _knowledge_database(database)
+    alternate = tmp_path / "alternate.sqlite"
+    _knowledge_database(alternate)
+    with sqlite3.connect(alternate) as connection:
+        connection.execute("INSERT INTO parent VALUES (2)")
+    alternate_bytes = alternate.read_bytes()
+    assert len(alternate_bytes) == database.stat().st_size
+    copyfile = artifacts_module.shutil.copyfile
+    mutated = False
+
+    def mutate_stable_before_copy(source: Path, destination: Path) -> str:
+        nonlocal mutated
+        if (
+            not mutated
+            and "geas-projection-validation-" in str(source)
+            and destination.name == "knowledge-projection.sqlite"
+        ):
+            source.write_bytes(alternate_bytes)
+            mutated = True
+        return str(copyfile(source, destination))
+
+    monkeypatch.setattr(artifacts_module.shutil, "copyfile", mutate_stable_before_copy)
+    store = MemoryArtifactStore().use_root(tmp_path / "remote-assets")
+
+    with pytest.raises(OntologyArtifactError, match="changed|content identity"):
+        OntologyArtifactManager(ontology).publish(
+            store=store,
+            published_by="test:operator",
+            storage_rights_basis="operator-confirmed private storage",
+            knowledge_projection=database,
+        )
+
+    assert mutated
+    assert store.values == {}
+    assert not (ontology / "artifacts.yaml").exists()
+
+
+def test_projection_publication_verifies_exact_bytes_stored_before_manifest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ontology = tmp_path / "routing"
+    ontology.mkdir()
+    database = tmp_path / "knowledge.sqlite"
+    _knowledge_database(database)
+    alternate = tmp_path / "alternate.sqlite"
+    _knowledge_database(alternate)
+    with sqlite3.connect(alternate) as connection:
+        connection.execute("INSERT INTO parent VALUES (2)")
+    alternate_bytes = alternate.read_bytes()
+    assert len(alternate_bytes) == database.stat().st_size
+    store = MemoryArtifactStore().use_root(tmp_path / "remote-assets")
+    ensure = store.ensure
+
+    def mutate_only_during_upload(artifact: OntologyArtifact, source: Path) -> bool:
+        original = source.read_bytes()
+        source.write_bytes(alternate_bytes)
+        try:
+            return ensure(artifact, source)
+        finally:
+            source.write_bytes(original)
+
+    monkeypatch.setattr(store, "ensure", mutate_only_during_upload)
+
+    with pytest.raises(OntologyArtifactError, match="stored.*(content|invalid)|content address"):
+        OntologyArtifactManager(ontology).publish(
+            store=store,
+            published_by="test:operator",
+            storage_rights_basis="operator-confirmed private storage",
+            knowledge_projection=database,
+        )
+
+    assert not (ontology / "artifacts.yaml").exists()
+
+
+def test_preseeded_projection_copy_never_unlinks_concurrent_destination(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ontology = tmp_path / "routing"
+    ontology.mkdir()
+    database = tmp_path / "knowledge.sqlite"
+    _knowledge_database(database)
+    artifact_store = MemoryArtifactStore().use_root(tmp_path / "remote-assets")
+    artifact = OntologyArtifactManager(ontology).publish(
+        store=artifact_store,
         published_by="test:operator",
         storage_rights_basis="operator-confirmed private storage",
         knowledge_projection=database,
+    ).artifacts[0]
+    destination = tmp_path / "artifact-workspace" / "query.sqlite"
+    concurrent = b"concurrent destination owner\n"
+    unchanged = StableProjectionReader.source_is_unchanged
+    injected = False
+
+    def replace_destination_before_result(reader: object) -> bool:
+        nonlocal injected
+        result = unchanged(reader)  # type: ignore[arg-type]
+        if not injected:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(concurrent)
+            injected = True
+            return False
+        return result
+
+    monkeypatch.setattr(
+        StableProjectionReader,
+        "source_is_unchanged",
+        replace_destination_before_result,
     )
 
-    artifact = receipt.artifacts[0]
-    uploaded = store.values[(artifact.release_tag, artifact.asset_name)]
-    assert uploaded.read_bytes() == original
-    assert artifact.content_sha256 == artifacts_module.hashlib.sha256(original).hexdigest()
+    with pytest.raises(ValueError, match="changed while it was copied"):
+        pr_skill_sync_module._PreseededProjectionStore(database).download(
+            artifact,
+            destination,
+        )
+
+    assert destination.read_bytes() == concurrent
 
 
 def test_knowledge_projection_hydration_rejects_manifest_input_revision_mismatch(
@@ -315,7 +443,7 @@ def test_knowledge_projection_hydration_rejects_manifest_input_revision_mismatch
     with pytest.raises(OntologyArtifactError, match="input revision"):
         manager.hydrate(store=store)
 
-    assert store.download_calls == 1
+    assert store.download_calls == 2
 
 
 def test_projection_hydration_rejects_destination_replacement_after_validation(
@@ -410,6 +538,7 @@ def test_hydration_rejects_symlinked_cache_root_before_download_or_canonical_wri
         storage_rights_basis="operator-confirmed private storage",
         source_library=database,
     )
+    store.download_calls = 0
     canonical = ontology / "library.sqlite"
     canonical.write_bytes(b"canonical ontology bytes\n")
     (ontology / ".geas-artifacts").symlink_to(ontology, target_is_directory=True)
@@ -441,6 +570,7 @@ def test_hydration_prevalidates_every_selected_output_before_first_download(
         source_library=database,
         generated_content=generated,
     )
+    store.download_calls = 0
     manager.cache.mkdir()
     outside = tmp_path / "outside.sqlite"
     outside.write_bytes(b"outside bytes\n")
@@ -474,6 +604,7 @@ def test_hydration_prevalidates_later_artifact_file_kind_before_any_download(
         source_library=database,
         generated_content=generated,
     )
+    store.download_calls = 0
     manager.cache.mkdir()
     manager.cache.joinpath("library.sqlite").mkdir()
 
@@ -504,6 +635,7 @@ def test_hydration_prevalidates_generated_directory_kind_before_any_download(
         source_library=database,
         generated_content=generated,
     )
+    store.download_calls = 0
     manager.cache.mkdir()
     manager.cache.joinpath("generated").write_text("wrong target kind\n")
 
@@ -530,6 +662,7 @@ def test_hydration_revalidates_ontology_root_after_constructor(
         storage_rights_basis="public documentation fixture",
         source_library=database,
     )
+    store.download_calls = 0
     canonical = tmp_path / "canonical-routing"
     ontology.rename(canonical)
     canonical.joinpath("sentinel").write_bytes(b"canonical bytes\n")
