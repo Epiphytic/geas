@@ -247,6 +247,52 @@ def _write_projection_fixture(database: Path) -> None:
         connection.close()
 
 
+def _write_structural_projection_fixture(database: Path, *, reverse: bool) -> None:
+    connection = sqlite3.connect(database)
+    try:
+        connection.executescript(
+            """
+            PRAGMA page_size = 4096;
+            PRAGMA auto_vacuum = NONE;
+            CREATE TABLE concept(
+                id INTEGER PRIMARY KEY,
+                label TEXT NOT NULL,
+                payload TEXT NOT NULL
+            );
+            CREATE INDEX concept_label ON concept(label);
+            """
+        )
+        identifiers = range(1_500, 0, -1) if reverse else range(1, 1_501)
+        connection.executemany(
+            "INSERT INTO concept(id, label, payload) VALUES (?, ?, ?)",
+            (
+                (
+                    identifier,
+                    f"label-{identifier:04d}",
+                    "P" * (20_000 if identifier == 750 else 2_400),
+                )
+                for identifier in identifiers
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def _sqlite_varint(value: int) -> bytes:
+    assert 0 <= value < 1 << 56
+    chunks = [value & 0x7F]
+    value >>= 7
+    while value:
+        chunks.append(value & 0x7F)
+        value >>= 7
+    chunks.reverse()
+    return bytes(
+        chunk | (0x80 if index < len(chunks) - 1 else 0)
+        for index, chunk in enumerate(chunks)
+    )
+
+
 def _apply_native_or_simulated_windows_mode(file_descriptor: int, mode: int) -> None:
     if os.name == "nt":
         truth_module._windows_apply_candidate_mode(file_descriptor, mode)
@@ -342,6 +388,7 @@ def _stamp_with_corrupted_canonical_candidate(
     corrupt: Callable[[Path], None],
     expected_error: str,
     large_payload: bool = False,
+    structural: bool = False,
 ) -> None:
     workspace, store = _workspace(tmp_path)
     instant = datetime(2026, 8, 2, 12, 0, tzinfo=UTC)
@@ -349,7 +396,10 @@ def _stamp_with_corrupted_canonical_candidate(
         created_by="operator:test"
     )
     database = tmp_path / "query.sqlite"
-    _write_projection_fixture(database)
+    if structural:
+        _write_structural_projection_fixture(database, reverse=False)
+    else:
+        _write_projection_fixture(database)
     if large_payload:
         connection = sqlite3.connect(database)
         try:
@@ -365,7 +415,12 @@ def _stamp_with_corrupted_canonical_candidate(
 
     def corrupt_then_normalize(candidate: Path, authority: object) -> None:
         corrupt(candidate)
-        normalize(candidate, authority)  # type: ignore[arg-type]
+        corrupted = candidate.read_bytes()
+        try:
+            normalize(candidate, authority)  # type: ignore[arg-type]
+        except BaseException:
+            assert candidate.read_bytes() == corrupted
+            raise
 
     monkeypatch.setattr(
         truth_module,
@@ -391,6 +446,8 @@ def _stamp_with_corrupted_canonical_candidate(
         (0, b"not sqlite format", "not a database|invalid SQLite header"),
         (20, b"\x01", "invalid page layout"),
         (100, b"\x00", "malformed|non-B-tree page"),
+        (105, b"\x00\x00", "malformed|cell-content offset"),
+        (107, b"\x3d", "malformed|free-space header"),
     ),
 )
 def test_projection_stamp_rejects_malformed_canonical_page_headers(
@@ -477,6 +534,108 @@ def test_projection_stamp_rejects_overlapping_canonical_live_ranges(
     )
 
 
+def test_projection_stamp_rejects_canonical_btree_cycle_without_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def corrupt(candidate: Path) -> None:
+        connection = sqlite3.connect(candidate)
+        try:
+            root_page = int(
+                connection.execute(
+                    "SELECT rootpage FROM sqlite_schema WHERE name = 'concept'"
+                ).fetchone()[0]
+            )
+        finally:
+            connection.close()
+        content = bytearray(candidate.read_bytes())
+        page_size = int.from_bytes(content[16:18], "big")
+        page_start = (root_page - 1) * page_size
+        assert content[page_start] == 0x05
+        content[page_start + 8 : page_start + 12] = root_page.to_bytes(4, "big")
+        candidate.write_bytes(content)
+
+    _stamp_with_corrupted_canonical_candidate(
+        tmp_path=tmp_path,
+        monkeypatch=monkeypatch,
+        corrupt=corrupt,
+        expected_error="B-tree reference is repeated",
+        structural=True,
+    )
+
+
+def test_projection_stamp_rejects_canonical_ancestor_cycle_without_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def corrupt(candidate: Path) -> None:
+        connection = sqlite3.connect(candidate)
+        try:
+            root_page = int(
+                connection.execute(
+                    "SELECT rootpage FROM sqlite_schema WHERE name = 'concept'"
+                ).fetchone()[0]
+            )
+        finally:
+            connection.close()
+        content = bytearray(candidate.read_bytes())
+        page_size = int.from_bytes(content[16:18], "big")
+        root_start = (root_page - 1) * page_size
+        assert content[root_start] == 0x05
+        child_page = int.from_bytes(content[root_start + 8 : root_start + 12], "big")
+        child_start = (child_page - 1) * page_size
+        assert content[child_start] == 0x05
+        content[child_start + 8 : child_start + 12] = root_page.to_bytes(4, "big")
+        candidate.write_bytes(content)
+
+    _stamp_with_corrupted_canonical_candidate(
+        tmp_path=tmp_path,
+        monkeypatch=monkeypatch,
+        corrupt=corrupt,
+        expected_error="B-tree reference is repeated",
+        structural=True,
+    )
+
+
+def test_projection_stamp_rejects_canonical_multiple_parent_reference(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def corrupt(candidate: Path) -> None:
+        connection = sqlite3.connect(candidate)
+        try:
+            root_page = int(
+                connection.execute(
+                    "SELECT rootpage FROM sqlite_schema WHERE name = 'concept'"
+                ).fetchone()[0]
+            )
+        finally:
+            connection.close()
+        content = bytearray(candidate.read_bytes())
+        page_size = int.from_bytes(content[16:18], "big")
+        root_start = (root_page - 1) * page_size
+        assert content[root_start] == 0x05
+        cell_count = int.from_bytes(content[root_start + 3 : root_start + 5], "big")
+        assert cell_count >= 2
+        first_offset = int.from_bytes(content[root_start + 12 : root_start + 14], "big")
+        second_offset = int.from_bytes(content[root_start + 14 : root_start + 16], "big")
+        first_child = content[
+            root_start + first_offset : root_start + first_offset + 4
+        ]
+        content[
+            root_start + second_offset : root_start + second_offset + 4
+        ] = first_child
+        candidate.write_bytes(content)
+
+    _stamp_with_corrupted_canonical_candidate(
+        tmp_path=tmp_path,
+        monkeypatch=monkeypatch,
+        corrupt=corrupt,
+        expected_error="B-tree reference is repeated",
+        structural=True,
+    )
+
+
 def test_projection_stamp_rejects_truncated_canonical_overflow_chain(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -538,6 +697,67 @@ def test_canonical_sqlite_cell_parser_rejects_malformed_live_ranges() -> None:
 
 
 @pytest.mark.parametrize(
+    ("page_type", "prefix", "expected_child"),
+    (
+        (0x02, (7).to_bytes(4, "big"), 7),
+        (0x05, (11).to_bytes(4, "big"), 11),
+        (0x0A, b"", None),
+        (0x0D, b"", None),
+    ),
+)
+def test_canonical_sqlite_cell_parser_covers_every_btree_page_type(
+    page_type: int,
+    prefix: bytes,
+    expected_child: int | None,
+) -> None:
+    if page_type == 0x05:
+        content = bytearray(prefix + _sqlite_varint(23))
+    else:
+        payload = b"abc"
+        rowid = _sqlite_varint(23) if page_type == 0x0D else b""
+        content = bytearray(prefix + _sqlite_varint(len(payload)) + rowid + payload)
+
+    cell_end, child, overflow = truth_module._canonical_sqlite_cell_extent(
+        content,  # type: ignore[arg-type]
+        cell_start=0,
+        page_type=page_type,
+        page_end=len(content),
+        usable_size=4096,
+    )
+
+    assert cell_end == len(content)
+    assert child == expected_child
+    assert overflow is None
+
+
+def test_canonical_sqlite_cell_parser_reports_exact_overflow_extent() -> None:
+    payload_size = 5_750
+    local_size = truth_module._canonical_sqlite_local_payload_size(
+        payload_size,
+        usable_size=4096,
+        table_leaf=True,
+    )
+    content = bytearray(
+        _sqlite_varint(payload_size)
+        + _sqlite_varint(49)
+        + b"L" * local_size
+        + (1355).to_bytes(4, "big")
+    )
+
+    cell_end, child, overflow = truth_module._canonical_sqlite_cell_extent(
+        content,  # type: ignore[arg-type]
+        cell_start=0,
+        page_type=0x0D,
+        page_end=len(content),
+        usable_size=4096,
+    )
+
+    assert cell_end == len(content)
+    assert child is None
+    assert overflow == (1355, payload_size - local_size)
+
+
+@pytest.mark.parametrize(
     ("remaining", "next_page", "expected_error"),
     (
         (5000, 0, "overflow chain is truncated"),
@@ -562,6 +782,7 @@ def test_canonical_sqlite_overflow_parser_rejects_invalid_chains(
             page_count=2,
             visited_btree={1},
             visited_overflow=set(),
+            zero_ranges=[],
         )
 
 
@@ -596,6 +817,58 @@ def test_projection_stamp_preserves_exact_integrity_after_unused_region_zeroing(
         truth_report=manager.verify(snapshot),
     ).clean
     assert _projection_candidate_paths(database) == ()
+
+
+def test_projection_stamp_canonicalizes_rich_btree_histories_idempotently(
+    tmp_path: Path,
+) -> None:
+    workspace, store = _workspace(tmp_path)
+    instant = datetime(2026, 8, 2, 12, 0, tzinfo=UTC)
+    manager = _manager(workspace, store, instant=instant)
+    snapshot = manager.capture(created_by="operator:test")
+    first = tmp_path / "forward.sqlite"
+    second = tmp_path / "reverse.sqlite"
+    _write_structural_projection_fixture(first, reverse=False)
+    _write_structural_projection_fixture(second, reverse=True)
+    _fill_page_one_unallocated_bytes(first, 0x5A)
+    _fill_page_one_unallocated_bytes(second, 0xA5)
+    guard = SQLiteProjectionGuard(clock=lambda: instant)
+
+    for database in (first, second):
+        guard.stamp(
+            database,
+            snapshot,
+            schema_version=1,
+            builder_version="projection-builder/test",
+        )
+
+    assert first.read_bytes() == second.read_bytes()
+    canonical = first.read_bytes()
+    page_size = int.from_bytes(canonical[16:18], "big")
+    page_types = {
+        canonical[100 if page_number == 1 else (page_number - 1) * page_size]
+        for page_number in range(1, len(canonical) // page_size + 1)
+    }
+    assert {0x02, 0x05, 0x0A, 0x0D} <= page_types
+    with _sqlite_connection(first) as connection:
+        assert connection.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+
+    guard.stamp(
+        first,
+        snapshot,
+        schema_version=1,
+        builder_version="projection-builder/test",
+    )
+
+    assert first.read_bytes() == canonical
+    assert guard.verify(
+        first,
+        snapshot,
+        truth_report=manager.verify(snapshot),
+    ).clean
+    assert _projection_candidate_paths(first) == ()
+    assert _projection_candidate_paths(second) == ()
 
 
 def test_projection_stamp_closes_sqlite_before_raw_canonicalization(

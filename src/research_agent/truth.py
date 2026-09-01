@@ -1579,15 +1579,15 @@ def _normalize_sqlite_unused_regions(
     try:
         if connection.execute("PRAGMA freelist_count").fetchone() != (0,):
             raise ValueError("canonicalized projection retains free-list pages")
-        roots = {
-            1,
-            *(
-                int(row[0])
-                for row in connection.execute(
-                    "SELECT rootpage FROM sqlite_schema WHERE rootpage > 0"
-                )
-            ),
-        }
+        schema_roots = tuple(
+            int(row[0])
+            for row in connection.execute(
+                "SELECT rootpage FROM sqlite_schema WHERE rootpage > 0"
+            )
+        )
+        if len(set(schema_roots)) != len(schema_roots):
+            raise ValueError("canonical SQLite has duplicate B-tree roots")
+        roots = {1, *schema_roots}
     finally:
         connection.close()
     descriptor = os.open(database, os.O_RDWR | _O_NOFOLLOW | _O_BINARY)
@@ -1614,12 +1614,14 @@ def _normalize_sqlite_unused_regions(
             usable_size = page_size - reserved
             page_count = len(content) // page_size
             pending = sorted(roots, reverse=True)
+            claimed_btree = set(roots)
             visited_btree: set[int] = set()
             visited_overflow: set[int] = set()
+            zero_ranges: list[tuple[int, int]] = []
             while pending:
                 page_number = pending.pop()
                 if page_number in visited_btree:
-                    continue
+                    raise ValueError("canonical SQLite B-tree reference is repeated")
                 _validate_canonical_page_number(page_number, page_count)
                 if page_number in visited_overflow:
                     raise ValueError("canonical SQLite page roles overlap")
@@ -1639,6 +1641,23 @@ def _normalize_sqlite_unused_regions(
                 page_end = page_start + usable_size
                 if pointer_end > page_end:
                     raise ValueError("canonical SQLite cell pointer array is invalid")
+                encoded_cell_content = int.from_bytes(
+                    content[header_start + 5 : header_start + 7],
+                    "big",
+                )
+                if encoded_cell_content == 0:
+                    if page_size != 65536:
+                        raise ValueError(
+                            "canonical SQLite cell-content offset is invalid"
+                        )
+                    encoded_cell_content = 65536
+                cell_content_start = page_start + encoded_cell_content
+                fragmented_bytes = content[header_start + 7]
+                if (
+                    not pointer_end <= cell_content_start <= page_end
+                    or fragmented_bytes > 60
+                ):
+                    raise ValueError("canonical SQLite free-space header is invalid")
                 children: list[int] = []
                 if page_type in {0x02, 0x05}:
                     children.append(
@@ -1678,6 +1697,7 @@ def _normalize_sqlite_unused_regions(
                         page_count=page_count,
                         visited_btree=visited_btree,
                         visited_overflow=visited_overflow,
+                        zero_ranges=zero_ranges,
                     )
                 freeblock = int.from_bytes(
                     content[header_start + 1 : header_start + 3],
@@ -1688,7 +1708,7 @@ def _normalize_sqlite_unused_regions(
                     block_start = page_start + freeblock
                     if (
                         freeblock <= previous_freeblock
-                        or block_start < pointer_end
+                        or block_start < cell_content_start
                         or block_start + 4 > page_end
                     ):
                         raise ValueError("canonical SQLite freeblock chain is invalid")
@@ -1707,25 +1727,61 @@ def _normalize_sqlite_unused_regions(
                     previous_freeblock = freeblock
                     freeblock = next_freeblock
                 occupied_end = pointer_end
+                fragment_total = 0
                 for region_start, region_end in sorted(occupied):
-                    if region_start < occupied_end or region_end > page_end:
+                    if region_start < cell_content_start or region_end > page_end:
+                        raise ValueError("canonical SQLite page regions overlap")
+                    if occupied_end == pointer_end:
+                        if region_start != cell_content_start:
+                            raise ValueError(
+                                "canonical SQLite cell-content area is invalid"
+                            )
+                    else:
+                        gap = region_start - occupied_end
+                        if gap < 0 or gap > 3:
+                            raise ValueError(
+                                "canonical SQLite fragmented free space is invalid"
+                            )
+                        fragment_total += gap
+                    if region_start < occupied_end:
                         raise ValueError("canonical SQLite page regions overlap")
                     occupied_end = region_end
+                if not occupied and cell_content_start != page_end:
+                    raise ValueError("canonical SQLite cell-content area is invalid")
+                if occupied:
+                    tail_fragment = page_end - occupied_end
+                    if tail_fragment > 3:
+                        raise ValueError(
+                            "canonical SQLite fragmented free space is invalid"
+                        )
+                    fragment_total += tail_fragment
+                if fragment_total != fragmented_bytes:
+                    raise ValueError(
+                        "canonical SQLite fragmented free-byte count is invalid"
+                    )
                 cursor = pointer_end
                 for live_start, live_end in sorted(preserved):
                     if live_start < cursor or live_end > page_end:
                         raise ValueError("canonical SQLite page regions overlap")
-                    content[cursor:live_start] = b"\0" * (live_start - cursor)
+                    zero_ranges.append((cursor, live_start))
                     cursor = live_end
-                content[cursor : page_start + page_size] = b"\0" * (
-                    page_start + page_size - cursor
-                )
+                zero_ranges.append((cursor, page_start + page_size))
                 for child in sorted(children, reverse=True):
                     _validate_canonical_page_number(child, page_count)
-                    if child not in visited_btree:
-                        pending.append(child)
+                    if child in claimed_btree:
+                        raise ValueError(
+                            "canonical SQLite B-tree reference is repeated"
+                        )
+                    claimed_btree.add(child)
+                    pending.append(child)
             if visited_btree | visited_overflow != set(range(1, page_count + 1)):
                 raise ValueError("canonical SQLite contains unreachable pages")
+            zero_end = 0
+            for zero_start, zero_stop in sorted(zero_ranges):
+                if zero_start < zero_end or zero_stop < zero_start:
+                    raise ValueError("canonical SQLite zero regions overlap")
+                content[zero_start:zero_stop] = b"\0" * (zero_stop - zero_start)
+                zero_end = zero_stop
             content.flush()
         os.fsync(descriptor)
     finally:
@@ -1818,6 +1874,7 @@ def _normalize_sqlite_overflow_tail(
     page_count: int,
     visited_btree: set[int],
     visited_overflow: set[int],
+    zero_ranges: list[tuple[int, int]],
 ) -> None:
     if overflow is None:
         return
@@ -1831,9 +1888,7 @@ def _normalize_sqlite_overflow_tail(
         chunk_size = min(remaining, usable_size - 4)
         next_page = int.from_bytes(content[page_start : page_start + 4], "big")
         tail_start = page_start + 4 + chunk_size
-        content[tail_start : page_start + page_size] = b"\0" * (
-            page_start + page_size - tail_start
-        )
+        zero_ranges.append((tail_start, page_start + page_size))
         remaining -= chunk_size
         if remaining and next_page == 0:
             raise ValueError("canonical SQLite overflow chain is truncated")
