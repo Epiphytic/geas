@@ -1,3 +1,4 @@
+import hashlib
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
@@ -45,11 +46,85 @@ from research_agent.render import (
 )
 from research_agent.research import DiscoveryExecutor, OfflineResearchRunner
 from research_agent.store import ImmutableStore
-from research_agent.truth import DriftKind, SQLiteProjectionGuard, TruthManager, TruthPolicy
+from research_agent.truth import (
+    DriftKind,
+    SQLiteProjectionGuard,
+    TruthManager,
+    TruthPolicy,
+    _canonicalize_sqlite_projection,
+)
 
 FIXTURE_CORPUS = Path("tests/fixtures/fluoridation_corpus")
 FIXTURE_PACK = Path("tests/fixtures/fluoridation_knowledge.yaml")
 INSTANT = datetime(2026, 8, 2, 12, 0, tzinfo=UTC)
+
+
+def _write_cross_platform_projection_fixture(
+    path: Path,
+    *,
+    reverse_statistics: bool,
+    writer_version: bytes,
+) -> None:
+    with sqlite3.connect(path) as connection:
+        connection.executescript(
+            """
+            PRAGMA page_size = 4096;
+            PRAGMA journal_mode = DELETE;
+            CREATE TABLE alpha(id INTEGER PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE beta(id INTEGER PRIMARY KEY, value TEXT NOT NULL);
+            CREATE INDEX alpha_value ON alpha(value);
+            CREATE INDEX beta_value ON beta(value);
+            INSERT INTO alpha(value) VALUES ('one'), ('two'), ('three');
+            INSERT INTO beta(value) VALUES ('four'), ('five'), ('six');
+            ANALYZE;
+            """
+        )
+        statistics = connection.execute(
+            "SELECT tbl, idx, stat FROM sqlite_stat1 ORDER BY tbl, idx, stat"
+        ).fetchall()
+        connection.execute("DELETE FROM sqlite_stat1")
+        connection.executemany(
+            "INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES (?, ?, ?)",
+            reversed(statistics) if reverse_statistics else statistics,
+        )
+        connection.commit()
+    with path.open("r+b") as stream:
+        for offset in (24, 40, 92, 96):
+            stream.seek(offset)
+            stream.write(writer_version)
+
+
+def test_projection_physical_bytes_are_canonical_across_sqlite_versions(
+    tmp_path: Path,
+) -> None:
+    first = tmp_path / "first.sqlite"
+    second = tmp_path / "second.sqlite"
+    _write_cross_platform_projection_fixture(
+        first,
+        reverse_statistics=False,
+        writer_version=b"\x03\x32\x01\x00",
+    )
+    _write_cross_platform_projection_fixture(
+        second,
+        reverse_statistics=True,
+        writer_version=b"\x03\x35\x01\x00",
+    )
+    assert first.read_bytes() != second.read_bytes()
+
+    _canonicalize_sqlite_projection(first)
+    _canonicalize_sqlite_projection(second)
+
+    assert first.read_bytes() == second.read_bytes()
+    assert all(
+        first.read_bytes()[offset : offset + 4] == b"\0\0\0\0"
+        for offset in (24, 40, 92, 96)
+    )
+    first_digest = hashlib.sha256(first.read_bytes()).hexdigest()
+    _canonicalize_sqlite_projection(first)
+    assert hashlib.sha256(first.read_bytes()).hexdigest() == first_digest
+    assert hashlib.sha256(first.read_bytes()).hexdigest() == (
+        "3dbf117555f682f40f58f1f60d2c80bc0663a346da6e66b2b5239fc607881f8f"
+    )
 
 
 class _CrossrefFixtureTransport:

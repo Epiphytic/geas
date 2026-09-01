@@ -2,16 +2,16 @@
 # Verify hashes and embedded SQLite projection stamps before use.
 version: 1
 ontology: open-source-research-agents
-published_at: '2026-08-31T04:19:34.410070Z'
+published_at: '2026-09-01T02:43:52.117085Z'
 published_by: operator:epiphytic-maintainer
 artifacts:
 - role: knowledge-projection
   format: sqlite
-  input_revision: d9cd56ddfbc9e240389a703c8078eab972892049536d3440a55c0fdcd49898b1
-  content_sha256: d9620304750ed3354c52535c5e4b0f9f8d253c4d8883e711ab3261887325b71e
-  size_bytes: 1548288
-  asset_name: geas-knowledge-projection-d9620304750ed3354c52535c5e4b0f9f8d253c4d8883e711ab3261887325b71e.sqlite
-  release_tag: geas-artifact-d9620304750ed3354c52535c5e4b0f9f8d253c4d8883e711ab3261887325b71e
+  input_revision: c12ae7d017e085d26fc77e93e8a6b10b74d7c64d4c0089b7c5d011abe8777759
+  content_sha256: 4cc2fc5efb4c94f013babbe56b45b9bec05a0e08a3e57ec356b5621a4a833702
+  size_bytes: 1499136
+  asset_name: geas-knowledge-projection-4cc2fc5efb4c94f013babbe56b45b9bec05a0e08a3e57ec356b5621a4a833702.sqlite
+  release_tag: geas-artifact-4cc2fc5efb4c94f013babbe56b45b9bec05a0e08a3e57ec356b5621a4a833702
   contains_source_text: true
   storage_rights_basis: Rebuildable accepted-knowledge projection containing attributed
     project-authored source-card excerpts and exact license-recorded official-repository

@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
 import sqlite3
 import subprocess
 from collections.abc import Callable
@@ -16,6 +17,50 @@ import yaml
 from pydantic import Field, field_validator
 
 from research_agent.models import StrictModel, canonical_json, content_id, utc_now
+
+
+_SQLITE_HEADER = b"SQLite format 3\0"
+_SQLITE_NON_SEMANTIC_HEADER_FIELDS = (24, 40, 92, 96)
+_SQLITE_HEADER_FIELD_SIZE = 4
+
+
+def _canonicalize_sqlite_projection(database: Path) -> None:
+    """Normalize SQLite's non-semantic, library-version-dependent bytes."""
+    with sqlite3.connect(database) as connection:
+        connection.execute("PRAGMA foreign_keys = ON")
+        statistics_table = connection.execute(
+            "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'sqlite_stat1'"
+        ).fetchone()
+        if statistics_table is not None:
+            statistics = connection.execute(
+                "SELECT tbl, idx, stat FROM sqlite_stat1 ORDER BY tbl, idx, stat"
+            ).fetchall()
+            connection.execute("PRAGMA secure_delete = ON")
+            connection.execute("DELETE FROM sqlite_stat1")
+            connection.executemany(
+                "INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES (?, ?, ?)",
+                statistics,
+            )
+            connection.commit()
+        connection.execute("VACUUM")
+        if connection.execute("PRAGMA integrity_check").fetchone() != ("ok",):
+            raise ValueError("canonicalized projection failed SQLite integrity check")
+        invalid = connection.execute("PRAGMA foreign_key_check").fetchall()
+        if invalid:
+            raise ValueError(
+                f"canonicalized projection has foreign-key violations: {invalid!r}"
+            )
+
+    minimum_size = max(_SQLITE_NON_SEMANTIC_HEADER_FIELDS) + _SQLITE_HEADER_FIELD_SIZE
+    with database.open("r+b") as stream:
+        header = stream.read(minimum_size)
+        if len(header) != minimum_size or not header.startswith(_SQLITE_HEADER):
+            raise ValueError("canonicalized projection has an invalid SQLite header")
+        for offset in _SQLITE_NON_SEMANTIC_HEADER_FIELDS:
+            stream.seek(offset)
+            stream.write(b"\0" * _SQLITE_HEADER_FIELD_SIZE)
+        stream.flush()
+        os.fsync(stream.fileno())
 
 
 class ArtifactRole(StrEnum):
@@ -479,6 +524,7 @@ class SQLiteProjectionGuard:
                 (canonical_json(stamp).decode(),),
             )
             connection.commit()
+        _canonicalize_sqlite_projection(database)
         return stamp
 
     def verify(
