@@ -604,6 +604,82 @@ def test_sqlite_stored_values_keep_normal_placeholder_classification(
     assert (ontology / "artifacts.yaml").is_file()
 
 
+def test_sqlite_expression_index_payload_rejects_without_upload(
+    tmp_path: Path,
+) -> None:
+    """Derived index records receive the same scan as other masked live bytes."""
+    ontology = tmp_path / "routing"
+    ontology.mkdir()
+    database = tmp_path / "library.sqlite"
+    _library_database(database)
+    assignment = b"FIRECRAWL_KEY=operator-secret-value-123"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "CREATE TABLE indexed_parts(prefix TEXT NOT NULL, suffix TEXT NOT NULL)"
+        )
+        connection.execute(
+            "CREATE INDEX indexed_assignment "
+            "ON indexed_parts(prefix || '=' || suffix)"
+        )
+        connection.execute(
+            "INSERT INTO indexed_parts VALUES (?, ?)",
+            ("FIRECRAWL_KEY", "operator-secret-value-123"),
+        )
+        assert connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+    assert assignment in database.read_bytes()
+    store = MemoryArtifactStore().use_root(tmp_path / "remote-assets")
+
+    with pytest.raises(OntologyArtifactError, match="possible credential"):
+        OntologyArtifactManager(ontology).publish(
+            store=store,
+            published_by="test:operator",
+            storage_rights_basis="operator-confirmed private storage",
+            source_library=database,
+        )
+
+    assert store.values == {}
+    assert tuple((tmp_path / "remote-assets").iterdir()) == ()
+    assert not (ontology / "artifacts.yaml").exists()
+
+
+def test_sqlite_expression_index_overflow_payload_rejects_without_upload(
+    tmp_path: Path,
+) -> None:
+    """Index assignments split across local and overflow payload still reject."""
+    ontology = tmp_path / "routing"
+    ontology.mkdir()
+    database = tmp_path / "library.sqlite"
+    _library_database(database)
+    prefix = "x" * 475 + "\nFIRECRAWL_KEY"
+    suffix = "operator-secret-value-123" + "y" * 5000
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "CREATE TABLE indexed_parts(prefix TEXT NOT NULL, suffix TEXT NOT NULL)"
+        )
+        connection.execute(
+            "CREATE INDEX indexed_assignment "
+            "ON indexed_parts(prefix || '=' || suffix)"
+        )
+        connection.execute("INSERT INTO indexed_parts VALUES (?, ?)", (prefix, suffix))
+        assert connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+        assert connection.execute(
+            "SELECT prefix || '=' || suffix FROM indexed_parts"
+        ).fetchone() == (prefix + "=" + suffix,)
+    store = MemoryArtifactStore().use_root(tmp_path / "remote-assets")
+
+    with pytest.raises(OntologyArtifactError, match="possible credential"):
+        OntologyArtifactManager(ontology).publish(
+            store=store,
+            published_by="test:operator",
+            storage_rights_basis="operator-confirmed private storage",
+            source_library=database,
+        )
+
+    assert store.values == {}
+    assert tuple((tmp_path / "remote-assets").iterdir()) == ()
+    assert not (ontology / "artifacts.yaml").exists()
+
+
 @pytest.mark.parametrize("residue_kind", ("page-slack", "freelist"))
 def test_sqlite_artifact_rejects_deleted_assignment_residue_without_upload(
     tmp_path: Path,
