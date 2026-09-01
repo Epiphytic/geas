@@ -39,6 +39,7 @@ from research_agent.ontology_subscriptions import (
     OntologySubscription,
     normalize_active_ref,
 )
+from research_agent.truth import SQLiteProjectionGuard
 
 REPOSITORY = "Epiphytic/geas"
 REPOSITORY_ID = "1320458746"
@@ -318,14 +319,26 @@ class _PreseededProjectionStore:
         source = self.projection
         if source.is_symlink() or not source.is_file():
             raise ValueError("preseeded knowledge projection is missing or unsafe")
-        if source.stat().st_size != artifact.size_bytes:
-            raise ValueError("preseeded knowledge projection has the wrong size")
-        if _sha256_file(source) != artifact.content_sha256:
-            raise ValueError("preseeded knowledge projection has the wrong content address")
-        if _sqlite_input_revision(source, artifact.role) != artifact.input_revision:
-            raise ValueError("preseeded knowledge projection has the wrong input revision")
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(source, destination)
+        reader = SQLiteProjectionGuard().open_stable_snapshot(source)
+        try:
+            stable = reader.authority.candidate
+            if stable.stat().st_size != artifact.size_bytes:
+                raise ValueError("preseeded knowledge projection has the wrong size")
+            if _sha256_file(stable) != artifact.content_sha256:
+                raise ValueError(
+                    "preseeded knowledge projection has the wrong content address"
+                )
+            if _sqlite_input_revision(stable, artifact.role) != artifact.input_revision:
+                raise ValueError("preseeded knowledge projection has the wrong input revision")
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(stable, destination)
+            if not reader.source_is_unchanged():
+                destination.unlink(missing_ok=True)
+                raise ValueError(
+                    "preseeded knowledge projection changed while it was copied"
+                )
+        finally:
+            reader.close()
         destination.chmod(0o644)
 
 

@@ -4,7 +4,6 @@ import hashlib
 import json
 import re
 import sqlite3
-import tempfile
 import threading
 from collections.abc import Iterable
 from contextlib import suppress
@@ -270,13 +269,10 @@ class SQLiteKnowledgeProjection:
         database.parent.mkdir(parents=True, exist_ok=True)
         guard.validate_destination_parent(database)
         expected_destination_identity = guard.capture_destination_identity(database)
-        transaction_directory = Path(
-            tempfile.mkdtemp(
-                prefix=f".{database.name}.build-",
-                dir=database.parent,
-            )
+        transaction_directory = guard.create_transaction_directory(
+            prefix=f".{database.name}.build-",
+            parent=database.parent,
         )
-        transaction_directory.chmod(0o700)
         temporary = transaction_directory / "projection.sqlite"
         temporary.touch(mode=0o600, exist_ok=False)
         expected_candidate_identity = guard.capture_destination_identity(temporary)

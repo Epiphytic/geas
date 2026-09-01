@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+import research_agent.ontology_artifacts as artifacts_module
 from research_agent.ontology_artifacts import (
     ArtifactRole,
     OntologyArtifact,
@@ -245,6 +246,50 @@ def test_knowledge_projection_publication_rejects_full_guard_failure_before_uplo
     assert not manager.manifest_path.exists()
 
 
+def test_projection_publication_binds_revision_scan_hash_and_upload_to_one_copy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ontology = tmp_path / "routing"
+    ontology.mkdir()
+    database = tmp_path / "knowledge.sqlite"
+    _knowledge_database(database)
+    original = database.read_bytes()
+    alternate = tmp_path / "alternate.sqlite"
+    _knowledge_database(alternate)
+    with sqlite3.connect(alternate) as connection:
+        connection.execute("CREATE TABLE replacement(value TEXT)")
+    revision = artifacts_module._sqlite_input_revision
+    replaced = False
+
+    def replace_source_after_revision(*args: object, **kwargs: object) -> str:
+        nonlocal replaced
+        result = revision(*args, **kwargs)
+        if not replaced:
+            alternate.replace(database)
+            replaced = True
+        return result
+
+    monkeypatch.setattr(
+        artifacts_module,
+        "_sqlite_input_revision",
+        replace_source_after_revision,
+    )
+    store = MemoryArtifactStore().use_root(tmp_path / "remote-assets")
+
+    receipt = OntologyArtifactManager(ontology).publish(
+        store=store,
+        published_by="test:operator",
+        storage_rights_basis="operator-confirmed private storage",
+        knowledge_projection=database,
+    )
+
+    artifact = receipt.artifacts[0]
+    uploaded = store.values[(artifact.release_tag, artifact.asset_name)]
+    assert uploaded.read_bytes() == original
+    assert artifact.content_sha256 == artifacts_module.hashlib.sha256(original).hexdigest()
+
+
 def test_knowledge_projection_hydration_rejects_manifest_input_revision_mismatch(
     tmp_path: Path,
 ) -> None:
@@ -271,6 +316,82 @@ def test_knowledge_projection_hydration_rejects_manifest_input_revision_mismatch
         manager.hydrate(store=store)
 
     assert store.download_calls == 1
+
+
+def test_projection_hydration_rejects_destination_replacement_after_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ontology = tmp_path / "routing"
+    ontology.mkdir()
+    database = tmp_path / "knowledge.sqlite"
+    _knowledge_database(database)
+    store = MemoryArtifactStore().use_root(tmp_path / "remote-assets")
+    manager = OntologyArtifactManager(ontology)
+    manager.publish(
+        store=store,
+        published_by="test:operator",
+        storage_rights_basis="operator-confirmed private storage",
+        knowledge_projection=database,
+    )
+    revision = artifacts_module._sqlite_input_revision
+    replaced = False
+
+    def replace_destination_after_revision(path: Path, *args: object, **kwargs: object) -> str:
+        nonlocal replaced
+        result = revision(path, *args, **kwargs)
+        if not replaced and "geas-projection-validation-" in str(path):
+            manager._cache_path(manager.load().artifacts[0]).write_bytes(b"replacement")
+            replaced = True
+        return result
+
+    monkeypatch.setattr(
+        artifacts_module,
+        "_sqlite_input_revision",
+        replace_destination_after_revision,
+    )
+
+    with pytest.raises(OntologyArtifactError, match="changed while it was hydrated"):
+        manager.hydrate(store=store)
+
+    assert replaced
+
+
+@pytest.mark.parametrize(
+    ("role", "artifact_format"),
+    (
+        (ArtifactRole.KNOWLEDGE_PROJECTION.value, "zip"),
+        (ArtifactRole.SOURCE_LIBRARY.value, "zip"),
+        (ArtifactRole.GENERATED_CONTENT.value, "sqlite"),
+    ),
+)
+def test_hydration_rejects_incompatible_role_format_before_download(
+    tmp_path: Path,
+    role: str,
+    artifact_format: str,
+) -> None:
+    ontology = tmp_path / "routing"
+    ontology.mkdir()
+    database = tmp_path / "library.sqlite"
+    _library_database(database)
+    store = MemoryArtifactStore().use_root(tmp_path / "remote-assets")
+    manager = OntologyArtifactManager(ontology)
+    manager.publish(
+        store=store,
+        published_by="test:operator",
+        storage_rights_basis="operator-confirmed private storage",
+        source_library=database,
+    )
+    payload = manager.load().model_dump(mode="json")
+    payload["artifacts"][0]["role"] = role
+    payload["artifacts"][0]["format"] = artifact_format
+    manager.manifest_path.write_text(json.dumps(payload))
+    store.download_calls = 0
+
+    with pytest.raises(ValueError, match="role.*format|format.*role"):
+        manager.hydrate(store=store)
+
+    assert store.download_calls == 0
 
 
 def test_hydration_rejects_symlinked_cache_root_before_download_or_canonical_write(

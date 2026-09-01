@@ -6,12 +6,14 @@ import errno
 import hashlib
 import json
 import os
+import secrets
 import sqlite3
 import stat
 import subprocess
 import sys
 import tempfile
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
@@ -31,6 +33,8 @@ _SQLITE_PORTABLE_PAGE_SIZE = 4096
 _COPY_BLOCK_SIZE = 1024 * 1024
 _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 _O_BINARY = getattr(os, "O_BINARY", 0)
+_HOST_PLATFORM = sys.platform
+_WINDOWS_PRIVATE_DIRECTORY_IDENTITIES: dict[str, tuple[int, int]] = {}
 
 
 def _require_no_symlink_components(
@@ -88,7 +92,10 @@ class _CandidateAuthority:
             or self.transaction_directory.parent != self.parent_directory
             or not stat.S_ISDIR(directory.st_mode)
             or stat.S_ISLNK(directory.st_mode)
-            or stat.S_IMODE(directory.st_mode) != 0o700
+            or not _private_directory_mode_is_safe(
+                self.transaction_directory,
+                directory,
+            )
             or directory.st_dev != self.directory_device
             or directory.st_ino != self.directory_inode
             or self.candidate.parent != self.transaction_directory
@@ -100,10 +107,88 @@ class _CandidateAuthority:
             raise ValueError("projection stamp candidate identity is unsafe")
 
 
+def _private_directory_mode_is_safe(path: Path, information: os.stat_result) -> bool:
+    if os.name != "nt":
+        return stat.S_IMODE(information.st_mode) == 0o700
+    return _WINDOWS_PRIVATE_DIRECTORY_IDENTITIES.get(str(path.absolute())) == (
+        information.st_dev,
+        information.st_ino,
+    )
+
+
+class _WindowsSecurityAttributes(ctypes.Structure):
+    _fields_ = (
+        ("nLength", ctypes.c_uint32),
+        ("lpSecurityDescriptor", ctypes.c_void_p),
+        ("bInheritHandle", ctypes.c_int),
+    )
+
+
+def _windows_create_private_directory(path: Path) -> None:
+    try:
+        advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    except (AttributeError, OSError) as error:
+        raise OSError(errno.ENOTSUP, "Windows private DACL support is unavailable") from error
+    descriptor = ctypes.c_void_p()
+    convert = advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW
+    if not convert(
+        "D:P(A;;FA;;;OW)",  # protected DACL: file-all-access to the owner only
+        1,  # SDDL_REVISION_1
+        ctypes.byref(descriptor),
+        None,
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
+    attributes = _WindowsSecurityAttributes(
+        ctypes.sizeof(_WindowsSecurityAttributes),
+        descriptor,
+        0,
+    )
+    kernel32 = _windows_kernel32()
+    try:
+        if not kernel32.CreateDirectoryW(str(path), ctypes.byref(attributes)):
+            raise ctypes.WinError(ctypes.get_last_error())
+    finally:
+        kernel32.LocalFree(descriptor)
+
+
+def _create_private_transaction_directory(
+    *,
+    prefix: str,
+    parent: Path | None = None,
+) -> Path:
+    if os.name != "nt":
+        directory = Path(
+            tempfile.mkdtemp(
+                prefix=prefix,
+                dir=parent,
+            )
+        ).absolute()
+        directory.chmod(0o700)
+        return directory
+    root = (parent if parent is not None else Path(tempfile.gettempdir())).absolute()
+    for _ in range(128):
+        directory = root / f"{prefix}{secrets.token_hex(16)}"
+        try:
+            _windows_create_private_directory(directory)
+        except FileExistsError:
+            continue
+        information = os.lstat(directory)
+        if not stat.S_ISDIR(information.st_mode) or stat.S_ISLNK(information.st_mode):
+            raise ValueError("Windows projection transaction directory is unsafe")
+        _WINDOWS_PRIVATE_DIRECTORY_IDENTITIES[str(directory)] = (
+            information.st_dev,
+            information.st_ino,
+        )
+        return directory
+    raise FileExistsError("could not reserve a private projection transaction directory")
+
+
 @dataclass
 class StableProjectionReader:
     connection: sqlite3.Connection
     authority: _CandidateAuthority
+    source: Path
+    source_identity: _ProjectionSourceIdentity
     _closed: bool = False
 
     def close(self) -> None:
@@ -112,7 +197,14 @@ class StableProjectionReader:
         self.connection.close()
         _unlink_candidate_identity(self.authority)
         self.authority.transaction_directory.rmdir()
+        _WINDOWS_PRIVATE_DIRECTORY_IDENTITIES.pop(
+            str(self.authority.transaction_directory),
+            None,
+        )
         self._closed = True
+
+    def source_is_unchanged(self) -> bool:
+        return _source_matches_identity(self.source, self.source_identity)
 
 
 def _candidate_ready_for_sqlite(authority: _CandidateAuthority) -> None:
@@ -328,16 +420,33 @@ def _copy_projection_candidate(
         raise
     try:
         identity = _read_fd_identity(source_file_descriptor)
+        copied_digest = hashlib.sha256()
+        copied_size = 0
         os.lseek(source_file_descriptor, 0, os.SEEK_SET)
         for block in iter(
             lambda: os.read(source_file_descriptor, _COPY_BLOCK_SIZE),
             b"",
         ):
+            copied_digest.update(block)
+            copied_size += len(block)
             view = memoryview(block)
             while view:
                 written = os.write(candidate_file_descriptor, view)
                 view = view[written:]
         os.fsync(candidate_file_descriptor)
+        source_after_copy = _read_fd_identity(source_file_descriptor)
+        candidate_identity = _read_fd_identity(candidate_file_descriptor)
+        if (
+            source_after_copy != identity
+            or copied_size != identity.size
+            or copied_digest.hexdigest() != identity.sha256
+            or candidate_identity.size != identity.size
+            or candidate_identity.sha256 != identity.sha256
+            or not _source_matches_identity(database, identity)
+        ):
+            raise ValueError(
+                "copied knowledge projection does not match its authenticated source"
+            )
         return identity
     finally:
         os.close(source_file_descriptor)
@@ -349,6 +458,13 @@ def _source_matches_identity(
 ) -> bool:
     if _has_sqlite_sidecar(database):
         return False
+    return _path_matches_identity(database, identity)
+
+
+def _path_matches_identity(
+    database: Path,
+    identity: _ProjectionSourceIdentity | None,
+) -> bool:
     if identity is None:
         try:
             os.lstat(database)
@@ -418,7 +534,7 @@ def _windows_flush_directory(directory: Path) -> None:
     create_file.restype = ctypes.c_void_p
     handle = create_file(
         str(directory),
-        0x80000000,  # GENERIC_READ
+        0x40000000,  # GENERIC_WRITE, required by FlushFileBuffers
         0x00000001 | 0x00000002 | 0x00000004,
         None,
         3,  # OPEN_EXISTING
@@ -446,7 +562,7 @@ def _windows_replace_file(
         str(database),
         str(candidate),
         str(backup) if backup is not None else None,
-        0x00000001,  # REPLACEFILE_WRITE_THROUGH
+        0,  # REPLACEFILE_WRITE_THROUGH is explicitly unsupported
         None,
         None,
     )
@@ -463,6 +579,47 @@ def _windows_move_no_replace(candidate: Path, database: Path) -> None:
         0x00000008,  # MOVEFILE_WRITE_THROUGH; deliberately no replace flag
     ):
         raise ctypes.WinError(ctypes.get_last_error())
+
+
+def _move_path_no_replace(source: Path, destination: Path) -> None:
+    """Move one path only if the destination name is still absent."""
+    if _HOST_PLATFORM == "win32":
+        _windows_move_no_replace(source, destination)
+        return
+    libc = ctypes.CDLL(None, use_errno=True)
+    source_bytes = os.fsencode(source)
+    destination_bytes = os.fsencode(destination)
+    if _HOST_PLATFORM.startswith("linux"):
+        rename = getattr(libc, "renameat2", None)
+        if rename is None:
+            raise OSError(errno.ENOTSUP, "no-clobber projection move is unsupported")
+        rename.argtypes = (
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        )
+        rename.restype = ctypes.c_int
+        result = rename(
+            -100,  # AT_FDCWD
+            source_bytes,
+            -100,
+            destination_bytes,
+            1,  # RENAME_NOREPLACE
+        )
+    elif _HOST_PLATFORM == "darwin":
+        rename = getattr(libc, "renamex_np", None)
+        if rename is None:
+            raise OSError(errno.ENOTSUP, "no-clobber projection move is unsupported")
+        rename.argtypes = (ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint)
+        rename.restype = ctypes.c_int
+        result = rename(source_bytes, destination_bytes, 4)  # RENAME_EXCL
+    else:
+        raise OSError(errno.ENOTSUP, "no-clobber projection move is unsupported")
+    if result != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number))
 
 
 def _fsync_file(
@@ -493,19 +650,69 @@ def _apply_candidate_mode(
     mode: int,
 ) -> None:
     authority.validate()
-    fchmod = getattr(os, "fchmod", None)
-    if fchmod is not None:
+    if sys.platform == "win32":
+        _windows_apply_candidate_mode(candidate_file_descriptor, mode)
+    elif (fchmod := getattr(os, "fchmod", None)) is not None:
         fchmod(candidate_file_descriptor, mode)
     else:
         os.chmod(authority.candidate, mode, follow_symlinks=False)
     information = os.fstat(candidate_file_descriptor)
+    mode_preserved = (
+        bool(stat.S_IMODE(information.st_mode) & 0o222) == bool(mode & 0o222)
+        if os.name == "nt"
+        else stat.S_IMODE(information.st_mode) == mode
+    )
     if (
         information.st_dev != authority.candidate_device
         or information.st_ino != authority.candidate_inode
-        or stat.S_IMODE(information.st_mode) != mode
+        or not mode_preserved
     ):
         raise ValueError("projection stamp candidate mode was not preserved")
     authority.validate()
+
+
+class _WindowsFileBasicInfo(ctypes.Structure):
+    _fields_ = (
+        ("CreationTime", ctypes.c_int64),
+        ("LastAccessTime", ctypes.c_int64),
+        ("LastWriteTime", ctypes.c_int64),
+        ("ChangeTime", ctypes.c_int64),
+        ("FileAttributes", ctypes.c_uint32),
+    )
+
+
+def _windows_os_handle(file_descriptor: int) -> int:
+    try:
+        import msvcrt
+    except ImportError as error:
+        raise OSError(errno.ENOTSUP, "Windows file-handle mode support is unavailable") from error
+    return msvcrt.get_osfhandle(file_descriptor)
+
+
+def _windows_apply_candidate_mode(file_descriptor: int, mode: int) -> None:
+    kernel32 = _windows_kernel32()
+    information = _WindowsFileBasicInfo()
+    handle = _windows_os_handle(file_descriptor)
+    if not kernel32.GetFileInformationByHandleEx(
+        handle,
+        0,  # FileBasicInfo
+        ctypes.byref(information),
+        ctypes.sizeof(information),
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
+    if mode & 0o222:
+        information.FileAttributes &= ~0x00000001  # FILE_ATTRIBUTE_READONLY
+        if information.FileAttributes == 0:
+            information.FileAttributes = 0x00000080  # FILE_ATTRIBUTE_NORMAL
+    else:
+        information.FileAttributes |= 0x00000001
+    if not kernel32.SetFileInformationByHandle(
+        handle,
+        0,  # FileBasicInfo
+        ctypes.byref(information),
+        ctypes.sizeof(information),
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
 
 
 def _atomic_exchange_paths(first: Path, second: Path) -> None:
@@ -577,18 +784,46 @@ def _unlink_candidate_identity(
     allowed_link_counts: tuple[int, ...] = (1,),
 ) -> None:
     try:
-        information = os.lstat(authority.candidate)
+        os.lstat(authority.candidate)
     except FileNotFoundError:
         return
+    _remove_path_identity_no_clobber(
+        authority.candidate,
+        expected_device=authority.candidate_device,
+        expected_inode=authority.candidate_inode,
+        allowed_link_counts=allowed_link_counts,
+        quarantine=authority.transaction_directory / ".candidate-cleanup",
+        error_message="projection stamp candidate identity is unsafe",
+    )
+
+
+def _remove_path_identity_no_clobber(
+    path: Path,
+    *,
+    expected_device: int,
+    expected_inode: int,
+    allowed_link_counts: tuple[int, ...],
+    quarantine: Path,
+    error_message: str,
+) -> None:
+    try:
+        os.lstat(quarantine)
+    except FileNotFoundError:
+        pass
+    else:
+        raise ValueError(error_message)
+    _move_path_no_replace(path, quarantine)
+    information = os.lstat(quarantine)
     if (
         not stat.S_ISREG(information.st_mode)
-        or information.st_dev != authority.candidate_device
-        or information.st_ino != authority.candidate_inode
+        or information.st_dev != expected_device
+        or information.st_ino != expected_inode
         or information.st_nlink not in allowed_link_counts
-        or authority.candidate.parent != authority.transaction_directory
     ):
-        raise ValueError("projection stamp candidate identity is unsafe")
-    authority.candidate.unlink()
+        with suppress(OSError):
+            _move_path_no_replace(quarantine, path)
+        raise ValueError(error_message)
+    quarantine.unlink()
 
 
 def _unlink_source_identity(
@@ -597,15 +832,14 @@ def _unlink_source_identity(
 ) -> None:
     if not _source_matches_identity(candidate, identity):
         raise ValueError("source changed while projection stamp was prepared")
-    information = os.lstat(candidate)
-    if (
-        not stat.S_ISREG(information.st_mode)
-        or information.st_dev != identity.device
-        or information.st_ino != identity.inode
-        or stat.S_IMODE(information.st_mode) != identity.mode
-    ):
-        raise ValueError("source changed while projection stamp was prepared")
-    candidate.unlink()
+    _remove_path_identity_no_clobber(
+        candidate,
+        expected_device=identity.device,
+        expected_inode=identity.inode,
+        allowed_link_counts=(1,),
+        quarantine=candidate.parent / ".source-cleanup",
+        error_message="source changed while projection stamp was prepared",
+    )
 
 
 def _rollback_atomic_exchange(
@@ -614,12 +848,104 @@ def _rollback_atomic_exchange(
     identity: _ProjectionSourceIdentity,
     authority: _CandidateAuthority,
 ) -> None:
-    if not _path_has_candidate_identity(database, authority):
-        return
-    if not _source_matches_identity(candidate, identity):
-        return
-    _atomic_exchange_paths(candidate, database)
+    _restore_path_without_clobber(
+        candidate,
+        database,
+        identity,
+        authority,
+    )
+
+
+def _restore_path_without_clobber(
+    source: Path,
+    database: Path,
+    source_identity: _ProjectionSourceIdentity,
+    authority: _CandidateAuthority,
+) -> None:
+    """Restore *source* without ever replacing an unexpected destination path."""
+    quarantine = authority.transaction_directory / "rollback-destination.sqlite"
+    try:
+        os.lstat(quarantine)
+    except FileNotFoundError:
+        pass
+    else:
+        raise RuntimeError("projection rollback quarantine path is not empty")
+
+    _move_path_no_replace(database, quarantine)
+    if not _path_has_candidate_identity(quarantine, authority):
+        try:
+            _move_path_no_replace(quarantine, database)
+            _fsync_directory(database.parent)
+        except BaseException as restore_error:
+            raise RuntimeError(
+                "projection rollback destination changed and was quarantined"
+            ) from restore_error
+        raise RuntimeError(
+            "projection rollback destination changed; it was restored without clobbering"
+        )
+
+    try:
+        if not _path_matches_identity(source, source_identity):
+            raise RuntimeError("projection rollback source changed and was quarantined")
+        _move_path_no_replace(source, database)
+        if not _path_matches_identity(database, source_identity):
+            raise RuntimeError("projection rollback restored unexpected bytes")
+        _fsync_directory(database.parent)
+    except BaseException as restore_error:
+        if (
+            _path_matches_identity(database, source_identity)
+            and _path_has_candidate_identity(quarantine, authority)
+        ):
+            _remove_path_identity_no_clobber(
+                quarantine,
+                expected_device=authority.candidate_device,
+                expected_inode=authority.candidate_inode,
+                allowed_link_counts=(1,),
+                quarantine=authority.transaction_directory / ".rollback-cleanup",
+                error_message="projection rollback installed bytes were quarantined",
+            )
+        raise RuntimeError(
+            "projection rollback failed safely and retained quarantined state: "
+            f"{restore_error}"
+        ) from restore_error
+
+    installed_information = os.lstat(quarantine)
+    if (
+        not stat.S_ISREG(installed_information.st_mode)
+        or installed_information.st_dev != authority.candidate_device
+        or installed_information.st_ino != authority.candidate_inode
+        or installed_information.st_nlink != 1
+    ):
+        raise RuntimeError("projection rollback installed bytes were quarantined")
+    quarantine.unlink()
     _fsync_directory(database.parent)
+
+
+def _rollback_installed_to_absent_without_clobber(
+    database: Path,
+    authority: _CandidateAuthority,
+) -> None:
+    quarantine = authority.transaction_directory / "rollback-installed.sqlite"
+    try:
+        os.lstat(quarantine)
+    except FileNotFoundError:
+        pass
+    else:
+        raise RuntimeError("projection rollback quarantine path is not empty")
+    _move_path_no_replace(database, quarantine)
+    if _path_has_candidate_identity(quarantine, authority):
+        _fsync_directory(database.parent)
+        raise RuntimeError("projection rollback retained installed bytes in quarantine")
+    try:
+        _move_path_no_replace(quarantine, database)
+        _fsync_directory(database.parent)
+    except BaseException as restore_error:
+        raise RuntimeError(
+            "projection rollback destination changed and was quarantined"
+        ) from restore_error
+    raise RuntimeError(
+        "projection rollback destination changed; it was restored without clobbering"
+    )
 
 
 def _replace_candidate_windows(
@@ -631,16 +957,18 @@ def _replace_candidate_windows(
     if identity is None:
         moved = False
         try:
-            _windows_move_no_replace(candidate, database)
+            _windows_flush_directory(database.parent)
+            _move_path_no_replace(candidate, database)
             moved = True
             if not _path_has_candidate_identity(database, authority):
                 raise ValueError("projection install destination identity is unsafe")
+            if _has_sqlite_sidecar(database):
+                raise ValueError("knowledge projection has an active SQLite sidecar")
             _fsync_directory(database.parent)
             return
         except BaseException:
-            if moved and _path_has_candidate_identity(database, authority):
-                _windows_move_no_replace(database, candidate)
-                _fsync_directory(database.parent)
+            if moved:
+                _rollback_installed_to_absent_without_clobber(database, authority)
             raise
 
     backup = authority.transaction_directory / "displaced.sqlite"
@@ -652,11 +980,36 @@ def _replace_candidate_windows(
             pass
         else:
             raise ValueError("projection install backup path is not empty")
+        _windows_flush_directory(database.parent)
         _windows_replace_file(database, candidate, backup)
         replaced = True
-        if not _source_matches_identity(backup, identity):
-            _windows_replace_file(database, backup, None)
+        if not _path_has_candidate_identity(database, authority):
             replaced = False
+            displaced_identity = _capture_projection_identity(backup)
+            if displaced_identity is None:
+                raise RuntimeError("projection rollback source is missing")
+            _restore_path_without_clobber(
+                backup,
+                database,
+                displaced_identity,
+                authority,
+            )
+            raise ValueError("projection install candidate changed at replacement")
+        if _has_sqlite_sidecar(database):
+            replaced = False
+            _restore_path_without_clobber(backup, database, identity, authority)
+            raise ValueError("knowledge projection has an active SQLite sidecar")
+        if not _source_matches_identity(backup, identity):
+            replaced = False
+            displaced_identity = _capture_projection_identity(backup)
+            if displaced_identity is None:
+                raise RuntimeError("projection rollback source is missing")
+            _restore_path_without_clobber(
+                backup,
+                database,
+                displaced_identity,
+                authority,
+            )
             raise ValueError("source changed while projection stamp was prepared")
         _fsync_directory(database.parent)
         _unlink_source_identity(backup, identity)
@@ -668,8 +1021,18 @@ def _replace_candidate_windows(
                 raise RuntimeError(
                     "projection stamp failed and its Windows rollback is unsafe"
                 ) from operation_error
-            _windows_replace_file(database, backup, None)
-            _fsync_directory(database.parent)
+            replaced = False
+            try:
+                _restore_path_without_clobber(
+                    backup,
+                    database,
+                    identity,
+                    authority,
+                )
+            except BaseException as rollback_error:
+                raise RuntimeError(
+                    "projection stamp failed and its Windows rollback was quarantined"
+                ) from rollback_error
         raise
 
 
@@ -686,27 +1049,20 @@ def _replace_candidate_if_source_unchanged(
         _replace_candidate_windows(candidate, database, identity, authority)
         return
     if identity is None:
-        linked = False
+        moved = False
         try:
-            os.link(candidate, database, follow_symlinks=False)
-            linked = True
+            _move_path_no_replace(candidate, database)
+            moved = True
+            if not _path_has_candidate_identity(database, authority):
+                raise ValueError("projection install destination identity is unsafe")
+            if _has_sqlite_sidecar(database):
+                raise ValueError("knowledge projection has an active SQLite sidecar")
             _fsync_file(database)
             _fsync_directory(database.parent)
-            _unlink_candidate_identity(authority, allowed_link_counts=(2,))
             return
         except BaseException:
-            if linked:
-                try:
-                    linked_information = os.lstat(database)
-                    if (
-                        stat.S_ISREG(linked_information.st_mode)
-                        and linked_information.st_dev == authority.candidate_device
-                        and linked_information.st_ino == authority.candidate_inode
-                    ):
-                        database.unlink()
-                        _fsync_directory(database.parent)
-                except (OSError, ValueError):
-                    pass
+            if moved:
+                _rollback_installed_to_absent_without_clobber(database, authority)
             raise
 
     exchanged = False
@@ -714,9 +1070,35 @@ def _replace_candidate_if_source_unchanged(
         authority.validate()
         _atomic_exchange_paths(candidate, database)
         exchanged = True
-        if not _source_matches_identity(candidate, identity):
-            _atomic_exchange_paths(candidate, database)
+        if not _path_has_candidate_identity(database, authority):
             exchanged = False
+            _rollback_atomic_exchange(
+                candidate,
+                database,
+                identity,
+                authority,
+            )
+            raise ValueError("projection install candidate changed at replacement")
+        if _has_sqlite_sidecar(database):
+            exchanged = False
+            _rollback_atomic_exchange(
+                candidate,
+                database,
+                identity,
+                authority,
+            )
+            raise ValueError("knowledge projection has an active SQLite sidecar")
+        if not _source_matches_identity(candidate, identity):
+            exchanged = False
+            displaced_identity = _capture_projection_identity(candidate)
+            if displaced_identity is None:
+                raise RuntimeError("projection rollback source is missing")
+            _rollback_atomic_exchange(
+                candidate,
+                database,
+                displaced_identity,
+                authority,
+            )
             raise ValueError("source changed while projection stamp was prepared")
         _fsync_directory(database.parent)
         _unlink_source_identity(candidate, identity)
@@ -1240,12 +1622,13 @@ def _validated_projection_state_bound(
 
 def _open_stable_projection_connection(
     database: Path,
+    *,
+    validate_projection: bool = True,
 ) -> tuple[StableProjectionReader, ProjectionStamp | None, str | None]:
     database = database.absolute()
-    transaction_directory = Path(
-        tempfile.mkdtemp(prefix="geas-projection-validation-")
-    ).absolute()
-    transaction_directory.chmod(0o700)
+    transaction_directory = _create_private_transaction_directory(
+        prefix="geas-projection-validation-"
+    )
     parent = transaction_directory.parent
     parent_information = os.lstat(parent)
     directory_information = os.lstat(transaction_directory)
@@ -1268,6 +1651,7 @@ def _open_stable_projection_connection(
         candidate_inode=candidate_information.st_ino,
     )
     connection: sqlite3.Connection | None = None
+    transferred = False
     try:
         source_identity = _copy_projection_candidate(
             database,
@@ -1280,11 +1664,19 @@ def _open_stable_projection_connection(
             mode="ro",
             authority=candidate_authority,
         )
-        stamp, digest = _validated_projection_state_on_connection(
-            candidate,
-            candidate_authority,
-            connection,
-        )
+        if validate_projection:
+            stamp, digest = _validated_projection_state_on_connection(
+                candidate,
+                candidate_authority,
+                connection,
+            )
+        else:
+            connection.execute("PRAGMA query_only = ON")
+            if connection.execute("PRAGMA integrity_check").fetchall() != [("ok",)]:
+                raise ValueError("SQLite artifact failed its integrity check")
+            if connection.execute("PRAGMA foreign_key_check").fetchall():
+                raise ValueError("SQLite artifact has foreign-key violations")
+            stamp, digest = None, None
         if not _source_matches_identity(database, source_identity):
             raise ValueError("knowledge projection changed while it was validated")
         os.close(candidate_file_descriptor)
@@ -1292,8 +1684,11 @@ def _open_stable_projection_connection(
         reader = StableProjectionReader(
             connection=connection,
             authority=candidate_authority,
+            source=database,
+            source_identity=source_identity,
         )
         connection = None
+        transferred = True
         return reader, stamp, digest
     except BaseException:
         if connection is not None:
@@ -1302,9 +1697,11 @@ def _open_stable_projection_connection(
     finally:
         if candidate_file_descriptor >= 0:
             os.close(candidate_file_descriptor)
-        if connection is not None and transaction_directory.exists():
+        if not transferred and transaction_directory.exists():
             _unlink_candidate_identity(candidate_authority)
             transaction_directory.rmdir()
+            _WINDOWS_PRIVATE_DIRECTORY_IDENTITIES.pop(str(transaction_directory), None)
+            _fsync_directory(parent)
 
 
 def _validated_projection_state(
@@ -1337,6 +1734,10 @@ class SQLiteProjectionGuard:
         self.clock = clock
 
     @staticmethod
+    def create_transaction_directory(*, prefix: str, parent: Path) -> Path:
+        return _create_private_transaction_directory(prefix=prefix, parent=parent)
+
+    @staticmethod
     def capture_destination_identity(
         database: Path,
     ) -> _ProjectionSourceIdentity | None:
@@ -1362,7 +1763,10 @@ class SQLiteProjectionGuard:
         directory_information = os.lstat(candidate.parent)
         if (
             not stat.S_ISDIR(directory_information.st_mode)
-            or stat.S_IMODE(directory_information.st_mode) != 0o700
+            or not _private_directory_mode_is_safe(
+                candidate.parent,
+                directory_information,
+            )
         ):
             raise ValueError("projection install candidate directory is unsafe")
         candidate_file_descriptor = os.open(
@@ -1396,6 +1800,8 @@ class SQLiteProjectionGuard:
             )
             _validate_stamped_projection(candidate, expected_stamp, authority)
             os.fsync(candidate_file_descriptor)
+            os.close(candidate_file_descriptor)
+            candidate_file_descriptor = -1
             _replace_candidate_if_source_unchanged(
                 candidate,
                 database,
@@ -1403,7 +1809,8 @@ class SQLiteProjectionGuard:
                 authority,
             )
         finally:
-            os.close(candidate_file_descriptor)
+            if candidate_file_descriptor >= 0:
+                os.close(candidate_file_descriptor)
 
     @staticmethod
     def cleanup_install_transaction(
@@ -1418,16 +1825,16 @@ class SQLiteProjectionGuard:
         else:
             if expected_candidate_identity is None:
                 raise ValueError("projection install candidate identity is unknown")
-            information = os.lstat(candidate)
-            if (
-                not stat.S_ISREG(information.st_mode)
-                or information.st_nlink != 1
-                or information.st_dev != expected_candidate_identity.device
-                or information.st_ino != expected_candidate_identity.inode
-            ):
-                raise ValueError("projection install candidate identity is unsafe")
-            candidate.unlink()
+            _remove_path_identity_no_clobber(
+                candidate,
+                expected_device=expected_candidate_identity.device,
+                expected_inode=expected_candidate_identity.inode,
+                allowed_link_counts=(1,),
+                quarantine=candidate.parent / ".install-cleanup",
+                error_message="projection install candidate identity is unsafe",
+            )
         candidate.parent.rmdir()
+        _WINDOWS_PRIVATE_DIRECTORY_IDENTITIES.pop(str(candidate.parent), None)
         _fsync_directory(candidate.parent.parent)
 
     def stamp(
@@ -1445,13 +1852,10 @@ class SQLiteProjectionGuard:
         parent_information = os.lstat(database.parent)
         if not stat.S_ISDIR(parent_information.st_mode):
             raise ValueError("knowledge projection parent is not a directory")
-        transaction_directory = Path(
-            tempfile.mkdtemp(
-                prefix=f".{database.name}.stamp-",
-                dir=database.parent,
-            )
+        transaction_directory = _create_private_transaction_directory(
+            prefix=f".{database.name}.stamp-",
+            parent=database.parent,
         )
-        transaction_directory.chmod(0o700)
         directory_information = os.lstat(transaction_directory)
         candidate = transaction_directory / "candidate.sqlite"
         candidate_file_descriptor = os.open(
@@ -1536,6 +1940,8 @@ class SQLiteProjectionGuard:
             authority.validate()
             os.fsync(candidate_file_descriptor)
             _fsync_file(candidate, authority)
+            os.close(candidate_file_descriptor)
+            candidate_file_descriptor = -1
             _replace_candidate_if_source_unchanged(
                 candidate,
                 database,
@@ -1544,10 +1950,28 @@ class SQLiteProjectionGuard:
             )
             return stamp
         finally:
-            os.close(candidate_file_descriptor)
-            _unlink_candidate_identity(authority)
-            transaction_directory.rmdir()
-            _fsync_directory(database.parent)
+            if candidate_file_descriptor >= 0:
+                os.close(candidate_file_descriptor)
+            active_error = sys.exc_info()[0] is not None
+            try:
+                _unlink_candidate_identity(authority)
+            except (OSError, ValueError):
+                if not active_error:
+                    raise
+            try:
+                transaction_directory.rmdir()
+            except OSError as cleanup_error:
+                if (
+                    not active_error
+                    and cleanup_error.errno not in (errno.ENOTEMPTY, errno.EEXIST)
+                ):
+                    raise
+            else:
+                _WINDOWS_PRIVATE_DIRECTORY_IDENTITIES.pop(
+                    str(transaction_directory),
+                    None,
+                )
+                _fsync_directory(database.parent)
 
     def verify(
         self,
@@ -1704,6 +2128,19 @@ class SQLiteProjectionGuard:
         except BaseException:
             reader.close()
             raise
+
+    def open_stable_snapshot(
+        self,
+        database: Path,
+        *,
+        knowledge_projection: bool = True,
+    ) -> StableProjectionReader:
+        """Return one integrity-checked immutable copy of the selected SQLite file."""
+        reader, _, _ = _open_stable_projection_connection(
+            database,
+            validate_projection=knowledge_projection,
+        )
+        return reader
 
     def validated_stamp(self, database: Path) -> ProjectionStamp:
         reader, stamp, actual_digest = _open_stable_projection_connection(

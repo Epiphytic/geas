@@ -72,6 +72,20 @@ class OntologyArtifact(StrictModel):
             raise ValueError("ontology artifact release tag is invalid")
         return value
 
+    @model_validator(mode="after")
+    def role_and_format_are_compatible(self) -> OntologyArtifact:
+        expected = (
+            ArtifactFormat.ZIP
+            if self.role is ArtifactRole.GENERATED_CONTENT
+            else ArtifactFormat.SQLITE
+        )
+        if self.format is not expected:
+            raise ValueError(
+                f"ontology artifact role {self.role.value!r} requires format "
+                f"{expected.value!r}"
+            )
+        return self
+
 
 class OntologyArtifactManifest(StrictModel):
     version: Literal[1] = 1
@@ -345,25 +359,6 @@ class OntologyArtifactManager:
                 if path is None:
                     continue
                 previous = by_role.get(role)
-                if role is not ArtifactRole.GENERATED_CONTENT:
-                    source = path.expanduser()
-                    if source.is_symlink() or not source.is_file():
-                        raise OntologyArtifactError(
-                            f"SQLite ontology artifact is missing or unsafe: {path}"
-                        )
-                    quick_revision = _sqlite_input_revision(
-                        source.absolute(),
-                        role,
-                        verify_contents=False,
-                    )
-                    if (
-                        previous is not None
-                        and previous.input_revision == quick_revision
-                        and store.available(previous)
-                    ):
-                        by_role[role] = previous
-                        reused.append(role)
-                        continue
                 prepared = self._prepare(
                     role,
                     path,
@@ -475,18 +470,38 @@ class OntologyArtifactManager:
                 ontology_directory=self.ontology_directory,
                 expected_kind="file",
             )
-            _verify_file(destination, artifact)
             if artifact.format is ArtifactFormat.SQLITE:
-                actual_input_revision = _sqlite_input_revision(
-                    destination,
-                    artifact.role,
-                )
-                if actual_input_revision != artifact.input_revision:
-                    raise OntologyArtifactError(
-                        "SQLite ontology artifact input revision does not match "
-                        "its manifest"
+                try:
+                    reader = SQLiteProjectionGuard().open_stable_snapshot(
+                        destination,
+                        knowledge_projection=(
+                            artifact.role is ArtifactRole.KNOWLEDGE_PROJECTION
+                        ),
                     )
+                except (OSError, sqlite3.Error, ValueError) as error:
+                    raise OntologyArtifactError(
+                        f"invalid SQLite ontology artifact: {destination}"
+                    ) from error
+                try:
+                    stable = reader.authority.candidate
+                    _verify_file(stable, artifact)
+                    actual_input_revision = _sqlite_input_revision(
+                        stable,
+                        artifact.role,
+                    )
+                    if actual_input_revision != artifact.input_revision:
+                        raise OntologyArtifactError(
+                            "SQLite ontology artifact input revision does not match "
+                            "its manifest"
+                        )
+                    if not reader.source_is_unchanged():
+                        raise OntologyArtifactError(
+                            "SQLite ontology artifact changed while it was hydrated"
+                        )
+                finally:
+                    reader.close()
             else:
+                _verify_file(destination, artifact)
                 _extract_generated_zip(
                     destination,
                     generated_output,
@@ -535,10 +550,28 @@ class OntologyArtifactManager:
         else:
             if not source.is_file():
                 raise OntologyArtifactError(f"SQLite ontology artifact is missing: {path}")
-            input_revision = _sqlite_input_revision(source, role)
-            prepared = source
+            try:
+                reader = SQLiteProjectionGuard().open_stable_snapshot(
+                    source,
+                    knowledge_projection=(
+                        role is ArtifactRole.KNOWLEDGE_PROJECTION
+                    ),
+                )
+            except (OSError, sqlite3.Error, ValueError) as error:
+                raise OntologyArtifactError(
+                    f"invalid SQLite ontology artifact: {path}"
+                ) from error
+            prepared = temporary_root / f"{role.value}.sqlite"
+            try:
+                stable = reader.authority.candidate
+                input_revision = _sqlite_input_revision(stable, role)
+                _scan_sensitive_content(stable)
+                shutil.copyfile(stable, prepared)
+            finally:
+                reader.close()
             format = ArtifactFormat.SQLITE
-        _scan_sensitive_content(prepared)
+        if role is ArtifactRole.GENERATED_CONTENT:
+            _scan_sensitive_content(prepared)
         digest = _sha256_file(prepared)
         extension = format.value
         asset_name = f"geas-{role.value}-{digest}.{extension}"

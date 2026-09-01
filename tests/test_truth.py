@@ -1,3 +1,4 @@
+import ctypes
 import sqlite3
 import stat
 import subprocess
@@ -467,6 +468,105 @@ def test_projection_stamp_rejects_source_change_before_atomic_replace(
     assert _projection_candidate_paths(database) == ()
 
 
+def test_projection_stamp_closes_candidate_descriptor_before_namespace_install(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace, store = _workspace(tmp_path)
+    instant = datetime(2026, 8, 2, 12, 0, tzinfo=UTC)
+    snapshot = _manager(workspace, store, instant=instant).capture(
+        created_by="operator:test"
+    )
+    database = tmp_path / "query.sqlite"
+    _write_projection_fixture(database)
+    apply_mode = truth_module._apply_candidate_mode
+    install = truth_module._replace_candidate_if_source_unchanged
+    candidate_descriptor = -1
+
+    def record_descriptor(*args: object, **kwargs: object) -> None:
+        nonlocal candidate_descriptor
+        candidate_descriptor = int(args[0])
+        apply_mode(*args, **kwargs)
+
+    def assert_closed_before_install(*args: object, **kwargs: object) -> None:
+        with pytest.raises(OSError):
+            truth_module.os.fstat(candidate_descriptor)
+        install(*args, **kwargs)
+
+    monkeypatch.setattr(truth_module, "_apply_candidate_mode", record_descriptor)
+    monkeypatch.setattr(
+        truth_module,
+        "_replace_candidate_if_source_unchanged",
+        assert_closed_before_install,
+    )
+
+    SQLiteProjectionGuard(clock=lambda: instant).stamp(
+        database,
+        snapshot,
+        schema_version=1,
+        builder_version="projection-builder/test",
+    )
+
+    assert candidate_descriptor >= 0
+
+
+def test_projection_stamp_rejects_copy_not_bound_to_authenticated_source_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace, store = _workspace(tmp_path)
+    instant = datetime(2026, 8, 2, 12, 0, tzinfo=UTC)
+    snapshot = _manager(workspace, store, instant=instant).capture(
+        created_by="operator:test"
+    )
+    database = tmp_path / "query.sqlite"
+    _write_projection_fixture(database)
+    original = database.read_bytes()
+    alternate = tmp_path / "alternate.sqlite"
+    _write_projection_fixture(alternate)
+    with sqlite3.connect(alternate) as connection:
+        connection.execute("UPDATE concept SET label = 'Mutated!'")
+    alternate_bytes = alternate.read_bytes()
+    assert len(alternate_bytes) == len(original)
+
+    read = truth_module.os.read
+    source_descriptor: int | None = None
+    source_reads = 0
+    restored = False
+
+    def mutate_during_second_source_pass(file_descriptor: int, size: int) -> bytes:
+        nonlocal source_descriptor, source_reads, restored
+        if source_descriptor is None:
+            source_descriptor = file_descriptor
+        if file_descriptor == source_descriptor and not restored:
+            source_reads += 1
+            if source_reads == 3:
+                with database.open("r+b") as stream:
+                    stream.write(alternate_bytes)
+                    stream.flush()
+                    truth_module.os.fsync(stream.fileno())
+            elif source_reads == 4:
+                with database.open("r+b") as stream:
+                    stream.write(original)
+                    stream.flush()
+                    truth_module.os.fsync(stream.fileno())
+                restored = True
+        return read(file_descriptor, size)
+
+    monkeypatch.setattr(truth_module.os, "read", mutate_during_second_source_pass)
+
+    with pytest.raises(ValueError, match="copied knowledge projection.*source"):
+        SQLiteProjectionGuard(clock=lambda: instant).stamp(
+            database,
+            snapshot,
+            schema_version=1,
+            builder_version="projection-builder/test",
+        )
+
+    assert database.read_bytes() == original
+    assert _projection_candidate_paths(database) == ()
+
+
 def test_projection_stamp_atomic_exchange_preserves_concurrent_replacement(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -537,6 +637,10 @@ def test_projection_stamp_rejects_unsupported_atomic_exchange_platform(
     assert _projection_candidate_paths(database) == ()
 
 
+@pytest.mark.skipif(
+    truth_module.sys.platform == "win32",
+    reason="native Windows uses ReplaceFileW/MoveFileExW adapters",
+)
 def test_atomic_exchange_swaps_two_regular_files(tmp_path: Path) -> None:
     first = tmp_path / "first"
     second = tmp_path / "second"
@@ -547,6 +651,109 @@ def test_atomic_exchange_swaps_two_regular_files(tmp_path: Path) -> None:
 
     assert first.read_bytes() == b"second"
     assert second.read_bytes() == b"first"
+
+
+def test_atomic_rollback_never_overwrites_newer_destination_after_check(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transaction = tmp_path / "transaction"
+    transaction.mkdir(mode=0o700)
+    candidate = transaction / "candidate.sqlite"
+    candidate.write_bytes(b"stamped candidate")
+    candidate_information = candidate.stat()
+    parent_information = tmp_path.stat()
+    directory_information = transaction.stat()
+    authority = truth_module._CandidateAuthority(
+        parent_directory=tmp_path,
+        parent_device=parent_information.st_dev,
+        parent_inode=parent_information.st_ino,
+        transaction_directory=transaction,
+        directory_device=directory_information.st_dev,
+        directory_inode=directory_information.st_ino,
+        candidate=candidate,
+        candidate_device=candidate_information.st_dev,
+        candidate_inode=candidate_information.st_ino,
+    )
+    database = tmp_path / "query.sqlite"
+    database.write_bytes(b"selected source")
+    source_identity = truth_module._capture_projection_identity(database)
+    assert source_identity is not None
+    truth_module._atomic_exchange_paths(candidate, database)
+    newer = tmp_path / "newer.sqlite"
+    newer.write_bytes(b"newer destination")
+    newer_bytes = newer.read_bytes()
+    moves = 0
+
+    def move_no_replace(source: Path, destination: Path) -> None:
+        nonlocal moves
+        moves += 1
+        if moves == 1:
+            newer.replace(database)
+        if destination.exists():
+            raise FileExistsError(destination)
+        source.rename(destination)
+
+    monkeypatch.setattr(
+        truth_module,
+        "_move_path_no_replace",
+        move_no_replace,
+        raising=False,
+    )
+
+    with pytest.raises(RuntimeError, match="rollback.*(quarantined|without clobbering)"):
+        truth_module._rollback_atomic_exchange(
+            candidate,
+            database,
+            source_identity,
+            authority,
+        )
+
+    assert database.read_bytes() == newer_bytes
+
+
+def test_projection_stamp_rejects_sidecar_created_at_exchange_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace, store = _workspace(tmp_path)
+    instant = datetime(2026, 8, 2, 12, 0, tzinfo=UTC)
+    snapshot = _manager(workspace, store, instant=instant).capture(
+        created_by="operator:test"
+    )
+    database = tmp_path / "query.sqlite"
+    _write_projection_fixture(database)
+    original = database.read_bytes()
+    sidecar = Path(f"{database}-wal")
+    exchange = truth_module._atomic_exchange_paths
+    exchanges = 0
+
+    def add_sidecar_after_exchange(first: Path, second: Path) -> None:
+        nonlocal exchanges
+        exchange(first, second)
+        exchanges += 1
+        if exchanges == 1:
+            sidecar.write_bytes(b"concurrent sqlite owner")
+
+    monkeypatch.setattr(
+        truth_module,
+        "_atomic_exchange_paths",
+        add_sidecar_after_exchange,
+    )
+
+    with pytest.raises(
+        (ValueError, RuntimeError),
+        match="sidecar|rollback.*quarantined",
+    ):
+        SQLiteProjectionGuard(clock=lambda: instant).stamp(
+            database,
+            snapshot,
+            schema_version=1,
+            builder_version="projection-builder/test",
+        )
+
+    assert database.read_bytes() == original
+    assert sidecar.read_bytes() == b"concurrent sqlite owner"
 
 
 def test_windows_projection_replace_adapter_preserves_atomic_cas_and_durability(
@@ -585,6 +792,11 @@ def test_windows_projection_replace_adapter_preserves_atomic_cas_and_durability(
         "_windows_flush_directory",
         lambda path: flushes.append(path),
     )
+    monkeypatch.setattr(
+        truth_module,
+        "_windows_apply_candidate_mode",
+        lambda fd, mode: truth_module.os.fchmod(fd, mode),
+    )
 
     with pytest.raises(ValueError, match="changed while projection stamp was prepared"):
         SQLiteProjectionGuard(clock=lambda: instant).stamp(
@@ -595,9 +807,226 @@ def test_windows_projection_replace_adapter_preserves_atomic_cas_and_durability(
         )
 
     assert database.read_bytes() == concurrent_bytes
-    assert replace_calls == 2
+    assert replace_calls == 1
     assert flushes
     assert _projection_candidate_paths(database) == ()
+
+
+def test_windows_projection_rollback_never_overwrites_newer_destination(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace, store = _workspace(tmp_path)
+    instant = datetime(2026, 8, 2, 12, 0, tzinfo=UTC)
+    snapshot = _manager(workspace, store, instant=instant).capture(
+        created_by="operator:test"
+    )
+    database = tmp_path / "query.sqlite"
+    _write_projection_fixture(database)
+    displaced = tmp_path / "displaced.sqlite"
+    displaced.write_bytes(b"displaced concurrent owner")
+    newer = tmp_path / "newer.sqlite"
+    newer.write_bytes(b"newer concurrent owner")
+    newer_bytes = newer.read_bytes()
+    move_calls = 0
+
+    def replace_file(database_path: Path, candidate: Path, backup: Path | None) -> None:
+        displaced.replace(database_path)
+        assert backup is not None
+        database_path.replace(backup)
+        candidate.replace(database_path)
+
+    def move_no_replace(source: Path, target: Path) -> None:
+        nonlocal move_calls
+        move_calls += 1
+        if move_calls == 1:
+            newer.replace(database)
+        if target.exists():
+            raise FileExistsError(target)
+        source.rename(target)
+
+    monkeypatch.setattr(truth_module.sys, "platform", "win32")
+    monkeypatch.setattr(truth_module, "_windows_replace_file", replace_file)
+    monkeypatch.setattr(truth_module, "_move_path_no_replace", move_no_replace)
+    monkeypatch.setattr(truth_module, "_windows_move_no_replace", move_no_replace)
+    monkeypatch.setattr(truth_module, "_windows_flush_directory", lambda path: None)
+    monkeypatch.setattr(
+        truth_module,
+        "_windows_apply_candidate_mode",
+        lambda fd, mode: truth_module.os.fchmod(fd, mode),
+    )
+
+    with pytest.raises(
+        (RuntimeError, ValueError),
+        match=(
+            "rollback.*(quarantined|without clobbering)"
+            "|changed while projection stamp was prepared"
+        ),
+    ):
+        SQLiteProjectionGuard(clock=lambda: instant).stamp(
+            database,
+            snapshot,
+            schema_version=1,
+            builder_version="projection-builder/test",
+        )
+
+    assert database.read_bytes() == newer_bytes
+
+
+def test_windows_replace_file_uses_only_supported_flags(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[object, ...]] = []
+
+    class FakeFunction:
+        def __init__(self, result: int = 1) -> None:
+            self.result = result
+
+        def __call__(self, *args: object) -> int:
+            calls.append(args)
+            return self.result
+
+    class Kernel32:
+        ReplaceFileW = FakeFunction()
+
+    monkeypatch.setattr(truth_module, "_windows_kernel32", lambda: Kernel32())
+
+    truth_module._windows_replace_file(
+        tmp_path / "database.sqlite",
+        tmp_path / "candidate.sqlite",
+        tmp_path / "backup.sqlite",
+    )
+
+    assert calls == [
+        (
+            str(tmp_path / "database.sqlite"),
+            str(tmp_path / "candidate.sqlite"),
+            str(tmp_path / "backup.sqlite"),
+            0,
+            None,
+            None,
+        )
+    ]
+
+
+def test_windows_directory_durability_uses_write_access(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    create_calls: list[tuple[object, ...]] = []
+    flushed: list[int] = []
+    closed: list[int] = []
+
+    class FakeFunction:
+        restype: object = None
+
+        def __init__(self, function: object) -> None:
+            self.function = function
+
+        def __call__(self, *args: object) -> object:
+            return self.function(*args)  # type: ignore[operator]
+
+    class Kernel32:
+        CreateFileW = FakeFunction(
+            lambda *args: create_calls.append(args) or 41
+        )
+        FlushFileBuffers = FakeFunction(
+            lambda handle: flushed.append(handle) or 1
+        )
+        CloseHandle = FakeFunction(lambda handle: closed.append(handle) or 1)
+
+    monkeypatch.setattr(truth_module, "_windows_kernel32", lambda: Kernel32())
+
+    truth_module._windows_flush_directory(tmp_path)
+
+    assert create_calls[0][1] == 0x40000000  # GENERIC_WRITE
+    assert create_calls[0][5] & 0x02000000  # FILE_FLAG_BACKUP_SEMANTICS
+    assert flushed == [41]
+    assert closed == [41]
+
+
+def test_windows_private_directory_uses_protected_owner_only_dacl(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sddl: list[str] = []
+    created: list[str] = []
+
+    class FakeFunction:
+        def __init__(self, function: object) -> None:
+            self.function = function
+
+        def __call__(self, *args: object) -> object:
+            return self.function(*args)  # type: ignore[operator]
+
+    def convert(value: str, revision: int, descriptor: object, size: object) -> int:
+        sddl.append(value)
+        ctypes.cast(descriptor, ctypes.POINTER(ctypes.c_void_p))[0] = ctypes.c_void_p(7)
+        return 1
+
+    class Advapi32:
+        ConvertStringSecurityDescriptorToSecurityDescriptorW = FakeFunction(convert)
+
+    class Kernel32:
+        CreateDirectoryW = FakeFunction(
+            lambda path, attributes: created.append(path) or 1
+        )
+        LocalFree = FakeFunction(lambda descriptor: 0)
+
+    monkeypatch.setattr(
+        truth_module.ctypes,
+        "WinDLL",
+        lambda *args, **kwargs: Advapi32(),
+        raising=False,
+    )
+    monkeypatch.setattr(truth_module, "_windows_kernel32", lambda: Kernel32())
+
+    destination = tmp_path / "private"
+    truth_module._windows_create_private_directory(destination)
+
+    assert sddl == ["D:P(A;;FA;;;OW)"]
+    assert created == [str(destination)]
+
+
+def test_windows_candidate_mode_updates_readonly_attribute_by_open_handle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: list[tuple[int, int]] = []
+
+    class FakeFunction:
+        def __init__(self, function: object) -> None:
+            self.function = function
+
+        def __call__(self, *args: object) -> object:
+            return self.function(*args)  # type: ignore[operator]
+
+    def get_info(handle: int, kind: int, pointer: object, size: int) -> int:
+        information = ctypes.cast(
+            pointer,
+            ctypes.POINTER(truth_module._WindowsFileBasicInfo),
+        )[0]
+        information.FileAttributes = 0x20
+        return 1
+
+    def set_info(handle: int, kind: int, pointer: object, size: int) -> int:
+        information = ctypes.cast(
+            pointer,
+            ctypes.POINTER(truth_module._WindowsFileBasicInfo),
+        )[0]
+        observed.append((handle, information.FileAttributes))
+        return 1
+
+    class Kernel32:
+        GetFileInformationByHandleEx = FakeFunction(get_info)
+        SetFileInformationByHandle = FakeFunction(set_info)
+
+    monkeypatch.setattr(truth_module, "_windows_kernel32", lambda: Kernel32())
+    monkeypatch.setattr(truth_module, "_windows_os_handle", lambda descriptor: 71)
+
+    truth_module._windows_apply_candidate_mode(9, 0o444)
+
+    assert observed == [(71, 0x21)]
 
 
 def test_windows_projection_move_adapter_installs_absent_destination(
@@ -618,11 +1047,16 @@ def test_windows_projection_move_adapter_installs_absent_destination(
         candidate.replace(target)
 
     monkeypatch.setattr(truth_module.sys, "platform", "win32")
-    monkeypatch.setattr(truth_module, "_windows_move_no_replace", move_no_replace)
+    monkeypatch.setattr(truth_module, "_move_path_no_replace", move_no_replace)
     monkeypatch.setattr(
         truth_module,
         "_windows_flush_directory",
         lambda path: flushes.append(path),
+    )
+    monkeypatch.setattr(
+        truth_module,
+        "_windows_apply_candidate_mode",
+        lambda fd, mode: truth_module.os.fchmod(fd, mode),
     )
 
     SQLiteProjectionGuard(clock=lambda: instant).stamp(
@@ -638,6 +1072,90 @@ def test_windows_projection_move_adapter_installs_absent_destination(
         expected_builder_version="projection-builder/test",
     ).snapshot_id == snapshot.id
     assert flushes
+
+
+def test_absent_projection_install_never_unlinks_replacement_candidate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace, store = _workspace(tmp_path)
+    instant = datetime(2026, 8, 2, 12, 0, tzinfo=UTC)
+    snapshot = _manager(workspace, store, instant=instant).capture(
+        created_by="operator:test"
+    )
+    database = tmp_path / "query.sqlite"
+    replacement = tmp_path / "replacement.sqlite"
+    replacement.write_bytes(b"replacement candidate owner")
+    replacement_bytes = replacement.read_bytes()
+    unlink = Path.unlink
+
+    def replace_at_unlink(path: Path, *args: object, **kwargs: object) -> None:
+        if path.name == "candidate.sqlite" and ".stamp-" in path.parent.name:
+            replacement.replace(path)
+        unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", replace_at_unlink)
+
+    SQLiteProjectionGuard(clock=lambda: instant).stamp(
+        database,
+        snapshot,
+        schema_version=1,
+        builder_version="projection-builder/test",
+    )
+
+    assert replacement.read_bytes() == replacement_bytes
+
+
+def test_windows_absent_projection_rollback_preserves_newer_destination(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace, store = _workspace(tmp_path)
+    instant = datetime(2026, 8, 2, 12, 0, tzinfo=UTC)
+    snapshot = _manager(workspace, store, instant=instant).capture(
+        created_by="operator:test"
+    )
+    database = tmp_path / "query.sqlite"
+    newer = tmp_path / "newer.sqlite"
+    newer.write_bytes(b"newer absent-destination owner")
+    newer_bytes = newer.read_bytes()
+    moves = 0
+
+    def move_no_replace(source: Path, target: Path) -> None:
+        nonlocal moves
+        moves += 1
+        if moves == 2:
+            newer.replace(database)
+        if target.exists():
+            raise FileExistsError(target)
+        source.rename(target)
+
+    flushes = 0
+
+    def fail_after_install(path: Path) -> None:
+        nonlocal flushes
+        flushes += 1
+        if flushes == 2:
+            raise OSError("post-install durability failure")
+
+    monkeypatch.setattr(truth_module.sys, "platform", "win32")
+    monkeypatch.setattr(truth_module, "_move_path_no_replace", move_no_replace)
+    monkeypatch.setattr(truth_module, "_windows_flush_directory", fail_after_install)
+    monkeypatch.setattr(
+        truth_module,
+        "_windows_apply_candidate_mode",
+        lambda fd, mode: truth_module.os.fchmod(fd, mode),
+    )
+
+    with pytest.raises((OSError, RuntimeError)):
+        SQLiteProjectionGuard(clock=lambda: instant).stamp(
+            database,
+            snapshot,
+            schema_version=1,
+            builder_version="projection-builder/test",
+        )
+
+    assert database.read_bytes() == newer_bytes
 
 
 def test_candidate_mode_fallback_does_not_follow_replacement(
@@ -662,6 +1180,54 @@ def test_candidate_mode_fallback_does_not_follow_replacement(
     )
 
     assert stat.S_IMODE(database.stat().st_mode) == 0o444
+
+
+def test_windows_candidate_mode_uses_open_handle_on_python_312(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidate = tmp_path / "candidate.sqlite"
+    transaction = tmp_path / "transaction"
+    transaction.mkdir(mode=0o700)
+    candidate = transaction / "candidate.sqlite"
+    candidate.write_bytes(b"candidate")
+    descriptor = truth_module.os.open(candidate, truth_module.os.O_RDWR)
+    calls: list[tuple[int, int]] = []
+    fchmod = truth_module.os.fchmod
+    try:
+        monkeypatch.setattr(truth_module.sys, "platform", "win32")
+        monkeypatch.delattr(truth_module.os, "fchmod", raising=False)
+        monkeypatch.setattr(
+            truth_module.os,
+            "chmod",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("path chmod must not be used on Windows 3.12")
+            ),
+        )
+        monkeypatch.setattr(
+            truth_module,
+            "_windows_apply_candidate_mode",
+            lambda fd, mode: (calls.append((fd, mode)), fchmod(fd, mode)),
+            raising=False,
+        )
+        information = candidate.stat()
+        authority = truth_module._CandidateAuthority(
+            parent_directory=tmp_path,
+            parent_device=tmp_path.stat().st_dev,
+            parent_inode=tmp_path.stat().st_ino,
+            transaction_directory=transaction,
+            directory_device=transaction.stat().st_dev,
+            directory_inode=transaction.stat().st_ino,
+            candidate=candidate,
+            candidate_device=information.st_dev,
+            candidate_inode=information.st_ino,
+        )
+
+        truth_module._apply_candidate_mode(descriptor, authority, 0o600)
+    finally:
+        truth_module.os.close(descriptor)
+
+    assert calls == [(descriptor, 0o600)]
 
 
 def test_raw_sqlite_open_includes_platform_binary_flag(
@@ -779,6 +1345,61 @@ def test_projection_stamp_never_unlinks_substituted_candidate_hardlink(
     assert database.read_bytes() == original
 
 
+@pytest.mark.parametrize("operation", ("candidate", "builder"))
+def test_projection_cleanup_never_unlinks_replacement_at_remove_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    transaction = tmp_path / "transaction"
+    transaction.mkdir(mode=0o700)
+    candidate = transaction / "candidate.sqlite"
+    candidate.write_bytes(b"owned candidate")
+    expected_identity = truth_module._capture_projection_identity(candidate)
+    assert expected_identity is not None
+    candidate_information = candidate.stat()
+    authority = truth_module._CandidateAuthority(
+        parent_directory=tmp_path,
+        parent_device=tmp_path.stat().st_dev,
+        parent_inode=tmp_path.stat().st_ino,
+        transaction_directory=transaction,
+        directory_device=transaction.stat().st_dev,
+        directory_inode=transaction.stat().st_ino,
+        candidate=candidate,
+        candidate_device=candidate_information.st_dev,
+        candidate_inode=candidate_information.st_ino,
+    )
+    replacement = tmp_path / "replacement.sqlite"
+    replacement.write_bytes(b"replacement owner")
+    replacement_bytes = replacement.read_bytes()
+    move = truth_module._move_path_no_replace
+    injected = False
+
+    def replace_at_remove_boundary(source: Path, destination: Path) -> None:
+        nonlocal injected
+        if source == candidate and not injected:
+            replacement.replace(candidate)
+            injected = True
+        move(source, destination)
+
+    monkeypatch.setattr(
+        truth_module,
+        "_move_path_no_replace",
+        replace_at_remove_boundary,
+    )
+
+    with pytest.raises(ValueError, match="identity.*unsafe"):
+        if operation == "candidate":
+            truth_module._unlink_candidate_identity(authority)
+        else:
+            SQLiteProjectionGuard.cleanup_install_transaction(
+                candidate,
+                expected_identity,
+            )
+
+    assert candidate.read_bytes() == replacement_bytes
+
+
 @pytest.mark.parametrize("operation", ("verify", "require"))
 def test_projection_reader_rejects_source_replacement_after_snapshot_validation(
     tmp_path: Path,
@@ -828,6 +1449,52 @@ def test_projection_reader_rejects_source_replacement_after_snapshot_validation(
             )
 
     assert database.read_bytes() == concurrent_bytes
+
+
+@pytest.mark.parametrize("failure", ("missing", "copy", "connect"))
+def test_projection_reader_failure_cleans_private_validation_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    validation_root = tmp_path / "validation-root"
+    validation_root.mkdir()
+    created: list[Path] = []
+
+    def make_validation_directory(*, prefix: str, dir: Path | None = None) -> str:
+        assert dir is None
+        directory = validation_root / f"{prefix}{len(created)}"
+        directory.mkdir(mode=0o700)
+        created.append(directory)
+        return str(directory)
+
+    monkeypatch.setattr(truth_module.tempfile, "mkdtemp", make_validation_directory)
+    database = tmp_path / "query.sqlite"
+    if failure != "missing":
+        _write_projection_fixture(database)
+    if failure == "copy":
+        monkeypatch.setattr(
+            truth_module,
+            "_copy_projection_candidate",
+            lambda *args, **kwargs: (_ for _ in ()).throw(OSError("copy failed")),
+        )
+    elif failure == "connect":
+        monkeypatch.setattr(
+            truth_module,
+            "_connect_sqlite",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                sqlite3.OperationalError("connect failed")
+            ),
+        )
+
+    expected_error = ValueError if failure == "missing" else (
+        OSError if failure == "copy" else sqlite3.OperationalError
+    )
+    with pytest.raises(expected_error):
+        truth_module._open_stable_projection_connection(database)
+
+    assert created
+    assert tuple(validation_root.iterdir()) == ()
 
 
 def test_projection_reader_rejects_sidecar_created_after_snapshot_validation(
