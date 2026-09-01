@@ -318,6 +318,12 @@ def _researched_store(tmp_path: Path) -> tuple[ImmutableStore, object]:
         clock=lambda: INSTANT,
     ).run(plan, topic_branch="topic:community-water-fluoridation")
     assert len(result.source_versions) == 5
+    fixture_pack = KnowledgePack.from_yaml(FIXTURE_PACK)
+    required_digests = {
+        *(item.source_content_sha256 for item in fixture_pack.evidence),
+        *fixture_pack.inspect_source_sha256s,
+    }
+    assert {item.content_sha256 for item in result.source_versions} == required_digests
 
     crossref = CrossrefDiscoveryConnector(_CrossrefFixtureTransport())
     crossref_plan = QueryPlanValidator(

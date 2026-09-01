@@ -757,6 +757,22 @@ def _fsync_file(
         authority.validate()
 
 
+def _fsync_writable_projection_candidate(
+    file_descriptor: int,
+    authority: _CandidateAuthority,
+) -> None:
+    """Durably flush the authenticated writable candidate descriptor."""
+    authority.validate()
+    information = os.fstat(file_descriptor)
+    if (
+        information.st_dev != authority.candidate_device
+        or information.st_ino != authority.candidate_inode
+    ):
+        raise ValueError("projection stamp candidate identity is unsafe")
+    os.fsync(file_descriptor)
+    authority.validate()
+
+
 def _apply_candidate_mode(
     candidate_file_descriptor: int,
     authority: _CandidateAuthority,
@@ -910,12 +926,122 @@ def _windows_clear_readonly_path(
             kernel32.CloseHandle(handle)
 
 
+def _same_projection_content_identity(
+    first: _ProjectionSourceIdentity,
+    second: _ProjectionSourceIdentity,
+) -> bool:
+    return (
+        first.device == second.device
+        and first.inode == second.inode
+        and first.size == second.size
+        and first.sha256 == second.sha256
+    )
+
+
+def _windows_set_projection_readonly_state(
+    path: Path,
+    identity: _ProjectionSourceIdentity,
+    *,
+    readonly: bool,
+) -> _ProjectionSourceIdentity:
+    """Change READONLY only through the handle bound to *identity*."""
+    kernel32 = _windows_kernel32()
+    handle = kernel32.CreateFileW(
+        str(path),
+        0x80000000 | 0x00000100,  # GENERIC_READ | FILE_WRITE_ATTRIBUTES
+        0x00000001 | 0x00000002 | 0x00000004,  # share read/write/delete
+        None,
+        3,  # OPEN_EXISTING
+        0x00200000,  # FILE_FLAG_OPEN_REPARSE_POINT
+        None,
+    )
+    invalid_handle = ctypes.c_void_p(-1).value
+    if handle in (None, invalid_handle):
+        raise ctypes.WinError(ctypes.get_last_error())
+    descriptor = -1
+    original_information: _WindowsFileBasicInfo | None = None
+    attributes_changed = False
+    try:
+        descriptor = _windows_adopt_handle_descriptor(handle)
+        handle = None
+        before = _read_fd_identity(descriptor)
+        if before != identity:
+            raise ValueError("projection mode target identity is unsafe")
+        information = _WindowsFileBasicInfo()
+        native_handle = _windows_os_handle(descriptor)
+        if not kernel32.GetFileInformationByHandleEx(
+            native_handle,
+            0,
+            ctypes.byref(information),
+            ctypes.sizeof(information),
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        if information.FileAttributes & 0x00000400:
+            raise ValueError("projection mode target identity is unsafe")
+        original_information = _WindowsFileBasicInfo.from_buffer_copy(information)
+        original_attributes = original_information.FileAttributes
+        if readonly:
+            information.FileAttributes |= 0x00000001
+        else:
+            information.FileAttributes &= ~0x00000001
+            if information.FileAttributes == 0:
+                information.FileAttributes = 0x00000080
+        if information.FileAttributes != original_attributes:
+            if not kernel32.SetFileInformationByHandle(
+                native_handle,
+                0,
+                ctypes.byref(information),
+                ctypes.sizeof(information),
+            ):
+                raise ctypes.WinError(ctypes.get_last_error())
+            attributes_changed = True
+        after = _read_fd_identity(descriptor)
+        if (
+            not _same_projection_content_identity(before, after)
+            or bool(after.mode & 0o222) == readonly
+        ):
+            raise ValueError("projection mode target identity is unsafe")
+        current = os.lstat(path)
+        if (
+            not stat.S_ISREG(current.st_mode)
+            or current.st_dev != after.device
+            or current.st_ino != after.inode
+        ):
+            raise ValueError("projection mode target identity is unsafe")
+        return after
+    except BaseException:
+        if attributes_changed and original_information is not None and descriptor >= 0:
+            try:
+                if not kernel32.SetFileInformationByHandle(
+                    _windows_os_handle(descriptor),
+                    0,
+                    ctypes.byref(original_information),
+                    ctypes.sizeof(original_information),
+                ):
+                    raise ctypes.WinError(ctypes.get_last_error())
+                if _read_fd_identity(descriptor) != identity:
+                    raise RuntimeError(
+                        "projection mode target restoration identity is unsafe"
+                    )
+            except BaseException as restoration_error:
+                raise RuntimeError(
+                    "projection mode transition failed and restoration could not "
+                    "be proven"
+                ) from restoration_error
+        raise
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        elif handle not in (None, invalid_handle):
+            kernel32.CloseHandle(handle)
+
+
 def _atomic_exchange_paths(first: Path, second: Path) -> None:
     """Atomically exchange two existing paths without a replacement gap."""
-    libc = ctypes.CDLL(None, use_errno=True)
     first_bytes = os.fsencode(first)
     second_bytes = os.fsencode(second)
     if sys.platform.startswith("linux"):
+        libc = ctypes.CDLL(None, use_errno=True)
         exchange = getattr(libc, "renameat2", None)
         if exchange is None:
             raise OSError(
@@ -938,6 +1064,7 @@ def _atomic_exchange_paths(first: Path, second: Path) -> None:
             2,  # RENAME_EXCHANGE
         )
     elif sys.platform == "darwin":
+        libc = ctypes.CDLL(None, use_errno=True)
         exchange = getattr(libc, "renamex_np", None)
         if exchange is None:
             raise OSError(
@@ -1178,7 +1305,14 @@ def _restore_path_without_clobber(
         or installed_information.st_nlink != 1
     ):
         raise RuntimeError("projection rollback installed bytes were quarantined")
-    quarantine.unlink()
+    _remove_path_identity_no_clobber(
+        quarantine,
+        expected_device=authority.candidate_device,
+        expected_inode=authority.candidate_inode,
+        allowed_link_counts=(1,),
+        quarantine=authority.transaction_directory / ".rollback-installed-cleanup",
+        error_message="projection rollback installed bytes were quarantined",
+    )
     _fsync_directory(database.parent)
 
 
@@ -1209,11 +1343,39 @@ def _rollback_installed_to_absent_without_clobber(
     )
 
 
-def _replace_candidate_windows(
+def _restore_windows_source_readonly_state(
+    database: Path,
+    backup: Path,
+    writable_identity: _ProjectionSourceIdentity,
+    original_identity: _ProjectionSourceIdentity,
+) -> None:
+    matches = tuple(
+        path
+        for path in (database, backup, backup.parent / ".source-cleanup")
+        if _path_matches_identity(path, writable_identity)
+    )
+    if len(matches) != 1:
+        raise RuntimeError(
+            "Windows projection replacement could not safely restore READONLY"
+        )
+    restored = _windows_set_projection_readonly_state(
+        matches[0],
+        writable_identity,
+        readonly=True,
+    )
+    if restored != original_identity:
+        raise RuntimeError(
+            "Windows projection replacement restored an unexpected source mode"
+        )
+
+
+def _replace_candidate_windows_prepared(
     candidate: Path,
     database: Path,
     identity: _ProjectionSourceIdentity | None,
     authority: _CandidateAuthority,
+    *,
+    restore_installed_readonly: bool,
 ) -> None:
     if identity is None:
         moved = False
@@ -1284,6 +1446,25 @@ def _replace_candidate_windows(
                 authority,
             )
             raise ValueError("source changed while projection stamp was prepared")
+        if restore_installed_readonly:
+            installed_identity = _capture_projection_identity(database)
+            candidate_identity = _capture_projection_identity(candidate)
+            # ReplaceFileW has consumed the candidate pathname.  Bind the
+            # installed content to the authority inode and the validated bytes
+            # observed at the destination before changing its attributes.
+            if (
+                installed_identity is None
+                or installed_identity.device != authority.candidate_device
+                or installed_identity.inode != authority.candidate_inode
+            ):
+                raise ValueError("projection install destination identity is unsafe")
+            if candidate_identity is not None:
+                raise ValueError("projection install candidate namespace is unsafe")
+            _windows_set_projection_readonly_state(
+                database,
+                installed_identity,
+                readonly=True,
+            )
         _fsync_directory(database.parent)
         _unlink_source_identity(backup, identity)
         _fsync_directory(database.parent)
@@ -1306,6 +1487,63 @@ def _replace_candidate_windows(
                 raise RuntimeError(
                     "projection stamp failed and its Windows rollback was quarantined"
                 ) from rollback_error
+        raise
+
+
+def _replace_candidate_windows(
+    candidate: Path,
+    database: Path,
+    identity: _ProjectionSourceIdentity | None,
+    authority: _CandidateAuthority,
+) -> None:
+    if identity is None or identity.mode & 0o222:
+        _replace_candidate_windows_prepared(
+            candidate,
+            database,
+            identity,
+            authority,
+            restore_installed_readonly=False,
+        )
+        return
+
+    backup = authority.transaction_directory / "displaced.sqlite"
+    writable_identity = _windows_set_projection_readonly_state(
+        database,
+        identity,
+        readonly=False,
+    )
+    if (
+        not _same_projection_content_identity(identity, writable_identity)
+        or not writable_identity.mode & 0o222
+    ):
+        _restore_windows_source_readonly_state(
+            database,
+            backup,
+            writable_identity,
+            identity,
+        )
+        raise ValueError("projection source mode transition is unsafe")
+    try:
+        _replace_candidate_windows_prepared(
+            candidate,
+            database,
+            writable_identity,
+            authority,
+            restore_installed_readonly=True,
+        )
+    except BaseException:
+        try:
+            _restore_windows_source_readonly_state(
+                database,
+                backup,
+                writable_identity,
+                identity,
+            )
+        except BaseException as restoration_error:
+            raise RuntimeError(
+                "Windows projection replacement failed and READONLY restoration "
+                "could not be proven"
+            ) from restoration_error
         raise
 
 
@@ -1549,7 +1787,10 @@ def _canonicalize_sqlite_projection(
             if copied != canonical_identity.size:
                 raise ValueError("SQLite canonicalization output has the wrong size")
             os.ftruncate(candidate_file_descriptor, copied)
-            os.fsync(candidate_file_descriptor)
+            _fsync_writable_projection_candidate(
+                candidate_file_descriptor,
+                authority,
+            )
         finally:
             if candidate_file_descriptor >= 0:
                 os.close(candidate_file_descriptor)
@@ -2581,17 +2822,27 @@ class SQLiteProjectionGuard:
             if _read_fd_identity(candidate_file_descriptor) != expected_candidate_identity:
                 raise ValueError("projection install candidate changed after stamping")
             _candidate_ready_for_install(authority)
+            candidate_mode = (
+                expected_destination_identity.mode
+                if expected_destination_identity is not None
+                else expected_candidate_identity.mode
+            )
+            if (
+                sys.platform == "win32"
+                and expected_destination_identity is not None
+                and not expected_destination_identity.mode & 0o222
+            ):
+                candidate_mode = 0o600
             _apply_candidate_mode(
                 candidate_file_descriptor,
                 authority,
-                (
-                    expected_destination_identity.mode
-                    if expected_destination_identity is not None
-                    else expected_candidate_identity.mode
-                ),
+                candidate_mode,
             )
             _validate_stamped_projection(candidate, expected_stamp, authority)
-            os.fsync(candidate_file_descriptor)
+            _fsync_writable_projection_candidate(
+                candidate_file_descriptor,
+                authority,
+            )
             os.close(candidate_file_descriptor)
             candidate_file_descriptor = -1
             _replace_candidate_if_source_unchanged(
@@ -2726,14 +2977,31 @@ class SQLiteProjectionGuard:
             finally:
                 connection.close()
             _canonicalize_sqlite_projection(candidate, authority)
+            candidate_mode = (
+                source_identity.mode
+                if source_identity is not None
+                else 0o600
+            )
+            if (
+                sys.platform == "win32"
+                and source_identity is not None
+                and not source_identity.mode & 0o222
+            ):
+                # ReplaceFileW requires write access to both selected names.
+                # The authenticated install boundary restores READONLY on the
+                # proven candidate inode after replacement.
+                candidate_mode = 0o600
             _apply_candidate_mode(
                 candidate_file_descriptor,
                 authority,
-                source_identity.mode if source_identity is not None else 0o600,
+                candidate_mode,
             )
             _validate_stamped_projection(candidate, stamp, authority)
             authority.validate()
-            os.fsync(candidate_file_descriptor)
+            _fsync_writable_projection_candidate(
+                candidate_file_descriptor,
+                authority,
+            )
             if sys.platform != "win32":
                 _fsync_file(candidate, authority)
             os.close(candidate_file_descriptor)

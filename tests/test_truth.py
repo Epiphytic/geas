@@ -293,9 +293,12 @@ def _sqlite_varint(value: int) -> bytes:
     )
 
 
+_NATIVE_WINDOWS_APPLY_MODE = truth_module._windows_apply_candidate_mode
+
+
 def _apply_native_or_simulated_windows_mode(file_descriptor: int, mode: int) -> None:
     if os.name == "nt":
-        truth_module._windows_apply_candidate_mode(file_descriptor, mode)
+        _NATIVE_WINDOWS_APPLY_MODE(file_descriptor, mode)
     else:
         os.fchmod(file_descriptor, mode)
 
@@ -959,7 +962,7 @@ def test_projection_stamp_foreign_key_failure_preserves_unstamped_source(
     (
         ("_normalize_sqlite_header", "header write"),
         ("_validate_stamped_projection", "integrity"),
-        ("_fsync_file", "file fsync"),
+        ("_fsync_writable_projection_candidate", "file fsync"),
         ("_fsync_directory", "directory fsync"),
     ),
 )
@@ -1045,6 +1048,7 @@ def test_projection_stamp_preserves_source_mode(tmp_path: Path) -> None:
     database = tmp_path / "query.sqlite"
     _write_projection_fixture(database)
     database.chmod(0o640)
+    source_mode = stat.S_IMODE(database.stat().st_mode)
 
     SQLiteProjectionGuard(clock=lambda: instant).stamp(
         database,
@@ -1053,7 +1057,11 @@ def test_projection_stamp_preserves_source_mode(tmp_path: Path) -> None:
         builder_version="projection-builder/test",
     )
 
-    assert stat.S_IMODE(database.stat().st_mode) == 0o640
+    resulting_mode = stat.S_IMODE(database.stat().st_mode)
+    if os.name == "nt":
+        assert bool(resulting_mode & 0o222) == bool(source_mode & 0o222)
+    else:
+        assert resulting_mode == source_mode
     assert _projection_candidate_paths(database) == ()
 
 
@@ -1068,6 +1076,7 @@ def test_projection_stamp_can_replace_read_only_source_and_preserves_mode(
     database = tmp_path / "query.sqlite"
     _write_projection_fixture(database)
     database.chmod(0o444)
+    source_mode = stat.S_IMODE(database.stat().st_mode)
 
     SQLiteProjectionGuard(clock=lambda: instant).stamp(
         database,
@@ -1076,12 +1085,88 @@ def test_projection_stamp_can_replace_read_only_source_and_preserves_mode(
         builder_version="projection-builder/test",
     )
 
-    assert stat.S_IMODE(database.stat().st_mode) == 0o444
+    resulting_mode = stat.S_IMODE(database.stat().st_mode)
+    if os.name == "nt":
+        assert bool(resulting_mode & 0o222) == bool(source_mode & 0o222)
+    else:
+        assert resulting_mode == source_mode
     assert SQLiteProjectionGuard().require_compatible(
         database,
         expected_schema_version=1,
         expected_builder_version="projection-builder/test",
     ).snapshot_id == snapshot.id
+
+
+@pytest.mark.parametrize("winerror", (None, 1175, 1176, 1177))
+def test_windows_readonly_projection_replace_failure_restores_exact_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    winerror: int | None,
+) -> None:
+    workspace, store = _workspace(tmp_path)
+    instant = datetime(2026, 8, 2, 12, 0, tzinfo=UTC)
+    snapshot = _manager(workspace, store, instant=instant).capture(
+        created_by="operator:test"
+    )
+    database = tmp_path / "query.sqlite"
+    _write_projection_fixture(database)
+    original = database.read_bytes()
+    database.chmod(0o444)
+    source_mode = stat.S_IMODE(database.stat().st_mode)
+
+    if os.name != "nt":
+        def simulate_readonly_state(
+            path: Path,
+            identity: object,
+            *,
+            readonly: bool,
+        ) -> object:
+            assert truth_module._capture_projection_identity(path) == identity
+            path.chmod(0o444 if readonly else 0o644)
+            updated = truth_module._capture_projection_identity(path)
+            assert updated is not None
+            return updated
+
+        monkeypatch.setattr(
+            truth_module,
+            "_windows_set_projection_readonly_state",
+            simulate_readonly_state,
+        )
+
+    def fail_replace(
+        selected: Path,
+        candidate: Path,
+        backup: Path | None,
+    ) -> None:
+        assert backup is not None
+        if winerror == 1177:
+            selected.replace(backup)
+        error = OSError("injected ReplaceFileW failure")
+        if winerror is not None:
+            error.winerror = winerror  # type: ignore[attr-defined]
+        raise error
+
+    monkeypatch.setattr(truth_module.sys, "platform", "win32")
+    monkeypatch.setattr(truth_module, "_windows_replace_file", fail_replace)
+    monkeypatch.setattr(truth_module, "_windows_flush_directory", lambda path: None)
+    monkeypatch.setattr(
+        truth_module,
+        "_windows_apply_candidate_mode",
+        _apply_native_or_simulated_windows_mode,
+    )
+
+    with pytest.raises(OSError, match="injected ReplaceFileW failure"):
+        SQLiteProjectionGuard(clock=lambda: instant).stamp(
+            database,
+            snapshot,
+            schema_version=1,
+            builder_version="projection-builder/test",
+        )
+
+    assert database.read_bytes() == original
+    resulting_mode = stat.S_IMODE(database.stat().st_mode)
+    assert bool(resulting_mode & 0o222) == bool(source_mode & 0o222)
+    assert _projection_candidate_paths(database) == ()
 
 
 def test_projection_stamp_rejects_active_sidecar_without_mutation(tmp_path: Path) -> None:
@@ -1409,21 +1494,38 @@ def test_projection_stamp_rejects_sidecar_created_at_exchange_boundary(
     _write_projection_fixture(database)
     original = database.read_bytes()
     sidecar = Path(f"{database}-wal")
-    exchange = truth_module._atomic_exchange_paths
-    exchanges = 0
+    if os.name == "nt":
+        replace = truth_module._windows_replace_file
 
-    def add_sidecar_after_exchange(first: Path, second: Path) -> None:
-        nonlocal exchanges
-        exchange(first, second)
-        exchanges += 1
-        if exchanges == 1:
+        def add_sidecar_after_replace(
+            selected: Path,
+            candidate: Path,
+            backup: Path | None,
+        ) -> None:
+            replace(selected, candidate, backup)
             sidecar.write_bytes(b"concurrent sqlite owner")
 
-    monkeypatch.setattr(
-        truth_module,
-        "_atomic_exchange_paths",
-        add_sidecar_after_exchange,
-    )
+        monkeypatch.setattr(
+            truth_module,
+            "_windows_replace_file",
+            add_sidecar_after_replace,
+        )
+    else:
+        exchange = truth_module._atomic_exchange_paths
+        exchanges = 0
+
+        def add_sidecar_after_exchange(first: Path, second: Path) -> None:
+            nonlocal exchanges
+            exchange(first, second)
+            exchanges += 1
+            if exchanges == 1:
+                sidecar.write_bytes(b"concurrent sqlite owner")
+
+        monkeypatch.setattr(
+            truth_module,
+            "_atomic_exchange_paths",
+            add_sidecar_after_exchange,
+        )
 
     with pytest.raises(
         (ValueError, RuntimeError),
@@ -2432,10 +2534,15 @@ def test_projection_reader_failure_cleans_or_safely_quarantines_validation_snaps
     if failure != "missing":
         _write_projection_fixture(database)
     if failure == "token":
+        token_bytes = truth_module.secrets.token_bytes
         monkeypatch.setattr(
             truth_module.secrets,
             "token_bytes",
-            lambda length: (_ for _ in ()).throw(OSError("token generation failed")),
+            lambda length: (
+                (_ for _ in ()).throw(OSError("token generation failed"))
+                if length == 32
+                else token_bytes(length)
+            ),
         )
     elif failure == "open":
         open_file = truth_module.os.open
