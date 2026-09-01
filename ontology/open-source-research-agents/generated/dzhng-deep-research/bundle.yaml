@@ -3,9 +3,9 @@ topic: State of available open-source research agents
 topic_concept_id: concept:open-source-research-agents
 recorded_at: '2026-08-04T18:26:46.073536Z'
 sources:
-- key: dzhng-deep-research-e157f80f5866
-  path: sources/dzhng-deep-research-e157f80f5866.md
-  expected_sha256: e157f80f58668649c2d0b528dbad422de671d52a551cf2160156be685c7947fd
+- key: dzhng-deep-research-7813045fe377
+  path: sources/dzhng-deep-research-7813045fe377.md
+  expected_sha256: 7813045fe3770dc540fc1b95aeb9f4f76d9dc848e0920d05fabdc7f041795259
   acquired_at: '2026-08-04T18:25:35.445054Z'
   original_locator: https://github.com/dzhng/deep-research/tree/1f8f3e285bbc23e80b98a66a64effab9069f3ad4/README.md
   title: dzhng/deep-research README at 1f8f3e285bbc
@@ -139,13 +139,13 @@ concepts:
   review_state: accepted
 evidence:
 - key: identity-description-evidence-1
-  source_key: dzhng-deep-research-e157f80f5866
+  source_key: dzhng-deep-research-7813045fe377
   exact: An AI-powered research assistant that performs iterative, deep research on
     any topic by combining search engines, web scraping, and large language models.
   start: 22
   end: 176
 - key: goal-simplicity-evidence-1
-  source_key: dzhng-deep-research-e157f80f5866
+  source_key: dzhng-deep-research-7813045fe377
   exact: The goal of this repo is to provide the simplest implementation of a deep
     research agent - e.g. an agent that can refine its research direction over time
     and deep dive into a topic. Goal is to keep the repo size at <500 LoC so it is
@@ -153,98 +153,98 @@ evidence:
   start: 178
   end: 450
 - key: creator-duet-evidence-1
-  source_key: dzhng-deep-research-e157f80f5866
+  source_key: dzhng-deep-research-7813045fe377
   exact: If you like this project, please consider starring it and giving me a follow
     on [X/Twitter](https://x.com/dzhng). This project is created by [Duet](https://duet.so).
   start: 452
   end: 617
 - key: feature-iterative-research-evidence-1
-  source_key: dzhng-deep-research-e157f80f5866
+  source_key: dzhng-deep-research-7813045fe377
   exact: '- **Iterative Research**: Performs deep research by iteratively generating
     search queries, processing results, and diving deeper based on findings'
   start: 1756
   end: 1902
 - key: feature-query-generation-evidence-1
-  source_key: dzhng-deep-research-e157f80f5866
+  source_key: dzhng-deep-research-7813045fe377
   exact: '- **Intelligent Query Generation**: Uses LLMs to generate targeted search
     queries based on research goals and previous findings'
   start: 1903
   end: 2030
 - key: feature-depth-breadth-evidence-1
-  source_key: dzhng-deep-research-e157f80f5866
+  source_key: dzhng-deep-research-7813045fe377
   exact: '- **Depth & Breadth Control**: Configurable parameters to control how wide
     (breadth) and deep (depth) the research goes'
   start: 2031
   end: 2150
 - key: feature-smart-followup-evidence-1
-  source_key: dzhng-deep-research-e157f80f5866
+  source_key: dzhng-deep-research-7813045fe377
   exact: '- **Smart Follow-up**: Generates follow-up questions to better understand
     research needs'
   start: 2151
   end: 2239
 - key: feature-comprehensive-reports-evidence-1
-  source_key: dzhng-deep-research-e157f80f5866
+  source_key: dzhng-deep-research-7813045fe377
   exact: '- **Comprehensive Reports**: Produces detailed markdown reports with findings
     and sources'
   start: 2240
   end: 2329
 - key: feature-concurrent-processing-evidence-1
-  source_key: dzhng-deep-research-e157f80f5866
+  source_key: dzhng-deep-research-7813045fe377
   exact: '- **Concurrent Processing**: Handles multiple searches and result processing
     in parallel for efficiency'
   start: 2330
   end: 2433
 - key: requirement-nodejs-evidence-1
-  source_key: dzhng-deep-research-e157f80f5866
+  source_key: dzhng-deep-research-7813045fe377
   exact: '- Node.js environment'
   start: 2452
   end: 2473
 - key: requirement-firecrawl-evidence-1
-  source_key: dzhng-deep-research-e157f80f5866
+  source_key: dzhng-deep-research-7813045fe377
   exact: '  - Firecrawl API (for web search and content extraction)'
   start: 2490
   end: 2547
 - key: requirement-openai-evidence-1
-  source_key: dzhng-deep-research-e157f80f5866
+  source_key: dzhng-deep-research-7813045fe377
   exact: '  - OpenAI API (for o3 mini model)'
   start: 2548
   end: 2582
 - key: local-model-config-evidence-1
-  source_key: dzhng-deep-research-e157f80f5866
+  source_key: dzhng-deep-research-7813045fe377
   exact: 'To use local LLM, comment out `OPENAI_KEY` and instead uncomment `OPENAI_ENDPOINT`
     and `OPENAI_MODEL`:'
   start: 2936
   end: 3038
 - key: local-model-config-evidence-2
-  source_key: dzhng-deep-research-e157f80f5866
+  source_key: dzhng-deep-research-7813045fe377
   exact: '- Set `OPENAI_ENDPOINT` to the address of your local server (eg."http://localhost:1234/v1")'
   start: 3040
   end: 3131
 - key: local-model-config-evidence-3
-  source_key: dzhng-deep-research-e157f80f5866
+  source_key: dzhng-deep-research-7813045fe377
   exact: '- Set `OPENAI_MODEL` to the name of the model loaded in your local server.'
   start: 3132
   end: 3206
 - key: deepseek-r1-config-evidence-1
-  source_key: dzhng-deep-research-e157f80f5866
+  source_key: dzhng-deep-research-7813045fe377
   exact: 'Deep research performs great on R1! We use [Fireworks](http://fireworks.ai)
     as the main provider for the R1 model. To use R1, simply set a Fireworks API key:'
   start: 4484
   end: 4641
 - key: deepseek-r1-config-evidence-2
-  source_key: dzhng-deep-research-e157f80f5866
+  source_key: dzhng-deep-research-7813045fe377
   exact: The system will automatically switch over to use R1 instead of `o3-mini`
     when the key is detected.
   start: 4680
   end: 4778
 - key: custom-endpoint-config-evidence-1
-  source_key: dzhng-deep-research-e157f80f5866
+  source_key: dzhng-deep-research-7813045fe377
   exact: There are 2 other optional env vars that lets you tweak the endpoint (for
     other OpenAI compatible APIs like OpenRouter or Gemini) as well as the model string.
   start: 4813
   end: 4971
 - key: custom-endpoint-config-evidence-2
-  source_key: dzhng-deep-research-e157f80f5866
+  source_key: dzhng-deep-research-7813045fe377
   exact: 'OPENAI_ENDPOINT="custom_endpoint"
 
     CUSTOM_MODEL="custom_model"
@@ -253,122 +253,122 @@ evidence:
   start: 4981
   end: 5043
 - key: docker-deployment-evidence-1
-  source_key: dzhng-deep-research-e157f80f5866
+  source_key: dzhng-deep-research-7813045fe377
   exact: '### Docker'
   start: 3208
   end: 3218
 - key: docker-deployment-evidence-2
-  source_key: dzhng-deep-research-e157f80f5866
+  source_key: dzhng-deep-research-7813045fe377
   exact: 1. Clone the repository
   start: 3220
   end: 3243
 - key: docker-deployment-evidence-3
-  source_key: dzhng-deep-research-e157f80f5866
+  source_key: dzhng-deep-research-7813045fe377
   exact: 2. Rename `.env.example` to `.env.local` and set your API keys
   start: 3244
   end: 3306
 - key: docker-deployment-evidence-4
-  source_key: dzhng-deep-research-e157f80f5866
+  source_key: dzhng-deep-research-7813045fe377
   exact: 3. Run `docker build -f Dockerfile`
   start: 3308
   end: 3343
 - key: docker-deployment-evidence-5
-  source_key: dzhng-deep-research-e157f80f5866
+  source_key: dzhng-deep-research-7813045fe377
   exact: '4. Run the Docker image:'
   start: 3345
   end: 3369
 - key: docker-deployment-evidence-6
-  source_key: dzhng-deep-research-e157f80f5866
+  source_key: dzhng-deep-research-7813045fe377
   exact: 'docker compose up -d
 
     '
   start: 3379
   end: 3400
 - key: docker-deployment-evidence-7
-  source_key: dzhng-deep-research-e157f80f5866
+  source_key: dzhng-deep-research-7813045fe377
   exact: '5. Execute `npm run docker` in the docker service:'
   start: 3405
   end: 3455
 - key: docker-deployment-evidence-8
-  source_key: dzhng-deep-research-e157f80f5866
+  source_key: dzhng-deep-research-7813045fe377
   exact: 'docker exec -it deep-research npm run docker
 
     '
   start: 3465
   end: 3510
 - key: concurrency-config-evidence-1
-  source_key: dzhng-deep-research-e157f80f5866
+  source_key: dzhng-deep-research-7813045fe377
   exact: If you have a paid version of Firecrawl or a local version, feel free to
     increase the `ConcurrencyLimit` by setting the `CONCURRENCY_LIMIT` environment
     variable so it runs faster.
   start: 4149
   end: 4328
 - key: output-report-evidence-1
-  source_key: dzhng-deep-research-e157f80f5866
+  source_key: dzhng-deep-research-7813045fe377
   exact: The final report will be saved as `report.md` or `answer.md` in your working
     directory, depending on which modes you selected.
   start: 4004
   end: 4130
 - key: license-mit-evidence-1
-  source_key: dzhng-deep-research-e157f80f5866
+  source_key: dzhng-deep-research-7813045fe377
   exact: MIT License - feel free to use and modify as needed.
-  start: 5918
-  end: 5970
+  start: 5920
+  end: 5972
 - key: architecture-flow-evidence-1
-  source_key: dzhng-deep-research-e157f80f5866
+  source_key: dzhng-deep-research-7813045fe377
   exact: "```mermaid\nflowchart TB\n    subgraph Input\n        Q[User Query]\n  \
     \      B[Breadth Parameter]\n        D[Depth Parameter]\n    end"
   start: 636
   end: 764
 - key: architecture-flow-evidence-2
-  source_key: dzhng-deep-research-e157f80f5866
+  source_key: dzhng-deep-research-7813045fe377
   exact: "    DR[Deep Research] -->\n    SQ[SERP Queries] -->\n    PR[Process Results]"
   start: 766
   end: 840
 - key: architecture-flow-evidence-3
-  source_key: dzhng-deep-research-e157f80f5866
+  source_key: dzhng-deep-research-7813045fe377
   exact: "    subgraph Results[Results]\n        direction TB\n        NL((Learnings))\n\
     \        ND((Directions))\n    end"
   start: 842
   end: 949
 - key: architecture-flow-evidence-4
-  source_key: dzhng-deep-research-e157f80f5866
+  source_key: dzhng-deep-research-7813045fe377
   exact: "    PR --> NL\n    PR --> ND"
   start: 951
   end: 978
 - key: architecture-flow-evidence-5
-  source_key: dzhng-deep-research-e157f80f5866
+  source_key: dzhng-deep-research-7813045fe377
   exact: '    DP{depth > 0?}'
   start: 980
   end: 998
 - key: architecture-flow-evidence-6
-  source_key: dzhng-deep-research-e157f80f5866
+  source_key: dzhng-deep-research-7813045fe377
   exact: "    RD[\"Next Direction:\n    - Prior Goals\n    - New Questions\n    -\
     \ Learnings\"]"
   start: 1000
   end: 1079
 - key: architecture-flow-evidence-7
-  source_key: dzhng-deep-research-e157f80f5866
+  source_key: dzhng-deep-research-7813045fe377
   exact: '    MR[Markdown Report]'
   start: 1081
   end: 1104
 - key: architecture-flow-evidence-8
-  source_key: dzhng-deep-research-e157f80f5866
+  source_key: dzhng-deep-research-7813045fe377
   exact: "    %% Main Flow\n    Q & B & D --> DR"
   start: 1106
   end: 1143
 - key: architecture-flow-evidence-9
-  source_key: dzhng-deep-research-e157f80f5866
+  source_key: dzhng-deep-research-7813045fe377
   exact: "    %% Results to Decision\n    NL & ND --> DP"
   start: 1145
   end: 1190
 - key: architecture-flow-evidence-10
-  source_key: dzhng-deep-research-e157f80f5866
+  source_key: dzhng-deep-research-7813045fe377
   exact: "    %% Circular Flow\n    DP -->|Yes| RD\n    RD -->|New Context| DR"
   start: 1192
   end: 1258
 - key: architecture-flow-evidence-11
-  source_key: dzhng-deep-research-e157f80f5866
+  source_key: dzhng-deep-research-7813045fe377
   exact: "    %% Final Output\n    DP -->|No| MR"
   start: 1260
   end: 1297

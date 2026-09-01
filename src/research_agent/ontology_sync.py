@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -13,7 +14,9 @@ from uuid import uuid4
 
 from pydantic import Field
 
+from research_agent.credential_scanning import contains_possible_credential
 from research_agent.models import StrictModel, utc_now
+from research_agent.ontology_subscriptions import OntologySubscription
 from research_agent.user_config import OntologyGitConfig
 
 if os.name == "nt":
@@ -44,17 +47,7 @@ ontology-build-state.json
 _SENSITIVE_NAME = re.compile(
     r"(?i)(^|/)(?:\.env(?:\..*)?|.*(?:credential|secret).*)$|\.(?:key|pem|p12|pfx)$"
 )
-_SENSITIVE_CONTENT = (
-    re.compile(rb"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----"),
-    re.compile(rb"\b(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]{20,}\b"),
-    re.compile(rb"\bAKIA[0-9A-Z]{16}\b"),
-    re.compile(rb"\bsk-[A-Za-z0-9_-]{20,}\b"),
-    re.compile(
-        rb"(?im)^\s*[A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD)\s*[:=]"
-        rb"\s*['\"]?[^\s'\"]{12,}"
-    ),
-)
-_GIT_ID = re.compile(r"^[0-9a-f]{40}$")
+_GIT_ID = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 
 
 class OntologySyncError(RuntimeError):
@@ -83,65 +76,82 @@ class OntologyFreshnessReceipt(StrictModel):
 
 
 class OntologyRepositoryManager:
-    def __init__(self, *, checkout: Path, config: OntologyGitConfig) -> None:
+    def __init__(self, *, checkout: Path, config: OntologyGitConfig | OntologySubscription) -> None:
         self.checkout = checkout.expanduser().resolve()
         self.config = config
+
+    def assert_pushable(self) -> None:
+        """Read-only proof that artifact publication can be followed by a safe push."""
+        if not self._is_branch_ref():
+            raise OntologySyncError(
+                "tag and commit ontology refs are read-only; publication requires a branch"
+            )
+        if not (self.checkout / ".git").is_dir():
+            raise OntologySyncError("ontology publication checkout is not a Git repository")
+        self._assert_checkout_root()
+        self._assert_remote(create_missing=False)
+        self._assert_active_checkout()
+        if self._status(ignore_generated_gitignore=True):
+            raise OntologySyncError(
+                "ontology checkout has local changes; refusing artifact publication"
+            )
 
     def pull(self) -> dict[str, object]:
         cloned = self._ensure_checkout()
         self._assert_remote()
         old_commit = self._head()
         if old_commit is not None and not cloned:
-            self._assert_profile_branch()
+            self._assert_active_checkout()
         if self._status(ignore_generated_gitignore=True):
             raise OntologySyncError(
                 "ontology checkout has local changes; commit/push or restore them before pull"
             )
         fetched_ref = self._fetched_ref()
-        remote_branch = self._run(
-            (
-                "git",
-                "ls-remote",
-                "--exit-code",
-                "--heads",
-                self.config.remote,
-                self.config.branch,
-            ),
-            check=False,
+        expected_object = (
+            self._active_ref()
+            if _GIT_ID.fullmatch(self._active_ref())
+            else self._advertised_object()
         )
-        if remote_branch.returncode not in {0, 2}:
+        if expected_object is None and not self._is_branch_ref():
             raise OntologySyncError(
-                "Git ls-remote failed for the configured ontology remote; "
-                "check network access and authentication"
+                f"configured ontology ref {self._active_ref()!r} does not exist on the remote"
             )
-        exists = remote_branch.returncode == 0
-        if not exists and old_commit is not None:
+        if expected_object is None and old_commit is not None:
             raise OntologySyncError(
-                f"configured ontology branch {self.config.branch!r} does not exist on the remote"
+                f"configured ontology branch {self._branch_name()!r} does not exist on the remote"
             )
+        exists = expected_object is not None
         if exists:
+            source = self._active_ref()
             self._run(
                 (
                     "git",
                     "fetch",
                     "--no-tags",
                     self.config.remote,
-                    f"+refs/heads/{self.config.branch}:{fetched_ref}",
+                    f"+{source}:{fetched_ref}",
                 )
             )
+            fetched_object = self._run(("git", "rev-parse", "--verify", fetched_ref)).stdout.strip()
+            if fetched_object != expected_object:
+                raise OntologySyncError("fetched ontology ref does not match the advertised object")
             fetched_commit = self._run(
                 ("git", "rev-parse", "--verify", f"{fetched_ref}^{{commit}}")
             ).stdout.strip()
             if not _GIT_ID.fullmatch(fetched_commit):
-                raise OntologySyncError("fetched ontology branch is not a full Git object ID")
-            if self._has_head():
-                current = self._run(("git", "branch", "--show-current")).stdout.strip()
-                if cloned and current != self.config.branch:
-                    self._run(("git", "checkout", "-B", self.config.branch, fetched_commit))
+                raise OntologySyncError("fetched ontology ref is not a full Git commit ID")
+            if self._is_branch_ref():
+                branch = self._branch_name()
+                if self._has_head():
+                    current = self._run(("git", "branch", "--show-current")).stdout.strip()
+                    if cloned and current != branch:
+                        self._run(("git", "checkout", "-B", branch, fetched_commit))
+                    else:
+                        self._run(("git", "merge", "--ff-only", fetched_commit))
                 else:
-                    self._run(("git", "merge", "--ff-only", fetched_commit))
+                    self._run(("git", "checkout", "-B", branch, fetched_commit))
             else:
-                self._run(("git", "checkout", "-B", self.config.branch, fetched_commit))
+                self._run(("git", "checkout", "--detach", fetched_commit))
             integrated_commit = self._head()
             if integrated_commit != fetched_commit:
                 raise OntologySyncError(
@@ -149,7 +159,7 @@ class OntologyRepositoryManager:
                 )
             if self._status(ignore_generated_gitignore=True):
                 raise OntologySyncError(
-                    "ontology checkout changed after fast-forward; refusing downstream work"
+                    "ontology checkout changed after synchronization; refusing downstream work"
                 )
         else:
             self._set_unborn_branch()
@@ -158,7 +168,8 @@ class OntologyRepositoryManager:
         return {
             "checkout": str(self.checkout),
             "repository": self.config.url,
-            "branch": self.config.branch,
+            "branch": self._branch_name() if self._is_branch_ref() else self._active_ref(),
+            "active_ref": self._active_ref(),
             "cloned": cloned,
             "pulled": exists,
             "old_commit": old_commit,
@@ -221,7 +232,7 @@ class OntologyRepositoryManager:
             local_commit = self._head()
             next_state = OntologyFreshnessState(
                 repository=self.config.url,
-                branch=self.config.branch,
+                branch=self._active_ref(),
                 checked_at=now,
                 remote_commit=remote_commit,
                 local_commit=local_commit,
@@ -249,6 +260,10 @@ class OntologyRepositoryManager:
         message: str = "geas: update ontologies",
         freshness_state_path: Path | None = None,
     ) -> dict[str, object]:
+        if not self._is_branch_ref():
+            raise OntologySyncError(
+                "tag and commit ontology refs are read-only; push requires a branch"
+            )
         self._ensure_checkout()
         self._assert_remote()
         self._set_unborn_branch()
@@ -260,21 +275,16 @@ class OntologyRepositoryManager:
         self._run(("git", "add", "-A", "--", *(item.as_posix() for item in targets)))
         all_staged = tuple(
             Path(line)
-            for line in self._run(("git", "diff", "--cached", "--name-only")).stdout.splitlines()
+            for line in self._run(
+                ("git", "diff", "--cached", "--no-renames", "--name-only", "-z")
+            ).stdout.split("\x00")
             if line
         )
         unexpected = tuple(path for path in all_staged if not self._within_targets(path, targets))
         if unexpected:
             names = ", ".join(path.as_posix() for path in unexpected)
             raise OntologySyncError(f"refusing to include previously staged paths: {names}")
-        scanned = tuple(
-            Path(line)
-            for line in self._run(
-                ("git", "diff", "--cached", "--name-only", "--diff-filter=ACMR")
-            ).stdout.splitlines()
-            if line
-        )
-        self._scan_staged(scanned)
+        self._scan_staged(all_staged)
         changed = bool(self._run(("git", "diff", "--cached", "--quiet"), check=False).returncode)
         if changed:
             self._run(("git", "commit", "-m", message))
@@ -284,20 +294,43 @@ class OntologyRepositoryManager:
                     "push",
                     "--set-upstream",
                     self.config.remote,
-                    self.config.branch,
+                    f"HEAD:{self._active_ref()}",
                 )
             )
+            head = self._head()
+            assert head is not None
+            self._run(("git", "update-ref", self._fetched_ref(), head))
             if freshness_state_path is not None:
                 self._record_successful_push(freshness_state_path)
         return {
             "checkout": str(self.checkout),
             "repository": self.config.url,
-            "branch": self.config.branch,
+            "branch": self._branch_name(),
+            "active_ref": self._active_ref(),
             "changed": changed,
             "pushed": changed,
             "commit": self._head(),
             "staged_paths": tuple(path.as_posix() for path in all_staged),
         }
+
+    def assert_removable(self) -> None:
+        """Validate exact identity and clean synchronized state before removal."""
+        if not (self.checkout / ".git").is_dir():
+            raise OntologySyncError("subscription checkout is not a Git repository")
+        self._assert_checkout_root()
+        self._assert_remote(create_missing=False)
+        self._assert_active_checkout()
+        changes = self._status(ignore_generated_gitignore=True)
+        if changes:
+            raise OntologySyncError(
+                "ontology checkout has local changes; preserve it or restore them before removal"
+            )
+        head = self._head()
+        synchronized = self._remote_head()
+        if head is None or synchronized is None or head != synchronized:
+            raise OntologySyncError(
+                "ontology checkout does not match its exact last synchronized commit"
+            )
 
     def ensure_gitignore(self) -> Path:
         path = self.checkout / ".gitignore"
@@ -326,14 +359,16 @@ class OntologyRepositoryManager:
         if top != self.checkout:
             raise OntologySyncError("configured ontology directory is not the Git checkout root")
 
-    def _assert_remote(self) -> None:
+    def _assert_remote(self, *, create_missing: bool = True) -> None:
         result = self._run(
             ("git", "remote", "get-url", self.config.remote),
             check=False,
         )
         if result.returncode != 0:
-            self._run(("git", "remote", "add", self.config.remote, self.config.url))
-            return
+            if create_missing:
+                self._run(("git", "remote", "add", self.config.remote, self.config.url))
+                return
+            raise OntologySyncError(f"ontology remote identity {self.config.remote!r} is missing")
         if _normalized_url(result.stdout.strip()) != _normalized_url(self.config.url):
             raise OntologySyncError(
                 f"ontology remote {self.config.remote!r} does not match the configured URL"
@@ -341,9 +376,9 @@ class OntologyRepositoryManager:
 
     def _set_unborn_branch(self) -> None:
         if self._has_head():
-            self._assert_profile_branch()
+            self._assert_active_checkout()
             return
-        self._run(("git", "symbolic-ref", "HEAD", f"refs/heads/{self.config.branch}"))
+        self._run(("git", "symbolic-ref", "HEAD", self._active_ref()))
 
     def _has_head(self) -> bool:
         return self._run(("git", "rev-parse", "--verify", "HEAD"), check=False).returncode == 0
@@ -359,15 +394,58 @@ class OntologyRepositoryManager:
         )
         return result.stdout.strip() if result.returncode == 0 else None
 
-    def _assert_profile_branch(self) -> None:
+    def _assert_active_checkout(self) -> None:
         current = self._run(("git", "branch", "--show-current")).stdout.strip()
-        if current != self.config.branch:
+        if self._is_branch_ref() and current != self._branch_name():
             raise OntologySyncError(
-                f"ontology checkout is on branch {current!r}, expected {self.config.branch!r}"
+                f"ontology checkout is on branch {current!r}, expected {self._branch_name()!r}"
+            )
+        if not self._is_branch_ref() and current:
+            raise OntologySyncError(
+                f"ontology checkout is on branch {current!r}, expected a detached read-only ref"
             )
 
     def _fetched_ref(self) -> str:
-        return f"refs/geas-sync/{self.config.branch}"
+        if self._is_branch_ref():
+            return f"refs/geas-sync/{self._branch_name()}"
+        digest = hashlib.sha256(self._active_ref().encode()).hexdigest()
+        return f"refs/geas-sync/{digest}"
+
+    def _active_ref(self) -> str:
+        return self.config.active_ref
+
+    def _is_branch_ref(self) -> bool:
+        return self._active_ref().startswith("refs/heads/")
+
+    def _branch_name(self) -> str:
+        if not self._is_branch_ref():
+            raise OntologySyncError("configured ontology ref is not a writable branch")
+        return self._active_ref().removeprefix("refs/heads/")
+
+    def _advertised_object(self) -> str | None:
+        active_ref = self._active_ref()
+        arguments = (
+            (self.config.remote, active_ref)
+            if not _GIT_ID.fullmatch(active_ref)
+            else (self.config.remote,)
+        )
+        result = self._run(("git", "ls-remote", "--exit-code", *arguments), check=False)
+        if result.returncode == 2:
+            return None
+        if result.returncode != 0:
+            raise OntologySyncError(
+                "Git ls-remote failed for the configured ontology remote; "
+                "check network access and authentication"
+            )
+        matches: set[str] = set()
+        for line in result.stdout.splitlines():
+            object_id, _, ref = line.partition("\t")
+            if (_GIT_ID.fullmatch(active_ref) and object_id == active_ref) or ref == active_ref:
+                matches.add(object_id)
+        if len(matches) != 1:
+            return None
+        match = next(iter(matches))
+        return match if _GIT_ID.fullmatch(match) else None
 
     def _load_freshness_state(self, path: Path) -> OntologyFreshnessState | None:
         if not path.exists():
@@ -395,7 +473,7 @@ class OntologyRepositoryManager:
                 path,
                 OntologyFreshnessState(
                     repository=self.config.url,
-                    branch=self.config.branch,
+                    branch=self._active_ref(),
                     checked_at=now,
                     remote_commit=head,
                     local_commit=head,
@@ -413,10 +491,12 @@ class OntologyRepositoryManager:
             return False
         if not (self.checkout / ".git").is_dir():
             return False
-        if (
-            _normalized_url(state.repository) != _normalized_url(self.config.url)
-            or state.branch != self.config.branch
-        ):
+        if _normalized_url(state.repository) != _normalized_url(
+            self.config.url
+        ) or state.branch not in {
+            self._active_ref(),
+            self._branch_name() if self._is_branch_ref() else "",
+        }:
             return False
         age = now.timestamp() - state.checked_at.timestamp()
         return 0 <= age < max_age_seconds
@@ -437,26 +517,79 @@ class OntologyRepositoryManager:
             line for line in self._run(("git", "status", "--porcelain")).stdout.splitlines() if line
         )
         if ignore_generated_gitignore:
-            return tuple(line for line in lines if line != "?? .gitignore")
+            ignore = self.checkout / ".gitignore"
+            generated = (
+                not ignore.is_symlink()
+                and ignore.is_file()
+                and ignore.read_text() == DEFAULT_ONTOLOGY_GITIGNORE
+            )
+            return tuple(line for line in lines if line != "?? .gitignore" or not generated)
         return lines
 
     def _scan_staged(self, paths: tuple[Path, ...]) -> None:
+        requested = {relative.as_posix(): relative for relative in paths}
+        entries: dict[str, tuple[str, str]] = {}
+        if requested:
+            raw = self._run(
+                (
+                    "git",
+                    "ls-files",
+                    "--stage",
+                    "-z",
+                    "--",
+                    *requested,
+                )
+            ).stdout
+            for entry in raw.split("\x00"):
+                if not entry:
+                    continue
+                metadata, separator, name = entry.partition("\t")
+                if not separator or name not in requested:
+                    raise OntologySyncError("staged ontology index contains an unsafe path")
+                fields = metadata.split()
+                if len(fields) != 3:
+                    raise OntologySyncError("staged ontology index metadata is invalid")
+                mode, object_id, stage = fields
+                if stage != "0" or name in entries or not _GIT_ID.fullmatch(object_id):
+                    raise OntologySyncError("staged ontology index is not canonical")
+                entries[name] = (mode, object_id)
         for relative in paths:
             name = relative.as_posix()
+            staged = entries.get(name)
+            if staged is None:
+                # A deletion has no stage-zero blob to publish or scan.
+                continue
             if _SENSITIVE_NAME.search(name):
                 raise OntologySyncError(f"refusing to push credential-like path: {name}")
-            path = self.checkout / relative
-            if path.is_symlink():
-                raise OntologySyncError(f"refusing to push symbolic link: {name}")
-            if not path.exists():
-                continue
-            if path.stat().st_size > 10_000_000:
+            mode, object_id = staged
+            if mode not in {"100644", "100755"}:
+                raise OntologySyncError(f"refusing to push unsafe staged mode {mode}: {name}")
+            if self._staged_blob_size(object_id) > 10_000_000:
                 raise OntologySyncError(f"refusing to scan oversized ontology file: {name}")
-            content = path.read_bytes()
+            content = self._read_staged_blob(object_id)
             if b"\x00" in content:
                 raise OntologySyncError(f"refusing to push binary ontology file: {name}")
-            if any(pattern.search(content) for pattern in _SENSITIVE_CONTENT):
+            if contains_possible_credential(content):
                 raise OntologySyncError(f"possible credential detected; refusing to push: {name}")
+
+    def _read_staged_blob(self, object_id: str) -> bytes:
+        completed = subprocess.run(
+            ("git", "cat-file", "blob", object_id),
+            cwd=self.checkout,
+            env=self._git_environment(),
+            capture_output=True,
+            check=False,
+        )
+        if completed.returncode != 0:
+            raise OntologySyncError("could not read a staged ontology blob")
+        return completed.stdout
+
+    def _staged_blob_size(self, object_id: str) -> int:
+        completed = self._run(("git", "cat-file", "-s", object_id))
+        value = completed.stdout.strip()
+        if not value.isascii() or not value.isdecimal():
+            raise OntologySyncError("staged ontology blob size is invalid")
+        return int(value)
 
     @staticmethod
     def _within_targets(path: Path, targets: tuple[Path, ...]) -> bool:
@@ -480,13 +613,7 @@ class OntologyRepositoryManager:
         cwd: Path,
         check: bool,
     ) -> subprocess.CompletedProcess[str]:
-        environment = {
-            **os.environ,
-            "GIT_TERMINAL_PROMPT": "0",
-            "GIT_CONFIG_COUNT": "1",
-            "GIT_CONFIG_KEY_0": "core.hooksPath",
-            "GIT_CONFIG_VALUE_0": os.devnull,
-        }
+        environment = OntologyRepositoryManager._git_environment()
         completed = subprocess.run(
             command,
             cwd=cwd,
@@ -499,6 +626,17 @@ class OntologyRepositoryManager:
             detail = completed.stderr.strip()[-2000:]
             raise OntologySyncError(f"Git command failed ({command[0]} {command[1]}): {detail}")
         return completed
+
+    @staticmethod
+    def _git_environment() -> dict[str, str]:
+        return {
+            **os.environ,
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_NO_REPLACE_OBJECTS": "1",
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "core.hooksPath",
+            "GIT_CONFIG_VALUE_0": os.devnull,
+        }
 
 
 def _normalized_url(value: str) -> str:

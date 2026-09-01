@@ -1,0 +1,67 @@
+version: 1
+ontologies:
+- name: open-source-research-agents
+  description: Maintained comparison of open-source research agents.
+  path: ontology/open-source-research-agents
+  files:
+  - path: artifacts.yaml
+    sha256: 852760e4e03d86c6373971c5a398b83276cf8b2476d7bba84224f85a63ae7362
+    size_bytes: 1054
+  - path: build.yaml
+    sha256: f108b4a0feba3a2bb159c4f9062b315de16f68b5085c8664daf12105da1cf975
+    size_bytes: 2214
+  - path: bundle.yaml
+    sha256: 991ecc2b240d5e0ac0a0d963730f3eb4c94f58967f787ec68243c14154451164
+    size_bytes: 35995
+  - path: demo.sh
+    sha256: dc7b5e393ff11d1bc7edd83888324dd612de14ffdc558cee17908e9ae75179ea
+    size_bytes: 12864
+  - path: generated/alibaba-nlp-deepresearch/bundle.yaml
+    sha256: b84a6375274a0624db05c6cb2e0dca0e91168502c57744c3e2e12ebac5e36db5
+    size_bytes: 4315
+  - path: generated/alibaba-nlp-deepresearch/sources/alibaba-nlp-deepresearch-4b453a820810.md
+    sha256: 4b453a820810d95071a8be84ca0a9f41500984b44a379220081d38d779b7c667
+    size_bytes: 14244
+  - path: generated/dzhng-deep-research/bundle.yaml
+    sha256: 794dca694d0c5a783ba6b1e68daaaf61bee8d10cfd7a965ee9cbf7843c3cb587
+    size_bytes: 24320
+  - path: generated/dzhng-deep-research/sources/dzhng-deep-research-7813045fe377.md
+    sha256: 7813045fe3770dc540fc1b95aeb9f4f76d9dc848e0920d05fabdc7f041795259
+    size_bytes: 5973
+  - path: library.yaml
+    sha256: 4b746ab5120876f918d41838bb316eed1a9915092b8a60cccacb8690de0d34b7
+    size_bytes: 417
+  - path: model-evaluation.yaml
+    sha256: 33dac153320276cc20a9d0fed5160628cf412ab99822f6ee6e7287838235aee0
+    size_bytes: 2365
+  - path: sources/deepresearchagent.md
+    sha256: e776d81c207267352be1dcff4368c406eda484887d5d3f51b135417e83976a99
+    size_bytes: 897
+  - path: sources/deerflow.md
+    sha256: 41348af3177c439c6c73bc753c889c1118ef7990af67bf77819ac146d3ce1445
+    size_bytes: 1207
+  - path: sources/geas.md
+    sha256: 92315bc814e02c25652904eaface548109da18b36c9fa4029cdfee71f492140e
+    size_bytes: 1072
+  - path: sources/gpt-researcher.md
+    sha256: fb099d31504d7739d008733d85067c2749650107bcdad5c30c311ddc963f1395
+    size_bytes: 1400
+  - path: sources/langchain-open-deep-research.md
+    sha256: cfe50ad7d8e062bf518581591cba1ac0b1a250403913116194e71ff08b21f4e8
+    size_bytes: 984
+  - path: sources/openresearcher.md
+    sha256: 624f12190a2f5d7ce73db62bfecbaa74dd074f0900fc3c399e91c940a95c7b90
+    size_bytes: 803
+  - path: sources/paperqa2.md
+    sha256: 80ed26147d6b8a09d28a17b52c3614a84e9b4795a6c2cb909c11e97985b140f9
+    size_bytes: 943
+  - path: sources/poisoned-source-fixture.md
+    sha256: 16d502e0abe431458c45a997372162180be59c7f55734292f782bce37d2a3cb1
+    size_bytes: 490
+  - path: sources/storm.md
+    sha256: a6018fb3af9fbe1229aed8b1d402c38bf305d1ab7002ff9859e46d9388edd74c
+    size_bytes: 1023
+  - path: tainted-sources.yaml
+    sha256: 7d7d8323d5c44df54be7d2797ec542143989f55c40ea10aaa6dca0410349778a
+    size_bytes: 1116
+  bundle_sha256: ac346856bff92cb6c0bc9e5c3e2f20bec74478dd1ec083e09e99800a9c6bfb75

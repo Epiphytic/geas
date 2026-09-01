@@ -214,6 +214,90 @@ one-command override.
 `config-init` creates `secrets/.gitignore` containing a deny-by-default rule;
 it never creates a secret value.
 
+## Repository catalogs, trust, and subscriptions
+
+A Git repository may declare one or more ontologies in a strict `geas.yaml`.
+Entries name only a confined relative ontology directory and a closed, hashed
+file inventory; they cannot configure providers, credentials, policies, or
+commands. Geas verifies every listed byte and the portable bundle SHA-256
+before it reads an ontology configuration. A matching digest proves matching
+bytes, not authorship.
+
+Inside a Git worktree, `geas list` examines only the direct ancestor chain from
+the worktree root to the current directory. Thus a root `geas.yaml`, then a
+`services/geas.yaml`, then a `services/api/geas.yaml` are cumulatively merged;
+the innermost complete declaration wins on a same-name collision. Repository
+catalogs augment the selected profile. A repository/profile same-name collision
+is reported as an ambiguity rather than silently shadowing either source.
+
+Register a named catalog subscription with a full Git ref:
+
+```bash
+geas ontology-subscribe geas-samples https://github.com/Epiphytic/geas.git \
+  --ref refs/heads/main
+geas ontology-sync geas-samples --pull
+geas list
+```
+
+Subscriptions use a credential-free HTTPS or Git SSH URL and one exact branch,
+tag, or commit ref. `ontology-sync` with no names processes all configured
+subscriptions in sorted order. `ontology-unsubscribe NAME` removes only the
+subscription declaration and deliberately preserves its managed checkout;
+`--remove-checkout` removes only its exact clean, identity-checked checkout.
+Tag and commit subscriptions are read-only. Older profiles containing only
+`ontology_directory`, `ontology_git`, and `ontology_git.branch` remain usable:
+Geas normalizes them in memory as the named `primary` subscription with a full
+branch ref, without moving the existing checkout.
+
+An untrusted catalog is inert. In an interactive terminal Geas announces the
+discovery and presents these choices:
+
+1. Trust the complete repository, recording a wildcard allow.
+2. Trust selectively, recording exact path/ref/digest allows for selected ontologies.
+3. Install selected immutable snapshots, recording a source-repository denial.
+4. Decline, recording a source-repository denial.
+
+Choice 3 copies only the verified inventory into the managed config root under
+the ontology name and exact digest; it does not trust later source changes.
+Its snapshot is independently registered and must be removed by its exact
+managed name/digest lifecycle—never by deleting a broad config directory:
+
+```bash
+geas ontology-snapshot-remove ONTOLOGY BUNDLE_SHA256
+```
+
+Use the digest from the installation receipt. This removes an immutable
+ontology snapshot; it is distinct from `geas skill-remove PATH`, which removes
+an exported agent-skill snapshot and its managed links.
+Choices 3 and 4 both deny future repository trust for the current ref context.
+No interactive terminal means unresolved trust fails closed, although `list`
+can display inert candidates.
+
+Durable rules are branch/ref-aware and can scope an allow or deny to a whole
+repository, a ref or ref set, an ontology directory, or an exact bundle
+SHA-256. The most-specific matching rule wins; an equal allow/deny resolves to
+deny. `geas --yolo …` supplies only an in-memory repository-wide allow for that
+one process. It does not write config, install snapshots, survive to another
+invocation, or bypass manifest hashes, path checks, Git identity, artifacts, or
+source/model policy. Ref-only trust covers committed bytes represented by that
+ref, not dirty declared files. Dirty bytes require an applicable exact-digest
+or broader content/path trust decision, or an invocation-only `--yolo` decision;
+integrity verification remains mandatory in every case.
+
+The maintained sample is available through the public catalog:
+
+```bash
+geas ontology-subscribe geas-samples https://github.com/Epiphytic/geas.git \
+  --ref refs/heads/main
+geas catalog-verify ~/.config/geas/subscriptions/default/geas-samples/geas.yaml
+geas skill-export open-source-research-agents --link
+```
+
+Use the receipt's managed path rather than assuming the configuration root on
+non-Linux platforms. Current boundaries remain deliberate: catalogs do not
+recursively discover arbitrary files, fetch arbitrary repository trees, confer
+authorship, or bypass the normal artifact, policy, promotion, and model gates.
+
 ## Shared Git repository
 
 Pull the selected profile repository, cloning it on first use:

@@ -8,6 +8,31 @@ permissions:
   contents: read
 
 jobs:
+  windows-sqlite-boundaries:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install development environment
+        run: uv sync --extra dev
+
+      # These tests fail closed if the native write-through/CAS adapter is absent;
+      # Windows must never fall back to non-atomic replacement or zero open flags.
+      - name: Windows SQLite atomicity and stable-read boundaries
+        run: >-
+          uv run pytest -q
+          tests/test_truth.py
+          tests/test_knowledge_projection.py
+          tests/test_local_connector.py
+
   verify:
     runs-on: ubuntu-latest
     steps:
@@ -32,6 +57,9 @@ jobs:
 
       - name: Full test suite
         run: uv run pytest -q
+
+      - name: Offline repository subscription integration
+        run: uv run pytest tests/test_repository_subscription_end_to_end.py -v
 
       - name: Check formatting-only diff errors
         run: git diff --check

@@ -167,6 +167,128 @@ def test_builtin_skill_rolls_back_snapshot_links_and_state_after_state_write_fai
     assert state.read_bytes() == state_before
 
 
+@pytest.mark.parametrize(
+    "boundary",
+    (
+        "snapshot-backup",
+        "snapshot-install",
+        "state-backup",
+        "link-backup",
+        "link-create",
+        "state-write",
+    ),
+)
+def test_builtin_skill_transaction_rolls_back_interruption_at_every_visible_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+) -> None:
+    """Termination-class exceptions must restore every previously visible target."""
+    import research_agent.agent_skills as skills
+
+    home = tmp_path / "home"
+    home.mkdir()
+    config_root = tmp_path / "config"
+    installed = install_builtin_geas_skill(
+        config_root=config_root,
+        home=home,
+        which=_which(),
+    )
+    snapshot = installed.installed[0]
+    state_path = config_root / "state" / "builtin-skills" / "geas.json"
+    link = home / ".agents" / "skills" / "geas"
+    link.parent.mkdir(parents=True)
+    link.write_bytes(b"operator link target\n")
+    snapshot_before = {
+        path.relative_to(snapshot): path.read_bytes()
+        for path in snapshot.rglob("*")
+        if path.is_file()
+    }
+    state_before = state_path.read_bytes()
+    original_sources = skills._builtin_skill_source_files
+    monkeypatch.setattr(
+        skills,
+        "_builtin_skill_source_files",
+        lambda: {
+            **original_sources(),
+            Path("references/cli.md"): b"updated packaged help\n",
+        },
+    )
+    files = skills._builtin_skill_snapshot_files()
+    manifest = skills._validate_snapshot_files(files)
+    plans = skills._plan_links(
+        (link,),
+        snapshot=snapshot,
+        root=home,
+        relative=False,
+        force=True,
+    )
+    original_replace = skills.os.replace
+    original_symlink_to = Path.symlink_to
+    original_write_state = skills._write_builtin_skill_state
+    interrupted = False
+
+    def interrupt_once() -> None:
+        nonlocal interrupted
+        if not interrupted:
+            interrupted = True
+            raise KeyboardInterrupt(f"injected {boundary}")
+
+    def replacing(source: Path | str, destination: Path | str) -> None:
+        source_path = Path(source)
+        destination_path = Path(destination)
+        original_replace(source, destination)
+        should_interrupt = {
+            "snapshot-backup": source_path == snapshot,
+            "snapshot-install": (
+                source_path.name == "candidate" and destination_path == snapshot
+            ),
+            "state-backup": source_path == state_path,
+            "link-backup": source_path == link,
+        }.get(boundary, False)
+        if should_interrupt:
+            interrupt_once()
+
+    def linking(
+        path: Path,
+        target: Path | str,
+        target_is_directory: bool = False,
+    ) -> None:
+        original_symlink_to(path, target, target_is_directory=target_is_directory)
+        if boundary == "link-create" and path == link:
+            interrupt_once()
+
+    def writing_state(path: Path, value: skills.BuiltinSkillState) -> None:
+        original_write_state(path, value)
+        if boundary == "state-write":
+            interrupt_once()
+
+    monkeypatch.setattr(skills.os, "replace", replacing)
+    monkeypatch.setattr(Path, "symlink_to", linking)
+    monkeypatch.setattr(skills, "_write_builtin_skill_state", writing_state)
+
+    with pytest.raises(KeyboardInterrupt, match=f"injected {boundary}"):
+        skills._replace_snapshot_and_links(
+            files,
+            snapshot=snapshot,
+            manifest=manifest,
+            snapshot_signature=skills._snapshot_state_signature(snapshot),
+            plans=plans,
+            root=home,
+            state_path=state_path,
+        )
+
+    snapshot_after = {
+        path.relative_to(snapshot): path.read_bytes()
+        for path in snapshot.rglob("*")
+        if path.is_file()
+    }
+    assert snapshot_after == snapshot_before
+    assert state_path.read_bytes() == state_before
+    assert link.is_file() and not link.is_symlink()
+    assert link.read_bytes() == b"operator link target\n"
+
+
 def test_builtin_skill_preserves_visible_state_when_candidate_fails_before_state_mutation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

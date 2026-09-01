@@ -11,6 +11,7 @@ import sys
 from datetime import UTC, datetime
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
+from typing import Literal, TextIO
 from uuid import uuid4
 
 from pydantic_core import to_jsonable_python
@@ -31,6 +32,7 @@ from research_agent.audit import DeterministicKnowledgeAuditor
 from research_agent.benchmark import ProjectionBenchmark
 from research_agent.budget import BudgetPolicy, UsageLedger
 from research_agent.bundles import KnowledgeBundleImporter
+from research_agent.catalog_skill_export import export_catalog_skill
 from research_agent.citations import CitationDocumentManager, IdentifierKind
 from research_agent.connectors import (
     CrossrefDiscoveryConnector,
@@ -97,19 +99,39 @@ from research_agent.ontology_artifacts import (
     ArtifactRole,
     GitHubReleaseArtifactStore,
     OntologyArtifactManager,
+    _sqlite_input_revision,
 )
 from research_agent.ontology_build import (
     OntologyBuildConfig,
     OntologyBuilder,
     OntologyBuildReceipt,
 )
-from research_agent.ontology_catalog import inventory_ontologies
+from research_agent.ontology_catalog import inventory_catalog, inventory_ontologies
+from research_agent.ontology_recovery import recover_managed_removals
+from research_agent.ontology_resolution import (
+    OntologyCatalog,
+    OntologySelection,
+    legacy_directory_candidates,
+    resolve_ontology_catalog,
+    select_ontology,
+)
+from research_agent.ontology_subscriptions import (
+    OntologySubscription,
+    SubscriptionManager,
+    validate_subscription_name,
+)
 from research_agent.ontology_sync import OntologyRepositoryManager
+from research_agent.ontology_trust import (
+    TrustPrompt,
+    authorize_repository_catalog,
+    remove_snapshot,
+)
 from research_agent.operator_policy import ResearchPolicy
 from research_agent.parsing import ParsedDocumentManager
 from research_agent.paths import (
     resolve_ontology_build_config,
     resolve_profile_ontology_config,
+    resolve_selected_ontology_config,
     shared_ontology_directory,
 )
 from research_agent.planning import (
@@ -136,6 +158,15 @@ from research_agent.render import (
     render_topic_obsidian,
     write_obsidian_vault,
 )
+from research_agent.repository_catalog import (
+    ResolvedRepositoryCatalog,
+    VerifiedCatalogOntology,
+    refresh_catalog,
+    resolve_repository_catalog,
+    validate_bundle_sha256,
+    validate_ontology_name,
+    verify_catalog,
+)
 from research_agent.research import DiscoveryExecutor, OfflineResearchRunner
 from research_agent.secrets import load_env_file, load_secret_sources
 from research_agent.store import ImmutableStore
@@ -144,6 +175,7 @@ from research_agent.truth import SQLiteProjectionGuard, TruthManager, TruthPolic
 from research_agent.user_config import (
     GeasProfile,
     GeasUserConfig,
+    OntologyGitConfig,
     UserConfigManager,
     default_config_path,
 )
@@ -196,6 +228,242 @@ def _local_approval_principal(root: Path) -> AuthenticatedPrincipal:
 
 def _user_config_manager(args: argparse.Namespace) -> UserConfigManager:
     return UserConfigManager(args.geas_config)
+
+
+def _validate_snapshot_removal_arguments(ontology: str, bundle_sha256: str) -> None:
+    """Validate untrusted CLI tokens before configuration-path resolution."""
+    validate_ontology_name(ontology)
+    validate_bundle_sha256(bundle_sha256)
+
+
+class _StderrTrustPrompt(TrustPrompt):
+    """Interactive decisions whose only capability is terminal I/O."""
+
+    def __init__(
+        self,
+        *,
+        input_stream: TextIO | None = None,
+        output_stream: TextIO | None = None,
+    ) -> None:
+        self.input_stream = input_stream or sys.stdin
+        self.output_stream = output_stream or sys.stderr
+
+    def _read_choice(self, prompt: str, allowed: frozenset[str]) -> str:
+        while True:
+            print(prompt, end="", file=self.output_stream, flush=True)
+            value = self.input_stream.readline()
+            if value == "":
+                raise ValueError("repository trust prompt ended without a decision")
+            normalized = value.strip()
+            if normalized in allowed:
+                return normalized
+            print(
+                f"Enter one of: {', '.join(sorted(allowed))}.",
+                file=self.output_stream,
+            )
+
+    def choose_action(
+        self, catalog: ResolvedRepositoryCatalog
+    ) -> Literal["1", "2", "3", "4"]:
+        identity = catalog.repository_identity if catalog is not None else "repository"
+        print(f"Repository ontologies were discovered from {identity}.", file=self.output_stream)
+        print("1. Trust completely", file=self.output_stream)
+        print("2. Trust selectively", file=self.output_stream)
+        print("3. Install immutable snapshots", file=self.output_stream)
+        print("4. No", file=self.output_stream)
+        value = self._read_choice(
+            "Choose 1, 2, 3, or 4: ", frozenset({"1", "2", "3", "4"})
+        )
+        if value not in {"1", "2", "3", "4"}:  # pragma: no cover - guarded above.
+            raise ValueError("invalid repository trust prompt choice")
+        return value
+
+    def select_ontology(
+        self,
+        ontology: VerifiedCatalogOntology,
+        *,
+        action: Literal["2", "3"],
+    ) -> bool:
+        verb = "trust" if action == "2" else "install"
+        value = self._read_choice(
+            f"{verb.capitalize()} ontology {ontology.name!r}? [y/n]: ",
+            frozenset({"n", "y"}),
+        )
+        return value == "y"
+
+
+def _interactive_trust_prompt() -> _StderrTrustPrompt | None:
+    if sys.stdin.isatty() and sys.stderr.isatty():
+        return _StderrTrustPrompt()
+    return None
+
+
+def _selected_user_config(
+    args: argparse.Namespace,
+    manager: UserConfigManager,
+) -> tuple[GeasUserConfig, str, GeasProfile]:
+    user_config = manager.load()
+    profile_name, profile = user_config.profile(args.geas_profile)
+    if profile_name != user_config.default_profile:
+        user_config = user_config.model_copy(update={"default_profile": profile_name})
+    return user_config, profile_name, profile
+
+
+def _resolve_cli_catalog(
+    args: argparse.Namespace,
+    *,
+    cwd: Path,
+    interactive: bool,
+) -> tuple[OntologyCatalog, UserConfigManager, GeasUserConfig, str, GeasProfile]:
+    manager = _user_config_manager(args)
+    if not manager.path.exists() and not args.yolo:
+        raise ValueError(
+            "catalog-aware ontology resolution requires an initialized Geas user config"
+        )
+    if manager.path.exists():
+        user_config, profile_name, profile = _selected_user_config(args, manager)
+    else:
+        user_config = GeasUserConfig.default()
+        profile_name, profile = user_config.profile(args.geas_profile)
+    catalog = resolve_ontology_catalog(
+        user_config=user_config,
+        manager=manager,
+        cwd=cwd,
+        yolo=args.yolo,
+        prompt=_interactive_trust_prompt() if interactive and not args.yolo else None,
+    )
+    return catalog, manager, user_config, profile_name, profile
+
+
+def _catalog_selection(
+    args: argparse.Namespace,
+    value: Path,
+    *,
+    freshen: bool = True,
+) -> OntologySelection | None:
+    if value.exists() or value.is_absolute() or len(value.parts) != 1:
+        return None
+    manager = _user_config_manager(args)
+    if not manager.path.exists() and not args.yolo:
+        return None
+    catalog, manager, _config, profile_name, _profile = _resolve_cli_catalog(
+        args,
+        cwd=Path.cwd(),
+        interactive=True,
+    )
+    selection = select_ontology(value.name, catalog=catalog)
+    subscription = selection.subscription
+    if subscription is None or not freshen:
+        return selection
+    checkout = manager.subscription_checkout(subscription)
+    if (
+        subscription.freshness.check_before_use
+        or subscription.pull_before_update
+        or not (checkout / ".git").is_dir()
+    ):
+        OntologyRepositoryManager(checkout=checkout, config=subscription).freshen(
+            state_path=(
+                manager.root
+                / "state"
+                / "ontology-sync"
+                / profile_name
+                / f"{selection.subscription_name}.json"
+            ),
+            max_age_seconds=subscription.freshness.max_age_seconds,
+            force=subscription.pull_before_update,
+        )
+        refreshed, _manager, _config, _profile_name, _profile = _resolve_cli_catalog(
+            args,
+            cwd=Path.cwd(),
+            interactive=True,
+        )
+        selection = select_ontology(value.name, catalog=refreshed)
+    return selection
+
+
+def _catalog_subscription_selection(
+    args: argparse.Namespace,
+    *,
+    ontology_name: str,
+    subscription_name: str,
+) -> OntologySelection:
+    """Resolve the exact manifest-declared source without cwd name shadowing."""
+    catalog, _manager, _config, _profile_name, _profile = _resolve_cli_catalog(
+        args,
+        cwd=Path.cwd(),
+        interactive=True,
+    )
+    matches = tuple(
+        candidate
+        for candidate in catalog.candidates
+        if candidate.name == ontology_name
+        and candidate.subscription_name == subscription_name
+        and candidate.source_kind == "subscription"
+    )
+    if len(matches) != 1:
+        raise ValueError(
+            f"ontology {ontology_name!r} is not uniquely declared by subscription "
+            f"{subscription_name!r}"
+        )
+    candidate = matches[0]
+    if candidate.trust_status != "trusted":
+        raise ValueError(
+            f"ontology {ontology_name!r} is not trusted for operational use "
+            f"({candidate.trust_status})"
+        )
+    return OntologySelection.model_validate(candidate.model_dump(mode="python"))
+
+
+def _subscription_catalog(path: Path) -> ResolvedRepositoryCatalog:
+    resolved = resolve_repository_catalog(path.parent)
+    if path.resolve() not in resolved.catalog_paths:
+        raise ValueError(f"configured subscription catalog was not discovered: {path}")
+    return resolved
+
+
+def _subscription_service(
+    args: argparse.Namespace,
+    *,
+    manager: UserConfigManager,
+    profile_name: str,
+) -> SubscriptionManager:
+    prompt = None if args.yolo else _interactive_trust_prompt()
+    return SubscriptionManager(
+        config_manager=manager,
+        profile_name=profile_name,
+        catalog_verifier=_subscription_catalog,
+        authorizer=lambda catalog: authorize_repository_catalog(
+            catalog,
+            manager=manager,
+            profile_name=profile_name,
+            yolo=args.yolo,
+            prompt=prompt,
+        ),
+    )
+
+
+def _rollback_first_subscription_config(
+    manager: UserConfigManager,
+    *,
+    expected_config: bytes,
+    checkout: Path,
+    root_existed: bool,
+) -> None:
+    """Restore the exact absent-config state after a first subscribe failure."""
+    if not manager.path.is_file() or manager.path.read_bytes() != expected_config:
+        raise RuntimeError("cannot safely restore absent Geas configuration state")
+    manager.path.unlink()
+    current = (manager.root / checkout).parent
+    while current.is_relative_to(manager.root):
+        if current == manager.root and root_existed:
+            break
+        try:
+            current.rmdir()
+        except OSError:
+            break
+        if current == manager.root:
+            break
+        current = current.parent
 
 
 def _profile_ontology_root(
@@ -280,23 +548,31 @@ def _resolve_portable_database(
     if not manager.path.exists():
         return value
     profile_name, profile = manager.profile(args.geas_profile)
-    if profile.ontology_git is None:
+    selection = _catalog_selection(args, value)
+    if selection is None:
         return value
-    root = _profile_ontology_root(
-        args,
-        pull_before_read=True,
-        ontology=value,
+    repository_config = selection.subscription
+    if repository_config is None and selection.source_kind == "legacy_profile":
+        repository_config = profile.ontology_git
+    if repository_config is None:
+        return value
+    ontology_directory = selection.ontology_directory
+    resolve_selected_ontology_config(
+        value,
+        filename="artifacts.yaml",
+        selection=selection,
     )
-    if root is None:
-        return value
-    ontology_directory = root / value.name
     artifact_manager = OntologyArtifactManager(ontology_directory)
     if not artifact_manager.manifest_path.is_file():
         return value
     receipt = artifact_manager.hydrate(
         store=GitHubReleaseArtifactStore(
-            profile.ontology_git.url,
-            branch=profile.ontology_git.branch,
+            repository_config.url,
+            branch=(
+                repository_config.active_ref
+                if isinstance(repository_config, OntologySubscription)
+                else repository_config.branch
+            ),
         ),
         roles=(role,),
     )
@@ -370,6 +646,52 @@ def _require_profile_matches_manifest(profile: GeasProfile, manifest: SkillManif
         )
 
 
+def _catalog_subscription_from_manifest(
+    profile: GeasProfile,
+    manifest: SkillManifest,
+) -> tuple[str, OntologySubscription]:
+    ontology = manifest.ontology
+    if (
+        ontology.subscription_name is None
+        or ontology.active_ref is None
+        or ontology.catalog_path is None
+        or ontology.ontology_path is None
+        or ontology.bundle_sha256 is None
+        or ontology.ontology_commit is None
+        or manifest.artifact is None
+    ):
+        raise ValueError("the skill manifest has incomplete catalog provenance")
+    subscriptions = profile.normalized_subscriptions()
+    try:
+        subscription = subscriptions[ontology.subscription_name]
+    except KeyError:
+        raise ValueError(
+            f"the declaring subscription {ontology.subscription_name!r} is not configured"
+        ) from None
+    if (
+        _normalized_git_url(subscription.url)
+        != _normalized_git_url(ontology.repository_url)
+        or subscription.active_ref != ontology.active_ref
+        or subscription.catalog.as_posix() != ontology.catalog_path
+    ):
+        raise ValueError(
+            "the declaring subscription URL/ref/catalog does not match the skill manifest"
+        )
+    return ontology.subscription_name, subscription
+
+
+def _selection_repository_config(
+    selection: OntologySelection,
+    *,
+    profile: GeasProfile,
+) -> OntologySubscription | OntologyGitConfig:
+    if selection.subscription is not None:
+        return selection.subscription
+    if selection.source_kind == "legacy_profile" and profile.ontology_git is not None:
+        return profile.ontology_git
+    raise ValueError(f"ontology {selection.name!r} has no declaring artifact subscription")
+
+
 def _selected_ontology(
     root: Path,
     name: str,
@@ -396,12 +718,10 @@ def _selected_ontology(
 def _load_portable_topic(
     ontology_directory: Path,
     *,
-    profile: GeasProfile,
+    repository_config: OntologySubscription | OntologyGitConfig,
     topic_concept_id: str,
 ) -> tuple[TopicView, ArtifactHydrationReceipt]:
     """Hydrate and verify only the manifest-pinned knowledge projection artifact."""
-    if profile.ontology_git is None:
-        raise ValueError("the selected Geas profile has no ontology artifact source")
     manager = OntologyArtifactManager(ontology_directory)
     if not manager.manifest_path.is_file() or manager.manifest_path.is_symlink():
         raise ValueError(
@@ -411,14 +731,21 @@ def _load_portable_topic(
         )
     hydration = manager.hydrate(
         store=GitHubReleaseArtifactStore(
-            profile.ontology_git.url,
-            branch=profile.ontology_git.branch,
+            repository_config.url,
+            branch=repository_config.active_ref,
         ),
         roles=(ArtifactRole.KNOWLEDGE_PROJECTION,),
     )
     if len(hydration.hydrated) != 1:
         raise ValueError("verified ontology artifacts did not yield one knowledge projection")
-    database = Path(hydration.hydrated[0].path)
+    hydrated = hydration.hydrated[0]
+    database = Path(hydrated.path)
+    actual_input_revision = _sqlite_input_revision(database, hydrated.role)
+    if actual_input_revision != hydrated.input_revision:
+        raise ValueError(
+            "knowledge-projection artifact input revision does not match its verified "
+            "SQLite projection stamp"
+        )
     topic = KnowledgeQueryEngine(database).topic(topic_concept_id)
     return topic, hydration
 
@@ -526,42 +853,94 @@ def _complete_skill_update(
     manifest: SkillManifest,
     geas_receipt: GeasUpdateReceipt,
 ) -> dict[str, object]:
+    catalog_bound = manifest.ontology.bundle_sha256 is not None
+    if (
+        _normalized_git_url(manifest.geas.project_url)
+        != _normalized_git_url(geas_receipt.repository_url)
+        or geas_receipt.branch != "main"
+        or manifest.geas.version != geas_receipt.old_version
+        or (catalog_bound and manifest.geas.commit is None)
+        or (
+            manifest.geas.commit is not None
+            and manifest.geas.commit != geas_receipt.old_commit
+        )
+    ):
+        raise ValueError("executing Geas identity does not match the skill manifest")
     user_config = manager.load()
     profile_name, profile = user_config.profile(args.geas_profile)
-    _require_profile_matches_manifest(profile, manifest)
-    assert profile.ontology_git is not None
-    ontology_root = manager.ontology_root(profile)
+    if catalog_bound:
+        subscription_name, repository_config = _catalog_subscription_from_manifest(
+            profile,
+            manifest,
+        )
+        ontology_root = manager.subscription_checkout(repository_config)
+    else:
+        _require_profile_matches_manifest(profile, manifest)
+        assert profile.ontology_git is not None
+        repository_config = profile.ontology_git
+        ontology_root = manager.ontology_root(profile)
     print("Fast-forwarding the trusted ontology checkout.", file=sys.stderr)
     pull = OntologyRepositoryManager(
         checkout=ontology_root,
-        config=profile.ontology_git,
+        config=repository_config,
     ).pull()
     ontology_commit = pull.get("commit")
     if not isinstance(ontology_commit, str):
         raise ValueError("the synchronized ontology checkout has no committed HEAD")
-    old_ontology_commit = manifest.ontology.commit
+    old_ontology_commit = manifest.ontology.ontology_commit or manifest.ontology.commit
     try:
-        ontology_directory, topic_concept_id = _selected_ontology(
-            ontology_root,
-            manifest.ontology.name,
-            user_config=user_config,
-        )
+        selection: OntologySelection | None = None
+        if catalog_bound:
+            selection = _catalog_subscription_selection(
+                args,
+                ontology_name=manifest.ontology.name,
+                subscription_name=subscription_name,
+            )
+            if selection.commit != ontology_commit:
+                raise ValueError("selected ontology commit does not match synchronized HEAD")
+            if selection.repository_path is None or (
+                selection.repository_path.as_posix() != manifest.ontology.ontology_path
+            ):
+                raise ValueError("selected ontology path does not match the skill manifest")
+        else:
+            ontology_directory, topic_concept_id = _selected_ontology(
+                ontology_root,
+                manifest.ontology.name,
+                user_config=user_config,
+            )
         print("Verifying the updated portable knowledge projection.", file=sys.stderr)
-        topic, artifact = _load_portable_topic(
-            ontology_directory,
-            profile=profile,
-            topic_concept_id=topic_concept_id,
-        )
-        files = render_ontology_skill(
-            topic,
-            skill_name=manifest.skill.name,
-            ontology_name=manifest.ontology.name,
-            repository_url=profile.ontology_git.url,
-            branch=profile.ontology_git.branch,
-            ontology_commit=ontology_commit,
-            geas_version=geas_receipt.new_version,
-            geas_commit=geas_receipt.new_commit,
-        )
+        if selection is not None:
+            assert isinstance(repository_config, OntologySubscription)
+            catalog_export = export_catalog_skill(
+                selection,
+                artifact_store=GitHubReleaseArtifactStore(
+                    repository_config.url,
+                    branch=repository_config.active_ref,
+                ),
+                skill_name=manifest.skill.name,
+                geas_version=geas_receipt.new_version,
+                geas_commit=geas_receipt.new_commit,
+                defaults=user_config.ontology_defaults,
+            )
+            files = catalog_export.files
+            artifact = catalog_export.artifact
+        else:
+            topic, artifact = _load_portable_topic(
+                ontology_directory,
+                repository_config=repository_config,
+                topic_concept_id=topic_concept_id,
+            )
+            assert isinstance(repository_config, OntologyGitConfig)
+            files = render_ontology_skill(
+                topic,
+                skill_name=manifest.skill.name,
+                ontology_name=manifest.ontology.name,
+                repository_url=repository_config.url,
+                branch=repository_config.branch,
+                ontology_commit=ontology_commit,
+                geas_version=geas_receipt.new_version,
+                geas_commit=geas_receipt.new_commit,
+            )
         candidate_manifest = SkillManifest.model_validate_json(files[Path("geas-skill.json")])
         changed_paths, unchanged_paths = _skill_file_lifecycle(
             manifest,
@@ -656,6 +1035,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="named Geas profile for ontology location, Git sync, and secret sources",
     )
     parser.add_argument(
+        "--yolo",
+        action="store_true",
+        help="authorize discovered repository ontologies for this invocation only",
+    )
+    parser.add_argument(
         "--truth-policy",
         type=Path,
         default=None,
@@ -717,11 +1101,48 @@ def _build_parser() -> argparse.ArgumentParser:
 
     ontology_sync = subparsers.add_parser(
         "ontology-sync",
-        help="pull or safely commit and push the selected profile's ontology repository",
+        help="synchronize selected named ontology subscriptions",
     )
+    ontology_sync.add_argument("names", nargs="*")
     ontology_sync.add_argument("--pull", action="store_true")
     ontology_sync.add_argument("--push", action="store_true")
     ontology_sync.add_argument("--message", default="geas: update ontologies")
+
+    catalog_verify = subparsers.add_parser(
+        "catalog-verify",
+        help="verify one strict repository ontology catalog",
+    )
+    catalog_verify.add_argument("catalog", nargs="?", type=Path, default=Path("geas.yaml"))
+
+    catalog_refresh = subparsers.add_parser(
+        "catalog-refresh",
+        help="refresh declared hashes in one repository ontology catalog",
+    )
+    catalog_refresh.add_argument("catalog", nargs="?", type=Path, default=Path("geas.yaml"))
+    catalog_refresh.add_argument("ontology", nargs="*")
+
+    ontology_subscribe = subparsers.add_parser(
+        "ontology-subscribe",
+        help="add, synchronize, verify, and authorize one named ontology subscription",
+    )
+    ontology_subscribe.add_argument("name")
+    ontology_subscribe.add_argument("url")
+    ontology_subscribe.add_argument("--ref", dest="active_ref", default="refs/heads/main")
+    ontology_subscribe.add_argument("--catalog", type=Path, default=Path("geas.yaml"))
+
+    ontology_unsubscribe = subparsers.add_parser(
+        "ontology-unsubscribe",
+        help="remove one named ontology subscription",
+    )
+    ontology_unsubscribe.add_argument("name")
+    ontology_unsubscribe.add_argument("--remove-checkout", action="store_true")
+
+    ontology_snapshot_remove = subparsers.add_parser(
+        "ontology-snapshot-remove",
+        help="remove one exact registered immutable ontology snapshot",
+    )
+    ontology_snapshot_remove.add_argument("ontology")
+    ontology_snapshot_remove.add_argument("bundle_sha256")
 
     artifact_publish = subparsers.add_parser(
         "ontology-artifact-publish",
@@ -755,16 +1176,17 @@ def _build_parser() -> argparse.ArgumentParser:
         default=[],
     )
 
-    ontology_list = subparsers.add_parser(
-        "ontology-list",
-        help="list ontologies in the selected profile or a provided directory",
-    )
-    ontology_list.add_argument(
-        "directory",
-        type=Path,
-        nargs="?",
-        help="ontology root to inspect; omit for the selected Geas profile",
-    )
+    for command in ("list", "ontology-list"):
+        ontology_list = subparsers.add_parser(
+            command,
+            help="list profile and repository ontology candidates",
+        )
+        ontology_list.add_argument(
+            "directory",
+            type=Path,
+            nargs="?",
+            help="catalog discovery directory; omit to use the current directory",
+        )
 
     smoke = subparsers.add_parser("model-smoke", help="run a tool-free model smoke test")
     smoke.add_argument("--provider")
@@ -1181,6 +1603,11 @@ def _build_parser() -> argparse.ArgumentParser:
     truth_snapshot.add_argument("--root", type=Path, default=Path("data"))
     truth_snapshot.add_argument("--workspace", type=Path, default=Path("."))
     truth_snapshot.add_argument("--created-by", required=True)
+    truth_snapshot.add_argument(
+        "--created-at",
+        type=datetime.fromisoformat,
+        help="explicit timezone-aware snapshot time for reproducible builds",
+    )
     truth_snapshot.add_argument("--predecessor")
 
     truth_check = subparsers.add_parser(
@@ -1425,45 +1852,81 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = _build_parser().parse_args()
+    if args.command == "ontology-snapshot-remove":
+        _validate_snapshot_removal_arguments(args.ontology, args.bundle_sha256)
     _resolve_cli_config_paths(args)
+    recover_managed_removals(_user_config_manager(args))
 
     if args.command == "skill-export":
         manager = _user_config_manager(args)
         user_config = manager.load()
         profile_name, profile = user_config.profile(args.geas_profile)
-        if profile.ontology_git is None:
-            raise ValueError(f"Geas profile {profile_name!r} has no trusted ontology_git config")
-        print("Synchronizing the trusted ontology checkout for skill export.", file=sys.stderr)
-        ontology_root = manager.ontology_root(profile)
-        pull = OntologyRepositoryManager(
-            checkout=ontology_root,
-            config=profile.ontology_git,
-        ).pull()
-        ontology_commit = pull.get("commit")
-        if not isinstance(ontology_commit, str):
-            raise ValueError("the synchronized ontology checkout has no committed HEAD")
-        ontology_directory, topic_concept_id = _selected_ontology(
-            ontology_root,
-            args.ontology,
-            user_config=user_config,
+        selection = (
+            _catalog_selection(args, Path(args.ontology))
+            if profile.subscriptions or manager.ontology_root(profile).exists()
+            else None
         )
+        if selection is not None and selection.subscription is not None:
+            repository_config: OntologySubscription | OntologyGitConfig = (
+                _selection_repository_config(selection, profile=profile)
+            )
+            ontology_commit = selection.commit
+            if ontology_commit is None:
+                raise ValueError("the selected ontology has no committed Git identity")
+        else:
+            if profile.ontology_git is None:
+                raise ValueError(
+                    f"Geas profile {profile_name!r} has no declaring ontology subscription"
+                )
+            print("Synchronizing the trusted ontology checkout for skill export.", file=sys.stderr)
+            ontology_root = manager.ontology_root(profile)
+            repository_config = profile.ontology_git
+            pull = OntologyRepositoryManager(
+                checkout=ontology_root,
+                config=repository_config,
+            ).pull()
+            ontology_commit = pull.get("commit")
+            if not isinstance(ontology_commit, str):
+                raise ValueError("the synchronized ontology checkout has no committed HEAD")
+            ontology_directory, topic_concept_id = _selected_ontology(
+                ontology_root,
+                args.ontology,
+                user_config=user_config,
+            )
         print("Verifying the portable knowledge projection.", file=sys.stderr)
-        topic, artifact = _load_portable_topic(
-            ontology_directory,
-            profile=profile,
-            topic_concept_id=topic_concept_id,
-        )
         geas_version, geas_commit = _current_geas_identity()
-        files = render_ontology_skill(
-            topic,
-            skill_name=args.name or args.ontology,
-            ontology_name=args.ontology,
-            repository_url=profile.ontology_git.url,
-            branch=profile.ontology_git.branch,
-            ontology_commit=ontology_commit,
-            geas_version=geas_version,
-            geas_commit=geas_commit,
-        )
+        if selection is not None and selection.subscription is not None:
+            assert isinstance(repository_config, OntologySubscription)
+            catalog_export = export_catalog_skill(
+                selection,
+                artifact_store=GitHubReleaseArtifactStore(
+                    repository_config.url,
+                    branch=repository_config.active_ref,
+                ),
+                skill_name=args.name or args.ontology,
+                geas_version=geas_version,
+                geas_commit=geas_commit,
+                defaults=user_config.ontology_defaults,
+            )
+            files = catalog_export.files
+            artifact = catalog_export.artifact
+        else:
+            topic, artifact = _load_portable_topic(
+                ontology_directory,
+                repository_config=repository_config,
+                topic_concept_id=topic_concept_id,
+            )
+            assert isinstance(repository_config, OntologyGitConfig)
+            files = render_ontology_skill(
+                topic,
+                skill_name=args.name or args.ontology,
+                ontology_name=args.ontology,
+                repository_url=repository_config.url,
+                branch=repository_config.branch,
+                ontology_commit=ontology_commit,
+                geas_version=geas_version,
+                geas_commit=geas_commit,
+            )
         print("Installing the complete verified skill snapshot.", file=sys.stderr)
         receipt = export_skill(
             files,
@@ -1585,48 +2048,122 @@ def main() -> None:
         )
         return
 
-    if args.command == "ontology-sync":
+    if args.command == "ontology-snapshot-remove":
         manager = _user_config_manager(args)
-        user_config = manager.load_or_create()
-        profile_name, profile = user_config.profile(args.geas_profile)
-        if profile.ontology_git is None:
-            raise ValueError(f"Geas profile {profile_name!r} has no ontology_git config")
-        repository = OntologyRepositoryManager(
-            checkout=manager.ontology_root(profile),
-            config=profile.ontology_git,
+        _config, profile_name, profile = _selected_user_config(args, manager)
+        snapshot = next(
+            (
+                item
+                for item in profile.installed_ontologies
+                if (item.name, item.bundle_sha256)
+                == (args.ontology, args.bundle_sha256)
+            ),
+            None,
         )
-        pull_requested = args.pull or not args.push
-        result: dict[str, object] = {
-            "profile": profile_name,
-            "config": str(manager.path),
-        }
-        state_path = manager.root / "state" / "ontology-sync" / f"{profile_name}.json"
-        if pull_requested:
-            result["pull"] = repository.freshen(
-                state_path=state_path,
-                max_age_seconds=user_config.ontology_freshness.max_age_seconds,
-                force=args.pull or profile.ontology_git.pull_before_update,
+        if snapshot is None:
+            raise ValueError("ontology snapshot is not registered in the selected profile")
+        print(
+            f"Removing exact ontology snapshot {snapshot.name!r} ({snapshot.bundle_sha256}).",
+            file=sys.stderr,
+        )
+        _json(remove_snapshot(snapshot, manager=manager, profile_name=profile_name))
+        return
+
+    if args.command in {"ontology-subscribe", "ontology-unsubscribe", "ontology-sync"}:
+        manager = _user_config_manager(args)
+        subscription = None
+        first_config = False
+        first_config_bytes = b""
+        root_existed = manager.root.exists()
+        if args.command == "ontology-subscribe":
+            validate_subscription_name(args.name)
+            initial = manager.load() if manager.path.exists() else GeasUserConfig.default()
+            profile_name, _profile = initial.profile(args.geas_profile)
+            subscription = OntologySubscription(
+                url=args.url,
+                active_ref=args.active_ref,
+                checkout=Path("subscriptions") / profile_name / args.name,
+                catalog=args.catalog,
+                freshness=initial.ontology_freshness,
             )
-        if args.push:
-            if not pull_requested:
-                result["preflight"] = repository.freshen(
-                    state_path=state_path,
-                    max_age_seconds=user_config.ontology_freshness.max_age_seconds,
-                    force=profile.ontology_git.pull_before_update,
+            if not manager.path.exists():
+                manager.replace(initial)
+                first_config = True
+                first_config_bytes = manager.path.read_bytes()
+        user_config = manager.load() if first_config else manager.load_or_create()
+        profile_name, _profile = user_config.profile(args.geas_profile)
+        subscriptions = _subscription_service(
+            args,
+            manager=manager,
+            profile_name=profile_name,
+        )
+        if args.command == "ontology-subscribe":
+            assert subscription is not None
+            print(f"Subscribing and verifying {args.name!r}.", file=sys.stderr)
+            try:
+                receipt = subscriptions.subscribe(args.name, subscription)
+            except BaseException:
+                if first_config:
+                    _rollback_first_subscription_config(
+                        manager,
+                        expected_config=first_config_bytes,
+                        checkout=subscription.checkout,
+                        root_existed=root_existed,
+                    )
+                raise
+            if first_config:
+                manager.load_or_create()
+            _json(receipt)
+            return
+        if args.command == "ontology-unsubscribe":
+            print(f"Unsubscribing {args.name!r}.", file=sys.stderr)
+            _json(
+                subscriptions.unsubscribe(
+                    args.name,
+                    remove_checkout=args.remove_checkout,
                 )
-            result["push"] = repository.push(
-                relative_paths=(Path("."),),
-                message=args.message,
-                freshness_state_path=state_path,
             )
-        _json(result)
+            return
+        print("Synchronizing ontology subscriptions.", file=sys.stderr)
+        pull_requested = args.pull or not args.push
+        _json(
+            {
+                "profile": profile_name,
+                "subscriptions": subscriptions.sync(
+                    tuple(args.names),
+                    pull=pull_requested,
+                    push=args.push,
+                ),
+            }
+        )
+        return
+
+    if args.command == "catalog-verify":
+        verified = verify_catalog(args.catalog)
+        _json(
+            {
+                "catalog": str(args.catalog.expanduser().resolve()),
+                "count": len(verified),
+                "ontologies": verified,
+            }
+        )
+        return
+
+    if args.command == "catalog-refresh":
+        refreshed = refresh_catalog(args.catalog, names=tuple(args.ontology))
+        selected = tuple(args.ontology) or tuple(item.name for item in refreshed.ontologies)
+        _json(
+            {
+                "catalog": str(args.catalog.expanduser().resolve()),
+                "ontologies": selected,
+                "refreshed": refreshed,
+            }
+        )
         return
 
     if args.command in {"ontology-artifact-publish", "ontology-artifact-sync"}:
         manager = _user_config_manager(args)
         profile_name, profile = manager.profile(args.geas_profile)
-        if profile.ontology_git is None:
-            raise ValueError(f"Geas profile {profile_name!r} has no ontology_git config")
         ontology_value = Path(args.ontology)
         if (
             ontology_value.is_absolute()
@@ -1634,19 +2171,43 @@ def main() -> None:
             or ontology_value.name.startswith(".")
         ):
             raise ValueError("ontology artifact commands require one configured ontology name")
-        ontology_root = _profile_ontology_root(
-            args,
-            pull_before_read=True,
-            ontology=ontology_value,
-        )
-        assert ontology_root is not None
-        ontology_directory = ontology_root / ontology_value.name
+        selection = _catalog_selection(args, ontology_value)
+        if selection is None:
+            raise ValueError(f"configured ontology does not exist: {ontology_value.name}")
+        ontology_directory = selection.ontology_directory
         if not ontology_directory.is_dir() or ontology_directory.is_symlink():
             raise ValueError(f"configured ontology does not exist: {ontology_value.name}")
+        repository_config = selection.subscription
+        repository_root = selection.repository_root
+        if repository_config is None and selection.source_kind == "legacy_profile":
+            repository_config = profile.ontology_git
+            repository_root = manager.ontology_root(profile)
+        if repository_config is None:
+            raise ValueError(
+                f"ontology {ontology_value.name!r} has no declaring artifact subscription"
+            )
+        resolve_selected_ontology_config(
+            ontology_value,
+            filename="artifacts.yaml",
+            selection=selection,
+        )
+        repository = None
+        if args.command == "ontology-artifact-publish":
+            if repository_root is None:
+                raise ValueError("ontology artifact publication has no repository checkout")
+            repository = OntologyRepositoryManager(
+                checkout=repository_root,
+                config=repository_config,
+            )
+            repository.assert_pushable()
         artifact_manager = OntologyArtifactManager(ontology_directory)
         artifact_store = GitHubReleaseArtifactStore(
-            profile.ontology_git.url,
-            branch=profile.ontology_git.branch,
+            repository_config.url,
+            branch=(
+                repository_config.active_ref
+                if isinstance(repository_config, OntologySubscription)
+                else repository_config.branch
+            ),
         )
         if args.command == "ontology-artifact-sync":
             _json(
@@ -1667,12 +2228,10 @@ def main() -> None:
             knowledge_projection=args.knowledge_projection,
             generated_content=args.generated_content,
         )
-        repository = OntologyRepositoryManager(
-            checkout=ontology_root,
-            config=profile.ontology_git,
-        )
+        assert repository is not None
+        relative = selection.repository_path or Path(ontology_value.name)
         push = repository.push(
-            relative_paths=(Path(ontology_value.name),),
+            relative_paths=(relative,),
             message=(args.message or f"geas: publish artifacts for {ontology_value.name}"),
             freshness_state_path=(
                 manager.root / "state" / "ontology-sync" / f"{profile_name}.json"
@@ -1687,31 +2246,56 @@ def main() -> None:
         )
         return
 
-    if args.command == "ontology-list":
+    if args.command in {"list", "ontology-list"}:
         manager = _user_config_manager(args)
-        profile_name = None
         user_config = manager.load() if manager.path.exists() else GeasUserConfig.default()
-        if args.directory is None:
-            if manager.path.exists():
-                profile_name, _profile = manager.profile(args.geas_profile)
-                root = _profile_ontology_root(args, pull_before_read=True)
-                assert root is not None
-            else:
-                profile_name, profile = user_config.profile(args.geas_profile)
-                root = manager.ontology_root(profile)
-            location = "selected_profile"
-        else:
-            root = args.directory
-            location = "provided_directory"
-        inventory = inventory_ontologies(
-            root,
-            defaults=user_config.ontology_defaults,
+        profile_name, _profile = user_config.profile(args.geas_profile)
+        if profile_name != user_config.default_profile:
+            user_config = user_config.model_copy(update={"default_profile": profile_name})
+        discovery = args.directory or Path.cwd()
+        catalog = resolve_ontology_catalog(
+            user_config=user_config,
+            manager=manager,
+            cwd=discovery,
+            yolo=args.yolo,
+            prompt=None,
         )
+        if args.directory is not None:
+            catalog = catalog.model_copy(
+                update={
+                    "candidates": tuple(
+                        item for item in catalog.candidates if item.source_kind == "repository"
+                    )
+                }
+            )
+            extra = legacy_directory_candidates(args.directory)
+            known = {
+                (item.name, item.ontology_directory.resolve(), item.source)
+                for item in catalog.candidates
+            }
+            additions = tuple(
+                item
+                for item in extra
+                if (item.name, item.ontology_directory.resolve(), item.source) not in known
+            )
+            catalog = catalog.model_copy(
+                update={
+                    "candidates": tuple(
+                        sorted(
+                            (*catalog.candidates, *additions),
+                            key=lambda item: (item.name, item.source),
+                        )
+                    )
+                }
+            )
+        inventory = inventory_catalog(catalog)
         _json(
             {
                 **inventory.model_dump(mode="json"),
-                "location": location,
-                "profile": profile_name,
+                "location": (
+                    "provided_directory" if args.directory is not None else "selected_profile"
+                ),
+                "profile": profile_name if args.directory is None else None,
             }
         )
         return
@@ -2151,20 +2735,29 @@ def main() -> None:
         return
 
     if args.command == "ontology-build":
-        ontology_root = _profile_ontology_root(
-            args,
-            pull_before_read=not args.check,
-            ontology=args.config,
-        )
-        config_path = (
-            resolve_profile_ontology_config(
-                args.config,
-                filename="build.yaml",
-                ontology_root=ontology_root,
+        selection = _catalog_selection(args, args.config, freshen=not args.check)
+        ontology_root = None
+        if selection is None:
+            ontology_root = _profile_ontology_root(
+                args,
+                pull_before_read=not args.check,
+                ontology=args.config,
             )
-            if ontology_root is not None
-            else resolve_ontology_build_config(args.config)
+        config_path = resolve_selected_ontology_config(
+            args.config,
+            filename="build.yaml",
+            selection=selection,
         )
+        if selection is None:
+            config_path = (
+                resolve_profile_ontology_config(
+                    args.config,
+                    filename="build.yaml",
+                    ontology_root=ontology_root,
+                )
+                if ontology_root is not None
+                else resolve_ontology_build_config(args.config)
+            )
         manager = _user_config_manager(args)
         user_config = manager.load() if manager.path.exists() else GeasUserConfig.default()
         config = OntologyBuildConfig.from_yaml(
@@ -2174,7 +2767,17 @@ def main() -> None:
         acceptance_repository = None
         ontology_directory = None
         resolved_config = config_path.resolve()
-        if ontology_root is not None and resolved_config.is_relative_to(ontology_root.resolve()):
+        if selection is not None and selection.repository_root is not None:
+            acceptance_repository = selection.repository_root
+            ontology_directory = selection.repository_path
+        elif selection is not None and selection.source_kind == "legacy_profile":
+            _profile_name, selected_profile = user_config.profile(args.geas_profile)
+            if selected_profile.ontology_git is not None:
+                acceptance_repository = manager.ontology_root(selected_profile)
+                ontology_directory = selection.ontology_directory.relative_to(
+                    acceptance_repository
+                )
+        elif ontology_root is not None and resolved_config.is_relative_to(ontology_root.resolve()):
             _profile_name, selected_profile = user_config.profile(args.geas_profile)
             if selected_profile.ontology_git is not None:
                 acceptance_repository = ontology_root
@@ -2725,10 +3328,17 @@ def main() -> None:
     if args.command == "truth-snapshot":
         store = ImmutableStore(args.root)
         store.initialize()
+        if args.created_at is not None and args.created_at.tzinfo is None:
+            raise ValueError("truth snapshot --created-at must include a timezone")
         manager = TruthManager(
             workspace_root=args.workspace,
             store_root=store.root,
             policy=TruthPolicy.from_yaml(args.truth_policy),
+            clock=(
+                (lambda: args.created_at)
+                if args.created_at is not None
+                else (lambda: datetime.now(UTC))
+            ),
         )
         snapshot = manager.capture(
             created_by=args.created_by,
@@ -2848,20 +3458,25 @@ def main() -> None:
         return
 
     if args.command == "library-build":
-        ontology_root = _profile_ontology_root(
-            args,
-            pull_before_read=True,
-            ontology=args.manifest,
+        selection = _catalog_selection(args, args.manifest)
+        ontology_root = None
+        if selection is None:
+            ontology_root = _profile_ontology_root(
+                args,
+                pull_before_read=True,
+                ontology=args.manifest,
+            )
+        manifest_path = resolve_selected_ontology_config(
+            args.manifest,
+            filename="library.yaml",
+            selection=selection,
         )
-        manifest_path = (
-            resolve_profile_ontology_config(
+        if selection is None and ontology_root is not None:
+            manifest_path = resolve_profile_ontology_config(
                 args.manifest,
                 filename="library.yaml",
                 ontology_root=ontology_root,
             )
-            if ontology_root is not None
-            else args.manifest
-        )
         _json(
             SourceLibraryBuilder(store=ImmutableStore(args.root)).build(
                 SourceLibraryManifest.from_yaml(manifest_path),

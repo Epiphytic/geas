@@ -1,18 +1,21 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from research_agent.library import SourceLibraryManifest
 from research_agent.models import StrictModel
 from research_agent.ontology_build import OntologyBuildConfig
 from research_agent.ontology_config import OntologyBuildDefaults
 
+if TYPE_CHECKING:
+    from research_agent.ontology_resolution import OntologyCatalog
+
 
 class OntologyInventoryItem(StrictModel):
     name: str
     directory: str
-    status: Literal["valid", "incomplete", "invalid"]
+    status: Literal["valid", "incomplete", "invalid", "inert"]
     build_config: str | None = None
     library_config: str | None = None
     topic: str | None = None
@@ -21,6 +24,14 @@ class OntologyInventoryItem(StrictModel):
     library_id: str | None = None
     library_title: str | None = None
     problems: tuple[str, ...] = ()
+    source: str | None = None
+    source_kind: str | None = None
+    trust_status: Literal["trusted", "untrusted", "denied"] | None = None
+    repository_identity: str | None = None
+    active_ref: str | None = None
+    commit: str | None = None
+    catalog_path: str | None = None
+    bundle_sha256: str | None = None
 
 
 class OntologyInventory(StrictModel):
@@ -104,4 +115,30 @@ def inventory_ontologies(
         exists=True,
         count=len(items),
         ontologies=tuple(items),
+    )
+
+
+def inventory_catalog(catalog: OntologyCatalog) -> OntologyInventory:
+    """Render inert catalog candidates without opening ontology configuration files."""
+    items = tuple(
+        OntologyInventoryItem(
+            name=candidate.name,
+            directory=str(candidate.ontology_directory),
+            status="valid" if candidate.trust_status == "trusted" else "inert",
+            source=candidate.source,
+            source_kind=candidate.source_kind,
+            trust_status=candidate.trust_status,
+            repository_identity=candidate.repository_identity,
+            active_ref=candidate.active_ref,
+            commit=candidate.commit,
+            catalog_path=(str(candidate.catalog_path) if candidate.catalog_path else None),
+            bundle_sha256=candidate.bundle_sha256,
+        )
+        for candidate in catalog.candidates
+    )
+    return OntologyInventory(
+        root=str(catalog.cwd),
+        exists=catalog.cwd.exists(),
+        count=len(items),
+        ontologies=items,
     )

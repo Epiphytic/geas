@@ -20,24 +20,18 @@ from uuid import uuid4
 import yaml
 from pydantic import Field, field_validator, model_validator
 
+from research_agent.credential_scanning import (
+    contains_binary_credential_residue,
+    contains_credential_assignment_marker,
+    contains_fixed_credential,
+    contains_possible_credential,
+)
 from research_agent.models import StrictModel, canonical_json, utc_now
-from research_agent.truth import ProjectionStamp, SQLiteProjectionGuard
+from research_agent.truth import SQLiteProjectionGuard
 
 _ONTOLOGY_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 _ASSET_NAME = re.compile(r"geas-[a-z-]+-[0-9a-f]{64}\.(?:sqlite|zip)")
 _RELEASE_TAG = re.compile(r"geas-artifact-[0-9a-f]{64}")
-_SENSITIVE_CONTENT = (
-    re.compile(rb"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----"),
-    re.compile(rb"\b(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]{20,}\b"),
-    re.compile(rb"\bAKIA[0-9A-Z]{16}\b"),
-    re.compile(rb"\bsk-[A-Za-z0-9_-]{20,}\b"),
-    re.compile(
-        rb"(?im)^\s*[A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD)\s*[:=]"
-        rb"\s*['\"]?[^\s'\"]{12,}"
-    ),
-)
-
-
 class OntologyArtifactError(RuntimeError):
     pass
 
@@ -77,6 +71,20 @@ class OntologyArtifact(StrictModel):
         if not _RELEASE_TAG.fullmatch(value):
             raise ValueError("ontology artifact release tag is invalid")
         return value
+
+    @model_validator(mode="after")
+    def role_and_format_are_compatible(self) -> OntologyArtifact:
+        expected = (
+            ArtifactFormat.ZIP
+            if self.role is ArtifactRole.GENERATED_CONTENT
+            else ArtifactFormat.SQLITE
+        )
+        if self.format is not expected:
+            raise ValueError(
+                f"ontology artifact role {self.role.value!r} requires format "
+                f"{expected.value!r}"
+            )
+        return self
 
 
 class OntologyArtifactManifest(StrictModel):
@@ -351,25 +359,6 @@ class OntologyArtifactManager:
                 if path is None:
                     continue
                 previous = by_role.get(role)
-                if role is not ArtifactRole.GENERATED_CONTENT:
-                    source = path.expanduser()
-                    if source.is_symlink() or not source.is_file():
-                        raise OntologyArtifactError(
-                            f"SQLite ontology artifact is missing or unsafe: {path}"
-                        )
-                    quick_revision = _sqlite_input_revision(
-                        source.resolve(),
-                        role,
-                        verify_contents=False,
-                    )
-                    if (
-                        previous is not None
-                        and previous.input_revision == quick_revision
-                        and store.available(previous)
-                    ):
-                        by_role[role] = previous
-                        reused.append(role)
-                        continue
                 prepared = self._prepare(
                     role,
                     path,
@@ -379,13 +368,25 @@ class OntologyArtifactManager:
                 if (
                     previous is not None
                     and previous.input_revision == prepared[0].input_revision
+                    and previous.content_sha256 == prepared[0].content_sha256
+                    and previous.size_bytes == prepared[0].size_bytes
                     and store.available(previous)
                 ):
                     by_role[role] = previous
                     reused.append(role)
+                    self._verify_stored_artifact(
+                        store,
+                        previous,
+                        temporary_root=temporary_root,
+                    )
                     continue
                 artifact, asset_path = prepared
                 uploaded = store.ensure(artifact, asset_path)
+                self._verify_stored_artifact(
+                    store,
+                    artifact,
+                    temporary_root=temporary_root,
+                )
                 by_role[role] = artifact
                 (published if uploaded else reused).append(role)
             artifacts = tuple(sorted(by_role.values(), key=lambda item: item.role.value))
@@ -416,6 +417,11 @@ class OntologyArtifactManager:
         store: ArtifactStore,
         roles: tuple[ArtifactRole, ...] = (),
     ) -> ArtifactHydrationReceipt:
+        _validate_cache_path(
+            self.ontology_directory,
+            ontology_directory=self.ontology_directory,
+            expected_kind="directory",
+        )
         manifest = self.load()
         selected = set(roles) if roles else {item.role for item in manifest.artifacts}
         unknown = selected - {item.role for item in manifest.artifacts}
@@ -424,24 +430,108 @@ class OntologyArtifactManager:
                 "artifact manifest does not provide roles: "
                 + ", ".join(sorted(item.value for item in unknown))
             )
+        selected_artifacts = tuple(
+            artifact for artifact in manifest.artifacts if artifact.role in selected
+        )
+        destinations = tuple(
+            (artifact, self._cache_path(artifact)) for artifact in selected_artifacts
+        )
+        generated_output = self.cache / "generated"
+        if any(
+            artifact.role is ArtifactRole.GENERATED_CONTENT
+            for artifact in selected_artifacts
+        ):
+            _validate_cache_path(
+                generated_output,
+                ontology_directory=self.ontology_directory,
+                expected_kind="directory",
+            )
+        _validate_cache_path(
+            self.cache,
+            ontology_directory=self.ontology_directory,
+            expected_kind="directory",
+        )
+        for _, destination in destinations:
+            _validate_cache_path(
+                destination,
+                ontology_directory=self.ontology_directory,
+                expected_kind="file",
+            )
+        self.cache.mkdir(exist_ok=True)
+        _validate_cache_path(
+            self.cache,
+            ontology_directory=self.ontology_directory,
+            expected_kind="directory",
+        )
+        if any(
+            artifact.role is ArtifactRole.GENERATED_CONTENT
+            for artifact in selected_artifacts
+        ):
+            _validate_cache_path(
+                generated_output,
+                ontology_directory=self.ontology_directory,
+                expected_kind="directory",
+            )
         hydrated: list[ArtifactHydrationItem] = []
-        for artifact in manifest.artifacts:
-            if artifact.role not in selected:
-                continue
-            destination = self._cache_path(artifact)
+        for artifact, destination in destinations:
             downloaded = not _cached_artifact_is_valid(destination, artifact)
             if downloaded:
                 store.download(artifact, destination)
-            _verify_file(destination, artifact)
+            _validate_cache_path(
+                destination,
+                ontology_directory=self.ontology_directory,
+                expected_kind="file",
+            )
             if artifact.format is ArtifactFormat.SQLITE:
-                _sqlite_input_revision(destination, artifact.role)
+                try:
+                    reader = SQLiteProjectionGuard().open_stable_snapshot(
+                        destination,
+                        knowledge_projection=(
+                            artifact.role is ArtifactRole.KNOWLEDGE_PROJECTION
+                        ),
+                    )
+                except (OSError, sqlite3.Error, ValueError) as error:
+                    raise OntologyArtifactError(
+                        f"invalid SQLite ontology artifact: {destination}"
+                    ) from error
+                try:
+                    stable = reader.authority.candidate
+                    if (
+                        reader.source_identity.sha256 != artifact.content_sha256
+                        or reader.source_identity.size != artifact.size_bytes
+                    ):
+                        raise OntologyArtifactError(
+                            "SQLite ontology artifact source identity does not match "
+                            "its manifest"
+                        )
+                    _verify_file(stable, artifact)
+                    actual_input_revision = _sqlite_input_revision(
+                        stable,
+                        artifact.role,
+                    )
+                    if actual_input_revision != artifact.input_revision:
+                        raise OntologyArtifactError(
+                            "SQLite ontology artifact input revision does not match "
+                            "its manifest"
+                        )
+                    if not reader.source_is_unchanged():
+                        raise OntologyArtifactError(
+                            "SQLite ontology artifact changed while it was hydrated"
+                        )
+                finally:
+                    reader.close()
             else:
-                _extract_generated_zip(destination, self.cache / "generated")
+                _verify_file(destination, artifact)
+                _extract_generated_zip(
+                    destination,
+                    generated_output,
+                    ontology_directory=self.ontology_directory,
+                )
             hydrated.append(
                 ArtifactHydrationItem(
                     role=artifact.role,
                     path=str(
-                        self.cache / "generated"
+                        generated_output
                         if artifact.role is ArtifactRole.GENERATED_CONTENT
                         else destination
                     ),
@@ -467,7 +557,7 @@ class OntologyArtifactManager:
         source = path.expanduser()
         if source.is_symlink():
             raise OntologyArtifactError(f"ontology artifact cannot be a symbolic link: {path}")
-        source = source.resolve()
+        source = source.absolute()
         if role is ArtifactRole.GENERATED_CONTENT:
             if not source.is_dir() and not source.is_file():
                 raise OntologyArtifactError(
@@ -480,10 +570,47 @@ class OntologyArtifactManager:
         else:
             if not source.is_file():
                 raise OntologyArtifactError(f"SQLite ontology artifact is missing: {path}")
-            input_revision = _sqlite_input_revision(source, role)
-            prepared = source
+            try:
+                reader = SQLiteProjectionGuard().open_stable_snapshot(
+                    source,
+                    knowledge_projection=(
+                        role is ArtifactRole.KNOWLEDGE_PROJECTION
+                    ),
+                )
+            except (OSError, sqlite3.Error, ValueError) as error:
+                raise OntologyArtifactError(
+                    f"invalid SQLite ontology artifact: {path}"
+                ) from error
+            prepared = temporary_root / f"{role.value}.sqlite"
+            try:
+                stable = reader.authority.candidate
+                expected_digest = reader.source_identity.sha256
+                expected_size = reader.source_identity.size
+                if (
+                    _sha256_file(stable) != expected_digest
+                    or stable.stat().st_size != expected_size
+                ):
+                    raise OntologyArtifactError(
+                        "SQLite ontology artifact stable content identity changed"
+                    )
+                input_revision = _sqlite_input_revision(stable, role)
+                _scan_sensitive_content(stable)
+                shutil.copyfile(stable, prepared)
+                if (
+                    _sha256_file(prepared) != expected_digest
+                    or prepared.stat().st_size != expected_size
+                    or _sha256_file(stable) != expected_digest
+                    or not reader.source_is_unchanged()
+                ):
+                    raise OntologyArtifactError(
+                        "SQLite ontology artifact changed while its content identity "
+                        "was prepared"
+                    )
+            finally:
+                reader.close()
             format = ArtifactFormat.SQLITE
-        _scan_sensitive_content(prepared)
+        if role is ArtifactRole.GENERATED_CONTENT:
+            _scan_sensitive_content(prepared)
         digest = _sha256_file(prepared)
         extension = format.value
         asset_name = f"geas-{role.value}-{digest}.{extension}"
@@ -501,6 +628,52 @@ class OntologyArtifactManager:
             prepared,
         )
 
+    def _verify_stored_artifact(
+        self,
+        store: ArtifactStore,
+        artifact: OntologyArtifact,
+        *,
+        temporary_root: Path,
+    ) -> None:
+        verified = temporary_root / f"stored-{artifact.role.value}.{artifact.format.value}"
+        store.download(artifact, verified)
+        if artifact.format is not ArtifactFormat.SQLITE:
+            _verify_file(verified, artifact)
+            return
+        try:
+            reader = SQLiteProjectionGuard().open_stable_snapshot(
+                verified,
+                knowledge_projection=(
+                    artifact.role is ArtifactRole.KNOWLEDGE_PROJECTION
+                ),
+            )
+        except (OSError, sqlite3.Error, ValueError) as error:
+            raise OntologyArtifactError(
+                "stored SQLite ontology artifact is invalid"
+            ) from error
+        try:
+            if (
+                reader.source_identity.sha256 != artifact.content_sha256
+                or reader.source_identity.size != artifact.size_bytes
+            ):
+                raise OntologyArtifactError(
+                    "stored SQLite ontology artifact content identity does not match"
+                )
+            _verify_file(reader.authority.candidate, artifact)
+            if (
+                _sqlite_input_revision(reader.authority.candidate, artifact.role)
+                != artifact.input_revision
+            ):
+                raise OntologyArtifactError(
+                    "stored SQLite ontology artifact input revision does not match"
+                )
+            if not reader.source_is_unchanged():
+                raise OntologyArtifactError(
+                    "stored SQLite ontology artifact changed while it was verified"
+                )
+        finally:
+            reader.close()
+
     def _cache_path(self, artifact: OntologyArtifact) -> Path:
         names = {
             ArtifactRole.SOURCE_LIBRARY: "library.sqlite",
@@ -508,8 +681,11 @@ class OntologyArtifactManager:
             ArtifactRole.GENERATED_CONTENT: "generated.zip",
         }
         path = self.cache / names[artifact.role]
-        if not path.resolve().is_relative_to(self.ontology_directory):
-            raise OntologyArtifactError("ontology artifact cache escapes its ontology")
+        _validate_cache_path(
+            path,
+            ontology_directory=self.ontology_directory,
+            expected_kind="file",
+        )
         return path
 
 
@@ -534,6 +710,14 @@ def _sqlite_input_revision(
     verify_contents: bool = True,
 ) -> str:
     try:
+        if role is ArtifactRole.KNOWLEDGE_PROJECTION:
+            stamp = SQLiteProjectionGuard().validated_stamp(path)
+            inputs = {
+                "truth_state_digest": stamp.truth_state_digest,
+                "schema_version": stamp.schema_version,
+                "builder_version": stamp.builder_version,
+            }
+            return hashlib.sha256(canonical_json(inputs)).hexdigest()
         with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as connection:
             if verify_contents:
                 integrity = connection.execute("PRAGMA integrity_check").fetchone()
@@ -557,24 +741,6 @@ def _sqlite_input_revision(
                     "source_version_ids": snapshot["source_version_ids"],
                     "text_derivation_ids": snapshot["text_derivation_ids"],
                     "repository_snapshot_ids": snapshot["repository_snapshot_ids"],
-                }
-            elif role is ArtifactRole.KNOWLEDGE_PROJECTION:
-                row = connection.execute(
-                    "SELECT payload FROM _research_projection_metadata WHERE singleton = 1"
-                ).fetchone()
-                if row is None:
-                    raise OntologyArtifactError("knowledge projection is unstamped")
-                stamp = ProjectionStamp.model_validate_json(row[0])
-                if verify_contents:
-                    actual = SQLiteProjectionGuard().logical_digest(connection)
-                    if actual != stamp.projection_digest:
-                        raise OntologyArtifactError(
-                            "knowledge projection logical digest does not match its stamp"
-                        )
-                inputs = {
-                    "truth_state_digest": stamp.truth_state_digest,
-                    "schema_version": stamp.schema_version,
-                    "builder_version": stamp.builder_version,
                 }
             else:
                 raise OntologyArtifactError("generated content is not a SQLite artifact")
@@ -626,9 +792,34 @@ def _safe_generated_files(root: Path) -> Iterable[Path]:
         yield path
 
 
-def _extract_generated_zip(archive_path: Path, destination: Path) -> None:
+def _extract_generated_zip(
+    archive_path: Path,
+    destination: Path,
+    *,
+    ontology_directory: Path,
+) -> None:
+    _validate_cache_path(
+        archive_path,
+        ontology_directory=ontology_directory,
+        expected_kind="file",
+    )
+    _validate_cache_path(
+        destination,
+        ontology_directory=ontology_directory,
+        expected_kind="directory",
+    )
     temporary = destination.with_name(f".{destination.name}.tmp-{uuid4().hex}")
     previous = destination.with_name(f".{destination.name}.previous-{uuid4().hex}")
+    _validate_cache_path(
+        temporary,
+        ontology_directory=ontology_directory,
+        expected_kind="directory",
+    )
+    _validate_cache_path(
+        previous,
+        ontology_directory=ontology_directory,
+        expected_kind="directory",
+    )
     temporary.mkdir(parents=True)
     try:
         with zipfile.ZipFile(archive_path) as archive:
@@ -654,6 +845,44 @@ def _extract_generated_zip(archive_path: Path, destination: Path) -> None:
             os.replace(previous, destination)
 
 
+def _validate_cache_path(
+    path: Path,
+    *,
+    ontology_directory: Path,
+    expected_kind: Literal["file", "directory"] | None = None,
+) -> None:
+    """Reject lexical cache aliases before any cache I/O can follow them."""
+    root = Path(os.path.abspath(ontology_directory))
+    if root.is_symlink() or not root.is_dir():
+        raise OntologyArtifactError("ontology artifact ontology root is unsafe")
+    candidate = Path(os.path.abspath(path))
+    try:
+        relative = candidate.relative_to(root)
+    except ValueError as error:
+        raise OntologyArtifactError("ontology artifact cache escapes its ontology") from error
+    current = root
+    for component in relative.parts:
+        current /= component
+        if current.is_symlink():
+            raise OntologyArtifactError(
+                f"ontology artifact cache contains a symbolic link: {current}"
+            )
+        if current != candidate and current.exists() and not current.is_dir():
+            raise OntologyArtifactError(
+                f"ontology artifact cache ancestor is not a directory: {current}"
+            )
+    if not candidate.exists() or expected_kind is None:
+        return
+    if expected_kind == "file" and not candidate.is_file():
+        raise OntologyArtifactError(
+            f"ontology artifact cache file target is unsafe: {candidate}"
+        )
+    if expected_kind == "directory" and not candidate.is_dir():
+        raise OntologyArtifactError(
+            f"ontology artifact cache directory target is unsafe: {candidate}"
+        )
+
+
 def _cached_artifact_is_valid(path: Path, artifact: OntologyArtifact) -> bool:
     if path.is_symlink() or not path.is_file():
         return False
@@ -676,15 +905,462 @@ def _verify_file(path: Path, artifact: OntologyArtifact) -> None:
 def _scan_sensitive_content(path: Path) -> None:
     if path.stat().st_size == 0:
         return
+    with path.open("rb") as handle:
+        sqlite_database = handle.read(16) == b"SQLite format 3\x00"
+    if sqlite_database:
+        _scan_sqlite_values(path)
+    access = mmap.ACCESS_COPY if sqlite_database else mmap.ACCESS_READ
     with path.open("rb") as handle, mmap.mmap(
         handle.fileno(),
         0,
-        access=mmap.ACCESS_READ,
+        access=access,
     ) as content:
-        if any(pattern.search(content) for pattern in _SENSITIVE_CONTENT):
+        if sqlite_database:
+            _mask_live_sqlite_cells(path, content)
+            sensitive = contains_binary_credential_residue(content)
+        else:
+            sensitive = contains_possible_credential(content)
+        if sensitive:
             raise OntologyArtifactError(
                 f"possible credential detected in ontology artifact: {path}"
             )
+
+
+def _mask_live_sqlite_cells(path: Path, content: mmap.mmap) -> None:
+    """Mask only reachable live B-tree structures in a private scan view."""
+    if len(content) < 100 or bytes(content[:16]) != b"SQLite format 3\x00":
+        raise OntologyArtifactError(f"invalid SQLite ontology artifact: {path}")
+    encoded_page_size = int.from_bytes(content[16:18], "big")
+    page_size = 65536 if encoded_page_size == 1 else encoded_page_size
+    reserved = content[20]
+    if (
+        page_size < 512
+        or page_size > 65536
+        or page_size & (page_size - 1)
+        or reserved >= page_size
+        or len(content) % page_size
+    ):
+        raise OntologyArtifactError(f"invalid SQLite page layout: {path}")
+    usable_size = page_size - reserved
+    page_count = len(content) // page_size
+    try:
+        with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as connection:
+            roots = {
+                1,
+                *(
+                    int(row[0])
+                    for row in connection.execute(
+                        "SELECT rootpage FROM sqlite_schema WHERE rootpage > 0"
+                    )
+                ),
+            }
+    except (sqlite3.Error, TypeError, ValueError) as error:
+        raise OntologyArtifactError(
+            f"could not inventory live SQLite pages: {path}"
+        ) from error
+
+    pending = sorted(roots, reverse=True)
+    visited: set[int] = set()
+    while pending:
+        page_number = pending.pop()
+        if page_number in visited:
+            continue
+        _validate_sqlite_page_number(page_number, page_count)
+        visited.add(page_number)
+        page_start = (page_number - 1) * page_size
+        header_start = page_start + (100 if page_number == 1 else 0)
+        page_type = content[header_start]
+        if page_type not in {0x02, 0x05, 0x0A, 0x0D}:
+            raise OntologyArtifactError("SQLite root traversal reached a non-B-tree page")
+        header_size = 12 if page_type in {0x02, 0x05} else 8
+        cell_count = int.from_bytes(content[header_start + 3 : header_start + 5], "big")
+        pointer_start = header_start + header_size
+        pointer_end = pointer_start + 2 * cell_count
+        page_usable_end = page_start + usable_size
+        if pointer_end > page_usable_end:
+            raise OntologyArtifactError("SQLite B-tree cell pointer array is invalid")
+        children: list[int] = []
+        if page_type in {0x02, 0x05}:
+            children.append(
+                int.from_bytes(content[header_start + 8 : header_start + 12], "big")
+            )
+        cell_offsets = tuple(
+            int.from_bytes(content[offset : offset + 2], "big")
+            for offset in range(pointer_start, pointer_end, 2)
+        )
+        if len(set(cell_offsets)) != len(cell_offsets):
+            raise OntologyArtifactError("duplicate SQLite B-tree cell pointer")
+        cells: list[
+            tuple[int, int, int | None, int, int, tuple[int, int] | None]
+        ] = []
+        for relative_offset in cell_offsets:
+            if relative_offset == 0 and page_size == 65536:
+                relative_offset = 65536
+            cell_start = page_start + relative_offset
+            if not pointer_end <= cell_start < page_usable_end:
+                raise OntologyArtifactError("SQLite B-tree cell offset is invalid")
+            cell_end, child, payload_start, local_size, overflow = (
+                _sqlite_live_cell_extent(
+                    content,
+                    cell_start=cell_start,
+                    page_type=page_type,
+                    page_usable_end=page_usable_end,
+                    usable_size=usable_size,
+                )
+            )
+            if child is not None:
+                children.append(child)
+            cells.append(
+                (cell_start, cell_end, child, payload_start, local_size, overflow)
+            )
+        previous_end = pointer_end
+        for cell_start, cell_end, *_rest in sorted(cells):
+            if cell_start < previous_end:
+                raise OntologyArtifactError("overlapping SQLite B-tree cells")
+            previous_end = cell_end
+
+        content[header_start:pointer_end] = b"\x00" * (pointer_end - header_start)
+        if page_number == 1:
+            content[:100] = b"\x00" * 100
+        for cell_start, cell_end, _child, payload_start, local_size, overflow in cells:
+            _scan_and_mask_sqlite_payload(
+                path,
+                content,
+                payload_start=payload_start,
+                local_size=local_size,
+                overflow=overflow,
+                scan_payload=page_type in {0x02, 0x0A},
+                page_size=page_size,
+                usable_size=usable_size,
+                page_count=page_count,
+                visited_btree=visited,
+            )
+            content[cell_start:cell_end] = b"\x00" * (cell_end - cell_start)
+        for child in sorted(children, reverse=True):
+            _validate_sqlite_page_number(child, page_count)
+            if child not in visited:
+                pending.append(child)
+
+
+def _sqlite_live_cell_extent(
+    content: mmap.mmap,
+    *,
+    cell_start: int,
+    page_type: int,
+    page_usable_end: int,
+    usable_size: int,
+) -> tuple[int, int | None, int, int, tuple[int, int] | None]:
+    cursor = cell_start
+    child: int | None = None
+    if page_type in {0x02, 0x05}:
+        if cursor + 4 > page_usable_end:
+            raise OntologyArtifactError("SQLite interior cell is truncated")
+        child = int.from_bytes(content[cursor : cursor + 4], "big")
+        cursor += 4
+    if page_type == 0x05:
+        _rowid, cursor = _read_sqlite_varint(content, cursor, page_usable_end)
+        return cursor, child, cursor, 0, None
+
+    payload_size, cursor = _read_sqlite_varint(content, cursor, page_usable_end)
+    if page_type == 0x0D:
+        _rowid, cursor = _read_sqlite_varint(content, cursor, page_usable_end)
+    local_size = _sqlite_local_payload_size(
+        payload_size,
+        usable_size=usable_size,
+        table_leaf=page_type == 0x0D,
+    )
+    payload_end = cursor + local_size
+    if payload_end > page_usable_end:
+        raise OntologyArtifactError("SQLite B-tree payload is truncated")
+    if local_size == payload_size:
+        return payload_end, child, cursor, local_size, None
+    if payload_end + 4 > page_usable_end:
+        raise OntologyArtifactError("SQLite overflow pointer is truncated")
+    overflow_page = int.from_bytes(content[payload_end : payload_end + 4], "big")
+    return (
+        payload_end + 4,
+        child,
+        cursor,
+        local_size,
+        (overflow_page, payload_size - local_size),
+    )
+
+
+def _read_sqlite_varint(
+    content: mmap.mmap,
+    offset: int,
+    limit: int,
+) -> tuple[int, int]:
+    value = 0
+    for index in range(9):
+        if offset >= limit:
+            raise OntologyArtifactError("SQLite varint is truncated")
+        byte = content[offset]
+        offset += 1
+        if index == 8:
+            return (value << 8) | byte, offset
+        value = (value << 7) | (byte & 0x7F)
+        if byte < 0x80:
+            return value, offset
+    raise AssertionError("SQLite varint loop did not terminate")
+
+
+def _sqlite_local_payload_size(
+    payload_size: int,
+    *,
+    usable_size: int,
+    table_leaf: bool,
+) -> int:
+    minimum = ((usable_size - 12) * 32 // 255) - 23
+    maximum = (
+        usable_size - 35
+        if table_leaf
+        else ((usable_size - 12) * 64 // 255) - 23
+    )
+    if minimum < 0 or maximum < minimum:
+        raise OntologyArtifactError("SQLite usable page size is invalid")
+    if payload_size <= maximum:
+        return payload_size
+    local = minimum + (payload_size - minimum) % (usable_size - 4)
+    return minimum if local > maximum else local
+
+
+def _scan_and_mask_sqlite_payload(
+    path: Path,
+    content: mmap.mmap,
+    *,
+    payload_start: int,
+    local_size: int,
+    overflow: tuple[int, int] | None,
+    scan_payload: bool,
+    page_size: int,
+    usable_size: int,
+    page_count: int,
+    visited_btree: set[int],
+) -> None:
+    """Scan unprojected index record bodies before masking their live bytes.
+
+    Table values are decoded and scanned by ``_scan_sqlite_values``. Index
+    records can contain derived expression values which SQLite does not expose
+    through that inventory. Their record header contains only SQLite serial
+    types, so scan the exact contiguous record body without evaluating SQL or
+    treating a separate physical layout as authority.
+    """
+    overflow_segments = _sqlite_overflow_segments(
+        content,
+        overflow=overflow,
+        page_size=page_size,
+        usable_size=usable_size,
+        page_count=page_count,
+        visited_btree=visited_btree,
+    )
+    segments = (
+        ((payload_start, local_size),) if local_size else ()
+    ) + tuple((start, size) for _page_start, start, size in overflow_segments)
+    payload_size = sum(size for _start, size in segments)
+    expected_size = local_size + (overflow[1] if overflow is not None else 0)
+    if payload_size != expected_size:
+        raise OntologyArtifactError("SQLite record payload extent is invalid")
+    if payload_size == 0:
+        if scan_payload:
+            raise OntologyArtifactError("SQLite index record payload is empty")
+        return
+    header_size = (
+        _validate_sqlite_record(content, segments, payload_size)
+        if scan_payload
+        else 0
+    )
+
+    # Binary assignment classification materializes at most 4 KiB. Keeping
+    # twice that much overlap makes every cross-page candidate visible while
+    # bounding each scan window to one SQLite page plus 8 KiB.
+    overlap_size = 8192
+    carry = b""
+    logical_offset = 0
+
+    def scan_segment(start: int, size: int) -> None:
+        nonlocal carry, logical_offset
+        if not scan_payload:
+            return
+        segment_end = logical_offset + size
+        body_offset = max(header_size - logical_offset, 0)
+        logical_offset = segment_end
+        if body_offset >= size:
+            return
+        segment = bytes(content[start + body_offset : start + size])
+        window = carry + segment
+        if contains_binary_credential_residue(window):
+            raise OntologyArtifactError(
+                f"possible credential detected in ontology artifact: {path}"
+            )
+        carry = window[-overlap_size:]
+
+    scan_segment(payload_start, local_size)
+    for page_start, segment_start, segment_size in overflow_segments:
+        scan_segment(segment_start, segment_size)
+        mask_end = segment_start + segment_size
+        content[page_start:mask_end] = b"\x00" * (mask_end - page_start)
+
+
+def _sqlite_overflow_segments(
+    content: mmap.mmap,
+    *,
+    overflow: tuple[int, int] | None,
+    page_size: int,
+    usable_size: int,
+    page_count: int,
+    visited_btree: set[int],
+) -> tuple[tuple[int, int, int], ...]:
+    if overflow is None:
+        return ()
+    page_number, remaining = overflow
+    visited: set[int] = set()
+    segments: list[tuple[int, int, int]] = []
+    while remaining:
+        _validate_sqlite_page_number(page_number, page_count)
+        if page_number in visited or page_number in visited_btree:
+            raise OntologyArtifactError("SQLite overflow page cycle is invalid")
+        visited.add(page_number)
+        page_start = (page_number - 1) * page_size
+        next_page = int.from_bytes(content[page_start : page_start + 4], "big")
+        segment_size = min(remaining, usable_size - 4)
+        segments.append((page_start, page_start + 4, segment_size))
+        remaining -= segment_size
+        if remaining and next_page == 0:
+            raise OntologyArtifactError("SQLite overflow chain ended early")
+        if not remaining and next_page != 0:
+            raise OntologyArtifactError("SQLite overflow chain exceeds its payload")
+        page_number = next_page
+    return tuple(segments)
+
+
+def _validate_sqlite_record(
+    content: mmap.mmap,
+    segments: tuple[tuple[int, int], ...],
+    payload_size: int,
+) -> int:
+    """Validate one complete SQLite record header and its declared body extent."""
+    segment_index = 0
+    segment_offset = 0
+    logical_offset = 0
+
+    def read_varint(limit: int) -> int:
+        nonlocal segment_index, segment_offset, logical_offset
+        value = 0
+        start = logical_offset
+        for index in range(9):
+            if logical_offset >= limit or segment_index >= len(segments):
+                raise OntologyArtifactError("SQLite record varint is truncated")
+            segment_start, segment_size = segments[segment_index]
+            byte = content[segment_start + segment_offset]
+            segment_offset += 1
+            logical_offset += 1
+            if segment_offset == segment_size:
+                segment_index += 1
+                segment_offset = 0
+            if index == 8:
+                value = (value << 8) | byte
+                break
+            value = (value << 7) | (byte & 0x7F)
+            if byte < 0x80:
+                break
+        consumed = logical_offset - start
+        if consumed != _sqlite_varint_size(value):
+            raise OntologyArtifactError("SQLite record varint is overlong")
+        return value
+
+    header_size = read_varint(payload_size)
+    if not logical_offset <= header_size <= payload_size:
+        raise OntologyArtifactError("SQLite record header size is invalid")
+    body_size = 0
+    available_body = payload_size - header_size
+    while logical_offset < header_size:
+        serial_type = read_varint(header_size)
+        body_size += _sqlite_serial_type_size(serial_type)
+        if body_size > available_body:
+            raise OntologyArtifactError("SQLite record body extent is invalid")
+    if logical_offset != header_size or body_size != available_body:
+        raise OntologyArtifactError("SQLite record body extent is invalid")
+    return header_size
+
+
+def _sqlite_varint_size(value: int) -> int:
+    if value > 0x00FFFFFFFFFFFFFF:
+        return 9
+    return max(1, (value.bit_length() + 6) // 7)
+
+
+def _sqlite_serial_type_size(serial_type: int) -> int:
+    fixed_sizes = (0, 1, 2, 3, 4, 6, 8, 8, 0, 0)
+    if serial_type < len(fixed_sizes):
+        return fixed_sizes[serial_type]
+    if serial_type in {10, 11}:
+        raise OntologyArtifactError("SQLite record serial type is reserved")
+    return (serial_type - 12) // 2
+
+
+def _validate_sqlite_page_number(page_number: int, page_count: int) -> None:
+    if not 1 <= page_number <= page_count:
+        raise OntologyArtifactError("SQLite page number is outside the database")
+
+
+def _scan_sqlite_values(path: Path) -> None:
+    try:
+        with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as connection:
+            schema_values = connection.execute(
+                "SELECT sql FROM sqlite_schema WHERE sql IS NOT NULL "
+                "ORDER BY type, name, tbl_name, rootpage, sql"
+            )
+            for (value,) in schema_values:
+                _raise_for_sqlite_schema_credential(path, value)
+            tables = tuple(
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name"
+                )
+            )
+            for table in tables:
+                quoted_table = _quoted_sqlite_identifier(table)
+                columns = tuple(
+                    row[1]
+                    for row in connection.execute(f"PRAGMA table_xinfo({quoted_table})")
+                )
+                for column in columns:
+                    quoted_column = _quoted_sqlite_identifier(column)
+                    values = connection.execute(
+                        f"SELECT {quoted_column} FROM {quoted_table} "
+                        f"WHERE typeof({quoted_column}) IN ('text', 'blob')"
+                    )
+                    for (value,) in values:
+                        _raise_for_sqlite_credential(path, value)
+    except (sqlite3.Error, TypeError, UnicodeError, ValueError) as error:
+        raise OntologyArtifactError(
+            f"could not scan SQLite ontology artifact for credentials: {path}"
+        ) from error
+
+
+def _raise_for_sqlite_credential(path: Path, value: str | bytes) -> None:
+    content = value.encode("utf-8") if isinstance(value, str) else bytes(value)
+    if contains_possible_credential(content) or contains_binary_credential_residue(
+        content
+    ):
+        raise OntologyArtifactError(
+            f"possible credential detected in ontology artifact: {path}"
+        )
+
+
+def _raise_for_sqlite_schema_credential(path: Path, value: str) -> None:
+    content = value.encode("utf-8")
+    if contains_fixed_credential(content) or contains_credential_assignment_marker(
+        content
+    ):
+        raise OntologyArtifactError(
+            f"possible credential detected in ontology artifact: {path}"
+        )
+
+
+def _quoted_sqlite_identifier(value: str) -> str:
+    return '"' + value.replace('"', '""') + '"'
 
 
 def _sha256_file(path: Path) -> str:

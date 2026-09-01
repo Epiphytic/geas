@@ -362,9 +362,15 @@ def identified(prefix: str, fields: dict[str, object]) -> str:
 
 def locator_path(locator: str) -> Path:
     """Convert a file locator to a path without accepting other schemes."""
-    from urllib.parse import unquote, urlsplit
+    from urllib.parse import urlsplit
+    from urllib.request import url2pathname
 
     parsed = urlsplit(locator)
-    if parsed.scheme != "file" or parsed.netloc not in {"", "localhost"}:
+    if (
+        parsed.scheme != "file"
+        or parsed.netloc not in {"", "localhost"}
+        or parsed.query
+        or parsed.fragment
+    ):
         raise ValueError("local connector accepts only local file URIs")
-    return Path(unquote(parsed.path))
+    return Path(url2pathname(parsed.path))

@@ -49,7 +49,9 @@ class ProjectionBenchmark:
         if claim_count < 1:
             raise ValueError("benchmark claim count must be positive")
         with tempfile.TemporaryDirectory(prefix="research-agent-benchmark-") as directory:
-            root = Path(directory)
+            # TemporaryDirectory created this path; canonicalizing its platform alias
+            # does not erase any operator-supplied destination authority.
+            root = Path(directory).resolve()
             store = ImmutableStore(root / "data")
             store.initialize()
             started = time.perf_counter()

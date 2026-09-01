@@ -9,6 +9,15 @@ This does not change the authority order. Accepted Git ontology files and
 immutable records remain authoritative. Hydrated databases and generated files
 are verified caches that can be discarded and rebuilt.
 
+An artifact is not a general source archive. Its manifest identifies a
+content-addressed projection or generated payload and may contain exact source
+text only when the declared storage-rights basis permits it. Ontology exports
+keep original source links and bounded evidence/provenance references; they do
+not automatically download and bundle every referenced document. Use the
+catalog bundle digest and skill provenance to find the declaring repository,
+then use normal Geas acquisition and policy gates for any additional source
+material.
+
 ## Freshness before use
 
 The user configuration defaults to checking the selected ontology repository

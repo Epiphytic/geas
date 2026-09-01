@@ -87,12 +87,13 @@ class FakeGeasUpdater:
         self, _argv: tuple[str, ...], *, continuation: str | None
     ) -> GeasUpdateReceipt:
         assert continuation == "lifecycle"
+        old_commit = type(self).current_commit
         type(self).current_commit = GEAS_NEW_COMMIT
         return GeasUpdateReceipt(
             installer="git-development",
             directory=Path("/trusted/geas"),
             executable=Path("/trusted/geas/bin/geas"),
-            old_commit=GEAS_OLD_COMMIT,
+            old_commit=old_commit,
             new_commit=GEAS_NEW_COMMIT,
             old_version="0.1.0",
             new_version="0.1.0",

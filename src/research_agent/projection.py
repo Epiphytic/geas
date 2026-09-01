@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
 import sqlite3
+import threading
 from collections.abc import Iterable
+from contextlib import suppress
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
@@ -262,26 +263,47 @@ class SQLiteKnowledgeProjection:
         before = truth_manager.verify(snapshot)
         if not before.clean:
             raise ValueError("canonical truth does not match the selected snapshot")
-        database = database.resolve()
+        database = database.absolute()
+        guard = SQLiteProjectionGuard()
+        guard.validate_destination_parent(database)
         database.parent.mkdir(parents=True, exist_ok=True)
-        temporary = database.with_name(f".{database.name}.{os.getpid()}.tmp")
-        if temporary.exists():
-            temporary.unlink()
+        guard.validate_destination_parent(database)
+        expected_destination_identity = guard.capture_destination_identity(database)
+        transaction_directory = guard.create_transaction_directory(
+            prefix=f".{database.name}.build-",
+            parent=database.parent,
+        )
+        temporary = transaction_directory / "projection.sqlite"
+        temporary.touch(mode=0o600, exist_ok=False)
+        expected_candidate_identity = guard.capture_destination_identity(temporary)
+        if expected_candidate_identity is None:
+            raise ValueError("projection build candidate is missing")
         try:
             counts = self._build_database(temporary)
             after = truth_manager.verify(snapshot)
             if not after.clean:
                 raise ValueError("canonical truth changed while the projection was building")
-            stamp = SQLiteProjectionGuard().stamp(
+            stamp = guard.stamp(
                 temporary,
                 snapshot,
                 schema_version=self.schema_version,
                 builder_version=self.builder_version,
             )
-            os.replace(temporary, database)
+            expected_candidate_identity = guard.capture_destination_identity(temporary)
+            if expected_candidate_identity is None:
+                raise ValueError("stamped projection install candidate is missing")
+            guard.install_stamped(
+                temporary,
+                database,
+                expected_stamp=stamp,
+                expected_candidate_identity=expected_candidate_identity,
+                expected_destination_identity=expected_destination_identity,
+            )
         finally:
-            if temporary.exists():
-                temporary.unlink()
+            guard.cleanup_install_transaction(
+                temporary,
+                expected_candidate_identity,
+            )
         return ProjectionBuildResult(
             database=str(database),
             snapshot_id=snapshot.id,
@@ -294,7 +316,11 @@ class SQLiteKnowledgeProjection:
     def _build_database(self, database: Path) -> dict[str, int]:
         concepts = self._concepts()
 
-        with sqlite3.connect(database) as connection:
+        connection = sqlite3.connect(database)
+        try:
+            connection.execute("PRAGMA page_size = 4096")
+            connection.execute("PRAGMA auto_vacuum = NONE")
+            connection.execute("PRAGMA encoding = 'UTF-8'")
             connection.execute("PRAGMA foreign_keys = ON")
             connection.execute("PRAGMA journal_mode = DELETE")
             connection.execute("PRAGMA synchronous = FULL")
@@ -367,11 +393,12 @@ class SQLiteKnowledgeProjection:
                     for value in self.store.iter_records("extraction-proposal")
                 ),
             )
-            connection.execute("PRAGMA optimize")
             connection.commit()
             invalid = connection.execute("PRAGMA foreign_key_check").fetchall()
             if invalid:
                 raise ValueError(f"projection has foreign-key violations: {invalid!r}")
+        finally:
+            connection.close()
         return counts
 
     def _concepts(self) -> tuple[Concept, ...]:
@@ -1581,13 +1608,45 @@ class SQLiteKnowledgeProjection:
 
 
 class KnowledgeQueryEngine:
-    def __init__(self, database: Path) -> None:
-        self.database = database.resolve()
-        SQLiteProjectionGuard().require_compatible(
+    def __init__(
+        self,
+        database: Path,
+        *,
+        expected_content_sha256: str | None = None,
+    ) -> None:
+        self.database = database.absolute()
+        self._owner_thread = threading.get_ident()
+        self._reader = SQLiteProjectionGuard().open_compatible_connection(
             self.database,
             expected_schema_version=SQLiteKnowledgeProjection.schema_version,
             expected_builder_version=SQLiteKnowledgeProjection.builder_version,
         )
+        if (
+            expected_content_sha256 is not None
+            and self._reader.source_identity.sha256 != expected_content_sha256
+        ):
+            self._reader.close()
+            raise ValueError(
+                "knowledge projection content does not match its expected artifact"
+            )
+        self._connection: sqlite3.Connection | None = self._reader.connection
+        self._connection.row_factory = sqlite3.Row
+
+    def close(self) -> None:
+        connection = getattr(self, "_connection", None)
+        if connection is not None:
+            self._reader.close()
+            self._connection = None
+
+    def __enter__(self) -> KnowledgeQueryEngine:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        with suppress(sqlite3.Error):
+            self.close()
 
     def query(
         self,
@@ -2085,11 +2144,11 @@ class KnowledgeQueryEngine:
         )
 
     def _connect(self) -> sqlite3.Connection:
-        if not self.database.is_file():
-            raise ValueError(f"projection does not exist: {self.database}")
-        connection = sqlite3.connect(f"file:{self.database}?mode=ro", uri=True)
-        connection.row_factory = sqlite3.Row
-        return connection
+        if threading.get_ident() != self._owner_thread:
+            raise RuntimeError("knowledge query engine is bound to its creating thread")
+        if self._connection is None:
+            raise ValueError("knowledge query engine is closed")
+        return self._connection
 
     @staticmethod
     def _rows(

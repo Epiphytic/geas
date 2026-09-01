@@ -1,0 +1,131 @@
+name: PR Skill Writeback
+
+on:
+  workflow_run:
+    workflows:
+      - PR Skill Regeneration
+    types:
+      - completed
+
+permissions:
+  actions: read
+  contents: read
+  id-token: write
+  pull-requests: read
+
+jobs:
+  writeback:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out protected trusted code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: refs/heads/main
+          path: trusted
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86
+        with:
+          enable-cache: true
+
+      - name: Install only protected trusted code
+        working-directory: trusted
+        run: |
+          set -euo pipefail
+          uv sync
+
+      - name: Validate the originating workflow before artifact access
+        id: event
+        working-directory: trusted
+        run: |
+          set -euo pipefail
+          uv run python -m research_agent.pr_skill_sync evaluate-event \
+            --event "$GITHUB_EVENT_PATH" \
+            --context event-context.json \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Download only the fixed artifact from the validated run
+        if: steps.event.outputs.writeback == 'true'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: geas-pr-skills
+          path: pr-skill-artifact
+          run-id: ${{ steps.event.outputs.run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Query the current pull request
+        if: steps.event.outputs.writeback == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GEAS_PULL_REQUEST: ${{ steps.event.outputs.pull_request }}
+        run: |
+          set -euo pipefail
+          gh api "repos/Epiphytic/geas/pulls/${GEAS_PULL_REQUEST}" > trusted/pull-request.json
+
+      - name: Check out the untrusted head as inert comparison bytes
+        if: steps.event.outputs.writeback == 'true'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ steps.event.outputs.head_sha }}
+          path: pr-source
+          persist-credentials: false
+
+      - name: Verify artifact bytes, metadata, head, and changed state
+        if: steps.event.outputs.writeback == 'true'
+        id: verify
+        working-directory: trusted
+        run: |
+          set -euo pipefail
+          uv run python -m research_agent.pr_skill_sync verify \
+            --artifact ../pr-skill-artifact \
+            --context event-context.json \
+            --pull-request pull-request.json \
+            --repository ../pr-source \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Exchange OIDC for a short-lived path-scoped write token
+        if: steps.verify.outputs.changed == 'true'
+        id: sts
+        uses: octo-sts/action@f603d3be9d8dd9871a265776e625a27b00effe05
+        with:
+          domain: sts.epiphytic.org
+          scope: Epiphytic/.github
+          identity: geas-pr-skill-sync
+
+      - name: Check out the still-expected head with the short-lived token
+        if: steps.verify.outputs.changed == 'true'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ steps.event.outputs.head_sha }}
+          path: writeback
+          token: ${{ steps.sts.outputs.token }}
+
+      - name: Re-query the pull request immediately before mutation
+        if: steps.verify.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GEAS_PULL_REQUEST: ${{ steps.event.outputs.pull_request }}
+        run: |
+          set -euo pipefail
+          gh api "repos/Epiphytic/geas/pulls/${GEAS_PULL_REQUEST}" > trusted/pull-request-current.json
+
+      - name: Copy exact bytes, stage exact roots, and push with an exact lease
+        if: steps.verify.outputs.changed == 'true'
+        working-directory: trusted
+        run: |
+          set -euo pipefail
+          uv run python -m research_agent.pr_skill_sync writeback \
+            --artifact ../pr-skill-artifact \
+            --context event-context.json \
+            --pull-request pull-request-current.json \
+            --repository ../writeback

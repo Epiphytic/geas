@@ -16,7 +16,14 @@ from pydantic import Field, field_validator, model_validator
 from research_agent.agent_skills import BuiltinSkillReceipt, install_builtin_geas_skill
 from research_agent.models import StrictModel
 from research_agent.ontology_config import OntologyBuildDefaults
+from research_agent.ontology_subscriptions import (
+    NormalizedProfile,
+    OntologyFreshnessConfig,
+    OntologySubscription,
+)
+from research_agent.ontology_trust import InstalledOntologySnapshot, TrustRule
 from research_agent.paths import geas_config_home
+from research_agent.removal_journal import validate_removal_journal_namespace
 
 DEFAULT_ONTOLOGY_REPOSITORY = "https://github.com/liamhelmer-bel/ontologies.git"
 DEFAULT_CONFIG_FILENAMES = (
@@ -71,6 +78,10 @@ class OntologyGitConfig(StrictModel):
     pull_before_update: bool = False
     push_on_update: bool = False
 
+    @property
+    def active_ref(self) -> str:
+        return f"refs/heads/{self.branch}"
+
     @field_validator("url")
     @classmethod
     def url_has_no_embedded_credentials(cls, value: str) -> str:
@@ -83,18 +94,15 @@ class OntologyGitConfig(StrictModel):
         return value
 
 
-class OntologyFreshnessConfig(StrictModel):
-    check_before_use: bool = True
-    max_age_seconds: int = Field(default=3600, ge=60, le=604_800)
-    hydrate_artifacts_before_use: bool = False
-
-
 class GeasProfile(StrictModel):
     ontology_directory: Path = Path("ontologies")
     secret_sources: tuple[SecretSource, ...] = (
         SecretSource(path=Path("secrets/common.env"), format="dotenv"),
     )
     ontology_git: OntologyGitConfig | None = None
+    subscriptions: dict[str, OntologySubscription] = Field(default_factory=dict)
+    trust_rules: tuple[TrustRule, ...] = ()
+    installed_ontologies: tuple[InstalledOntologySnapshot, ...] = ()
 
     @field_validator("ontology_directory")
     @classmethod
@@ -103,13 +111,51 @@ class GeasProfile(StrictModel):
             raise ValueError("profile ontology_directory must be config-relative")
         return value
 
+    @model_validator(mode="after")
+    def trust_selectors_are_unique(self) -> GeasProfile:
+        NormalizedProfile(subscriptions=self.normalized_subscriptions())
+        selectors = [
+            (
+                rule.repository,
+                rule.refs,
+                rule.paths,
+                rule.bundle_sha256,
+            )
+            for rule in self.trust_rules
+        ]
+        if len(selectors) != len(set(selectors)):
+            raise ValueError("duplicate trust rule selectors")
+        snapshots = [
+            (snapshot.name, snapshot.bundle_sha256) for snapshot in self.installed_ontologies
+        ]
+        if len(snapshots) != len(set(snapshots)):
+            raise ValueError("duplicate installed ontology snapshot")
+        return self
+
+    def normalized_subscriptions(
+        self,
+        *,
+        freshness: OntologyFreshnessConfig | None = None,
+    ) -> dict[str, OntologySubscription]:
+        subscriptions = dict(self.subscriptions)
+        if self.ontology_git is not None and "primary" not in subscriptions:
+            subscriptions["primary"] = OntologySubscription(
+                url=self.ontology_git.url,
+                active_ref=self.ontology_git.active_ref,
+                checkout=self.ontology_directory,
+                catalog=Path("geas.yaml"),
+                remote=self.ontology_git.remote,
+                pull_before_update=self.ontology_git.pull_before_update,
+                push_on_update=self.ontology_git.push_on_update,
+                freshness=freshness or OntologyFreshnessConfig(),
+            )
+        return dict(sorted(subscriptions.items()))
+
 
 class GeasUserConfig(StrictModel):
     version: Literal[1] = 1
     default_profile: str = "default"
-    ontology_freshness: OntologyFreshnessConfig = Field(
-        default_factory=OntologyFreshnessConfig
-    )
+    ontology_freshness: OntologyFreshnessConfig = Field(default_factory=OntologyFreshnessConfig)
     ontology_defaults: OntologyBuildDefaults = Field(default_factory=OntologyBuildDefaults)
     profiles: dict[str, GeasProfile]
 
@@ -127,6 +173,24 @@ class GeasUserConfig(StrictModel):
         invalid = sorted(name for name in self.profiles if not _PROFILE_NAME.fullmatch(name))
         if invalid:
             raise ValueError(f"invalid profile names: {', '.join(invalid)}")
+        checkouts: list[tuple[str, Path]] = []
+        for profile_name, profile in sorted(self.profiles.items()):
+            normalized = profile.normalized_subscriptions(freshness=self.ontology_freshness)
+            for subscription_name, subscription in normalized.items():
+                validate_removal_journal_namespace(subscription.checkout)
+                identity = f"{profile_name}/{subscription_name}"
+                for existing_identity, existing_checkout in checkouts:
+                    if (
+                        subscription.checkout == existing_checkout
+                        or subscription.checkout.is_relative_to(existing_checkout)
+                        or existing_checkout.is_relative_to(subscription.checkout)
+                    ):
+                        raise ValueError(
+                            "subscription checkouts overlap across profiles: "
+                            f"{existing_identity!r}={existing_checkout.as_posix()!r}, "
+                            f"{identity!r}={subscription.checkout.as_posix()!r}"
+                        )
+                checkouts.append((identity, subscription.checkout))
         return self
 
     @classmethod
@@ -157,6 +221,12 @@ class GeasUserConfig(StrictModel):
         except KeyError:
             raise ValueError(f"unknown Geas profile: {selected}") from None
 
+    def normalized_profile(self, name: str | None = None) -> NormalizedProfile:
+        _, profile = self.profile(name)
+        return NormalizedProfile(
+            subscriptions=profile.normalized_subscriptions(freshness=self.ontology_freshness)
+        )
+
 
 class UserConfigManager:
     def __init__(self, path: Path | None = None) -> None:
@@ -168,12 +238,15 @@ class UserConfigManager:
     def load(self) -> GeasUserConfig:
         if not self.path.is_file():
             raise ValueError(f"Geas user config does not exist: {self.path}")
-        return GeasUserConfig.from_yaml(self.path)
+        config = GeasUserConfig.from_yaml(self.path)
+        self.validate_subscription_layout(config)
+        return config
 
     def load_or_create(self, *, update_defaults: bool = False) -> GeasUserConfig:
         if self.path.exists():
             raw = yaml.safe_load(self.path.read_text())
             config = GeasUserConfig.model_validate(raw)
+            self.validate_subscription_layout(config)
             explicit = config.model_dump(mode="json", exclude_none=False)
             if _fill_missing(raw, explicit):
                 _atomic_write(
@@ -187,7 +260,8 @@ class UserConfigManager:
         else:
             self.root.mkdir(parents=True, exist_ok=True)
             config = GeasUserConfig.default()
-            self.path.write_text(config.explicit_yaml())
+            self.validate_subscription_layout(config)
+            _atomic_write(self.path, config.explicit_yaml().encode())
         self._ensure_secret_scaffold()
         self.last_defaults_receipt = self.install_defaults(update=update_defaults)
         return config
@@ -256,9 +330,7 @@ class UserConfigManager:
                 _atomic_write(candidate, template)
             candidates.append(candidate.name)
             next_files[filename] = ManagedDefaultFile(
-                installed_sha256=(
-                    previous.installed_sha256 if previous is not None else None
-                ),
+                installed_sha256=(previous.installed_sha256 if previous is not None else None),
                 template_sha256=template_hash,
             )
 
@@ -331,13 +403,96 @@ class UserConfigManager:
         config = self.load_or_create() if create else self.load()
         return config.profile(name)
 
+    def replace(self, config: GeasUserConfig) -> None:
+        """Atomically replace trusted user configuration with a validated value."""
+        validated = GeasUserConfig.model_validate(config.model_dump(mode="python"))
+        self.validate_subscription_layout(validated)
+        if self.path.is_symlink():
+            raise ValueError("Geas user config cannot be a symbolic link")
+        _atomic_write(self.path, validated.explicit_yaml().encode())
+
+    def restore_bytes(self, value: bytes) -> None:
+        """Atomically restore an exact previously validated configuration snapshot."""
+        try:
+            GeasUserConfig.model_validate(yaml.safe_load(value))
+        except (ValueError, yaml.YAMLError) as error:
+            raise ValueError("cannot restore invalid Geas user configuration bytes") from error
+        if self.path.is_symlink():
+            raise ValueError("Geas user config cannot be a symbolic link")
+        _atomic_write(self.path, value)
+
     def ontology_root(self, profile: GeasProfile) -> Path:
         return self._confined(profile.ontology_directory)
 
+    def subscription_checkout(self, subscription: OntologySubscription) -> Path:
+        return self._confined_subscription_path(subscription.checkout)
+
+    def validate_subscription_layout(self, config: GeasUserConfig) -> None:
+        """Reject filesystem aliases and overlaps without following symlinks."""
+        resolved: list[tuple[str, Path]] = []
+        for profile_name, profile in sorted(config.profiles.items()):
+            normalized = profile.normalized_subscriptions(freshness=config.ontology_freshness)
+            for name, subscription in normalized.items():
+                validate_removal_journal_namespace(subscription.checkout)
+                checkout = self._confined_subscription_path(subscription.checkout)
+                canonical = checkout.resolve()
+                self._confined_subscription_path(subscription.checkout)
+                identity = f"{profile_name}/{name}"
+                for sibling_identity, sibling in resolved:
+                    if (
+                        canonical == sibling
+                        or canonical.is_relative_to(sibling)
+                        or sibling.is_relative_to(canonical)
+                    ):
+                        raise ValueError(
+                            "subscriptions resolve to the same checkout or overlap: "
+                            f"{sibling_identity!r}, {identity!r}"
+                        )
+                resolved.append((identity, canonical))
+
+    def validate_subscription_removal(
+        self,
+        config: GeasUserConfig,
+        *,
+        profile_name: str,
+        subscription_name: str,
+        expected_checkout: Path,
+    ) -> None:
+        """Prove no configured checkout aliases or overlaps a removal target."""
+        self.validate_subscription_layout(config)
+        _, selected_profile = config.profile(profile_name)
+        try:
+            selected = selected_profile.normalized_subscriptions(
+                freshness=config.ontology_freshness
+            )[subscription_name]
+        except KeyError:
+            raise ValueError(f"unknown ontology subscription: {subscription_name}") from None
+        checkout = self._confined_subscription_path(selected.checkout)
+        if checkout != expected_checkout:
+            raise RuntimeError("subscription checkout identity changed before removal")
+        canonical = checkout.resolve()
+        self._confined_subscription_path(selected.checkout)
+        for other_profile_name, profile in sorted(config.profiles.items()):
+            normalized = profile.normalized_subscriptions(freshness=config.ontology_freshness)
+            for other_name, subscription in normalized.items():
+                if other_profile_name == profile_name and other_name == subscription_name:
+                    continue
+                other_checkout = self._confined_subscription_path(subscription.checkout)
+                other_canonical = other_checkout.resolve()
+                self._confined_subscription_path(subscription.checkout)
+                if (
+                    canonical == other_canonical
+                    or canonical.is_relative_to(other_canonical)
+                    or other_canonical.is_relative_to(canonical)
+                ):
+                    raise ValueError(
+                        "subscription removal checkout overlaps checkout referenced by "
+                        f"{other_profile_name}/{other_name!s}"
+                    )
+
     def secret_paths(self, profile: GeasProfile) -> tuple[tuple[Path, str], ...]:
         return tuple(
-            (self._confined(source.path), source.format)
-            for source in profile.secret_sources
+            (self._confined(source.path), source.format) for source in profile.secret_sources
         )
 
     def _confined(self, relative: Path) -> Path:
@@ -345,6 +500,17 @@ class UserConfigManager:
         if not resolved.is_relative_to(self.root):
             raise ValueError("Geas profile path escapes the user config directory")
         return resolved
+
+    def _confined_subscription_path(self, relative: Path) -> Path:
+        candidate = self.root / relative
+        current = self.root
+        for component in relative.parts:
+            current /= component
+            if current.is_symlink():
+                raise ValueError(f"subscription checkout contains a symbolic link: {current}")
+            if current.exists() and not current.is_dir():
+                raise ValueError(f"subscription checkout component is not a directory: {current}")
+        return candidate
 
 
 def default_config_path(filename: str) -> Path:

@@ -10,6 +10,7 @@ import yaml
 from research_agent.user_config import (
     DEFAULT_CONFIG_FILENAMES,
     DEFAULT_ONTOLOGY_REPOSITORY,
+    GeasProfile,
     GeasUserConfig,
     UserConfigManager,
 )
@@ -27,9 +28,7 @@ def test_user_config_initializes_explicit_profile_and_secret_scaffold(
     assert profile.ontology_git is not None
     assert profile.ontology_git.url == DEFAULT_ONTOLOGY_REPOSITORY
     assert manager.ontology_root(profile) == tmp_path / "geas" / "ontologies"
-    assert (tmp_path / "geas" / "secrets" / ".gitignore").read_text() == (
-        "*\n!.gitignore\n"
-    )
+    assert (tmp_path / "geas" / "secrets" / ".gitignore").read_text() == ("*\n!.gitignore\n")
     assert all((tmp_path / "geas" / name).is_file() for name in DEFAULT_CONFIG_FILENAMES)
     assert (tmp_path / "geas" / "defaults-state.json").is_file()
     assert manager.last_defaults_receipt is not None
@@ -66,6 +65,7 @@ def test_user_config_initializes_explicit_profile_and_secret_scaffold(
         "pull_before_update": False,
         "push_on_update": False,
     }
+    assert serialized["profiles"]["default"]["subscriptions"] == {}
 
 
 def test_user_config_supports_team_profiles_and_confines_paths(tmp_path: Path) -> None:
@@ -122,9 +122,7 @@ def test_config_init_materializes_new_global_defaults_without_overwriting_values
     assert config.ontology_defaults.provider == "deepseek_local"
     assert serialized["ontology_defaults"]["provider"] == "deepseek_local"
     assert serialized["ontology_freshness"]["max_age_seconds"] == 3600
-    assert serialized["profiles"]["default"]["ontology_directory"] == (
-        "custom/ontologies"
-    )
+    assert serialized["profiles"]["default"]["ontology_directory"] == ("custom/ontologies")
     assert serialized["profiles"]["default"]["secret_sources"] == []
 
 
@@ -140,6 +138,63 @@ def test_user_config_rejects_escaping_and_credential_bearing_values() -> None:
     )
     with pytest.raises(ValueError, match="embed credentials"):
         GeasUserConfig.model_validate(raw)
+
+
+def test_user_config_replace_is_atomic_on_replacement_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed replacement must preserve the complete previous trusted config."""
+    manager = UserConfigManager(tmp_path / "geas" / "config.yaml")
+    manager.root.mkdir(parents=True)
+    original = GeasUserConfig.default()
+    manager.replace(original)
+    before = manager.path.read_bytes()
+    other_profile = original.profiles["default"].model_copy(
+        update={"ontology_directory": Path("other-ontologies")}
+    )
+    changed = original.model_copy(
+        update={
+            "default_profile": "other",
+            "profiles": {
+                **original.profiles,
+                "other": other_profile,
+            },
+        }
+    )
+
+    def fail_replace(source: object, destination: object) -> None:
+        raise OSError("injected replacement failure")
+
+    monkeypatch.setattr("research_agent.user_config.os.replace", fail_replace)
+    with pytest.raises(OSError, match="injected"):
+        manager.replace(changed)
+
+    assert manager.path.read_bytes() == before
+    assert not tuple(manager.root.glob(".config.yaml.tmp-*"))
+
+
+def test_user_config_replace_revalidates_constructed_model_instances(
+    tmp_path: Path,
+) -> None:
+    """A caller must not smuggle invalid trusted paths through Pydantic construct."""
+    manager = UserConfigManager(tmp_path / "geas" / "config.yaml")
+    manager.root.mkdir(parents=True)
+    invalid_profile = GeasProfile.model_construct(
+        ontology_directory=Path("../outside"),
+        secret_sources=(),
+        ontology_git=None,
+        trust_rules=(),
+        installed_ontologies=(),
+    )
+    invalid = GeasUserConfig.model_construct(
+        version=1,
+        default_profile="default",
+        profiles={"default": invalid_profile},
+    )
+
+    with pytest.raises(ValueError, match="config-relative"):
+        manager.replace(invalid)
+    assert not manager.path.exists()
 
 
 def test_managed_default_updates_preserve_operator_changes(
@@ -182,9 +237,7 @@ def test_preexisting_unmanaged_config_is_never_adopted_as_overwritable(
 
     assert "providers.toml" in first.preserved
     assert "providers.toml" in second.preserved
-    assert (manager.root / "providers.toml").read_text() == (
-        "preexisting operator config\n"
-    )
+    assert (manager.root / "providers.toml").read_text() == ("preexisting operator config\n")
 
 
 def test_packaged_defaults_match_repository_templates() -> None:
