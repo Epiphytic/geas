@@ -10,6 +10,7 @@ import pytest
 
 import research_agent.ontology_artifacts as artifacts_module
 import research_agent.pr_skill_sync as pr_skill_sync_module
+import research_agent.truth as truth_module
 from research_agent.ontology_artifacts import (
     ArtifactRole,
     OntologyArtifact,
@@ -416,6 +417,52 @@ def test_preseeded_projection_copy_never_unlinks_concurrent_destination(
         )
 
     assert destination.read_bytes() == concurrent
+
+
+def test_preseeded_projection_copy_rejects_replacement_before_return(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ontology = tmp_path / "routing"
+    ontology.mkdir()
+    database = tmp_path / "knowledge.sqlite"
+    _knowledge_database(database)
+    artifact_store = MemoryArtifactStore().use_root(tmp_path / "remote-assets")
+    artifact = OntologyArtifactManager(ontology).publish(
+        store=artifact_store,
+        published_by="test:operator",
+        storage_rights_basis="operator-confirmed private storage",
+        knowledge_projection=database,
+    ).artifacts[0]
+    destination = tmp_path / "artifact-workspace" / "query.sqlite"
+    destination.parent.mkdir()
+    replacement = tmp_path / "replacement.sqlite"
+    replacement.write_bytes(b"concurrent destination owner\n")
+    replacement_bytes = replacement.read_bytes()
+    unlink_candidate = truth_module._unlink_candidate_identity
+    injected = False
+
+    def replace_after_candidate_unlink(*args: object, **kwargs: object) -> None:
+        nonlocal injected
+        unlink_candidate(*args, **kwargs)  # type: ignore[arg-type]
+        if not injected and destination.exists():
+            replacement.replace(destination)
+            injected = True
+
+    monkeypatch.setattr(
+        truth_module,
+        "_unlink_candidate_identity",
+        replace_after_candidate_unlink,
+    )
+
+    with pytest.raises(ValueError, match="changed before return"):
+        pr_skill_sync_module._PreseededProjectionStore(database).download(
+            artifact,
+            destination,
+        )
+
+    assert injected
+    assert destination.read_bytes() == replacement_bytes
 
 
 def test_knowledge_projection_hydration_rejects_manifest_input_revision_mismatch(

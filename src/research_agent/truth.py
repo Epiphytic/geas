@@ -238,6 +238,16 @@ class StableProjectionReader:
                 self.authority,
                 allowed_link_counts=(2,),
             )
+            installed = os.lstat(destination)
+            if (
+                not stat.S_ISREG(installed.st_mode)
+                or installed.st_dev != self.authority.candidate_device
+                or installed.st_ino != self.authority.candidate_inode
+                or installed.st_nlink != 1
+            ):
+                raise ValueError(
+                    "stable projection destination changed before return"
+                )
         except BaseException:
             if _path_has_candidate_identity(destination, self.authority):
                 _remove_path_identity_no_clobber(
@@ -453,6 +463,8 @@ def _copy_projection_candidate(
     database: Path,
     candidate_file_descriptor: int,
 ) -> _ProjectionSourceIdentity | None:
+    os.ftruncate(candidate_file_descriptor, 0)
+    os.lseek(candidate_file_descriptor, 0, os.SEEK_SET)
     if _has_sqlite_sidecar(database):
         raise ValueError("knowledge projection has an active SQLite sidecar")
     try:
@@ -884,6 +896,39 @@ def _unlink_candidate_identity(
         quarantine=authority.transaction_directory / ".candidate-cleanup",
         error_message="projection stamp candidate identity is unsafe",
     )
+
+
+def _unlink_candidate_content_token(
+    candidate: Path,
+    token: bytes,
+    transaction_directory: Path,
+) -> None:
+    """Remove an exclusively-created candidate when descriptor stat is unavailable."""
+    quarantine = transaction_directory / ".validation-token-cleanup"
+    try:
+        _move_path_no_replace(candidate, quarantine)
+    except FileNotFoundError:
+        return
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            quarantine,
+            os.O_RDONLY | _O_NOFOLLOW | _O_BINARY,
+        )
+        observed = os.read(descriptor, len(token) + 1)
+        if observed != token:
+            try:
+                _move_path_no_replace(quarantine, candidate)
+            except BaseException as restore_error:
+                raise RuntimeError(
+                    "projection validation cleanup retained an unknown path in "
+                    "quarantine"
+                ) from restore_error
+            raise ValueError("projection validation candidate token is unsafe")
+        os.unlink(quarantine)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
 
 
 def _remove_path_identity_no_clobber(
@@ -1789,6 +1834,7 @@ def _open_stable_projection_connection(
     candidate = transaction_directory / "projection.sqlite"
     candidate_file_descriptor = -1
     candidate_information: os.stat_result | None = None
+    candidate_cleanup_token: bytes | None = None
     candidate_authority: _CandidateAuthority | None = None
     connection: sqlite3.Connection | None = None
     transferred = False
@@ -1800,6 +1846,8 @@ def _open_stable_projection_connection(
             os.O_RDWR | os.O_CREAT | os.O_EXCL | _O_NOFOLLOW | _O_BINARY,
             0o600,
         )
+        candidate_cleanup_token = secrets.token_bytes(32)
+        os.write(candidate_file_descriptor, candidate_cleanup_token)
         try:
             candidate_information = os.fstat(candidate_file_descriptor)
         except BaseException:
@@ -1862,27 +1910,40 @@ def _open_stable_projection_connection(
             connection.close()
         raise
     finally:
+        active_error = sys.exc_info()[0] is not None
         if candidate_file_descriptor >= 0:
             os.close(candidate_file_descriptor)
         if not transferred:
-            if candidate_authority is not None:
-                _unlink_candidate_identity(candidate_authority)
-            elif candidate_information is not None:
-                _remove_path_identity_no_clobber(
-                    candidate,
-                    expected_device=candidate_information.st_dev,
-                    expected_inode=candidate_information.st_ino,
-                    allowed_link_counts=(1,),
-                    quarantine=transaction_directory / ".validation-cleanup",
-                    error_message="projection validation candidate identity is unsafe",
-                )
-            if transaction_directory.exists():
-                transaction_directory.rmdir()
-                _WINDOWS_PRIVATE_DIRECTORY_IDENTITIES.pop(
-                    str(transaction_directory),
-                    None,
-                )
-                _fsync_directory(parent)
+            try:
+                if candidate_authority is not None:
+                    _unlink_candidate_identity(candidate_authority)
+                elif candidate_information is not None:
+                    _remove_path_identity_no_clobber(
+                        candidate,
+                        expected_device=candidate_information.st_dev,
+                        expected_inode=candidate_information.st_ino,
+                        allowed_link_counts=(1,),
+                        quarantine=transaction_directory / ".validation-cleanup",
+                        error_message=(
+                            "projection validation candidate identity is unsafe"
+                        ),
+                    )
+                elif candidate_cleanup_token is not None:
+                    _unlink_candidate_content_token(
+                        candidate,
+                        candidate_cleanup_token,
+                        transaction_directory,
+                    )
+                if transaction_directory.exists():
+                    transaction_directory.rmdir()
+                    _WINDOWS_PRIVATE_DIRECTORY_IDENTITIES.pop(
+                        str(transaction_directory),
+                        None,
+                    )
+                    _fsync_directory(parent)
+            except BaseException:
+                if not active_error:
+                    raise
 
 
 def _validated_projection_state(

@@ -1538,7 +1538,15 @@ def test_projection_reader_rejects_source_replacement_after_snapshot_validation(
 
 @pytest.mark.parametrize(
     "failure",
-    ("missing", "open", "fstat", "authority", "copy", "connect"),
+    (
+        "missing",
+        "open",
+        "fstat",
+        "descriptor-stats",
+        "authority",
+        "copy",
+        "connect",
+    ),
 )
 def test_projection_reader_failure_cleans_private_validation_snapshot(
     tmp_path: Path,
@@ -1581,6 +1589,24 @@ def test_projection_reader_failure_cleans_private_validation_snapshot(
             return fstat(file_descriptor)
 
         monkeypatch.setattr(truth_module.os, "fstat", fail_candidate_fstat)
+    elif failure == "descriptor-stats":
+        stat_file = truth_module.os.stat
+        monkeypatch.setattr(
+            truth_module.os,
+            "fstat",
+            lambda file_descriptor: (_ for _ in ()).throw(
+                OSError("candidate fstat failed")
+            ),
+        )
+        monkeypatch.setattr(
+            truth_module.os,
+            "stat",
+            lambda path, *args, **kwargs: (_ for _ in ()).throw(
+                OSError("candidate descriptor stat failed")
+            )
+            if isinstance(path, int)
+            else stat_file(path, *args, **kwargs),
+        )
     elif failure == "authority":
         monkeypatch.setattr(
             truth_module,
@@ -1608,6 +1634,7 @@ def test_projection_reader_failure_cleans_private_validation_snapshot(
         "missing": ValueError,
         "open": OSError,
         "fstat": OSError,
+        "descriptor-stats": OSError,
         "authority": ValueError,
         "copy": OSError,
         "connect": sqlite3.OperationalError,
