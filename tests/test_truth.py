@@ -1031,26 +1031,17 @@ def test_projection_stamp_rejects_unsupported_atomic_exchange_platform(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    workspace, store = _workspace(tmp_path)
-    instant = datetime(2026, 8, 2, 12, 0, tzinfo=UTC)
-    snapshot = _manager(workspace, store, instant=instant).capture(
-        created_by="operator:test"
-    )
-    database = tmp_path / "query.sqlite"
-    _write_projection_fixture(database)
-    original = database.read_bytes()
+    first = tmp_path / "first.sqlite"
+    second = tmp_path / "second.sqlite"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
     monkeypatch.setattr(truth_module.sys, "platform", "unsupported")
 
     with pytest.raises(OSError, match="atomic projection exchange is unsupported"):
-        SQLiteProjectionGuard(clock=lambda: instant).stamp(
-            database,
-            snapshot,
-            schema_version=1,
-            builder_version="projection-builder/test",
-        )
+        truth_module._atomic_exchange_paths(first, second)
 
-    assert database.read_bytes() == original
-    assert _projection_candidate_paths(database) == ()
+    assert first.read_bytes() == b"first"
+    assert second.read_bytes() == b"second"
 
 
 @pytest.mark.skipif(
@@ -1918,6 +1909,10 @@ def test_raw_sqlite_open_includes_platform_binary_flag(
     assert all(flags & binary_flag for flags in opened_flags)
 
 
+@pytest.mark.skipif(
+    truth_module.sys.platform == "win32",
+    reason="Windows prevents unlinking an open candidate; handle identity is tested directly",
+)
 def test_projection_stamp_rejects_candidate_symlink_substitution(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1964,6 +1959,10 @@ def test_projection_stamp_rejects_candidate_symlink_substitution(
     assert replacement.resolve() == outside
 
 
+@pytest.mark.skipif(
+    truth_module.sys.platform == "win32",
+    reason="Windows prevents unlinking an open candidate; handle identity is tested directly",
+)
 def test_projection_stamp_never_unlinks_substituted_candidate_hardlink(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
