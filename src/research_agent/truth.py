@@ -18,7 +18,6 @@ from pydantic import Field, field_validator
 
 from research_agent.models import StrictModel, canonical_json, content_id, utc_now
 
-
 _SQLITE_HEADER = b"SQLite format 3\0"
 _SQLITE_NON_SEMANTIC_HEADER_FIELDS = (24, 40, 92, 96)
 _SQLITE_HEADER_FIELD_SIZE = 4
