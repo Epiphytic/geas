@@ -720,6 +720,13 @@ def test_projection_build_install_rejects_concurrent_destination_change(
     assert tuple(tmp_path.glob(f".{database.name}.build-*")) == ()
 
 
+@pytest.mark.skipif(
+    truth_module.sys.platform == "win32",
+    reason=(
+        "Windows prevents unlinking an open stamped candidate; the platform-safe "
+        "builder cleanup substitution is covered in test_truth"
+    ),
+)
 def test_projection_build_never_unlinks_substituted_stamped_candidate(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
