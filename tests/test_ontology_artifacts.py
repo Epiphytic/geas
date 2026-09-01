@@ -682,6 +682,49 @@ def test_live_placeholder_cannot_excuse_control_delimited_deleted_slack(
     assert not (ontology / "artifacts.yaml").exists()
 
 
+def test_live_placeholder_cannot_excuse_long_deleted_varint_record(
+    tmp_path: Path,
+) -> None:
+    """Occurrence accounting rejects a deleted record with a multibyte type."""
+    ontology = tmp_path / "routing"
+    ontology.mkdir()
+    database = tmp_path / "library.sqlite"
+    _library_database(database)
+    live_placeholder = b"FIRECRAWL_KEY=your_firecrawl_key"
+    deleted_residue = (
+        live_placeholder
+        + b"\x01operator-secret-value-123"
+        + b"x" * 256
+    )
+    with sqlite3.connect(database) as connection:
+        connection.execute("PRAGMA secure_delete=OFF")
+        connection.execute(
+            "CREATE TABLE source_text(id INTEGER PRIMARY KEY, content BLOB NOT NULL)"
+        )
+        connection.execute("INSERT INTO source_text(content) VALUES (?)", (live_placeholder,))
+        cursor = connection.execute(
+            "INSERT INTO source_text(content) VALUES (?)", (deleted_residue,)
+        )
+        connection.execute("DELETE FROM source_text WHERE id = ?", (cursor.lastrowid,))
+        assert connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+    database_bytes = database.read_bytes()
+    assert live_placeholder in database_bytes
+    assert deleted_residue in database_bytes
+    store = MemoryArtifactStore().use_root(tmp_path / "remote-assets")
+
+    with pytest.raises(OntologyArtifactError, match="possible credential"):
+        OntologyArtifactManager(ontology).publish(
+            store=store,
+            published_by="test:operator",
+            storage_rights_basis="public documentation fixture",
+            source_library=database,
+        )
+
+    assert store.values == {}
+    assert tuple((tmp_path / "remote-assets").iterdir()) == ()
+    assert not (ontology / "artifacts.yaml").exists()
+
+
 def test_deleted_prefixed_placeholder_residue_rejects_without_upload(
     tmp_path: Path,
 ) -> None:

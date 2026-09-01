@@ -21,7 +21,7 @@ import yaml
 from pydantic import Field, field_validator, model_validator
 
 from research_agent.credential_scanning import (
-    binary_residue_is_only_live_sqlite_placeholders,
+    binary_residue_matches_compacted_sqlite,
     contains_binary_credential_residue,
     contains_credential_assignment_marker,
     contains_fixed_credential,
@@ -33,7 +33,6 @@ from research_agent.truth import ProjectionStamp, SQLiteProjectionGuard
 _ONTOLOGY_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 _ASSET_NAME = re.compile(r"geas-[a-z-]+-[0-9a-f]{64}\.(?:sqlite|zip)")
 _RELEASE_TAG = re.compile(r"geas-artifact-[0-9a-f]{64}")
-_MAX_LIVE_SQLITE_PLACEHOLDER_BYTES = 4096
 class OntologyArtifactError(RuntimeError):
     pass
 
@@ -793,31 +792,55 @@ def _scan_sensitive_content(path: Path) -> None:
         return
     with path.open("rb") as handle:
         sqlite_database = handle.read(16) == b"SQLite format 3\x00"
-    live_values = _scan_sqlite_values(path) if sqlite_database else ()
-    with path.open("rb") as handle, mmap.mmap(
-        handle.fileno(),
-        0,
-        access=mmap.ACCESS_READ,
-    ) as content:
-        sensitive = (
-            contains_binary_credential_residue(content)
-            if sqlite_database
-            else contains_possible_credential(content)
-        )
-        if sensitive and not (
-            sqlite_database
-            and binary_residue_is_only_live_sqlite_placeholders(
-                content,
-                live_values,
+    compacted: Path | None = None
+    temporary_root: Path | None = None
+    try:
+        if sqlite_database:
+            _scan_sqlite_values(path)
+            temporary_root = Path(tempfile.mkdtemp(prefix="geas-sqlite-scan-"))
+            compacted = temporary_root / "compacted.sqlite"
+            _compact_sqlite_for_scanning(path, compacted)
+        with path.open("rb") as handle, mmap.mmap(
+            handle.fileno(),
+            0,
+            access=mmap.ACCESS_READ,
+        ) as content:
+            sensitive = (
+                contains_binary_credential_residue(content)
+                if sqlite_database
+                else contains_possible_credential(content)
             )
-        ):
-            raise OntologyArtifactError(
-                f"possible credential detected in ontology artifact: {path}"
-            )
+            reconciled = False
+            if sensitive and compacted is not None:
+                with compacted.open("rb") as compacted_handle, mmap.mmap(
+                    compacted_handle.fileno(),
+                    0,
+                    access=mmap.ACCESS_READ,
+                ) as compacted_content:
+                    reconciled = binary_residue_matches_compacted_sqlite(
+                        content,
+                        compacted_content,
+                    )
+            if sensitive and not reconciled:
+                raise OntologyArtifactError(
+                    f"possible credential detected in ontology artifact: {path}"
+                )
+    finally:
+        if temporary_root is not None:
+            shutil.rmtree(temporary_root, ignore_errors=True)
 
 
-def _scan_sqlite_values(path: Path) -> tuple[tuple[bytes, bool], ...]:
-    live_placeholders: set[tuple[bytes, bool]] = set()
+def _compact_sqlite_for_scanning(source: Path, destination: Path) -> None:
+    try:
+        with sqlite3.connect(f"file:{source}?mode=ro", uri=True) as connection:
+            connection.execute("VACUUM INTO ?", (str(destination),))
+    except sqlite3.Error as error:
+        raise OntologyArtifactError(
+            f"could not compact SQLite ontology artifact for scanning: {source}"
+        ) from error
+
+
+def _scan_sqlite_values(path: Path) -> None:
     try:
         with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as connection:
             schema_values = connection.execute(
@@ -846,18 +869,10 @@ def _scan_sqlite_values(path: Path) -> tuple[tuple[bytes, bool], ...]:
                     )
                     for (value,) in values:
                         _raise_for_sqlite_credential(path, value)
-                        content = value.encode("utf-8") if isinstance(value, str) else bytes(value)
-                        if (
-                            len(content) <= _MAX_LIVE_SQLITE_PLACEHOLDER_BYTES
-                            and contains_credential_assignment_marker(content)
-                            and len(live_placeholders) < 1024
-                        ):
-                            live_placeholders.add((content, isinstance(value, str)))
     except (sqlite3.Error, TypeError, UnicodeError, ValueError) as error:
         raise OntologyArtifactError(
             f"could not scan SQLite ontology artifact for credentials: {path}"
         ) from error
-    return tuple(sorted(live_placeholders, key=lambda item: (item[0], item[1])))
 
 
 def _raise_for_sqlite_credential(path: Path, value: str | bytes) -> None:

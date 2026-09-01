@@ -308,10 +308,10 @@ def test_oversized_credential_name_fails_closed_without_candidate_copy(
     original = credential_scanning._BinaryCredentialFinding
 
     def record_finding(
-        *, candidate: bytes, payload: bytes | None
+        *, candidate: bytes, payload: bytes | None, assignment: bytes | None
     ) -> credential_scanning._BinaryCredentialFinding:
         observed.append((len(candidate), None if payload is None else len(payload)))
-        return original(candidate=candidate, payload=payload)
+        return original(candidate=candidate, payload=payload, assignment=assignment)
 
     monkeypatch.setattr(
         credential_scanning,

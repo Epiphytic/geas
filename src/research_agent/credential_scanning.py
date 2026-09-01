@@ -22,12 +22,14 @@ _CREDENTIAL_MARKER_CONTROL_BYTES = bytes(range(0x20)) + b"\x7f"
 _INERT_LITERAL = re.compile(rb"[A-Za-z0-9._/-]*")
 _MIN_CREDENTIAL_LENGTH = 12
 _MAX_BINARY_ASSIGNMENT_BYTES = 4096
+_MAX_COMPACTED_SQLITE_FINDINGS = 1024
 
 
 @dataclass(frozen=True)
 class _BinaryCredentialFinding:
     candidate: bytes
     payload: bytes | None
+    assignment: bytes | None
 
 
 def contains_possible_credential(content: Buffer) -> bool:
@@ -72,24 +74,36 @@ def contains_binary_credential_residue(content: Buffer) -> bool:
     return next(_iter_binary_credential_findings(content), None) is not None
 
 
-def binary_residue_is_only_live_sqlite_placeholders(
+def binary_residue_matches_compacted_sqlite(
     content: Buffer,
-    live_values: tuple[tuple[bytes, bool], ...],
+    compacted_content: Buffer,
 ) -> bool:
-    """Return whether every binary finding is one exact verified live value.
+    """Return whether raw findings are reproduced by compacted live records.
 
-    ``live_values`` must already have passed the canonical scanner. This
-    narrow SQLite record exception is kept outside the binary classifier, so
-    the classifier itself never weakens a canonical finding.
+    The compacted database must be produced from the same valid SQLite input.
+    Its exact bounded finding multiset contains live record structure but no
+    deleted cells, freelist content, or page slack. Opaque findings can never
+    be reconciled.
     """
+    allowed: dict[bytes, int] = {}
+    allowed_count = 0
+    for finding in _iter_binary_credential_findings(compacted_content):
+        if finding.assignment is None:
+            continue
+        allowed_count += 1
+        if allowed_count > _MAX_COMPACTED_SQLITE_FINDINGS:
+            return False
+        allowed[finding.assignment] = allowed.get(finding.assignment, 0) + 1
+
     found = False
     for finding in _iter_binary_credential_findings(content):
         found = True
-        if finding.payload is None or not _is_live_sqlite_record_placeholder(
-            finding.payload,
-            live_values,
-        ):
+        if finding.assignment is None:
             return False
+        remaining = allowed.get(finding.assignment, 0)
+        if remaining == 0:
+            return False
+        allowed[finding.assignment] = remaining - 1
     return found
 
 
@@ -97,17 +111,17 @@ def _iter_binary_credential_findings(
     content: Buffer,
 ) -> Iterator[_BinaryCredentialFinding]:
     if contains_fixed_credential(content):
-        yield _BinaryCredentialFinding(candidate=b"", payload=None)
+        yield _BinaryCredentialFinding(candidate=b"", payload=None, assignment=None)
         return
     size = len(content)
     for context_start, _marker_start, marker_end, obfuscated in (
         _iter_binary_assignment_markers(content)
     ):
         if obfuscated:
-            yield _BinaryCredentialFinding(candidate=b"", payload=None)
+            yield _BinaryCredentialFinding(candidate=b"", payload=None, assignment=None)
             continue
         if marker_end - context_start > _MAX_BINARY_ASSIGNMENT_BYTES:
-            yield _BinaryCredentialFinding(candidate=b"", payload=None)
+            yield _BinaryCredentialFinding(candidate=b"", payload=None, assignment=None)
             continue
         start = context_start
         end = marker_end
@@ -120,9 +134,10 @@ def _iter_binary_credential_findings(
         if end == limit and end < size:
             next_value = content[end]
             if next_value == 0x09 or 0x20 <= next_value < 0x7F:
-                yield _BinaryCredentialFinding(candidate=b"", payload=None)
+                yield _BinaryCredentialFinding(candidate=b"", payload=None, assignment=None)
                 continue
         payload = bytes(content[start:end])
+        assignment = bytes(content[_marker_start:end])
         # Preserve CR/LF record boundaries, but include any other binary
         # delimiter. The canonical scanner must see a control adjacent to an
         # otherwise inert placeholder and reject it.
@@ -130,7 +145,11 @@ def _iter_binary_credential_findings(
             end += 1
         candidate = bytes(content[start:end])
         if contains_possible_credential(candidate):
-            yield _BinaryCredentialFinding(candidate=candidate, payload=payload)
+            yield _BinaryCredentialFinding(
+                candidate=candidate,
+                payload=payload,
+                assignment=assignment,
+            )
 
 
 def _iter_binary_assignment_markers(
@@ -208,26 +227,6 @@ def _iter_binary_assignment_markers(
 def _is_credential_name_suffix(suffix: bytearray) -> bool:
     value = bytes(suffix)
     return value.endswith((b"KEY", b"TOKEN", b"SECRET", b"PASSWORD"))
-
-
-def _is_live_sqlite_record_placeholder(
-    candidate: bytes,
-    live_values: tuple[tuple[bytes, bool], ...],
-) -> bool:
-    if not candidate:
-        return False
-    for value, is_text in live_values:
-        if contains_possible_credential(value):
-            continue
-        fragments = tuple(_normalize_line_separators(value).split(b"\n"))
-        if candidate in fragments:
-            return True
-        serial_type = 2 * len(value) + (13 if is_text else 12)
-        if serial_type >= 0x80:
-            continue
-        if candidate == bytes((serial_type,)) + fragments[0]:
-            return True
-    return False
 
 
 def contains_credential_assignment_marker(content: Buffer) -> bool:
