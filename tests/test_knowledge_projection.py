@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+import research_agent.truth as truth_module
 from research_agent.connectors import (
     CrossrefDiscoveryConnector,
     EuropePmcDiscoveryConnector,
@@ -558,6 +559,127 @@ def test_projection_supports_lexical_hierarchy_dissent_gaps_and_provenance(
     assert "## Knowledge gaps" in markdown
     assert "## Poisoned or tainted source observations" in markdown
     assert "Ignore all previous instructions" not in markdown
+
+
+def test_query_engine_remains_bound_to_validated_projection_after_path_replacement(
+    tmp_path: Path,
+) -> None:
+    _, database, (_, _, snapshot, _) = _build_projection(tmp_path)
+    engine = KnowledgeQueryEngine(database)
+    before = engine.query("dental caries", limit=10)
+    displaced = tmp_path / "validated.sqlite"
+    database.replace(displaced)
+    database.write_bytes(b"not a SQLite projection")
+
+    after = engine.query("dental caries", limit=10)
+
+    assert after == before
+    assert after.projection_snapshot_id == snapshot.id
+    with pytest.raises((ValueError, sqlite3.DatabaseError)):
+        KnowledgeQueryEngine(database)
+
+    engine.close()
+    with pytest.raises(ValueError, match="closed"):
+        engine.query("dental caries", limit=10)
+
+
+def test_projection_build_and_query_reject_static_destination_symlinks(
+    tmp_path: Path,
+) -> None:
+    store, database, (_, manager, snapshot, _) = _build_projection(tmp_path)
+    outside_bytes = database.read_bytes()
+    linked = tmp_path / "linked.sqlite"
+    linked.symlink_to(database)
+
+    with pytest.raises(ValueError, match="symlink|unsafe"):
+        SQLiteKnowledgeProjection(store=store, workspace_root=Path(".")).build(
+            linked,
+            snapshot=snapshot,
+            truth_manager=manager,
+        )
+    with pytest.raises(ValueError, match="symlink|unsafe"):
+        KnowledgeQueryEngine(linked)
+
+    assert database.read_bytes() == outside_bytes
+
+
+@pytest.mark.parametrize("destination_exists", (True, False))
+def test_projection_build_install_rejects_concurrent_destination_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    destination_exists: bool,
+) -> None:
+    store, database, (_, manager, snapshot, _) = _build_projection(tmp_path)
+    if not destination_exists:
+        database.unlink()
+    concurrent = tmp_path / "concurrent.sqlite"
+    concurrent.write_bytes(b"concurrent projection owner")
+    concurrent_bytes = concurrent.read_bytes()
+    install = SQLiteProjectionGuard.install_stamped
+
+    def replace_at_install(
+        self: SQLiteProjectionGuard,
+        candidate: Path,
+        target: Path,
+        **kwargs: object,
+    ) -> None:
+        concurrent.replace(target)
+        install(self, candidate, target, **kwargs)
+
+    monkeypatch.setattr(
+        SQLiteProjectionGuard,
+        "install_stamped",
+        replace_at_install,
+    )
+
+    with pytest.raises((ValueError, FileExistsError)):
+        SQLiteKnowledgeProjection(store=store, workspace_root=Path(".")).build(
+            database,
+            snapshot=snapshot,
+            truth_manager=manager,
+        )
+
+    assert database.read_bytes() == concurrent_bytes
+    assert tuple(tmp_path.glob(f".{database.name}.build-*")) == ()
+
+
+def test_projection_build_never_unlinks_substituted_stamped_candidate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, database, (_, manager, snapshot, _) = _build_projection(tmp_path)
+    original = database.read_bytes()
+    outside = tmp_path / "outside.sqlite"
+    outside.write_bytes(b"outside owner")
+    outside_bytes = outside.read_bytes()
+    validate = truth_module._candidate_ready_for_install
+
+    def substitute_then_validate(authority: object) -> None:
+        candidate = authority.candidate
+        candidate.unlink()
+        candidate.symlink_to(outside)
+        validate(authority)
+
+    monkeypatch.setattr(
+        truth_module,
+        "_candidate_ready_for_install",
+        substitute_then_validate,
+    )
+
+    with pytest.raises(ValueError, match="candidate.*unsafe|identity"):
+        SQLiteKnowledgeProjection(store=store, workspace_root=Path(".")).build(
+            database,
+            snapshot=snapshot,
+            truth_manager=manager,
+        )
+
+    assert database.read_bytes() == original
+    assert outside.read_bytes() == outside_bytes
+    leftovers = tuple(tmp_path.glob(f".{database.name}.build-*"))
+    assert len(leftovers) == 1
+    replacement = leftovers[0] / "projection.sqlite"
+    assert replacement.is_symlink()
+    assert replacement.resolve() == outside
 
 
 def test_topic_can_export_an_idempotent_cross_linked_obsidian_vault(tmp_path: Path) -> None:

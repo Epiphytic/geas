@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import base64
+import ctypes
+import errno
 import hashlib
 import json
 import os
 import sqlite3
 import stat
 import subprocess
+import sys
 import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -26,6 +29,27 @@ _SQLITE_NON_SEMANTIC_HEADER_FIELDS = (24, 40, 92, 96)
 _SQLITE_HEADER_FIELD_SIZE = 4
 _SQLITE_PORTABLE_PAGE_SIZE = 4096
 _COPY_BLOCK_SIZE = 1024 * 1024
+_O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_O_BINARY = getattr(os, "O_BINARY", 0)
+
+
+def _require_no_symlink_components(
+    path: Path,
+    *,
+    allow_missing: bool,
+) -> None:
+    absolute = path.absolute()
+    current = Path(absolute.anchor)
+    for part in absolute.parts[1:]:
+        current /= part
+        try:
+            information = os.lstat(current)
+        except FileNotFoundError:
+            if allow_missing:
+                return
+            raise ValueError("knowledge projection path is missing or unsafe") from None
+        if stat.S_ISLNK(information.st_mode):
+            raise ValueError("knowledge projection path contains a symlink")
 
 
 @dataclass(frozen=True)
@@ -33,14 +57,154 @@ class _ProjectionSourceIdentity:
     device: int
     inode: int
     size: int
-    modified_ns: int
     mode: int
     sha256: str
 
 
-def _normalize_sqlite_header(database: Path) -> None:
+@dataclass(frozen=True)
+class _CandidateAuthority:
+    parent_directory: Path
+    parent_device: int
+    parent_inode: int
+    transaction_directory: Path
+    directory_device: int
+    directory_inode: int
+    candidate: Path
+    candidate_device: int
+    candidate_inode: int
+
+    def validate(self) -> None:
+        try:
+            parent = os.lstat(self.parent_directory)
+            directory = os.lstat(self.transaction_directory)
+            candidate = os.lstat(self.candidate)
+        except OSError as error:
+            raise ValueError("projection stamp candidate is missing or unsafe") from error
+        if (
+            not stat.S_ISDIR(parent.st_mode)
+            or stat.S_ISLNK(parent.st_mode)
+            or parent.st_dev != self.parent_device
+            or parent.st_ino != self.parent_inode
+            or self.transaction_directory.parent != self.parent_directory
+            or not stat.S_ISDIR(directory.st_mode)
+            or stat.S_ISLNK(directory.st_mode)
+            or stat.S_IMODE(directory.st_mode) != 0o700
+            or directory.st_dev != self.directory_device
+            or directory.st_ino != self.directory_inode
+            or self.candidate.parent != self.transaction_directory
+            or not stat.S_ISREG(candidate.st_mode)
+            or candidate.st_nlink != 1
+            or candidate.st_dev != self.candidate_device
+            or candidate.st_ino != self.candidate_inode
+        ):
+            raise ValueError("projection stamp candidate identity is unsafe")
+
+
+@dataclass
+class StableProjectionReader:
+    connection: sqlite3.Connection
+    authority: _CandidateAuthority
+    _closed: bool = False
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self.connection.close()
+        _unlink_candidate_identity(self.authority)
+        self.authority.transaction_directory.rmdir()
+        self._closed = True
+
+
+def _candidate_ready_for_sqlite(authority: _CandidateAuthority) -> None:
+    authority.validate()
+
+
+def _candidate_ready_for_install(authority: _CandidateAuthority) -> None:
+    authority.validate()
+
+
+def _connect_sqlite(
+    database: Path,
+    *,
+    mode: Literal["ro", "rw"],
+    authority: _CandidateAuthority | None = None,
+) -> sqlite3.Connection:
+    if authority is not None:
+        authority.validate()
+    elif database.is_symlink() or not database.is_file():
+        raise ValueError("knowledge projection is missing or unsafe")
+    connection = sqlite3.connect(
+        f"{database.absolute().as_uri()}?mode={mode}&nofollow=1",
+        uri=True,
+    )
+    try:
+        if authority is not None:
+            authority.validate()
+        elif database.is_symlink() or not database.is_file():
+            raise ValueError("knowledge projection is missing or unsafe")
+        return connection
+    except BaseException:
+        connection.close()
+        raise
+
+
+def _read_sqlite_header(
+    database: Path,
+    length: int,
+    authority: _CandidateAuthority | None = None,
+) -> bytes:
+    if authority is not None:
+        authority.validate()
+    file_descriptor = _open_projection_read_only(database)
+    try:
+        if authority is not None:
+            information = os.fstat(file_descriptor)
+            if (
+                information.st_dev != authority.candidate_device
+                or information.st_ino != authority.candidate_inode
+            ):
+                raise ValueError("projection stamp candidate identity is unsafe")
+        header = os.read(file_descriptor, length)
+    finally:
+        os.close(file_descriptor)
+    if authority is not None:
+        authority.validate()
+    return header
+
+
+def _normalize_sqlite_header(
+    database: Path,
+    authority: _CandidateAuthority | None = None,
+) -> None:
     minimum_size = max(_SQLITE_NON_SEMANTIC_HEADER_FIELDS) + _SQLITE_HEADER_FIELD_SIZE
-    with database.open("r+b") as stream:
+    if authority is not None:
+        authority.validate()
+    try:
+        before = os.lstat(database)
+    except OSError as error:
+        raise ValueError("knowledge projection is missing or unsafe") from error
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+        raise ValueError("knowledge projection is missing or unsafe")
+    flags = os.O_RDWR | _O_NOFOLLOW | _O_BINARY
+    file_descriptor = os.open(database, flags)
+    information = os.fstat(file_descriptor)
+    after = os.lstat(database)
+    if (
+        not stat.S_ISREG(information.st_mode)
+        or stat.S_ISLNK(after.st_mode)
+        or (information.st_dev, information.st_ino)
+        != (before.st_dev, before.st_ino)
+        or (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino)
+    ):
+        os.close(file_descriptor)
+        raise ValueError("knowledge projection is missing or unsafe")
+    if authority is not None and (
+        information.st_dev != authority.candidate_device
+        or information.st_ino != authority.candidate_inode
+    ):
+        os.close(file_descriptor)
+        raise ValueError("projection stamp candidate identity is unsafe")
+    with os.fdopen(file_descriptor, "r+b") as stream:
         header = stream.read(minimum_size)
         if len(header) != minimum_size or not header.startswith(_SQLITE_HEADER):
             raise ValueError("canonicalized projection has an invalid SQLite header")
@@ -49,12 +213,16 @@ def _normalize_sqlite_header(database: Path) -> None:
             stream.write(b"\0" * _SQLITE_HEADER_FIELD_SIZE)
         stream.flush()
         os.fsync(stream.fileno())
+    if authority is not None:
+        authority.validate()
 
 
-def _require_normalized_sqlite_header(database: Path) -> None:
+def _require_normalized_sqlite_header(
+    database: Path,
+    authority: _CandidateAuthority | None = None,
+) -> None:
     minimum_size = max(_SQLITE_NON_SEMANTIC_HEADER_FIELDS) + _SQLITE_HEADER_FIELD_SIZE
-    with database.open("rb") as stream:
-        header = stream.read(minimum_size)
+    header = _read_sqlite_header(database, minimum_size, authority)
     if len(header) != minimum_size or not header.startswith(_SQLITE_HEADER):
         raise ValueError("knowledge projection has an invalid SQLite header")
     if any(
@@ -68,9 +236,9 @@ def _require_normalized_sqlite_header(database: Path) -> None:
 def _require_portable_sqlite_profile(
     database: Path,
     connection: sqlite3.Connection,
+    authority: _CandidateAuthority | None = None,
 ) -> None:
-    with database.open("rb") as stream:
-        header = stream.read(100)
+    header = _read_sqlite_header(database, 100, authority)
     if len(header) != 100 or not header.startswith(_SQLITE_HEADER):
         raise ValueError("knowledge projection has an invalid SQLite header")
     encoded_page_size = int.from_bytes(header[16:18], "big")
@@ -100,18 +268,38 @@ def _read_fd_identity(file_descriptor: int) -> _ProjectionSourceIdentity:
         device=information.st_dev,
         inode=information.st_ino,
         size=information.st_size,
-        modified_ns=information.st_mtime_ns,
         mode=stat.S_IMODE(information.st_mode),
         sha256=digest.hexdigest(),
     )
 
 
 def _open_projection_read_only(database: Path) -> int:
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
-        return os.open(database, flags)
+        before = os.lstat(database)
     except OSError as error:
         raise ValueError("knowledge projection is missing or unsafe") from error
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+        raise ValueError("knowledge projection is missing or unsafe")
+    flags = os.O_RDONLY | _O_NOFOLLOW | _O_BINARY
+    try:
+        file_descriptor = os.open(database, flags)
+    except OSError as error:
+        raise ValueError("knowledge projection is missing or unsafe") from error
+    try:
+        opened = os.fstat(file_descriptor)
+        after = os.lstat(database)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or stat.S_ISLNK(after.st_mode)
+            or not stat.S_ISREG(after.st_mode)
+            or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+            or (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino)
+        ):
+            raise ValueError("knowledge projection is missing or unsafe")
+        return file_descriptor
+    except BaseException:
+        os.close(file_descriptor)
+        raise
 
 
 def _has_sqlite_sidecar(database: Path) -> bool:
@@ -149,7 +337,6 @@ def _copy_projection_candidate(
             while view:
                 written = os.write(candidate_file_descriptor, view)
                 view = view[written:]
-        os.fchmod(candidate_file_descriptor, identity.mode)
         os.fsync(candidate_file_descriptor)
         return identity
     finally:
@@ -178,10 +365,36 @@ def _source_matches_identity(
         os.close(file_descriptor)
 
 
+def _capture_projection_identity(
+    database: Path,
+) -> _ProjectionSourceIdentity | None:
+    _require_no_symlink_components(database, allow_missing=True)
+    if _has_sqlite_sidecar(database):
+        raise ValueError("knowledge projection has an active SQLite sidecar")
+    try:
+        file_descriptor = _open_projection_read_only(database)
+    except ValueError:
+        try:
+            os.lstat(database)
+        except FileNotFoundError:
+            return None
+        raise
+    try:
+        identity = _read_fd_identity(file_descriptor)
+    finally:
+        os.close(file_descriptor)
+    if not _source_matches_identity(database, identity):
+        raise ValueError("knowledge projection changed while it was inspected")
+    return identity
+
+
 def _fsync_directory(directory: Path) -> None:
+    if sys.platform == "win32":
+        _windows_flush_directory(directory)
+        return
     file_descriptor = os.open(
         directory,
-        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        os.O_RDONLY | os.O_DIRECTORY,
     )
     try:
         os.fsync(file_descriptor)
@@ -189,37 +402,289 @@ def _fsync_directory(directory: Path) -> None:
         os.close(file_descriptor)
 
 
-def _fsync_file(path: Path) -> None:
+def _windows_kernel32() -> Any:
+    try:
+        return ctypes.WinDLL("kernel32", use_last_error=True)
+    except (AttributeError, OSError) as error:
+        raise OSError(
+            errno.ENOTSUP,
+            "Windows durable projection replacement is unavailable",
+        ) from error
+
+
+def _windows_flush_directory(directory: Path) -> None:
+    kernel32 = _windows_kernel32()
+    create_file = kernel32.CreateFileW
+    create_file.restype = ctypes.c_void_p
+    handle = create_file(
+        str(directory),
+        0x80000000,  # GENERIC_READ
+        0x00000001 | 0x00000002 | 0x00000004,
+        None,
+        3,  # OPEN_EXISTING
+        0x02000000 | 0x80000000,  # BACKUP_SEMANTICS | WRITE_THROUGH
+        None,
+    )
+    invalid_handle = ctypes.c_void_p(-1).value
+    if handle in (None, invalid_handle):
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        if not kernel32.FlushFileBuffers(handle):
+            raise ctypes.WinError(ctypes.get_last_error())
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _windows_replace_file(
+    database: Path,
+    candidate: Path,
+    backup: Path | None,
+) -> None:
+    kernel32 = _windows_kernel32()
+    replace = kernel32.ReplaceFileW
+    result = replace(
+        str(database),
+        str(candidate),
+        str(backup) if backup is not None else None,
+        0x00000001,  # REPLACEFILE_WRITE_THROUGH
+        None,
+        None,
+    )
+    if not result:
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def _windows_move_no_replace(candidate: Path, database: Path) -> None:
+    kernel32 = _windows_kernel32()
+    move = kernel32.MoveFileExW
+    if not move(
+        str(candidate),
+        str(database),
+        0x00000008,  # MOVEFILE_WRITE_THROUGH; deliberately no replace flag
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def _fsync_file(
+    path: Path,
+    authority: _CandidateAuthority | None = None,
+) -> None:
+    if authority is not None:
+        authority.validate()
     file_descriptor = _open_projection_read_only(path)
     try:
+        if authority is not None:
+            information = os.fstat(file_descriptor)
+            if (
+                information.st_dev != authority.candidate_device
+                or information.st_ino != authority.candidate_inode
+            ):
+                raise ValueError("projection stamp candidate identity is unsafe")
         os.fsync(file_descriptor)
     finally:
         os.close(file_descriptor)
+    if authority is not None:
+        authority.validate()
 
 
-def _restore_replaced_projection(
-    database: Path,
-    backup: Path | None,
+def _apply_candidate_mode(
+    candidate_file_descriptor: int,
+    authority: _CandidateAuthority,
+    mode: int,
+) -> None:
+    authority.validate()
+    fchmod = getattr(os, "fchmod", None)
+    if fchmod is not None:
+        fchmod(candidate_file_descriptor, mode)
+    else:
+        os.chmod(authority.candidate, mode, follow_symlinks=False)
+    information = os.fstat(candidate_file_descriptor)
+    if (
+        information.st_dev != authority.candidate_device
+        or information.st_ino != authority.candidate_inode
+        or stat.S_IMODE(information.st_mode) != mode
+    ):
+        raise ValueError("projection stamp candidate mode was not preserved")
+    authority.validate()
+
+
+def _atomic_exchange_paths(first: Path, second: Path) -> None:
+    """Atomically exchange two existing paths without a replacement gap."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    first_bytes = os.fsencode(first)
+    second_bytes = os.fsencode(second)
+    if sys.platform.startswith("linux"):
+        exchange = getattr(libc, "renameat2", None)
+        if exchange is None:
+            raise OSError(
+                errno.ENOTSUP,
+                "atomic projection exchange is unsupported",
+            )
+        exchange.argtypes = (
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        )
+        exchange.restype = ctypes.c_int
+        result = exchange(
+            -100,  # AT_FDCWD
+            first_bytes,
+            -100,
+            second_bytes,
+            2,  # RENAME_EXCHANGE
+        )
+    elif sys.platform == "darwin":
+        exchange = getattr(libc, "renamex_np", None)
+        if exchange is None:
+            raise OSError(
+                errno.ENOTSUP,
+                "atomic projection exchange is unsupported",
+            )
+        exchange.argtypes = (ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint)
+        exchange.restype = ctypes.c_int
+        result = exchange(first_bytes, second_bytes, 2)  # RENAME_SWAP
+    else:
+        raise OSError(
+            errno.ENOTSUP,
+            "atomic projection exchange is unsupported",
+        )
+    if result != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number))
+
+
+def _path_has_candidate_identity(
+    path: Path,
+    authority: _CandidateAuthority,
+) -> bool:
+    try:
+        information = os.lstat(path)
+    except OSError:
+        return False
+    return (
+        stat.S_ISREG(information.st_mode)
+        and information.st_nlink == 1
+        and information.st_dev == authority.candidate_device
+        and information.st_ino == authority.candidate_inode
+    )
+
+
+def _unlink_candidate_identity(
+    authority: _CandidateAuthority,
+    *,
+    allowed_link_counts: tuple[int, ...] = (1,),
 ) -> None:
     try:
-        if backup is None:
-            database.unlink(missing_ok=True)
+        information = os.lstat(authority.candidate)
+    except FileNotFoundError:
+        return
+    if (
+        not stat.S_ISREG(information.st_mode)
+        or information.st_dev != authority.candidate_device
+        or information.st_ino != authority.candidate_inode
+        or information.st_nlink not in allowed_link_counts
+        or authority.candidate.parent != authority.transaction_directory
+    ):
+        raise ValueError("projection stamp candidate identity is unsafe")
+    authority.candidate.unlink()
+
+
+def _unlink_source_identity(
+    candidate: Path,
+    identity: _ProjectionSourceIdentity,
+) -> None:
+    if not _source_matches_identity(candidate, identity):
+        raise ValueError("source changed while projection stamp was prepared")
+    information = os.lstat(candidate)
+    if (
+        not stat.S_ISREG(information.st_mode)
+        or information.st_dev != identity.device
+        or information.st_ino != identity.inode
+        or stat.S_IMODE(information.st_mode) != identity.mode
+    ):
+        raise ValueError("source changed while projection stamp was prepared")
+    candidate.unlink()
+
+
+def _rollback_atomic_exchange(
+    candidate: Path,
+    database: Path,
+    identity: _ProjectionSourceIdentity,
+    authority: _CandidateAuthority,
+) -> None:
+    if not _path_has_candidate_identity(database, authority):
+        return
+    if not _source_matches_identity(candidate, identity):
+        return
+    _atomic_exchange_paths(candidate, database)
+    _fsync_directory(database.parent)
+
+
+def _replace_candidate_windows(
+    candidate: Path,
+    database: Path,
+    identity: _ProjectionSourceIdentity | None,
+    authority: _CandidateAuthority,
+) -> None:
+    if identity is None:
+        moved = False
+        try:
+            _windows_move_no_replace(candidate, database)
+            moved = True
+            if not _path_has_candidate_identity(database, authority):
+                raise ValueError("projection install destination identity is unsafe")
+            _fsync_directory(database.parent)
+            return
+        except BaseException:
+            if moved and _path_has_candidate_identity(database, authority):
+                _windows_move_no_replace(database, candidate)
+                _fsync_directory(database.parent)
+            raise
+
+    backup = authority.transaction_directory / "displaced.sqlite"
+    replaced = False
+    try:
+        try:
+            os.lstat(backup)
+        except FileNotFoundError:
+            pass
         else:
-            os.replace(backup, database)
-        if database.exists():
-            _fsync_file(database)
+            raise ValueError("projection install backup path is not empty")
+        _windows_replace_file(database, candidate, backup)
+        replaced = True
+        if not _source_matches_identity(backup, identity):
+            _windows_replace_file(database, backup, None)
+            replaced = False
+            raise ValueError("source changed while projection stamp was prepared")
         _fsync_directory(database.parent)
-    except (OSError, ValueError):
-        pass
+        _unlink_source_identity(backup, identity)
+        _fsync_directory(database.parent)
+        replaced = False
+    except BaseException as operation_error:
+        if replaced:
+            if not _source_matches_identity(backup, identity):
+                raise RuntimeError(
+                    "projection stamp failed and its Windows rollback is unsafe"
+                ) from operation_error
+            _windows_replace_file(database, backup, None)
+            _fsync_directory(database.parent)
+        raise
 
 
 def _replace_candidate_if_source_unchanged(
     candidate: Path,
     database: Path,
     identity: _ProjectionSourceIdentity | None,
+    authority: _CandidateAuthority,
 ) -> None:
+    authority.validate()
     if not _source_matches_identity(database, identity):
         raise ValueError("source changed while projection stamp was prepared")
+    if sys.platform == "win32":
+        _replace_candidate_windows(candidate, database, identity, authority)
+        return
     if identity is None:
         linked = False
         try:
@@ -227,49 +692,59 @@ def _replace_candidate_if_source_unchanged(
             linked = True
             _fsync_file(database)
             _fsync_directory(database.parent)
-            candidate.unlink()
+            _unlink_candidate_identity(authority, allowed_link_counts=(2,))
             return
         except BaseException:
             if linked:
-                _restore_replaced_projection(database, None)
+                try:
+                    linked_information = os.lstat(database)
+                    if (
+                        stat.S_ISREG(linked_information.st_mode)
+                        and linked_information.st_dev == authority.candidate_device
+                        and linked_information.st_ino == authority.candidate_inode
+                    ):
+                        database.unlink()
+                        _fsync_directory(database.parent)
+                except (OSError, ValueError):
+                    pass
             raise
 
-    backup_file_descriptor, backup_name = tempfile.mkstemp(
-        prefix=f".{database.name}.",
-        suffix=".stamp-original",
-        dir=database.parent,
-    )
-    os.close(backup_file_descriptor)
-    backup = Path(backup_name)
-    backup.unlink()
-    replaced = False
+    exchanged = False
     try:
-        os.link(database, backup, follow_symlinks=False)
-        if (
-            not _source_matches_identity(database, identity)
-            or not _source_matches_identity(backup, identity)
-        ):
+        authority.validate()
+        _atomic_exchange_paths(candidate, database)
+        exchanged = True
+        if not _source_matches_identity(candidate, identity):
+            _atomic_exchange_paths(candidate, database)
+            exchanged = False
             raise ValueError("source changed while projection stamp was prepared")
-        os.replace(candidate, database)
-        replaced = True
-        if not _source_matches_identity(backup, identity):
-            raise ValueError("source changed while projection stamp was prepared")
-        _fsync_file(database)
         _fsync_directory(database.parent)
-        backup.unlink()
+        _unlink_source_identity(candidate, identity)
+        exchanged = False
     except BaseException:
-        if replaced:
-            _restore_replaced_projection(database, backup)
+        if exchanged:
+            try:
+                _rollback_atomic_exchange(
+                    candidate,
+                    database,
+                    identity,
+                    authority,
+                )
+            except (OSError, ValueError) as rollback_error:
+                raise RuntimeError(
+                    "projection stamp failed and its atomic rollback failed"
+                ) from rollback_error
         raise
-    finally:
-        backup.unlink(missing_ok=True)
 
 
-def _canonicalize_sqlite_projection(database: Path) -> None:
+def _canonicalize_sqlite_projection(
+    database: Path,
+    authority: _CandidateAuthority | None = None,
+) -> None:
     """Normalize SQLite's non-semantic, library-version-dependent bytes."""
-    with sqlite3.connect(database) as connection:
+    with _connect_sqlite(database, mode="rw", authority=authority) as connection:
         connection.execute("PRAGMA foreign_keys = ON")
-        _require_portable_sqlite_profile(database, connection)
+        _require_portable_sqlite_profile(database, connection, authority)
         planner_tables = tuple(
             row[0]
             for row in connection.execute(
@@ -303,7 +778,7 @@ def _canonicalize_sqlite_projection(database: Path) -> None:
                 f"canonicalized projection has foreign-key violations: {invalid!r}"
             )
 
-    _normalize_sqlite_header(database)
+    _normalize_sqlite_header(database, authority)
 
 
 class ArtifactRole(StrEnum):
@@ -725,35 +1200,130 @@ class ProjectionStamp(StrictModel):
     stamped_at: datetime
 
 
+def _validated_projection_state_on_connection(
+    database: Path,
+    authority: _CandidateAuthority,
+    connection: sqlite3.Connection,
+) -> tuple[ProjectionStamp | None, str | None]:
+    authority.validate()
+    if _has_sqlite_sidecar(database):
+        raise ValueError("knowledge projection is missing or unsafe")
+    connection.execute("PRAGMA query_only = ON")
+    _require_portable_sqlite_profile(database, connection, authority)
+    integrity = connection.execute("PRAGMA integrity_check").fetchall()
+    if integrity != [("ok",)]:
+        raise ValueError("knowledge projection failed SQLite integrity check")
+    invalid = connection.execute("PRAGMA foreign_key_check").fetchall()
+    if invalid:
+        raise ValueError(
+            f"knowledge projection has foreign-key violations: {invalid!r}"
+        )
+    guard = SQLiteProjectionGuard()
+    stamp = guard._read_stamp(connection)
+    if stamp is None:
+        return None, None
+    _require_normalized_sqlite_header(database, authority)
+    return stamp, guard.logical_digest(connection)
+
+
+def _validated_projection_state_bound(
+    database: Path,
+    authority: _CandidateAuthority,
+) -> tuple[ProjectionStamp | None, str | None]:
+    with _connect_sqlite(database, mode="ro", authority=authority) as connection:
+        return _validated_projection_state_on_connection(
+            database,
+            authority,
+            connection,
+        )
+
+
+def _open_stable_projection_connection(
+    database: Path,
+) -> tuple[StableProjectionReader, ProjectionStamp | None, str | None]:
+    database = database.absolute()
+    transaction_directory = Path(
+        tempfile.mkdtemp(prefix="geas-projection-validation-")
+    ).absolute()
+    transaction_directory.chmod(0o700)
+    parent = transaction_directory.parent
+    parent_information = os.lstat(parent)
+    directory_information = os.lstat(transaction_directory)
+    candidate = transaction_directory / "projection.sqlite"
+    candidate_file_descriptor = os.open(
+        candidate,
+        os.O_RDWR | os.O_CREAT | os.O_EXCL | _O_NOFOLLOW | _O_BINARY,
+        0o600,
+    )
+    candidate_information = os.fstat(candidate_file_descriptor)
+    candidate_authority = _CandidateAuthority(
+        parent_directory=parent,
+        parent_device=parent_information.st_dev,
+        parent_inode=parent_information.st_ino,
+        transaction_directory=transaction_directory,
+        directory_device=directory_information.st_dev,
+        directory_inode=directory_information.st_ino,
+        candidate=candidate,
+        candidate_device=candidate_information.st_dev,
+        candidate_inode=candidate_information.st_ino,
+    )
+    connection: sqlite3.Connection | None = None
+    try:
+        source_identity = _copy_projection_candidate(
+            database,
+            candidate_file_descriptor,
+        )
+        if source_identity is None:
+            raise ValueError("knowledge projection is missing or unsafe")
+        connection = _connect_sqlite(
+            candidate,
+            mode="ro",
+            authority=candidate_authority,
+        )
+        stamp, digest = _validated_projection_state_on_connection(
+            candidate,
+            candidate_authority,
+            connection,
+        )
+        if not _source_matches_identity(database, source_identity):
+            raise ValueError("knowledge projection changed while it was validated")
+        os.close(candidate_file_descriptor)
+        candidate_file_descriptor = -1
+        reader = StableProjectionReader(
+            connection=connection,
+            authority=candidate_authority,
+        )
+        connection = None
+        return reader, stamp, digest
+    except BaseException:
+        if connection is not None:
+            connection.close()
+        raise
+    finally:
+        if candidate_file_descriptor >= 0:
+            os.close(candidate_file_descriptor)
+        if connection is not None and transaction_directory.exists():
+            _unlink_candidate_identity(candidate_authority)
+            transaction_directory.rmdir()
+
+
 def _validated_projection_state(
     database: Path,
+    authority: _CandidateAuthority | None = None,
 ) -> tuple[ProjectionStamp | None, str | None]:
-    if database.is_symlink() or not database.is_file() or _has_sqlite_sidecar(database):
-        raise ValueError("knowledge projection is missing or unsafe")
-    with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as connection:
-        connection.execute("PRAGMA query_only = ON")
-        _require_portable_sqlite_profile(database, connection)
-        integrity = connection.execute("PRAGMA integrity_check").fetchall()
-        if integrity != [("ok",)]:
-            raise ValueError("knowledge projection failed SQLite integrity check")
-        invalid = connection.execute("PRAGMA foreign_key_check").fetchall()
-        if invalid:
-            raise ValueError(
-                f"knowledge projection has foreign-key violations: {invalid!r}"
-            )
-        guard = SQLiteProjectionGuard()
-        stamp = guard._read_stamp(connection)
-        if stamp is None:
-            return None, None
-        _require_normalized_sqlite_header(database)
-        return stamp, guard.logical_digest(connection)
+    if authority is not None:
+        return _validated_projection_state_bound(database, authority)
+    reader, stamp, digest = _open_stable_projection_connection(database)
+    reader.close()
+    return stamp, digest
 
 
 def _validate_stamped_projection(
     database: Path,
     expected_stamp: ProjectionStamp,
+    authority: _CandidateAuthority | None = None,
 ) -> None:
-    stamp, logical_digest = _validated_projection_state(database)
+    stamp, logical_digest = _validated_projection_state(database, authority)
     if stamp != expected_stamp:
         raise ValueError("knowledge projection has an unexpected projection stamp")
     if logical_digest != expected_stamp.projection_digest:
@@ -766,6 +1336,100 @@ class SQLiteProjectionGuard:
     def __init__(self, *, clock: Callable[[], datetime] = utc_now) -> None:
         self.clock = clock
 
+    @staticmethod
+    def capture_destination_identity(
+        database: Path,
+    ) -> _ProjectionSourceIdentity | None:
+        return _capture_projection_identity(database.absolute())
+
+    @staticmethod
+    def validate_destination_parent(database: Path) -> None:
+        database = database.absolute()
+        _require_no_symlink_components(database.parent, allow_missing=True)
+
+    def install_stamped(
+        self,
+        candidate: Path,
+        database: Path,
+        *,
+        expected_stamp: ProjectionStamp,
+        expected_candidate_identity: _ProjectionSourceIdentity,
+        expected_destination_identity: _ProjectionSourceIdentity | None,
+    ) -> None:
+        candidate = candidate.absolute()
+        database = database.absolute()
+        parent_information = os.lstat(candidate.parent.parent)
+        directory_information = os.lstat(candidate.parent)
+        if (
+            not stat.S_ISDIR(directory_information.st_mode)
+            or stat.S_IMODE(directory_information.st_mode) != 0o700
+        ):
+            raise ValueError("projection install candidate directory is unsafe")
+        candidate_file_descriptor = os.open(
+            candidate,
+            os.O_RDWR | _O_NOFOLLOW | _O_BINARY,
+        )
+        candidate_information = os.fstat(candidate_file_descriptor)
+        authority = _CandidateAuthority(
+            parent_directory=candidate.parent.parent,
+            parent_device=parent_information.st_dev,
+            parent_inode=parent_information.st_ino,
+            transaction_directory=candidate.parent,
+            directory_device=directory_information.st_dev,
+            directory_inode=directory_information.st_ino,
+            candidate=candidate,
+            candidate_device=candidate_information.st_dev,
+            candidate_inode=candidate_information.st_ino,
+        )
+        try:
+            if _read_fd_identity(candidate_file_descriptor) != expected_candidate_identity:
+                raise ValueError("projection install candidate changed after stamping")
+            _candidate_ready_for_install(authority)
+            _apply_candidate_mode(
+                candidate_file_descriptor,
+                authority,
+                (
+                    expected_destination_identity.mode
+                    if expected_destination_identity is not None
+                    else expected_candidate_identity.mode
+                ),
+            )
+            _validate_stamped_projection(candidate, expected_stamp, authority)
+            os.fsync(candidate_file_descriptor)
+            _replace_candidate_if_source_unchanged(
+                candidate,
+                database,
+                expected_destination_identity,
+                authority,
+            )
+        finally:
+            os.close(candidate_file_descriptor)
+
+    @staticmethod
+    def cleanup_install_transaction(
+        candidate: Path,
+        expected_candidate_identity: _ProjectionSourceIdentity | None,
+    ) -> None:
+        candidate = candidate.absolute()
+        try:
+            os.lstat(candidate)
+        except FileNotFoundError:
+            pass
+        else:
+            if expected_candidate_identity is None:
+                raise ValueError("projection install candidate identity is unknown")
+            information = os.lstat(candidate)
+            if (
+                not stat.S_ISREG(information.st_mode)
+                or information.st_nlink != 1
+                or information.st_dev != expected_candidate_identity.device
+                or information.st_ino != expected_candidate_identity.inode
+            ):
+                raise ValueError("projection install candidate identity is unsafe")
+            candidate.unlink()
+        candidate.parent.rmdir()
+        _fsync_directory(candidate.parent.parent)
+
     def stamp(
         self,
         database: Path,
@@ -775,22 +1439,53 @@ class SQLiteProjectionGuard:
         builder_version: str,
     ) -> ProjectionStamp:
         database = database.absolute()
+        self.validate_destination_parent(database)
         database.parent.mkdir(parents=True, exist_ok=True)
-        candidate_file_descriptor, candidate_name = tempfile.mkstemp(
-            prefix=f".{database.name}.",
-            suffix=".stamp",
-            dir=database.parent,
+        _require_no_symlink_components(database.parent, allow_missing=False)
+        parent_information = os.lstat(database.parent)
+        if not stat.S_ISDIR(parent_information.st_mode):
+            raise ValueError("knowledge projection parent is not a directory")
+        transaction_directory = Path(
+            tempfile.mkdtemp(
+                prefix=f".{database.name}.stamp-",
+                dir=database.parent,
+            )
         )
-        candidate = Path(candidate_name)
+        transaction_directory.chmod(0o700)
+        directory_information = os.lstat(transaction_directory)
+        candidate = transaction_directory / "candidate.sqlite"
+        candidate_file_descriptor = os.open(
+            candidate,
+            os.O_RDWR
+            | os.O_CREAT
+            | os.O_EXCL
+            | _O_NOFOLLOW
+            | _O_BINARY,
+            0o600,
+        )
+        candidate_information = os.fstat(candidate_file_descriptor)
+        authority = _CandidateAuthority(
+            parent_directory=database.parent,
+            parent_device=parent_information.st_dev,
+            parent_inode=parent_information.st_ino,
+            transaction_directory=transaction_directory,
+            directory_device=directory_information.st_dev,
+            directory_inode=directory_information.st_ino,
+            candidate=candidate,
+            candidate_device=candidate_information.st_dev,
+            candidate_inode=candidate_information.st_ino,
+        )
         try:
-            try:
-                source_identity = _copy_projection_candidate(
-                    database,
-                    candidate_file_descriptor,
-                )
-            finally:
-                os.close(candidate_file_descriptor)
-            with sqlite3.connect(candidate) as connection:
+            source_identity = _copy_projection_candidate(
+                database,
+                candidate_file_descriptor,
+            )
+            _candidate_ready_for_sqlite(authority)
+            with _connect_sqlite(
+                candidate,
+                mode="rw",
+                authority=authority,
+            ) as connection:
                 if source_identity is None:
                     connection.execute(
                         f"PRAGMA page_size = {_SQLITE_PORTABLE_PAGE_SIZE}"
@@ -799,7 +1494,11 @@ class SQLiteProjectionGuard:
                     connection.execute("PRAGMA encoding = 'UTF-8'")
                     connection.execute("PRAGMA journal_mode = DELETE")
                 else:
-                    _require_portable_sqlite_profile(candidate, connection)
+                    _require_portable_sqlite_profile(
+                        candidate,
+                        connection,
+                        authority,
+                    )
                 connection.execute("PRAGMA foreign_keys = ON")
                 connection.execute(
                     f"""
@@ -827,18 +1526,28 @@ class SQLiteProjectionGuard:
                     (canonical_json(stamp).decode(),),
                 )
                 connection.commit()
-            _canonicalize_sqlite_projection(candidate)
-            _validate_stamped_projection(candidate, stamp)
-            with candidate.open("rb") as stream:
-                os.fsync(stream.fileno())
+            _canonicalize_sqlite_projection(candidate, authority)
+            _apply_candidate_mode(
+                candidate_file_descriptor,
+                authority,
+                source_identity.mode if source_identity is not None else 0o600,
+            )
+            _validate_stamped_projection(candidate, stamp, authority)
+            authority.validate()
+            os.fsync(candidate_file_descriptor)
+            _fsync_file(candidate, authority)
             _replace_candidate_if_source_unchanged(
                 candidate,
                 database,
                 source_identity,
+                authority,
             )
             return stamp
         finally:
-            candidate.unlink(missing_ok=True)
+            os.close(candidate_file_descriptor)
+            _unlink_candidate_identity(authority)
+            transaction_directory.rmdir()
+            _fsync_directory(database.parent)
 
     def verify(
         self,
@@ -965,6 +1674,51 @@ class SQLiteProjectionGuard:
                 "incompatible projection stamp; rebuild the knowledge projection"
             )
         return stamp
+
+    def open_compatible_connection(
+        self,
+        database: Path,
+        *,
+        expected_schema_version: int,
+        expected_builder_version: str,
+    ) -> StableProjectionReader:
+        """Return the exact validated, stable read-only projection connection."""
+        reader, stamp, actual_digest = _open_stable_projection_connection(
+            database,
+        )
+        try:
+            if stamp is None:
+                raise ValueError("knowledge projection is unstamped")
+            if actual_digest != stamp.projection_digest:
+                raise ValueError(
+                    "knowledge projection logical digest does not match its stamp"
+                )
+            if (
+                stamp.schema_version != expected_schema_version
+                or stamp.builder_version != expected_builder_version
+            ):
+                raise ValueError(
+                    "incompatible projection stamp; rebuild the knowledge projection"
+                )
+            return reader
+        except BaseException:
+            reader.close()
+            raise
+
+    def validated_stamp(self, database: Path) -> ProjectionStamp:
+        reader, stamp, actual_digest = _open_stable_projection_connection(
+            database,
+        )
+        try:
+            if stamp is None:
+                raise ValueError("knowledge projection is unstamped")
+            if actual_digest != stamp.projection_digest:
+                raise ValueError(
+                    "knowledge projection logical digest does not match its stamp"
+                )
+            return stamp
+        finally:
+            reader.close()
 
     def logical_digest(self, connection: sqlite3.Connection) -> str:
         objects = connection.execute(

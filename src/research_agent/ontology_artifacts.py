@@ -27,7 +27,7 @@ from research_agent.credential_scanning import (
     contains_possible_credential,
 )
 from research_agent.models import StrictModel, canonical_json, utc_now
-from research_agent.truth import ProjectionStamp, SQLiteProjectionGuard
+from research_agent.truth import SQLiteProjectionGuard
 
 _ONTOLOGY_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 _ASSET_NAME = re.compile(r"geas-[a-z-]+-[0-9a-f]{64}\.(?:sqlite|zip)")
@@ -352,7 +352,7 @@ class OntologyArtifactManager:
                             f"SQLite ontology artifact is missing or unsafe: {path}"
                         )
                     quick_revision = _sqlite_input_revision(
-                        source.resolve(),
+                        source.absolute(),
                         role,
                         verify_contents=False,
                     )
@@ -477,7 +477,15 @@ class OntologyArtifactManager:
             )
             _verify_file(destination, artifact)
             if artifact.format is ArtifactFormat.SQLITE:
-                _sqlite_input_revision(destination, artifact.role)
+                actual_input_revision = _sqlite_input_revision(
+                    destination,
+                    artifact.role,
+                )
+                if actual_input_revision != artifact.input_revision:
+                    raise OntologyArtifactError(
+                        "SQLite ontology artifact input revision does not match "
+                        "its manifest"
+                    )
             else:
                 _extract_generated_zip(
                     destination,
@@ -514,7 +522,7 @@ class OntologyArtifactManager:
         source = path.expanduser()
         if source.is_symlink():
             raise OntologyArtifactError(f"ontology artifact cannot be a symbolic link: {path}")
-        source = source.resolve()
+        source = source.absolute()
         if role is ArtifactRole.GENERATED_CONTENT:
             if not source.is_dir() and not source.is_file():
                 raise OntologyArtifactError(
@@ -584,6 +592,14 @@ def _sqlite_input_revision(
     verify_contents: bool = True,
 ) -> str:
     try:
+        if role is ArtifactRole.KNOWLEDGE_PROJECTION:
+            stamp = SQLiteProjectionGuard().validated_stamp(path)
+            inputs = {
+                "truth_state_digest": stamp.truth_state_digest,
+                "schema_version": stamp.schema_version,
+                "builder_version": stamp.builder_version,
+            }
+            return hashlib.sha256(canonical_json(inputs)).hexdigest()
         with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as connection:
             if verify_contents:
                 integrity = connection.execute("PRAGMA integrity_check").fetchone()
@@ -607,24 +623,6 @@ def _sqlite_input_revision(
                     "source_version_ids": snapshot["source_version_ids"],
                     "text_derivation_ids": snapshot["text_derivation_ids"],
                     "repository_snapshot_ids": snapshot["repository_snapshot_ids"],
-                }
-            elif role is ArtifactRole.KNOWLEDGE_PROJECTION:
-                row = connection.execute(
-                    "SELECT payload FROM _research_projection_metadata WHERE singleton = 1"
-                ).fetchone()
-                if row is None:
-                    raise OntologyArtifactError("knowledge projection is unstamped")
-                stamp = ProjectionStamp.model_validate_json(row[0])
-                if verify_contents:
-                    actual = SQLiteProjectionGuard().logical_digest(connection)
-                    if actual != stamp.projection_digest:
-                        raise OntologyArtifactError(
-                            "knowledge projection logical digest does not match its stamp"
-                        )
-                inputs = {
-                    "truth_state_digest": stamp.truth_state_digest,
-                    "schema_version": stamp.schema_version,
-                    "builder_version": stamp.builder_version,
                 }
             else:
                 raise OntologyArtifactError("generated content is not a SQLite artifact")

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import shutil
 import sqlite3
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -13,6 +14,7 @@ from research_agent.ontology_artifacts import (
     OntologyArtifactError,
     OntologyArtifactManager,
 )
+from research_agent.truth import SQLiteProjectionGuard, TruthSnapshot
 
 _FORBIDDEN_CONTROL_VALUES = (
     *range(0x00, 0x09),
@@ -134,6 +136,35 @@ def _library_database(path: Path) -> None:
         )
 
 
+def _knowledge_database(path: Path) -> None:
+    with sqlite3.connect(path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE parent(id INTEGER PRIMARY KEY);
+            CREATE TABLE child(parent_id INTEGER REFERENCES parent(id));
+            INSERT INTO parent VALUES (1);
+            INSERT INTO child VALUES (1);
+            """
+        )
+    snapshot = TruthSnapshot(
+        id="truth-snapshot:test",
+        state_digest="a" * 64,
+        policy_sha256="b" * 64,
+        artifacts=(),
+        created_at=datetime(2026, 8, 31, tzinfo=UTC),
+        created_by="operator:test",
+        builder_version="truth-manager/test",
+    )
+    SQLiteProjectionGuard(
+        clock=lambda: datetime(2026, 8, 31, tzinfo=UTC)
+    ).stamp(
+        path,
+        snapshot,
+        schema_version=9,
+        builder_version="sqlite-knowledge-projection/10",
+    )
+
+
 def test_artifacts_publish_by_input_revision_and_hydrate_lazily(tmp_path: Path) -> None:
     ontology = tmp_path / "routing"
     ontology.mkdir()
@@ -180,6 +211,66 @@ def test_artifacts_publish_by_input_revision_and_hydrate_lazily(tmp_path: Path) 
 
     cached = manager.hydrate(store=store)
     assert all(not item.downloaded for item in cached.hydrated)
+
+
+@pytest.mark.parametrize("corruption", ("foreign-key", "header"))
+def test_knowledge_projection_publication_rejects_full_guard_failure_before_upload(
+    tmp_path: Path,
+    corruption: str,
+) -> None:
+    ontology = tmp_path / "routing"
+    ontology.mkdir()
+    database = tmp_path / "knowledge.sqlite"
+    _knowledge_database(database)
+    if corruption == "foreign-key":
+        with sqlite3.connect(database) as connection:
+            connection.execute("PRAGMA foreign_keys = OFF")
+            connection.execute("INSERT INTO child VALUES (99)")
+    else:
+        with database.open("r+b") as stream:
+            stream.seek(24)
+            stream.write(b"\x01\x00\x00\x00")
+    store = MemoryArtifactStore().use_root(tmp_path / "remote-assets")
+    manager = OntologyArtifactManager(ontology)
+
+    with pytest.raises(OntologyArtifactError, match="invalid SQLite|foreign-key|header"):
+        manager.publish(
+            store=store,
+            published_by="test:operator",
+            storage_rights_basis="operator-confirmed private storage",
+            knowledge_projection=database,
+        )
+
+    assert store.values == {}
+    assert not manager.manifest_path.exists()
+
+
+def test_knowledge_projection_hydration_rejects_manifest_input_revision_mismatch(
+    tmp_path: Path,
+) -> None:
+    ontology = tmp_path / "routing"
+    ontology.mkdir()
+    database = tmp_path / "knowledge.sqlite"
+    _knowledge_database(database)
+    store = MemoryArtifactStore().use_root(tmp_path / "remote-assets")
+    manager = OntologyArtifactManager(ontology)
+    publication = manager.publish(
+        store=store,
+        published_by="test:operator",
+        storage_rights_basis="operator-confirmed private storage",
+        knowledge_projection=database,
+    )
+    assert publication.changed
+    original_revision = manager.load().artifacts[0].input_revision
+    manifest_text = manager.manifest_path.read_text()
+    manager.manifest_path.write_text(
+        manifest_text.replace(original_revision, "f" * 64)
+    )
+
+    with pytest.raises(OntologyArtifactError, match="input revision"):
+        manager.hydrate(store=store)
+
+    assert store.download_calls == 1
 
 
 def test_hydration_rejects_symlinked_cache_root_before_download_or_canonical_write(
