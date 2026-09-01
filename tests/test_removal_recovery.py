@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -653,10 +652,14 @@ def test_snapshot_recovery_rejects_replaced_quarantine_inode(
     manager, snapshot = _snapshot_manager(tmp_path)
     _run_hard_exit(_SNAPSHOT_CHILD, manager, "quarantined")
     quarantine = next(manager.root.rglob("*.remove-*"))
-    shutil.rmtree(quarantine)
+    # Retain the original inode so filesystems are unable to recycle it for
+    # the replacement and accidentally turn this into an identity-match test.
+    replaced = tmp_path / "original-quarantine"
+    quarantine.rename(replaced)
     quarantine.mkdir()
 
     with pytest.raises(ValueError, match="identity changed"):
         remove_snapshot(snapshot, manager=manager, profile_name="default")
 
     assert snapshot in manager.load().profiles["default"].installed_ontologies
+    assert replaced.joinpath("sentinel").read_bytes() == _SNAPSHOT_CONTENT

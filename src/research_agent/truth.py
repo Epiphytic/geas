@@ -1329,7 +1329,18 @@ def _canonicalize_sqlite_projection(
     authority: _CandidateAuthority | None = None,
 ) -> None:
     """Normalize SQLite's non-semantic, library-version-dependent bytes."""
-    with _connect_sqlite(database, mode="rw", authority=authority) as connection:
+    if authority is None:
+        raise ValueError("SQLite canonicalization requires a private candidate authority")
+    authority.validate()
+    canonical = authority.transaction_directory / "canonical.sqlite"
+    try:
+        os.lstat(canonical)
+    except FileNotFoundError:
+        pass
+    else:
+        raise ValueError("SQLite canonicalization destination is not empty")
+    connection = _connect_sqlite(database, mode="rw", authority=authority)
+    try:
         connection.execute("PRAGMA foreign_keys = ON")
         _require_portable_sqlite_profile(database, connection, authority)
         planner_tables = tuple(
@@ -1356,15 +1367,83 @@ def _canonicalize_sqlite_projection(
                 statistics,
             )
             connection.commit()
-        connection.execute("VACUUM")
-        if connection.execute("PRAGMA integrity_check").fetchone() != ("ok",):
-            raise ValueError("canonicalized projection failed SQLite integrity check")
-        invalid = connection.execute("PRAGMA foreign_key_check").fetchall()
-        if invalid:
-            raise ValueError(
-                f"canonicalized projection has foreign-key violations: {invalid!r}"
+        # VACUUM may retain arbitrary bytes from the original file in unused
+        # B-tree regions.  SQLite versions differ in which of those bytes they
+        # overwrite, so in-place VACUUM is not a portable byte canonicalizer.
+        # VACUUM INTO constructs a new zero-backed file and has produced the
+        # same bytes for the supported portable profile across SQLite builds.
+        connection.execute("VACUUM INTO ?", (str(canonical),))
+    finally:
+        connection.close()
+    canonical_identity: _ProjectionSourceIdentity | None = None
+    try:
+        canonical_identity = _capture_projection_identity(canonical)
+        if canonical_identity is None:
+            raise ValueError("SQLite canonicalization did not create its output")
+        canonical_connection = _connect_sqlite(canonical, mode="ro")
+        try:
+            _require_portable_sqlite_profile(canonical, canonical_connection)
+            if canonical_connection.execute("PRAGMA integrity_check").fetchone() != (
+                "ok",
+            ):
+                raise ValueError(
+                    "canonicalized projection failed SQLite integrity check"
+                )
+            invalid = canonical_connection.execute("PRAGMA foreign_key_check").fetchall()
+            if invalid:
+                raise ValueError(
+                    f"canonicalized projection has foreign-key violations: {invalid!r}"
+                )
+        finally:
+            canonical_connection.close()
+        source_file_descriptor = _open_projection_read_only(canonical)
+        candidate_file_descriptor = -1
+        try:
+            if _read_fd_identity(source_file_descriptor) != canonical_identity:
+                raise ValueError("SQLite canonicalization output changed before copy")
+            candidate_file_descriptor = os.open(
+                database,
+                os.O_RDWR | _O_NOFOLLOW | _O_BINARY,
             )
-
+            candidate_information = os.fstat(candidate_file_descriptor)
+            if (
+                candidate_information.st_dev != authority.candidate_device
+                or candidate_information.st_ino != authority.candidate_inode
+            ):
+                raise ValueError("projection stamp candidate identity is unsafe")
+            os.lseek(source_file_descriptor, 0, os.SEEK_SET)
+            os.lseek(candidate_file_descriptor, 0, os.SEEK_SET)
+            copied = 0
+            while True:
+                block = os.read(source_file_descriptor, _COPY_BLOCK_SIZE)
+                if not block:
+                    break
+                view = memoryview(block)
+                while view:
+                    written = os.write(candidate_file_descriptor, view)
+                    if written <= 0:
+                        raise OSError("could not copy canonical SQLite bytes")
+                    copied += written
+                    view = view[written:]
+            if copied != canonical_identity.size:
+                raise ValueError("SQLite canonicalization output has the wrong size")
+            os.ftruncate(candidate_file_descriptor, copied)
+            os.fsync(candidate_file_descriptor)
+        finally:
+            if candidate_file_descriptor >= 0:
+                os.close(candidate_file_descriptor)
+            os.close(source_file_descriptor)
+        if not _source_matches_identity(canonical, canonical_identity):
+            raise ValueError("SQLite canonicalization output changed while copied")
+        authority.validate()
+    finally:
+        if canonical_identity is None:
+            try:
+                canonical_identity = _capture_projection_identity(canonical)
+            except (OSError, ValueError):
+                canonical_identity = None
+        if canonical_identity is not None:
+            _unlink_source_identity(canonical, canonical_identity)
     _normalize_sqlite_header(database, authority)
 
 

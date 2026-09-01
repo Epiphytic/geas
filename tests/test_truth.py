@@ -230,6 +230,87 @@ def _write_projection_fixture(database: Path) -> None:
         connection.execute("INSERT INTO concept VALUES ('concept:1', 'Ontology')")
 
 
+def _fill_page_one_unallocated_bytes(database: Path, value: int) -> None:
+    content = bytearray(database.read_bytes())
+    header_start = 100
+    page_type = content[header_start]
+    assert page_type in {0x02, 0x05, 0x0A, 0x0D}
+    header_size = 12 if page_type in {0x02, 0x05} else 8
+    cell_count = int.from_bytes(content[header_start + 3 : header_start + 5], "big")
+    pointer_end = header_start + header_size + 2 * cell_count
+    cell_content = int.from_bytes(content[header_start + 5 : header_start + 7], "big")
+    if cell_content == 0:
+        cell_content = 65536
+    assert pointer_end < cell_content
+    content[pointer_end:cell_content] = bytes((value,)) * (cell_content - pointer_end)
+    database.write_bytes(content)
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+
+
+def test_projection_stamp_canonicalizes_unallocated_bytes_across_sqlite_versions(
+    tmp_path: Path,
+) -> None:
+    """Catches library-dependent stale bytes left by in-place VACUUM."""
+    workspace, store = _workspace(tmp_path)
+    instant = datetime(2026, 8, 2, 12, 0, tzinfo=UTC)
+    snapshot = _manager(workspace, store, instant=instant).capture(
+        created_by="operator:test"
+    )
+    first = tmp_path / "first.sqlite"
+    second = tmp_path / "second.sqlite"
+    _write_projection_fixture(first)
+    second.write_bytes(first.read_bytes())
+    _fill_page_one_unallocated_bytes(first, 0x5A)
+    _fill_page_one_unallocated_bytes(second, 0xA5)
+    guard = SQLiteProjectionGuard(clock=lambda: instant)
+
+    for database in (first, second):
+        guard.stamp(
+            database,
+            snapshot,
+            schema_version=1,
+            builder_version="projection-builder/test",
+        )
+
+    assert first.read_bytes() == second.read_bytes()
+
+
+def test_projection_stamp_vacuums_into_a_fresh_zero_backed_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches version-dependent unused bytes retained by in-place VACUUM."""
+    workspace, store = _workspace(tmp_path)
+    instant = datetime(2026, 8, 2, 12, 0, tzinfo=UTC)
+    snapshot = _manager(workspace, store, instant=instant).capture(
+        created_by="operator:test"
+    )
+    database = tmp_path / "query.sqlite"
+    _write_projection_fixture(database)
+    original_connect = truth_module._connect_sqlite
+    statements: list[str] = []
+
+    def tracing_connect(*args: object, **kwargs: object) -> sqlite3.Connection:
+        connection = original_connect(*args, **kwargs)
+        connection.set_trace_callback(statements.append)
+        return connection
+
+    monkeypatch.setattr(truth_module, "_connect_sqlite", tracing_connect)
+
+    SQLiteProjectionGuard(clock=lambda: instant).stamp(
+        database,
+        snapshot,
+        schema_version=1,
+        builder_version="projection-builder/test",
+    )
+
+    normalized = tuple(statement.strip().upper() for statement in statements)
+    assert any(statement.startswith("VACUUM INTO ") for statement in normalized)
+    assert "VACUUM" not in normalized
+    assert _projection_candidate_paths(database) == ()
+
+
 def test_projection_stamp_foreign_key_failure_preserves_unstamped_source(
     tmp_path: Path,
 ) -> None:
