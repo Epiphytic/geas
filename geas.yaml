@@ -5,7 +5,7 @@ ontologies:
   path: ontology/open-source-research-agents
   files:
   - path: artifacts.yaml
-    sha256: dc029075edcee3ef296e8c8507ba53b5ed1cd6a26af62b9a2dca9ee8068e1e00
+    sha256: dd4ecc07d99c27cd86fa33e07870995745c15c07d99962b28fe07db74eedaa61
     size_bytes: 1061
   - path: build.yaml
     sha256: f108b4a0feba3a2bb159c4f9062b315de16f68b5085c8664daf12105da1cf975
@@ -64,4 +64,4 @@ ontologies:
   - path: tainted-sources.yaml
     sha256: 7d7d8323d5c44df54be7d2797ec542143989f55c40ea10aaa6dca0410349778a
     size_bytes: 1116
-  bundle_sha256: a6316c3ea2fcc21a0d2ec9a67bdcbbfd6b999faedfbcc4532748f2a951f70e37
+  bundle_sha256: 0bcf485e8f54083f32d44faec9b8581d9f3376fc0fff3c9e0e86ac5afdba4613
