@@ -1605,7 +1605,12 @@ class SQLiteKnowledgeProjection:
 
 
 class KnowledgeQueryEngine:
-    def __init__(self, database: Path) -> None:
+    def __init__(
+        self,
+        database: Path,
+        *,
+        expected_content_sha256: str | None = None,
+    ) -> None:
         self.database = database.absolute()
         self._owner_thread = threading.get_ident()
         self._reader = SQLiteProjectionGuard().open_compatible_connection(
@@ -1613,6 +1618,14 @@ class KnowledgeQueryEngine:
             expected_schema_version=SQLiteKnowledgeProjection.schema_version,
             expected_builder_version=SQLiteKnowledgeProjection.builder_version,
         )
+        if (
+            expected_content_sha256 is not None
+            and self._reader.source_identity.sha256 != expected_content_sha256
+        ):
+            self._reader.close()
+            raise ValueError(
+                "knowledge projection content does not match its expected artifact"
+            )
         self._connection: sqlite3.Connection | None = self._reader.connection
         self._connection.row_factory = sqlite3.Row
 

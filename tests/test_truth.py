@@ -1540,7 +1540,10 @@ def test_projection_reader_rejects_source_replacement_after_snapshot_validation(
     "failure",
     (
         "missing",
+        "token",
         "open",
+        "short-write",
+        "partial-write",
         "fstat",
         "descriptor-stats",
         "authority",
@@ -1568,7 +1571,13 @@ def test_projection_reader_failure_cleans_private_validation_snapshot(
     database = tmp_path / "query.sqlite"
     if failure != "missing":
         _write_projection_fixture(database)
-    if failure == "open":
+    if failure == "token":
+        monkeypatch.setattr(
+            truth_module.secrets,
+            "token_bytes",
+            lambda length: (_ for _ in ()).throw(OSError("token generation failed")),
+        )
+    elif failure == "open":
         open_file = truth_module.os.open
 
         def fail_candidate_open(path: object, *args: object, **kwargs: object) -> int:
@@ -1577,6 +1586,36 @@ def test_projection_reader_failure_cleans_private_validation_snapshot(
             return open_file(path, *args, **kwargs)
 
         monkeypatch.setattr(truth_module.os, "open", fail_candidate_open)
+    elif failure in ("short-write", "partial-write"):
+        write_file = truth_module.os.write
+        writes = 0
+
+        def bounded_candidate_write(file_descriptor: int, content: bytes) -> int:
+            nonlocal writes
+            writes += 1
+            if failure == "partial-write" and writes == 2:
+                raise OSError("candidate token write failed")
+            return write_file(file_descriptor, content[:3])
+
+        monkeypatch.setattr(truth_module.os, "write", bounded_candidate_write)
+        if failure == "short-write":
+            stat_file = truth_module.os.stat
+            monkeypatch.setattr(
+                truth_module.os,
+                "fstat",
+                lambda file_descriptor: (_ for _ in ()).throw(
+                    OSError("candidate fstat failed")
+                ),
+            )
+            monkeypatch.setattr(
+                truth_module.os,
+                "stat",
+                lambda path, *args, **kwargs: (_ for _ in ()).throw(
+                    OSError("candidate descriptor stat failed")
+                )
+                if isinstance(path, int)
+                else stat_file(path, *args, **kwargs),
+            )
     elif failure == "fstat":
         fstat = truth_module.os.fstat
         failed = False
@@ -1632,7 +1671,10 @@ def test_projection_reader_failure_cleans_private_validation_snapshot(
 
     expected_error = {
         "missing": ValueError,
+        "token": OSError,
         "open": OSError,
+        "short-write": OSError,
+        "partial-write": OSError,
         "fstat": OSError,
         "descriptor-stats": OSError,
         "authority": ValueError,

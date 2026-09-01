@@ -583,6 +583,34 @@ def test_query_engine_remains_bound_to_validated_projection_after_path_replaceme
         engine.query("dental caries", limit=10)
 
 
+def test_query_engine_rejects_different_valid_projection_with_same_input_revision(
+    tmp_path: Path,
+) -> None:
+    _, database, (_, _, snapshot, _) = _build_projection(tmp_path)
+    expected_digest = hashlib.sha256(database.read_bytes()).hexdigest()
+    replacement = tmp_path / "replacement.sqlite"
+    replacement.write_bytes(database.read_bytes())
+    with sqlite3.connect(replacement) as connection:
+        connection.execute(
+            "UPDATE concept SET label = label || ' replacement' WHERE id = "
+            "'concept:community-water-fluoridation'"
+        )
+    SQLiteProjectionGuard(clock=lambda: INSTANT).stamp(
+        replacement,
+        snapshot,
+        schema_version=SQLiteKnowledgeProjection.schema_version,
+        builder_version=SQLiteKnowledgeProjection.builder_version,
+    )
+    assert hashlib.sha256(replacement.read_bytes()).hexdigest() != expected_digest
+    replacement.replace(database)
+
+    with pytest.raises(ValueError, match="expected artifact"):
+        KnowledgeQueryEngine(
+            database,
+            expected_content_sha256=expected_digest,
+        )
+
+
 def test_projection_build_and_query_reject_static_destination_symlinks(
     tmp_path: Path,
 ) -> None:

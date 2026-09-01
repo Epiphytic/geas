@@ -1841,13 +1841,20 @@ def _open_stable_projection_connection(
     try:
         parent_information = os.lstat(parent)
         directory_information = os.lstat(transaction_directory)
+        cleanup_token = secrets.token_bytes(32)
         candidate_file_descriptor = os.open(
             candidate,
             os.O_RDWR | os.O_CREAT | os.O_EXCL | _O_NOFOLLOW | _O_BINARY,
             0o600,
         )
-        candidate_cleanup_token = secrets.token_bytes(32)
-        os.write(candidate_file_descriptor, candidate_cleanup_token)
+        candidate_cleanup_token = b""
+        token_view = memoryview(cleanup_token)
+        while token_view:
+            written = os.write(candidate_file_descriptor, token_view)
+            if written <= 0:
+                raise OSError("projection validation candidate token write stalled")
+            candidate_cleanup_token += bytes(token_view[:written])
+            token_view = token_view[written:]
         try:
             candidate_information = os.fstat(candidate_file_descriptor)
         except BaseException:

@@ -123,7 +123,11 @@ def export_catalog_skill(
             "SQLite projection stamp"
         )
     ontology = _catalog_ontology_identity(selection)
-    topic = KnowledgeQueryEngine(database).topic(topic_concept_id)
+    with KnowledgeQueryEngine(
+        database,
+        expected_content_sha256=hydrated.content_sha256,
+    ) as engine:
+        topic = engine.topic(topic_concept_id)
     rendered = render_ontology_skill(
         topic,
         skill_name=skill_name,
