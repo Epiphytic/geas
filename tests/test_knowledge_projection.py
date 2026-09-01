@@ -543,6 +543,13 @@ def test_projection_supports_lexical_hierarchy_dissent_gaps_and_provenance(
     assert build.counts["structural_derivations"] == 1
     assert build.counts["structural_anchors"] == 3
     with sqlite3.connect(database) as connection:
+        assert connection.execute("PRAGMA page_size").fetchone() == (4096,)
+        assert connection.execute("PRAGMA auto_vacuum").fetchone() == (0,)
+        assert connection.execute("PRAGMA encoding").fetchone() == ("UTF-8",)
+        assert connection.execute("PRAGMA journal_mode").fetchone() == ("delete",)
+        assert connection.execute(
+            "SELECT name FROM sqlite_schema WHERE name GLOB 'sqlite_stat*'"
+        ).fetchall() == []
         assert connection.execute(
             "SELECT parser_runtime FROM text_derivation"
         ).fetchone() == ("in_process_deterministic",)

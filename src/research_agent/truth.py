@@ -5,8 +5,11 @@ import hashlib
 import json
 import os
 import sqlite3
+import stat
 import subprocess
+import tempfile
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 from fnmatch import fnmatchcase
@@ -21,16 +24,266 @@ from research_agent.models import StrictModel, canonical_json, content_id, utc_n
 _SQLITE_HEADER = b"SQLite format 3\0"
 _SQLITE_NON_SEMANTIC_HEADER_FIELDS = (24, 40, 92, 96)
 _SQLITE_HEADER_FIELD_SIZE = 4
+_SQLITE_PORTABLE_PAGE_SIZE = 4096
+_COPY_BLOCK_SIZE = 1024 * 1024
+
+
+@dataclass(frozen=True)
+class _ProjectionSourceIdentity:
+    device: int
+    inode: int
+    size: int
+    modified_ns: int
+    mode: int
+    sha256: str
+
+
+def _normalize_sqlite_header(database: Path) -> None:
+    minimum_size = max(_SQLITE_NON_SEMANTIC_HEADER_FIELDS) + _SQLITE_HEADER_FIELD_SIZE
+    with database.open("r+b") as stream:
+        header = stream.read(minimum_size)
+        if len(header) != minimum_size or not header.startswith(_SQLITE_HEADER):
+            raise ValueError("canonicalized projection has an invalid SQLite header")
+        for offset in _SQLITE_NON_SEMANTIC_HEADER_FIELDS:
+            stream.seek(offset)
+            stream.write(b"\0" * _SQLITE_HEADER_FIELD_SIZE)
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def _require_normalized_sqlite_header(database: Path) -> None:
+    minimum_size = max(_SQLITE_NON_SEMANTIC_HEADER_FIELDS) + _SQLITE_HEADER_FIELD_SIZE
+    with database.open("rb") as stream:
+        header = stream.read(minimum_size)
+    if len(header) != minimum_size or not header.startswith(_SQLITE_HEADER):
+        raise ValueError("knowledge projection has an invalid SQLite header")
+    if any(
+        header[offset : offset + _SQLITE_HEADER_FIELD_SIZE]
+        != b"\0" * _SQLITE_HEADER_FIELD_SIZE
+        for offset in _SQLITE_NON_SEMANTIC_HEADER_FIELDS
+    ):
+        raise ValueError("knowledge projection header is not canonical")
+
+
+def _require_portable_sqlite_profile(
+    database: Path,
+    connection: sqlite3.Connection,
+) -> None:
+    with database.open("rb") as stream:
+        header = stream.read(100)
+    if len(header) != 100 or not header.startswith(_SQLITE_HEADER):
+        raise ValueError("knowledge projection has an invalid SQLite header")
+    encoded_page_size = int.from_bytes(header[16:18], "big")
+    page_size = 65536 if encoded_page_size == 1 else encoded_page_size
+    if (
+        page_size != _SQLITE_PORTABLE_PAGE_SIZE
+        or header[18:21] != b"\x01\x01\x00"
+        or header[21:24] != b"\x40\x20\x20"
+        or connection.execute("PRAGMA page_size").fetchone()
+        != (_SQLITE_PORTABLE_PAGE_SIZE,)
+        or connection.execute("PRAGMA auto_vacuum").fetchone() != (0,)
+        or connection.execute("PRAGMA encoding").fetchone() != ("UTF-8",)
+        or connection.execute("PRAGMA journal_mode").fetchone() != ("delete",)
+    ):
+        raise ValueError("knowledge projection has a non-portable SQLite file profile")
+
+
+def _read_fd_identity(file_descriptor: int) -> _ProjectionSourceIdentity:
+    information = os.fstat(file_descriptor)
+    if not stat.S_ISREG(information.st_mode):
+        raise ValueError("knowledge projection must be a regular file")
+    digest = hashlib.sha256()
+    os.lseek(file_descriptor, 0, os.SEEK_SET)
+    for block in iter(lambda: os.read(file_descriptor, _COPY_BLOCK_SIZE), b""):
+        digest.update(block)
+    return _ProjectionSourceIdentity(
+        device=information.st_dev,
+        inode=information.st_ino,
+        size=information.st_size,
+        modified_ns=information.st_mtime_ns,
+        mode=stat.S_IMODE(information.st_mode),
+        sha256=digest.hexdigest(),
+    )
+
+
+def _open_projection_read_only(database: Path) -> int:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        return os.open(database, flags)
+    except OSError as error:
+        raise ValueError("knowledge projection is missing or unsafe") from error
+
+
+def _has_sqlite_sidecar(database: Path) -> bool:
+    for suffix in ("-journal", "-wal", "-shm"):
+        try:
+            os.lstat(f"{database}{suffix}")
+        except FileNotFoundError:
+            continue
+        return True
+    return False
+
+
+def _copy_projection_candidate(
+    database: Path,
+    candidate_file_descriptor: int,
+) -> _ProjectionSourceIdentity | None:
+    if _has_sqlite_sidecar(database):
+        raise ValueError("knowledge projection has an active SQLite sidecar")
+    try:
+        source_file_descriptor = _open_projection_read_only(database)
+    except ValueError:
+        try:
+            os.lstat(database)
+        except FileNotFoundError:
+            return None
+        raise
+    try:
+        identity = _read_fd_identity(source_file_descriptor)
+        os.lseek(source_file_descriptor, 0, os.SEEK_SET)
+        for block in iter(
+            lambda: os.read(source_file_descriptor, _COPY_BLOCK_SIZE),
+            b"",
+        ):
+            view = memoryview(block)
+            while view:
+                written = os.write(candidate_file_descriptor, view)
+                view = view[written:]
+        os.fchmod(candidate_file_descriptor, identity.mode)
+        os.fsync(candidate_file_descriptor)
+        return identity
+    finally:
+        os.close(source_file_descriptor)
+
+
+def _source_matches_identity(
+    database: Path,
+    identity: _ProjectionSourceIdentity | None,
+) -> bool:
+    if _has_sqlite_sidecar(database):
+        return False
+    if identity is None:
+        try:
+            os.lstat(database)
+        except FileNotFoundError:
+            return True
+        return False
+    try:
+        file_descriptor = _open_projection_read_only(database)
+    except ValueError:
+        return False
+    try:
+        return _read_fd_identity(file_descriptor) == identity
+    finally:
+        os.close(file_descriptor)
+
+
+def _fsync_directory(directory: Path) -> None:
+    file_descriptor = os.open(
+        directory,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+    )
+    try:
+        os.fsync(file_descriptor)
+    finally:
+        os.close(file_descriptor)
+
+
+def _fsync_file(path: Path) -> None:
+    file_descriptor = _open_projection_read_only(path)
+    try:
+        os.fsync(file_descriptor)
+    finally:
+        os.close(file_descriptor)
+
+
+def _restore_replaced_projection(
+    database: Path,
+    backup: Path | None,
+) -> None:
+    try:
+        if backup is None:
+            database.unlink(missing_ok=True)
+        else:
+            os.replace(backup, database)
+        if database.exists():
+            _fsync_file(database)
+        _fsync_directory(database.parent)
+    except (OSError, ValueError):
+        pass
+
+
+def _replace_candidate_if_source_unchanged(
+    candidate: Path,
+    database: Path,
+    identity: _ProjectionSourceIdentity | None,
+) -> None:
+    if not _source_matches_identity(database, identity):
+        raise ValueError("source changed while projection stamp was prepared")
+    if identity is None:
+        linked = False
+        try:
+            os.link(candidate, database, follow_symlinks=False)
+            linked = True
+            _fsync_file(database)
+            _fsync_directory(database.parent)
+            candidate.unlink()
+            return
+        except BaseException:
+            if linked:
+                _restore_replaced_projection(database, None)
+            raise
+
+    backup_file_descriptor, backup_name = tempfile.mkstemp(
+        prefix=f".{database.name}.",
+        suffix=".stamp-original",
+        dir=database.parent,
+    )
+    os.close(backup_file_descriptor)
+    backup = Path(backup_name)
+    backup.unlink()
+    replaced = False
+    try:
+        os.link(database, backup, follow_symlinks=False)
+        if (
+            not _source_matches_identity(database, identity)
+            or not _source_matches_identity(backup, identity)
+        ):
+            raise ValueError("source changed while projection stamp was prepared")
+        os.replace(candidate, database)
+        replaced = True
+        if not _source_matches_identity(backup, identity):
+            raise ValueError("source changed while projection stamp was prepared")
+        _fsync_file(database)
+        _fsync_directory(database.parent)
+        backup.unlink()
+    except BaseException:
+        if replaced:
+            _restore_replaced_projection(database, backup)
+        raise
+    finally:
+        backup.unlink(missing_ok=True)
 
 
 def _canonicalize_sqlite_projection(database: Path) -> None:
     """Normalize SQLite's non-semantic, library-version-dependent bytes."""
     with sqlite3.connect(database) as connection:
         connection.execute("PRAGMA foreign_keys = ON")
-        statistics_table = connection.execute(
-            "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'sqlite_stat1'"
-        ).fetchone()
-        if statistics_table is not None:
+        _require_portable_sqlite_profile(database, connection)
+        planner_tables = tuple(
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_schema "
+                "WHERE type = 'table' AND name GLOB 'sqlite_stat*' ORDER BY name"
+            )
+        )
+        unexpected = tuple(name for name in planner_tables if name != "sqlite_stat1")
+        if unexpected:
+            raise ValueError(
+                f"unexpected SQLite planner statistics tables: {unexpected!r}"
+            )
+        statistics_table = "sqlite_stat1" in planner_tables
+        if statistics_table:
             statistics = connection.execute(
                 "SELECT tbl, idx, stat FROM sqlite_stat1 ORDER BY tbl, idx, stat"
             ).fetchall()
@@ -50,16 +303,7 @@ def _canonicalize_sqlite_projection(database: Path) -> None:
                 f"canonicalized projection has foreign-key violations: {invalid!r}"
             )
 
-    minimum_size = max(_SQLITE_NON_SEMANTIC_HEADER_FIELDS) + _SQLITE_HEADER_FIELD_SIZE
-    with database.open("r+b") as stream:
-        header = stream.read(minimum_size)
-        if len(header) != minimum_size or not header.startswith(_SQLITE_HEADER):
-            raise ValueError("canonicalized projection has an invalid SQLite header")
-        for offset in _SQLITE_NON_SEMANTIC_HEADER_FIELDS:
-            stream.seek(offset)
-            stream.write(b"\0" * _SQLITE_HEADER_FIELD_SIZE)
-        stream.flush()
-        os.fsync(stream.fileno())
+    _normalize_sqlite_header(database)
 
 
 class ArtifactRole(StrEnum):
@@ -481,6 +725,41 @@ class ProjectionStamp(StrictModel):
     stamped_at: datetime
 
 
+def _validated_projection_state(
+    database: Path,
+) -> tuple[ProjectionStamp | None, str | None]:
+    if database.is_symlink() or not database.is_file() or _has_sqlite_sidecar(database):
+        raise ValueError("knowledge projection is missing or unsafe")
+    with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as connection:
+        connection.execute("PRAGMA query_only = ON")
+        _require_portable_sqlite_profile(database, connection)
+        integrity = connection.execute("PRAGMA integrity_check").fetchall()
+        if integrity != [("ok",)]:
+            raise ValueError("knowledge projection failed SQLite integrity check")
+        invalid = connection.execute("PRAGMA foreign_key_check").fetchall()
+        if invalid:
+            raise ValueError(
+                f"knowledge projection has foreign-key violations: {invalid!r}"
+            )
+        guard = SQLiteProjectionGuard()
+        stamp = guard._read_stamp(connection)
+        if stamp is None:
+            return None, None
+        _require_normalized_sqlite_header(database)
+        return stamp, guard.logical_digest(connection)
+
+
+def _validate_stamped_projection(
+    database: Path,
+    expected_stamp: ProjectionStamp,
+) -> None:
+    stamp, logical_digest = _validated_projection_state(database)
+    if stamp != expected_stamp:
+        raise ValueError("knowledge projection has an unexpected projection stamp")
+    if logical_digest != expected_stamp.projection_digest:
+        raise ValueError("knowledge projection logical digest does not match its stamp")
+
+
 class SQLiteProjectionGuard:
     metadata_table = "_research_projection_metadata"
 
@@ -495,36 +774,71 @@ class SQLiteProjectionGuard:
         schema_version: int,
         builder_version: str,
     ) -> ProjectionStamp:
+        database = database.absolute()
         database.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(database) as connection:
-            connection.execute(
-                f"""
-                CREATE TABLE IF NOT EXISTS {self.metadata_table} (
-                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-                    payload TEXT NOT NULL
+        candidate_file_descriptor, candidate_name = tempfile.mkstemp(
+            prefix=f".{database.name}.",
+            suffix=".stamp",
+            dir=database.parent,
+        )
+        candidate = Path(candidate_name)
+        try:
+            try:
+                source_identity = _copy_projection_candidate(
+                    database,
+                    candidate_file_descriptor,
                 )
-                """
+            finally:
+                os.close(candidate_file_descriptor)
+            with sqlite3.connect(candidate) as connection:
+                if source_identity is None:
+                    connection.execute(
+                        f"PRAGMA page_size = {_SQLITE_PORTABLE_PAGE_SIZE}"
+                    )
+                    connection.execute("PRAGMA auto_vacuum = NONE")
+                    connection.execute("PRAGMA encoding = 'UTF-8'")
+                    connection.execute("PRAGMA journal_mode = DELETE")
+                else:
+                    _require_portable_sqlite_profile(candidate, connection)
+                connection.execute("PRAGMA foreign_keys = ON")
+                connection.execute(
+                    f"""
+                    CREATE TABLE IF NOT EXISTS {self.metadata_table} (
+                        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                        payload TEXT NOT NULL
+                    )
+                    """
+                )
+                projection_digest = self.logical_digest(connection)
+                stamp = ProjectionStamp(
+                    snapshot_id=snapshot.id,
+                    truth_state_digest=snapshot.state_digest,
+                    projection_digest=projection_digest,
+                    schema_version=schema_version,
+                    builder_version=builder_version,
+                    stamped_at=self.clock(),
+                )
+                connection.execute(
+                    f"""
+                    INSERT INTO {self.metadata_table}(singleton, payload)
+                    VALUES (1, ?)
+                    ON CONFLICT(singleton) DO UPDATE SET payload = excluded.payload
+                    """,
+                    (canonical_json(stamp).decode(),),
+                )
+                connection.commit()
+            _canonicalize_sqlite_projection(candidate)
+            _validate_stamped_projection(candidate, stamp)
+            with candidate.open("rb") as stream:
+                os.fsync(stream.fileno())
+            _replace_candidate_if_source_unchanged(
+                candidate,
+                database,
+                source_identity,
             )
-            projection_digest = self.logical_digest(connection)
-            stamp = ProjectionStamp(
-                snapshot_id=snapshot.id,
-                truth_state_digest=snapshot.state_digest,
-                projection_digest=projection_digest,
-                schema_version=schema_version,
-                builder_version=builder_version,
-                stamped_at=self.clock(),
-            )
-            connection.execute(
-                f"""
-                INSERT INTO {self.metadata_table}(singleton, payload)
-                VALUES (1, ?)
-                ON CONFLICT(singleton) DO UPDATE SET payload = excluded.payload
-                """,
-                (canonical_json(stamp).decode(),),
-            )
-            connection.commit()
-        _canonicalize_sqlite_projection(database)
-        return stamp
+            return stamp
+        finally:
+            candidate.unlink(missing_ok=True)
 
     def verify(
         self,
@@ -545,8 +859,17 @@ class SQLiteProjectionGuard:
         if not database.exists():
             items.append(DriftItem(kind=DriftKind.PROJECTION_MISSING, locator=str(database)))
         else:
-            with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as connection:
-                stamp = self._read_stamp(connection)
+            try:
+                stamp, actual_digest = _validated_projection_state(database)
+            except (OSError, sqlite3.Error, ValueError):
+                items.append(
+                    DriftItem(
+                        kind=DriftKind.PROJECTION_MUTATED,
+                        locator=str(database),
+                        actual="invalid SQLite projection",
+                    )
+                )
+            else:
                 if stamp is None:
                     items.append(
                         DriftItem(
@@ -588,7 +911,6 @@ class SQLiteProjectionGuard:
                                 actual=stamp.truth_state_digest,
                             )
                         )
-                    actual_digest = self.logical_digest(connection)
                     if actual_digest != stamp.projection_digest:
                         items.append(
                             DriftItem(
@@ -625,10 +947,16 @@ class SQLiteProjectionGuard:
         """Reject a projection whose stamp cannot support the current reader."""
         if not database.is_file():
             raise ValueError("knowledge projection is missing")
-        with sqlite3.connect(f"file:{database}?mode=ro", uri=True) as connection:
-            stamp = self._read_stamp(connection)
+        try:
+            stamp, actual_digest = _validated_projection_state(database)
+        except (OSError, sqlite3.Error, ValueError) as error:
+            if isinstance(error, ValueError):
+                raise
+            raise ValueError("knowledge projection is invalid") from error
         if stamp is None:
             raise ValueError("knowledge projection is unstamped")
+        if actual_digest != stamp.projection_digest:
+            raise ValueError("knowledge projection logical digest does not match its stamp")
         if (
             stamp.schema_version != expected_schema_version
             or stamp.builder_version != expected_builder_version

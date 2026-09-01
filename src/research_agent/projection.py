@@ -295,6 +295,9 @@ class SQLiteKnowledgeProjection:
         concepts = self._concepts()
 
         with sqlite3.connect(database) as connection:
+            connection.execute("PRAGMA page_size = 4096")
+            connection.execute("PRAGMA auto_vacuum = NONE")
+            connection.execute("PRAGMA encoding = 'UTF-8'")
             connection.execute("PRAGMA foreign_keys = ON")
             connection.execute("PRAGMA journal_mode = DELETE")
             connection.execute("PRAGMA synchronous = FULL")
@@ -367,7 +370,6 @@ class SQLiteKnowledgeProjection:
                     for value in self.store.iter_records("extraction-proposal")
                 ),
             )
-            connection.execute("PRAGMA optimize")
             connection.commit()
             invalid = connection.execute("PRAGMA foreign_key_check").fetchall()
             if invalid:

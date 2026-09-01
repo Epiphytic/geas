@@ -1,4 +1,5 @@
 import sqlite3
+import stat
 import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
@@ -6,6 +7,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+import research_agent.truth as truth_module
 from research_agent.store import ImmutableStore
 from research_agent.truth import (
     DriftKind,
@@ -215,6 +217,325 @@ def test_projection_mutation_is_detected_and_rebuild_is_required(tmp_path: Path)
     assert not report.clean
     assert report.recommended_action == "discard_and_rebuild"
     assert any(item.kind is DriftKind.PROJECTION_MUTATED for item in report.items)
+
+
+def _projection_candidate_paths(database: Path) -> tuple[Path, ...]:
+    return tuple(database.parent.glob(f".{database.name}.*"))
+
+
+def _write_projection_fixture(database: Path) -> None:
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE TABLE concept(id TEXT PRIMARY KEY, label TEXT)")
+        connection.execute("INSERT INTO concept VALUES ('concept:1', 'Ontology')")
+
+
+def test_projection_stamp_foreign_key_failure_preserves_unstamped_source(
+    tmp_path: Path,
+) -> None:
+    workspace, store = _workspace(tmp_path)
+    instant = datetime(2026, 8, 2, 12, 0, tzinfo=UTC)
+    manager = _manager(workspace, store, instant=instant)
+    snapshot = manager.capture(created_by="operator:test")
+    database = tmp_path / "query.sqlite"
+    with sqlite3.connect(database) as connection:
+        connection.executescript(
+            """
+            PRAGMA foreign_keys = OFF;
+            CREATE TABLE parent(id INTEGER PRIMARY KEY);
+            CREATE TABLE child(parent_id INTEGER REFERENCES parent(id));
+            INSERT INTO child(parent_id) VALUES (99);
+            """
+        )
+    original = database.read_bytes()
+    guard = SQLiteProjectionGuard(clock=lambda: instant)
+
+    with pytest.raises(ValueError, match="foreign-key"):
+        guard.stamp(
+            database,
+            snapshot,
+            schema_version=1,
+            builder_version="projection-builder/test",
+        )
+
+    assert database.read_bytes() == original
+    assert _projection_candidate_paths(database) == ()
+    assert not guard.verify(database, snapshot).clean
+    with pytest.raises(ValueError, match="unstamped|invalid|foreign-key"):
+        guard.require_compatible(
+            database,
+            expected_schema_version=1,
+            expected_builder_version="projection-builder/test",
+        )
+
+
+@pytest.mark.parametrize(
+    ("boundary", "message"),
+    (
+        ("_normalize_sqlite_header", "header write"),
+        ("_validate_stamped_projection", "integrity"),
+        ("_fsync_file", "file fsync"),
+        ("_fsync_directory", "directory fsync"),
+    ),
+)
+def test_projection_stamp_candidate_failure_preserves_original_and_cleans_temp(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    boundary: str,
+    message: str,
+) -> None:
+    workspace, store = _workspace(tmp_path)
+    instant = datetime(2026, 8, 2, 12, 0, tzinfo=UTC)
+    snapshot = _manager(workspace, store, instant=instant).capture(
+        created_by="operator:test"
+    )
+    database = tmp_path / "query.sqlite"
+    _write_projection_fixture(database)
+    original = database.read_bytes()
+
+    def fail(*_args: object, **_kwargs: object) -> None:
+        raise OSError(message)
+
+    monkeypatch.setattr(truth_module, boundary, fail, raising=False)
+
+    with pytest.raises(OSError, match=message):
+        SQLiteProjectionGuard(clock=lambda: instant).stamp(
+            database,
+            snapshot,
+            schema_version=1,
+            builder_version="projection-builder/test",
+        )
+
+    assert database.read_bytes() == original
+    assert _projection_candidate_paths(database) == ()
+
+
+def test_projection_stamp_post_canonical_integrity_failure_preserves_original(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace, store = _workspace(tmp_path)
+    instant = datetime(2026, 8, 2, 12, 0, tzinfo=UTC)
+    snapshot = _manager(workspace, store, instant=instant).capture(
+        created_by="operator:test"
+    )
+    database = tmp_path / "query.sqlite"
+    _write_projection_fixture(database)
+    original = database.read_bytes()
+    canonicalize = truth_module._canonicalize_sqlite_projection
+
+    def corrupt_after_canonicalization(candidate: Path) -> None:
+        canonicalize(candidate)
+        with candidate.open("r+b") as stream:
+            stream.seek(4096)
+            stream.write(b"\xff")
+
+    monkeypatch.setattr(
+        truth_module,
+        "_canonicalize_sqlite_projection",
+        corrupt_after_canonicalization,
+    )
+
+    with pytest.raises((ValueError, sqlite3.DatabaseError)):
+        SQLiteProjectionGuard(clock=lambda: instant).stamp(
+            database,
+            snapshot,
+            schema_version=1,
+            builder_version="projection-builder/test",
+        )
+
+    assert database.read_bytes() == original
+    assert _projection_candidate_paths(database) == ()
+
+
+def test_projection_stamp_preserves_source_mode(tmp_path: Path) -> None:
+    workspace, store = _workspace(tmp_path)
+    instant = datetime(2026, 8, 2, 12, 0, tzinfo=UTC)
+    snapshot = _manager(workspace, store, instant=instant).capture(
+        created_by="operator:test"
+    )
+    database = tmp_path / "query.sqlite"
+    _write_projection_fixture(database)
+    database.chmod(0o640)
+
+    SQLiteProjectionGuard(clock=lambda: instant).stamp(
+        database,
+        snapshot,
+        schema_version=1,
+        builder_version="projection-builder/test",
+    )
+
+    assert stat.S_IMODE(database.stat().st_mode) == 0o640
+    assert _projection_candidate_paths(database) == ()
+
+
+def test_projection_stamp_rejects_active_sidecar_without_mutation(tmp_path: Path) -> None:
+    workspace, store = _workspace(tmp_path)
+    instant = datetime(2026, 8, 2, 12, 0, tzinfo=UTC)
+    snapshot = _manager(workspace, store, instant=instant).capture(
+        created_by="operator:test"
+    )
+    database = tmp_path / "query.sqlite"
+    _write_projection_fixture(database)
+    original = database.read_bytes()
+    sidecar = Path(f"{database}-wal")
+    sidecar.write_bytes(b"active")
+
+    with pytest.raises(ValueError, match="active SQLite sidecar"):
+        SQLiteProjectionGuard(clock=lambda: instant).stamp(
+            database,
+            snapshot,
+            schema_version=1,
+            builder_version="projection-builder/test",
+        )
+
+    assert database.read_bytes() == original
+    assert sidecar.read_bytes() == b"active"
+    assert _projection_candidate_paths(database) == ()
+
+
+def test_projection_stamp_rejects_source_change_before_atomic_replace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace, store = _workspace(tmp_path)
+    instant = datetime(2026, 8, 2, 12, 0, tzinfo=UTC)
+    snapshot = _manager(workspace, store, instant=instant).capture(
+        created_by="operator:test"
+    )
+    database = tmp_path / "query.sqlite"
+    _write_projection_fixture(database)
+    replace = truth_module._replace_candidate_if_source_unchanged
+
+    def mutate_then_replace(*args: object, **kwargs: object) -> None:
+        with sqlite3.connect(database) as connection:
+            connection.execute(
+                "INSERT INTO concept VALUES ('concept:concurrent', 'Concurrent')"
+            )
+        replace(*args, **kwargs)
+
+    monkeypatch.setattr(
+        truth_module,
+        "_replace_candidate_if_source_unchanged",
+        mutate_then_replace,
+    )
+
+    with pytest.raises(ValueError, match="changed while projection stamp was prepared"):
+        SQLiteProjectionGuard(clock=lambda: instant).stamp(
+            database,
+            snapshot,
+            schema_version=1,
+            builder_version="projection-builder/test",
+        )
+
+    with sqlite3.connect(database) as connection:
+        assert connection.execute(
+            "SELECT label FROM concept WHERE id = 'concept:concurrent'"
+        ).fetchone() == ("Concurrent",)
+        assert connection.execute(
+            "SELECT 1 FROM sqlite_schema WHERE name = '_research_projection_metadata'"
+        ).fetchone() is None
+    assert _projection_candidate_paths(database) == ()
+
+
+def test_verify_and_require_compatible_reject_foreign_key_corruption(
+    tmp_path: Path,
+) -> None:
+    workspace, store = _workspace(tmp_path)
+    instant = datetime(2026, 8, 2, 12, 0, tzinfo=UTC)
+    manager = _manager(workspace, store, instant=instant)
+    snapshot = manager.capture(created_by="operator:test")
+    database = tmp_path / "query.sqlite"
+    with sqlite3.connect(database) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE parent(id INTEGER PRIMARY KEY);
+            CREATE TABLE child(parent_id INTEGER REFERENCES parent(id));
+            """
+        )
+    guard = SQLiteProjectionGuard(clock=lambda: instant)
+    guard.stamp(
+        database,
+        snapshot,
+        schema_version=1,
+        builder_version="projection-builder/test",
+    )
+    with sqlite3.connect(database) as connection:
+        connection.execute("PRAGMA foreign_keys = OFF")
+        connection.execute("INSERT INTO child(parent_id) VALUES (99)")
+
+    assert not guard.verify(database, snapshot).clean
+    with pytest.raises(ValueError, match="foreign-key"):
+        guard.require_compatible(
+            database,
+            expected_schema_version=1,
+            expected_builder_version="projection-builder/test",
+        )
+
+
+def test_projection_stamp_rejects_compile_option_stat4_without_mutation(
+    tmp_path: Path,
+) -> None:
+    workspace, store = _workspace(tmp_path)
+    instant = datetime(2026, 8, 2, 12, 0, tzinfo=UTC)
+    snapshot = _manager(workspace, store, instant=instant).capture(
+        created_by="operator:test"
+    )
+    database = tmp_path / "query.sqlite"
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE TABLE concept(id INTEGER PRIMARY KEY)")
+        connection.execute("CREATE TABLE stat4(tbl, idx, neq, nlt, ndlt, sample)")
+        connection.execute("PRAGMA writable_schema = ON")
+        connection.execute(
+            "UPDATE sqlite_schema SET name = 'sqlite_stat4', "
+            "tbl_name = 'sqlite_stat4', "
+            "sql = 'CREATE TABLE sqlite_stat4(tbl,idx,neq,nlt,ndlt,sample)' "
+            "WHERE name = 'stat4'"
+        )
+        connection.execute("PRAGMA writable_schema = OFF")
+        connection.execute("PRAGMA schema_version = 2")
+    original = database.read_bytes()
+
+    with pytest.raises(ValueError, match="unexpected SQLite planner statistics"):
+        SQLiteProjectionGuard(clock=lambda: instant).stamp(
+            database,
+            snapshot,
+            schema_version=1,
+            builder_version="projection-builder/test",
+        )
+
+    assert database.read_bytes() == original
+    assert _projection_candidate_paths(database) == ()
+
+
+@pytest.mark.parametrize("profile", ("page-size", "auto-vacuum"))
+def test_projection_stamp_rejects_nonportable_sqlite_profile_without_mutation(
+    tmp_path: Path,
+    profile: str,
+) -> None:
+    workspace, store = _workspace(tmp_path)
+    instant = datetime(2026, 8, 2, 12, 0, tzinfo=UTC)
+    snapshot = _manager(workspace, store, instant=instant).capture(
+        created_by="operator:test"
+    )
+    database = tmp_path / "query.sqlite"
+    with sqlite3.connect(database) as connection:
+        if profile == "page-size":
+            connection.execute("PRAGMA page_size = 8192")
+        else:
+            connection.execute("PRAGMA auto_vacuum = FULL")
+        connection.execute("CREATE TABLE concept(id INTEGER PRIMARY KEY)")
+    original = database.read_bytes()
+
+    with pytest.raises(ValueError, match="non-portable SQLite file profile"):
+        SQLiteProjectionGuard(clock=lambda: instant).stamp(
+            database,
+            snapshot,
+            schema_version=1,
+            builder_version="projection-builder/test",
+        )
+
+    assert database.read_bytes() == original
+    assert _projection_candidate_paths(database) == ()
 
 
 def test_projection_stale_against_new_truth_snapshot(tmp_path: Path) -> None:
