@@ -316,7 +316,8 @@ class SQLiteKnowledgeProjection:
     def _build_database(self, database: Path) -> dict[str, int]:
         concepts = self._concepts()
 
-        with sqlite3.connect(database) as connection:
+        connection = sqlite3.connect(database)
+        try:
             connection.execute("PRAGMA page_size = 4096")
             connection.execute("PRAGMA auto_vacuum = NONE")
             connection.execute("PRAGMA encoding = 'UTF-8'")
@@ -396,6 +397,8 @@ class SQLiteKnowledgeProjection:
             invalid = connection.execute("PRAGMA foreign_key_check").fetchall()
             if invalid:
                 raise ValueError(f"projection has foreign-key violations: {invalid!r}")
+        finally:
+            connection.close()
         return counts
 
     def _concepts(self) -> tuple[Concept, ...]:

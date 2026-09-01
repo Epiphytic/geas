@@ -31,6 +31,7 @@ jobs:
           uv run pytest -q
           tests/test_truth.py
           tests/test_knowledge_projection.py
+          tests/test_local_connector.py
 
   verify:
     runs-on: ubuntu-latest

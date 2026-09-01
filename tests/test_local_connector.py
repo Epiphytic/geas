@@ -44,6 +44,41 @@ def test_local_connector_rejects_acquisition_outside_root(tmp_path: Path) -> Non
         )
 
 
+def test_local_connector_acquires_native_file_uri_round_trip(tmp_path: Path) -> None:
+    source = tmp_path / "fixture with spaces.txt"
+    source.write_bytes(b"portable local fixture")
+    connector = LocalFileConnector([tmp_path])
+
+    result = connector.acquire(
+        AcquisitionRequest(
+            discovery_hit_id="hit:1",
+            locator=source.as_uri(),
+            max_content_bytes=1_000,
+        )
+    )
+
+    assert result.content == b"portable local fixture"
+
+
+@pytest.mark.parametrize("suffix", ("?query=unsafe", "#fragment"))
+def test_local_connector_rejects_file_uri_query_or_fragment(
+    tmp_path: Path,
+    suffix: str,
+) -> None:
+    source = tmp_path / "fixture.txt"
+    source.write_text("fixture")
+    connector = LocalFileConnector([tmp_path])
+
+    with pytest.raises(ValueError, match="local file URIs"):
+        connector.acquire(
+            AcquisitionRequest(
+                discovery_hit_id="hit:1",
+                locator=source.as_uri() + suffix,
+                max_content_bytes=1_000,
+            )
+        )
+
+
 def test_local_discovery_does_not_follow_symlink_outside_root(tmp_path: Path) -> None:
     root = tmp_path / "root"
     root.mkdir()

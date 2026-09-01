@@ -191,11 +191,14 @@ class StableProjectionReader:
     source: Path
     source_identity: _ProjectionSourceIdentity
     _closed: bool = False
+    _connection_closed: bool = False
 
     def close(self) -> None:
         if self._closed:
             return
-        self.connection.close()
+        if not self._connection_closed:
+            self.connection.close()
+            self._connection_closed = True
         _unlink_candidate_identity(self.authority)
         self.authority.transaction_directory.rmdir()
         _WINDOWS_PRIVATE_DIRECTORY_IDENTITIES.pop(
@@ -210,6 +213,14 @@ class StableProjectionReader:
     def install_copy_no_replace(self, destination: Path) -> None:
         """Install the validated inode at one absent path without a copy race."""
         destination = destination.absolute()
+        if self._closed:
+            raise ValueError("stable projection reader is closed")
+        if not self._connection_closed:
+            # Windows does not permit unlinking the private candidate while
+            # SQLite still retains an open handle.  Installation consumes the
+            # validated reader; no query may occur after this boundary.
+            self.connection.close()
+            self._connection_closed = True
         self.authority.validate()
         if destination.parent != self.authority.parent_directory:
             raise ValueError(
@@ -816,6 +827,45 @@ def _windows_apply_candidate_mode(file_descriptor: int, mode: int) -> None:
         raise ctypes.WinError(ctypes.get_last_error())
 
 
+def _windows_clear_readonly_path(path: Path) -> None:
+    """Clear READONLY through a no-reparse, delete-sharing Win32 handle."""
+    kernel32 = _windows_kernel32()
+    handle = kernel32.CreateFileW(
+        str(path),
+        0x00000100,  # FILE_WRITE_ATTRIBUTES
+        0x00000001 | 0x00000002 | 0x00000004,  # share read/write/delete
+        None,
+        3,  # OPEN_EXISTING
+        0x00200000,  # FILE_FLAG_OPEN_REPARSE_POINT
+        None,
+    )
+    invalid_handle = ctypes.c_void_p(-1).value
+    if handle in (None, invalid_handle):
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        information = _WindowsFileBasicInfo()
+        if not kernel32.GetFileInformationByHandleEx(
+            handle,
+            0,
+            ctypes.byref(information),
+            ctypes.sizeof(information),
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        if information.FileAttributes & 0x00000001:
+            information.FileAttributes &= ~0x00000001
+            if information.FileAttributes == 0:
+                information.FileAttributes = 0x00000080
+            if not kernel32.SetFileInformationByHandle(
+                handle,
+                0,
+                ctypes.byref(information),
+                ctypes.sizeof(information),
+            ):
+                raise ctypes.WinError(ctypes.get_last_error())
+    finally:
+        kernel32.CloseHandle(handle)
+
+
 def _atomic_exchange_paths(first: Path, second: Path) -> None:
     """Atomically exchange two existing paths without a replacement gap."""
     libc = ctypes.CDLL(None, use_errno=True)
@@ -931,6 +981,14 @@ def _unlink_candidate_content_token(
                     "quarantine"
                 ) from restore_error
             raise ValueError("projection validation candidate token is unsafe")
+        os.close(descriptor)
+        descriptor = -1
+        # The private transaction directory excludes other principals.  Close
+        # the Windows handle before the final bounded revalidation and unlink.
+        if quarantine.is_symlink() or not quarantine.is_file():
+            raise ValueError("projection validation candidate token is unsafe")
+        if quarantine.read_bytes() != token:
+            raise ValueError("projection validation candidate token is unsafe")
         os.unlink(quarantine)
     finally:
         if descriptor >= 0:
@@ -963,6 +1021,16 @@ def _remove_path_identity_no_clobber(
         with suppress(OSError):
             _move_path_no_replace(quarantine, path)
         raise ValueError(error_message)
+    if os.name == "nt":
+        _windows_clear_readonly_path(quarantine)
+        current = os.lstat(quarantine)
+        if (
+            not stat.S_ISREG(current.st_mode)
+            or current.st_dev != expected_device
+            or current.st_ino != expected_inode
+            or current.st_nlink not in allowed_link_counts
+        ):
+            raise ValueError(error_message)
     quarantine.unlink()
 
 
@@ -1896,12 +1964,15 @@ def _validated_projection_state_bound(
     database: Path,
     authority: _CandidateAuthority,
 ) -> tuple[ProjectionStamp | None, str | None]:
-    with _connect_sqlite(database, mode="ro", authority=authority) as connection:
+    connection = _connect_sqlite(database, mode="ro", authority=authority)
+    try:
         return _validated_projection_state_on_connection(
             database,
             authority,
             connection,
         )
+    finally:
+        connection.close()
 
 
 def _open_stable_projection_connection(
@@ -2219,11 +2290,12 @@ class SQLiteProjectionGuard:
                 candidate_file_descriptor,
             )
             _candidate_ready_for_sqlite(authority)
-            with _connect_sqlite(
+            connection = _connect_sqlite(
                 candidate,
                 mode="rw",
                 authority=authority,
-            ) as connection:
+            )
+            try:
                 if source_identity is None:
                     connection.execute(
                         f"PRAGMA page_size = {_SQLITE_PORTABLE_PAGE_SIZE}"
@@ -2264,6 +2336,8 @@ class SQLiteProjectionGuard:
                     (canonical_json(stamp).decode(),),
                 )
                 connection.commit()
+            finally:
+                connection.close()
             _canonicalize_sqlite_projection(candidate, authority)
             _apply_candidate_mode(
                 candidate_file_descriptor,
@@ -2273,7 +2347,8 @@ class SQLiteProjectionGuard:
             _validate_stamped_projection(candidate, stamp, authority)
             authority.validate()
             os.fsync(candidate_file_descriptor)
-            _fsync_file(candidate, authority)
+            if sys.platform != "win32":
+                _fsync_file(candidate, authority)
             os.close(candidate_file_descriptor)
             candidate_file_descriptor = -1
             _replace_candidate_if_source_unchanged(

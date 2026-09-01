@@ -95,6 +95,36 @@ def _write_cross_platform_projection_fixture(
             stream.write(writer_version)
 
 
+def _canonical_projection_bytes(source: Path, root: Path) -> bytes:
+    transaction = truth_module._create_private_transaction_directory(
+        prefix=".canonical-test-",
+        parent=root,
+    )
+    candidate = transaction / "candidate.sqlite"
+    candidate.write_bytes(source.read_bytes())
+    parent_information = root.stat()
+    directory_information = transaction.stat()
+    candidate_information = candidate.stat()
+    authority = truth_module._CandidateAuthority(
+        parent_directory=root,
+        parent_device=parent_information.st_dev,
+        parent_inode=parent_information.st_ino,
+        transaction_directory=transaction,
+        directory_device=directory_information.st_dev,
+        directory_inode=directory_information.st_ino,
+        candidate=candidate,
+        candidate_device=candidate_information.st_dev,
+        candidate_inode=candidate_information.st_ino,
+    )
+    try:
+        _canonicalize_sqlite_projection(candidate, authority)
+        return candidate.read_bytes()
+    finally:
+        truth_module._unlink_candidate_identity(authority)
+        transaction.rmdir()
+        truth_module._WINDOWS_PRIVATE_DIRECTORY_IDENTITIES.pop(str(transaction), None)
+
+
 def test_projection_physical_bytes_are_canonical_across_sqlite_versions(
     tmp_path: Path,
 ) -> None:
@@ -112,18 +142,19 @@ def test_projection_physical_bytes_are_canonical_across_sqlite_versions(
     )
     assert first.read_bytes() != second.read_bytes()
 
-    _canonicalize_sqlite_projection(first)
-    _canonicalize_sqlite_projection(second)
+    first_bytes = _canonical_projection_bytes(first, tmp_path)
+    second_bytes = _canonical_projection_bytes(second, tmp_path)
 
-    assert first.read_bytes() == second.read_bytes()
+    assert first_bytes == second_bytes
     assert all(
-        first.read_bytes()[offset : offset + 4] == b"\0\0\0\0"
+        first_bytes[offset : offset + 4] == b"\0\0\0\0"
         for offset in (24, 40, 92, 96)
     )
-    first_digest = hashlib.sha256(first.read_bytes()).hexdigest()
-    _canonicalize_sqlite_projection(first)
-    assert hashlib.sha256(first.read_bytes()).hexdigest() == first_digest
-    assert hashlib.sha256(first.read_bytes()).hexdigest() == (
+    canonical = tmp_path / "canonical.sqlite"
+    canonical.write_bytes(first_bytes)
+    repeated = _canonical_projection_bytes(canonical, tmp_path)
+    assert repeated == first_bytes
+    assert hashlib.sha256(first_bytes).hexdigest() == (
         "3dbf117555f682f40f58f1f60d2c80bc0663a346da6e66b2b5239fc607881f8f"
     )
 

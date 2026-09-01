@@ -1,4 +1,5 @@
 import ctypes
+import os
 import sqlite3
 import stat
 import subprocess
@@ -225,9 +226,20 @@ def _projection_candidate_paths(database: Path) -> tuple[Path, ...]:
 
 
 def _write_projection_fixture(database: Path) -> None:
-    with sqlite3.connect(database) as connection:
+    connection = sqlite3.connect(database)
+    try:
         connection.execute("CREATE TABLE concept(id TEXT PRIMARY KEY, label TEXT)")
         connection.execute("INSERT INTO concept VALUES ('concept:1', 'Ontology')")
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def _apply_native_or_simulated_windows_mode(file_descriptor: int, mode: int) -> None:
+    if os.name == "nt":
+        truth_module._windows_apply_candidate_mode(file_descriptor, mode)
+    else:
+        os.fchmod(file_descriptor, mode)
 
 
 def _fill_page_one_unallocated_bytes(database: Path, value: int) -> None:
@@ -308,6 +320,50 @@ def test_projection_stamp_vacuums_into_a_fresh_zero_backed_file(
     normalized = tuple(statement.strip().upper() for statement in statements)
     assert any(statement.startswith("VACUUM INTO ") for statement in normalized)
     assert "VACUUM" not in normalized
+    assert _projection_candidate_paths(database) == ()
+
+
+def test_projection_stamp_closes_sqlite_before_raw_canonicalization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace, store = _workspace(tmp_path)
+    instant = datetime(2026, 8, 2, 12, 0, tzinfo=UTC)
+    snapshot = _manager(workspace, store, instant=instant).capture(
+        created_by="operator:test"
+    )
+    database = tmp_path / "query.sqlite"
+    _write_projection_fixture(database)
+    original_connect = truth_module._connect_sqlite
+    original_canonicalize = truth_module._canonicalize_sqlite_projection
+    write_connections: list[sqlite3.Connection] = []
+
+    def recording_connect(*args: object, **kwargs: object) -> sqlite3.Connection:
+        connection = original_connect(*args, **kwargs)
+        if kwargs.get("mode") == "rw":
+            write_connections.append(connection)
+        return connection
+
+    def require_closed(candidate: Path, authority: object) -> None:
+        assert write_connections
+        with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+            write_connections[0].execute("SELECT 1")
+        original_canonicalize(candidate, authority)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(truth_module, "_connect_sqlite", recording_connect)
+    monkeypatch.setattr(
+        truth_module,
+        "_canonicalize_sqlite_projection",
+        require_closed,
+    )
+
+    SQLiteProjectionGuard(clock=lambda: instant).stamp(
+        database,
+        snapshot,
+        schema_version=1,
+        builder_version="projection-builder/test",
+    )
+
     assert _projection_candidate_paths(database) == ()
 
 
@@ -648,6 +704,10 @@ def test_projection_stamp_rejects_copy_not_bound_to_authenticated_source_bytes(
     assert _projection_candidate_paths(database) == ()
 
 
+@pytest.mark.skipif(
+    truth_module.sys.platform == "win32",
+    reason="native Windows uses the separately tested ReplaceFileW adapter",
+)
 def test_projection_stamp_atomic_exchange_preserves_concurrent_replacement(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -734,6 +794,10 @@ def test_atomic_exchange_swaps_two_regular_files(tmp_path: Path) -> None:
     assert second.read_bytes() == b"first"
 
 
+@pytest.mark.skipif(
+    truth_module.sys.platform == "win32",
+    reason="native Windows uses the separately tested ReplaceFileW rollback",
+)
 def test_atomic_rollback_never_overwrites_newer_destination_after_check(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -876,7 +940,7 @@ def test_windows_projection_replace_adapter_preserves_atomic_cas_and_durability(
     monkeypatch.setattr(
         truth_module,
         "_windows_apply_candidate_mode",
-        lambda fd, mode: truth_module.os.fchmod(fd, mode),
+        _apply_native_or_simulated_windows_mode,
     )
 
     with pytest.raises(ValueError, match="changed while projection stamp was prepared"):
@@ -934,7 +998,7 @@ def test_windows_projection_rollback_never_overwrites_newer_destination(
     monkeypatch.setattr(
         truth_module,
         "_windows_apply_candidate_mode",
-        lambda fd, mode: truth_module.os.fchmod(fd, mode),
+        _apply_native_or_simulated_windows_mode,
     )
 
     with pytest.raises(
@@ -1195,6 +1259,80 @@ def test_windows_candidate_mode_updates_readonly_attribute_by_open_handle(
     assert observed == [(71, 0x21)]
 
 
+def test_windows_readonly_cleanup_uses_delete_shared_attribute_handle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[object, ...]] = []
+    attributes: list[int] = []
+
+    class FakeFunction:
+        def __init__(self, function: object) -> None:
+            self.function = function
+
+        def __call__(self, *args: object) -> object:
+            return self.function(*args)  # type: ignore[operator]
+
+    def get_info(handle: int, kind: int, pointer: object, size: int) -> int:
+        information = ctypes.cast(
+            pointer,
+            ctypes.POINTER(truth_module._WindowsFileBasicInfo),
+        )[0]
+        information.FileAttributes = 0x21
+        return 1
+
+    def set_info(handle: int, kind: int, pointer: object, size: int) -> int:
+        information = ctypes.cast(
+            pointer,
+            ctypes.POINTER(truth_module._WindowsFileBasicInfo),
+        )[0]
+        attributes.append(information.FileAttributes)
+        return 1
+
+    class Kernel32:
+        CreateFileW = FakeFunction(lambda *args: calls.append(args) or 101)
+        GetFileInformationByHandleEx = FakeFunction(get_info)
+        SetFileInformationByHandle = FakeFunction(set_info)
+        CloseHandle = FakeFunction(lambda handle: 1)
+
+    monkeypatch.setattr(truth_module, "_windows_kernel32", lambda: Kernel32())
+
+    truth_module._windows_clear_readonly_path(tmp_path / "candidate.sqlite")
+
+    assert calls[0][1] == 0x00000100  # FILE_WRITE_ATTRIBUTES
+    assert calls[0][2] & 0x00000004  # FILE_SHARE_DELETE
+    assert calls[0][5] & 0x00200000  # FILE_FLAG_OPEN_REPARSE_POINT
+    assert attributes == [0x20]
+
+
+def test_stable_reader_closes_sqlite_before_unlinking_consumed_candidate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = tmp_path / "source.sqlite"
+    _write_projection_fixture(database)
+    reader, _stamp, _digest = truth_module._open_stable_projection_connection(
+        database,
+        validate_projection=False,
+        transaction_parent=tmp_path,
+    )
+    destination = tmp_path / "installed.sqlite"
+    unlink_candidate = truth_module._unlink_candidate_identity
+
+    def assert_closed(*args: object, **kwargs: object) -> None:
+        with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+            reader.connection.execute("SELECT 1")
+        unlink_candidate(*args, **kwargs)
+
+    monkeypatch.setattr(truth_module, "_unlink_candidate_identity", assert_closed)
+    try:
+        reader.install_copy_no_replace(destination)
+    finally:
+        reader.close()
+
+    assert destination.read_bytes() == database.read_bytes()
+
+
 def test_windows_projection_move_adapter_installs_absent_destination(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1222,7 +1360,14 @@ def test_windows_projection_move_adapter_installs_absent_destination(
     monkeypatch.setattr(
         truth_module,
         "_windows_apply_candidate_mode",
-        lambda fd, mode: truth_module.os.fchmod(fd, mode),
+        _apply_native_or_simulated_windows_mode,
+    )
+    monkeypatch.setattr(
+        truth_module,
+        "_fsync_file",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("Windows must fsync the authenticated writable descriptor")
+        ),
     )
 
     SQLiteProjectionGuard(clock=lambda: instant).stamp(
@@ -1310,7 +1455,7 @@ def test_windows_absent_projection_rollback_preserves_newer_destination(
     monkeypatch.setattr(
         truth_module,
         "_windows_apply_candidate_mode",
-        lambda fd, mode: truth_module.os.fchmod(fd, mode),
+        _apply_native_or_simulated_windows_mode,
     )
 
     with pytest.raises((OSError, RuntimeError)):
@@ -1324,6 +1469,7 @@ def test_windows_absent_projection_rollback_preserves_newer_destination(
     assert database.read_bytes() == newer_bytes
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX chmod fallback coverage")
 def test_candidate_mode_fallback_does_not_follow_replacement(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1348,6 +1494,7 @@ def test_candidate_mode_fallback_does_not_follow_replacement(
     assert stat.S_IMODE(database.stat().st_mode) == 0o444
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX simulation of Python 3.12 Windows")
 def test_windows_candidate_mode_uses_open_handle_on_python_312(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1641,15 +1788,23 @@ def test_projection_reader_failure_cleans_private_validation_snapshot(
     validation_root = tmp_path / "validation-root"
     validation_root.mkdir()
     created: list[Path] = []
+    create_private_directory = truth_module._create_private_transaction_directory
 
-    def make_validation_directory(*, prefix: str, dir: Path | None = None) -> str:
-        assert dir is None
-        directory = validation_root / f"{prefix}{len(created)}"
-        directory.mkdir(mode=0o700)
+    def make_validation_directory(
+        *,
+        prefix: str,
+        parent: Path | None = None,
+    ) -> Path:
+        assert parent is None
+        directory = create_private_directory(prefix=prefix, parent=validation_root)
         created.append(directory)
-        return str(directory)
+        return directory
 
-    monkeypatch.setattr(truth_module.tempfile, "mkdtemp", make_validation_directory)
+    monkeypatch.setattr(
+        truth_module,
+        "_create_private_transaction_directory",
+        make_validation_directory,
+    )
     database = tmp_path / "query.sqlite"
     if failure != "missing":
         _write_projection_fixture(database)
@@ -1796,6 +1951,10 @@ def test_projection_reader_failure_cleans_private_validation_snapshot(
 
     assert created
     assert tuple(validation_root.iterdir()) == ()
+    assert all(
+        str(directory) not in truth_module._WINDOWS_PRIVATE_DIRECTORY_IDENTITIES
+        for directory in created
+    )
 
 
 def test_projection_reader_rejects_sidecar_created_after_snapshot_validation(
@@ -1867,6 +2026,10 @@ def test_projection_reader_rejects_symlink_without_nofollow_support(
     assert outside.read_bytes() == outside_bytes
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="Windows forbids literal query and fragment characters in filenames",
+)
 def test_projection_sqlite_uri_escapes_query_and_fragment_characters(
     tmp_path: Path,
 ) -> None:
@@ -1887,6 +2050,32 @@ def test_projection_sqlite_uri_escapes_query_and_fragment_characters(
     )
 
     assert guard.verify(database, snapshot).clean
+    assert guard.require_compatible(
+        database,
+        expected_schema_version=1,
+        expected_builder_version="projection-builder/test",
+    ).snapshot_id == snapshot.id
+
+
+def test_projection_sqlite_uri_escapes_portable_percent_and_space_characters(
+    tmp_path: Path,
+) -> None:
+    workspace, store = _workspace(tmp_path)
+    instant = datetime(2026, 8, 2, 12, 0, tzinfo=UTC)
+    snapshot = _manager(workspace, store, instant=instant).capture(
+        created_by="operator:test"
+    )
+    database = tmp_path / "query %23 fragment.sqlite"
+    _write_projection_fixture(database)
+    guard = SQLiteProjectionGuard(clock=lambda: instant)
+
+    guard.stamp(
+        database,
+        snapshot,
+        schema_version=1,
+        builder_version="projection-builder/test",
+    )
+
     assert guard.require_compatible(
         database,
         expected_schema_version=1,
