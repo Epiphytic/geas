@@ -3,6 +3,7 @@ import os
 import sqlite3
 import stat
 import subprocess
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -320,6 +321,195 @@ def test_projection_stamp_vacuums_into_a_fresh_zero_backed_file(
     normalized = tuple(statement.strip().upper() for statement in statements)
     assert any(statement.startswith("VACUUM INTO ") for statement in normalized)
     assert "VACUUM" not in normalized
+    assert _projection_candidate_paths(database) == ()
+
+
+def _stamp_with_corrupted_canonical_candidate(
+    *,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    corrupt: Callable[[Path], None],
+    expected_error: str,
+    large_payload: bool = False,
+) -> None:
+    workspace, store = _workspace(tmp_path)
+    instant = datetime(2026, 8, 2, 12, 0, tzinfo=UTC)
+    snapshot = _manager(workspace, store, instant=instant).capture(
+        created_by="operator:test"
+    )
+    database = tmp_path / "query.sqlite"
+    _write_projection_fixture(database)
+    if large_payload:
+        connection = sqlite3.connect(database)
+        try:
+            connection.execute(
+                "UPDATE concept SET label = ? WHERE id = 'concept:1'",
+                ("X" * 20_000,),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+    original = database.read_bytes()
+    normalize = truth_module._normalize_sqlite_unused_regions
+
+    def corrupt_then_normalize(candidate: Path, authority: object) -> None:
+        corrupt(candidate)
+        normalize(candidate, authority)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(
+        truth_module,
+        "_normalize_sqlite_unused_regions",
+        corrupt_then_normalize,
+    )
+
+    with pytest.raises((ValueError, sqlite3.DatabaseError), match=expected_error):
+        SQLiteProjectionGuard(clock=lambda: instant).stamp(
+            database,
+            snapshot,
+            schema_version=1,
+            builder_version="projection-builder/test",
+        )
+
+    assert database.read_bytes() == original
+    assert _projection_candidate_paths(database) == ()
+
+
+@pytest.mark.parametrize(
+    ("offset", "replacement", "expected_error"),
+    (
+        (0, b"not sqlite format", "not a database|invalid SQLite header"),
+        (20, b"\x01", "invalid page layout"),
+        (100, b"\x00", "malformed|non-B-tree page"),
+    ),
+)
+def test_projection_stamp_rejects_malformed_canonical_page_headers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    offset: int,
+    replacement: bytes,
+    expected_error: str,
+) -> None:
+    def corrupt(candidate: Path) -> None:
+        with candidate.open("r+b") as stream:
+            stream.seek(offset)
+            stream.write(replacement)
+
+    _stamp_with_corrupted_canonical_candidate(
+        tmp_path=tmp_path,
+        monkeypatch=monkeypatch,
+        corrupt=corrupt,
+        expected_error=expected_error,
+    )
+
+
+def test_projection_stamp_rejects_cyclic_canonical_freeblock_chain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def corrupt(candidate: Path) -> None:
+        content = bytearray(candidate.read_bytes())
+        header_start = 100
+        page_type = content[header_start]
+        assert page_type in {0x02, 0x05, 0x0A, 0x0D}
+        header_size = 12 if page_type in {0x02, 0x05} else 8
+        cell_count = int.from_bytes(
+            content[header_start + 3 : header_start + 5], "big"
+        )
+        freeblock = header_start + header_size + 2 * cell_count
+        first_cell = min(
+            int.from_bytes(content[offset : offset + 2], "big")
+            for offset in range(
+                header_start + header_size,
+                freeblock,
+                2,
+            )
+        )
+        assert freeblock + 4 <= first_cell
+        content[header_start + 1 : header_start + 3] = freeblock.to_bytes(2, "big")
+        content[freeblock : freeblock + 2] = freeblock.to_bytes(2, "big")
+        content[freeblock + 2 : freeblock + 4] = (4).to_bytes(2, "big")
+        candidate.write_bytes(content)
+
+    _stamp_with_corrupted_canonical_candidate(
+        tmp_path=tmp_path,
+        monkeypatch=monkeypatch,
+        corrupt=corrupt,
+        expected_error="freeblock chain is invalid",
+    )
+
+
+def test_projection_stamp_rejects_truncated_canonical_overflow_chain(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def corrupt(candidate: Path) -> None:
+        connection = sqlite3.connect(candidate)
+        try:
+            root_page = int(
+                connection.execute(
+                    "SELECT rootpage FROM sqlite_schema WHERE name = 'concept'"
+                ).fetchone()[0]
+            )
+        finally:
+            connection.close()
+        content = bytearray(candidate.read_bytes())
+        page_size = int.from_bytes(content[16:18], "big")
+        page_start = (root_page - 1) * page_size
+        assert content[page_start] == 0x0D
+        cell_offset = int.from_bytes(content[page_start + 8 : page_start + 10], "big")
+        _cell_end, _child, overflow = truth_module._canonical_sqlite_cell_extent(
+            content,  # type: ignore[arg-type]
+            cell_start=page_start + cell_offset,
+            page_type=0x0D,
+            page_end=page_start + page_size,
+            usable_size=page_size,
+        )
+        assert overflow is not None
+        overflow_page, remaining = overflow
+        assert remaining > page_size - 4
+        overflow_start = (overflow_page - 1) * page_size
+        content[overflow_start : overflow_start + 4] = b"\0\0\0\0"
+        candidate.write_bytes(content)
+
+    _stamp_with_corrupted_canonical_candidate(
+        tmp_path=tmp_path,
+        monkeypatch=monkeypatch,
+        corrupt=corrupt,
+        expected_error="overflow chain is truncated",
+        large_payload=True,
+    )
+
+
+def test_projection_stamp_preserves_exact_integrity_after_unused_region_zeroing(
+    tmp_path: Path,
+) -> None:
+    workspace, store = _workspace(tmp_path)
+    instant = datetime(2026, 8, 2, 12, 0, tzinfo=UTC)
+    manager = _manager(workspace, store, instant=instant)
+    snapshot = manager.capture(created_by="operator:test")
+    database = tmp_path / "query.sqlite"
+    _write_projection_fixture(database)
+    _fill_page_one_unallocated_bytes(database, 0xA5)
+    guard = SQLiteProjectionGuard(clock=lambda: instant)
+
+    guard.stamp(
+        database,
+        snapshot,
+        schema_version=1,
+        builder_version="projection-builder/test",
+    )
+
+    connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
+    try:
+        assert connection.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+    finally:
+        connection.close()
+    assert guard.verify(
+        database,
+        snapshot,
+        truth_report=manager.verify(snapshot),
+    ).clean
     assert _projection_candidate_paths(database) == ()
 
 
