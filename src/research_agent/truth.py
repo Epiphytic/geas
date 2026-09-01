@@ -915,8 +915,14 @@ def _unlink_candidate_content_token(
             quarantine,
             os.O_RDONLY | _O_NOFOLLOW | _O_BINARY,
         )
-        observed = os.read(descriptor, len(token) + 1)
-        if observed != token:
+        observed = bytearray()
+        limit = len(token) + 1
+        while len(observed) < limit:
+            block = os.read(descriptor, limit - len(observed))
+            if not block:
+                break
+            observed.extend(block)
+        if bytes(observed) != token:
             try:
                 _move_path_no_replace(quarantine, candidate)
             except BaseException as restore_error:

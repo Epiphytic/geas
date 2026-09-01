@@ -1544,6 +1544,7 @@ def test_projection_reader_rejects_source_replacement_after_snapshot_validation(
         "open",
         "short-write",
         "partial-write",
+        "short-read",
         "fstat",
         "descriptor-stats",
         "authority",
@@ -1616,6 +1617,33 @@ def test_projection_reader_failure_cleans_private_validation_snapshot(
                 if isinstance(path, int)
                 else stat_file(path, *args, **kwargs),
             )
+    elif failure == "short-read":
+        read_file = truth_module.os.read
+        stat_file = truth_module.os.stat
+        monkeypatch.setattr(
+            truth_module.os,
+            "read",
+            lambda file_descriptor, length: read_file(
+                file_descriptor,
+                min(length, 3),
+            ),
+        )
+        monkeypatch.setattr(
+            truth_module.os,
+            "fstat",
+            lambda file_descriptor: (_ for _ in ()).throw(
+                OSError("candidate fstat failed")
+            ),
+        )
+        monkeypatch.setattr(
+            truth_module.os,
+            "stat",
+            lambda path, *args, **kwargs: (_ for _ in ()).throw(
+                OSError("candidate descriptor stat failed")
+            )
+            if isinstance(path, int)
+            else stat_file(path, *args, **kwargs),
+        )
     elif failure == "fstat":
         fstat = truth_module.os.fstat
         failed = False
@@ -1675,6 +1703,7 @@ def test_projection_reader_failure_cleans_private_validation_snapshot(
         "open": OSError,
         "short-write": OSError,
         "partial-write": OSError,
+        "short-read": OSError,
         "fstat": OSError,
         "descriptor-stats": OSError,
         "authority": ValueError,
