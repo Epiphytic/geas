@@ -3,7 +3,8 @@ import os
 import sqlite3
 import stat
 import subprocess
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -18,6 +19,16 @@ from research_agent.truth import (
     TruthManager,
     TruthPolicy,
 )
+
+
+@contextmanager
+def _sqlite_connection(path: Path) -> Iterator[sqlite3.Connection]:
+    connection = sqlite3.connect(path)
+    try:
+        with connection:
+            yield connection
+    finally:
+        connection.close()
 
 
 def _policy() -> TruthPolicy:
@@ -201,7 +212,7 @@ def test_projection_mutation_is_detected_and_rebuild_is_required(tmp_path: Path)
     manager = _manager(workspace, store, instant=instant)
     snapshot = manager.capture(created_by="operator:test")
     database = tmp_path / "query.sqlite"
-    with sqlite3.connect(database) as connection:
+    with _sqlite_connection(database) as connection:
         connection.execute("CREATE TABLE concept(id TEXT PRIMARY KEY, label TEXT)")
         connection.execute("INSERT INTO concept VALUES ('concept:1', 'Ontology')")
     guard = SQLiteProjectionGuard(clock=lambda: instant)
@@ -213,7 +224,7 @@ def test_projection_mutation_is_detected_and_rebuild_is_required(tmp_path: Path)
     )
     assert guard.verify(database, snapshot, truth_report=manager.verify(snapshot)).clean
 
-    with sqlite3.connect(database) as connection:
+    with _sqlite_connection(database) as connection:
         connection.execute("UPDATE concept SET label = 'Mutated'")
 
     report = guard.verify(database, snapshot, truth_report=manager.verify(snapshot))
@@ -257,7 +268,7 @@ def _fill_page_one_unallocated_bytes(database: Path, value: int) -> None:
     assert pointer_end < cell_content
     content[pointer_end:cell_content] = bytes((value,)) * (cell_content - pointer_end)
     database.write_bytes(content)
-    with sqlite3.connect(database) as connection:
+    with _sqlite_connection(database) as connection:
         assert connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
 
 
@@ -438,6 +449,34 @@ def test_projection_stamp_rejects_cyclic_canonical_freeblock_chain(
     )
 
 
+def test_projection_stamp_rejects_overlapping_canonical_live_ranges(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def corrupt(candidate: Path) -> None:
+        content = bytearray(candidate.read_bytes())
+        header_start = 100
+        page_type = content[header_start]
+        assert page_type in {0x02, 0x05, 0x0A, 0x0D}
+        header_size = 12 if page_type in {0x02, 0x05} else 8
+        cell_count = int.from_bytes(
+            content[header_start + 3 : header_start + 5], "big"
+        )
+        assert cell_count >= 2
+        pointer_start = header_start + header_size
+        content[pointer_start + 2 : pointer_start + 4] = content[
+            pointer_start : pointer_start + 2
+        ]
+        candidate.write_bytes(content)
+
+    _stamp_with_corrupted_canonical_candidate(
+        tmp_path=tmp_path,
+        monkeypatch=monkeypatch,
+        corrupt=corrupt,
+        expected_error="malformed database schema|duplicate cell pointers",
+    )
+
+
 def test_projection_stamp_rejects_truncated_canonical_overflow_chain(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -478,6 +517,52 @@ def test_projection_stamp_rejects_truncated_canonical_overflow_chain(
         expected_error="overflow chain is truncated",
         large_payload=True,
     )
+
+
+def test_canonical_sqlite_cell_parser_rejects_malformed_live_ranges() -> None:
+    with pytest.raises(ValueError, match="varint is truncated"):
+        truth_module._canonical_sqlite_varint(
+            bytearray(b"\x80"),  # type: ignore[arg-type]
+            0,
+            1,
+        )
+
+    with pytest.raises(ValueError, match="cell payload is truncated"):
+        truth_module._canonical_sqlite_cell_extent(
+            bytearray(b"\x05\x01abc"),  # type: ignore[arg-type]
+            cell_start=0,
+            page_type=0x0D,
+            page_end=5,
+            usable_size=4096,
+        )
+
+
+@pytest.mark.parametrize(
+    ("remaining", "next_page", "expected_error"),
+    (
+        (5000, 0, "overflow chain is truncated"),
+        (1, 1, "overflow chain is overlong"),
+    ),
+)
+def test_canonical_sqlite_overflow_parser_rejects_invalid_chains(
+    remaining: int,
+    next_page: int,
+    expected_error: str,
+) -> None:
+    page_size = 4096
+    content = bytearray(page_size * 2)
+    content[page_size : page_size + 4] = next_page.to_bytes(4, "big")
+
+    with pytest.raises(ValueError, match=expected_error):
+        truth_module._normalize_sqlite_overflow_tail(
+            content,  # type: ignore[arg-type]
+            overflow=(2, remaining),
+            page_size=page_size,
+            usable_size=page_size,
+            page_count=2,
+            visited_btree={1},
+            visited_overflow=set(),
+        )
 
 
 def test_projection_stamp_preserves_exact_integrity_after_unused_region_zeroing(
@@ -565,7 +650,7 @@ def test_projection_stamp_foreign_key_failure_preserves_unstamped_source(
     manager = _manager(workspace, store, instant=instant)
     snapshot = manager.capture(created_by="operator:test")
     database = tmp_path / "query.sqlite"
-    with sqlite3.connect(database) as connection:
+    with _sqlite_connection(database) as connection:
         connection.executescript(
             """
             PRAGMA foreign_keys = OFF;
@@ -765,7 +850,7 @@ def test_projection_stamp_rejects_source_change_before_atomic_replace(
     replace = truth_module._replace_candidate_if_source_unchanged
 
     def mutate_then_replace(*args: object, **kwargs: object) -> None:
-        with sqlite3.connect(database) as connection:
+        with _sqlite_connection(database) as connection:
             connection.execute(
                 "INSERT INTO concept VALUES ('concept:concurrent', 'Concurrent')"
             )
@@ -785,7 +870,7 @@ def test_projection_stamp_rejects_source_change_before_atomic_replace(
             builder_version="projection-builder/test",
         )
 
-    with sqlite3.connect(database) as connection:
+    with _sqlite_connection(database) as connection:
         assert connection.execute(
             "SELECT label FROM concept WHERE id = 'concept:concurrent'"
         ).fetchone() == ("Concurrent",)
@@ -851,7 +936,7 @@ def test_projection_stamp_rejects_copy_not_bound_to_authenticated_source_bytes(
     original = database.read_bytes()
     alternate = tmp_path / "alternate.sqlite"
     _write_projection_fixture(alternate)
-    with sqlite3.connect(alternate) as connection:
+    with _sqlite_connection(alternate) as connection:
         connection.execute("UPDATE concept SET label = 'Mutated!'")
     alternate_bytes = alternate.read_bytes()
     assert len(alternate_bytes) == len(original)
@@ -910,7 +995,7 @@ def test_projection_stamp_atomic_exchange_preserves_concurrent_replacement(
     database = tmp_path / "query.sqlite"
     _write_projection_fixture(database)
     concurrent = tmp_path / "concurrent.sqlite"
-    with sqlite3.connect(concurrent) as connection:
+    with _sqlite_connection(concurrent) as connection:
         connection.execute("CREATE TABLE concurrent(value TEXT)")
         connection.execute("INSERT INTO concurrent VALUES ('preserve me')")
     concurrent_bytes = concurrent.read_bytes()
@@ -1453,6 +1538,9 @@ def test_windows_readonly_cleanup_uses_delete_shared_attribute_handle(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    candidate = tmp_path / "candidate.sqlite"
+    candidate.write_bytes(b"selected")
+    expected = candidate.stat()
     calls: list[tuple[object, ...]] = []
     attributes: list[int] = []
 
@@ -1486,13 +1574,86 @@ def test_windows_readonly_cleanup_uses_delete_shared_attribute_handle(
         CloseHandle = FakeFunction(lambda handle: 1)
 
     monkeypatch.setattr(truth_module, "_windows_kernel32", lambda: Kernel32())
+    monkeypatch.setattr(
+        truth_module,
+        "_windows_adopt_handle_descriptor",
+        lambda _handle: os.open(candidate, os.O_RDONLY),
+    )
+    monkeypatch.setattr(truth_module, "_windows_os_handle", lambda _descriptor: 101)
 
-    truth_module._windows_clear_readonly_path(tmp_path / "candidate.sqlite")
+    truth_module._windows_clear_readonly_path(
+        candidate,
+        expected_device=expected.st_dev,
+        expected_inode=expected.st_ino,
+        allowed_link_counts=(1,),
+    )
 
     assert calls[0][1] == 0x00000100  # FILE_WRITE_ATTRIBUTES
     assert calls[0][2] & 0x00000004  # FILE_SHARE_DELETE
     assert calls[0][5] & 0x00200000  # FILE_FLAG_OPEN_REPARSE_POINT
     assert attributes == [0x20]
+
+
+def test_windows_readonly_cleanup_never_mutates_replaced_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    candidate = tmp_path / "candidate.sqlite"
+    candidate.write_bytes(b"selected")
+    expected = candidate.stat()
+    unknown = tmp_path / "unknown.sqlite"
+    unknown.write_bytes(b"unknown")
+    set_calls = 0
+
+    class FakeFunction:
+        def __init__(self, function: object) -> None:
+            self.function = function
+
+        def __call__(self, *args: object) -> object:
+            return self.function(*args)  # type: ignore[operator]
+
+    def replace_before_open(*_args: object) -> int:
+        unknown.replace(candidate)
+        return 101
+
+    def get_info(_handle: int, _kind: int, pointer: object, _size: int) -> int:
+        information = ctypes.cast(
+            pointer,
+            ctypes.POINTER(truth_module._WindowsFileBasicInfo),
+        )[0]
+        information.FileAttributes = 0x21
+        return 1
+
+    def set_info(*_args: object) -> int:
+        nonlocal set_calls
+        set_calls += 1
+        return 1
+
+    class Kernel32:
+        CreateFileW = FakeFunction(replace_before_open)
+        GetFileInformationByHandleEx = FakeFunction(get_info)
+        SetFileInformationByHandle = FakeFunction(set_info)
+        CloseHandle = FakeFunction(lambda _handle: 1)
+
+    monkeypatch.setattr(truth_module, "_windows_kernel32", lambda: Kernel32())
+    monkeypatch.setattr(
+        truth_module,
+        "_windows_adopt_handle_descriptor",
+        lambda _handle: os.open(candidate, os.O_RDONLY),
+        raising=False,
+    )
+    monkeypatch.setattr(truth_module, "_windows_os_handle", lambda _descriptor: 101)
+
+    with pytest.raises(ValueError, match="identity is unsafe"):
+        truth_module._windows_clear_readonly_path(
+            candidate,
+            expected_device=expected.st_dev,
+            expected_inode=expected.st_ino,
+            allowed_link_counts=(1,),
+        )
+
+    assert candidate.read_bytes() == b"unknown"
+    assert set_calls == 0
 
 
 def test_stable_reader_closes_sqlite_before_unlinking_consumed_candidate(
@@ -1925,7 +2086,7 @@ def test_projection_reader_rejects_source_replacement_after_snapshot_validation(
     )
     concurrent = tmp_path / "concurrent.sqlite"
     _write_projection_fixture(concurrent)
-    with sqlite3.connect(concurrent) as connection:
+    with _sqlite_connection(concurrent) as connection:
         connection.execute("UPDATE concept SET label = 'Concurrent'")
     concurrent_bytes = concurrent.read_bytes()
     validate = truth_module._validated_projection_state_on_connection
@@ -2281,7 +2442,7 @@ def test_verify_and_require_compatible_reject_foreign_key_corruption(
     manager = _manager(workspace, store, instant=instant)
     snapshot = manager.capture(created_by="operator:test")
     database = tmp_path / "query.sqlite"
-    with sqlite3.connect(database) as connection:
+    with _sqlite_connection(database) as connection:
         connection.executescript(
             """
             CREATE TABLE parent(id INTEGER PRIMARY KEY);
@@ -2295,7 +2456,7 @@ def test_verify_and_require_compatible_reject_foreign_key_corruption(
         schema_version=1,
         builder_version="projection-builder/test",
     )
-    with sqlite3.connect(database) as connection:
+    with _sqlite_connection(database) as connection:
         connection.execute("PRAGMA foreign_keys = OFF")
         connection.execute("INSERT INTO child(parent_id) VALUES (99)")
 
@@ -2317,7 +2478,7 @@ def test_projection_stamp_rejects_compile_option_stat4_without_mutation(
         created_by="operator:test"
     )
     database = tmp_path / "query.sqlite"
-    with sqlite3.connect(database) as connection:
+    with _sqlite_connection(database) as connection:
         connection.execute("CREATE TABLE concept(id INTEGER PRIMARY KEY)")
         connection.execute("CREATE TABLE stat4(tbl, idx, neq, nlt, ndlt, sample)")
         connection.execute("PRAGMA writable_schema = ON")
@@ -2354,7 +2515,7 @@ def test_projection_stamp_rejects_nonportable_sqlite_profile_without_mutation(
         created_by="operator:test"
     )
     database = tmp_path / "query.sqlite"
-    with sqlite3.connect(database) as connection:
+    with _sqlite_connection(database) as connection:
         if profile == "page-size":
             connection.execute("PRAGMA page_size = 8192")
         else:

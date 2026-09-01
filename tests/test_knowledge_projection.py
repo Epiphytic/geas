@@ -1,5 +1,7 @@
 import hashlib
 import sqlite3
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -60,13 +62,23 @@ FIXTURE_PACK = Path("tests/fixtures/fluoridation_knowledge.yaml")
 INSTANT = datetime(2026, 8, 2, 12, 0, tzinfo=UTC)
 
 
+@contextmanager
+def _sqlite_connection(path: Path) -> Iterator[sqlite3.Connection]:
+    connection = sqlite3.connect(path)
+    try:
+        with connection:
+            yield connection
+    finally:
+        connection.close()
+
+
 def _write_cross_platform_projection_fixture(
     path: Path,
     *,
     reverse_statistics: bool,
     writer_version: bytes,
 ) -> None:
-    with sqlite3.connect(path) as connection:
+    with _sqlite_connection(path) as connection:
         connection.executescript(
             """
             PRAGMA page_size = 4096;
@@ -574,7 +586,7 @@ def test_projection_supports_lexical_hierarchy_dissent_gaps_and_provenance(
     assert build.counts["text_derivations"] == 1
     assert build.counts["structural_derivations"] == 1
     assert build.counts["structural_anchors"] == 3
-    with sqlite3.connect(database) as connection:
+    with _sqlite_connection(database) as connection:
         assert connection.execute("PRAGMA page_size").fetchone() == (4096,)
         assert connection.execute("PRAGMA auto_vacuum").fetchone() == (0,)
         assert connection.execute("PRAGMA encoding").fetchone() == ("UTF-8",)
@@ -621,7 +633,7 @@ def test_query_engine_rejects_different_valid_projection_with_same_input_revisio
     expected_digest = hashlib.sha256(database.read_bytes()).hexdigest()
     replacement = tmp_path / "replacement.sqlite"
     replacement.write_bytes(database.read_bytes())
-    with sqlite3.connect(replacement) as connection:
+    with _sqlite_connection(replacement) as connection:
         connection.execute(
             "UPDATE concept SET label = label || ' replacement' WHERE id = "
             "'concept:community-water-fluoridation'"
@@ -816,7 +828,7 @@ def test_projection_is_stamped_and_mutation_is_detected(tmp_path: Path) -> None:
         truth_report=manager.verify(snapshot),
     ).clean
 
-    with sqlite3.connect(database) as connection:
+    with _sqlite_connection(database) as connection:
         connection.execute(
             "UPDATE knowledge_gap SET rationale = 'database is not canonical' "
             "WHERE rowid IN (SELECT rowid FROM knowledge_gap LIMIT 1)"

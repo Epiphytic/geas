@@ -828,8 +828,34 @@ def _windows_apply_candidate_mode(file_descriptor: int, mode: int) -> None:
         raise ctypes.WinError(ctypes.get_last_error())
 
 
-def _windows_clear_readonly_path(path: Path) -> None:
-    """Clear READONLY through a no-reparse, delete-sharing Win32 handle."""
+def _windows_adopt_handle_descriptor(handle: Any) -> int:
+    """Transfer one Win32 HANDLE into a binary CRT descriptor."""
+    try:
+        import msvcrt
+    except ImportError as error:
+        raise OSError(
+            errno.ENOTSUP,
+            "Windows file-handle identity support is unavailable",
+        ) from error
+    raw_handle = (
+        handle
+        if isinstance(handle, int)
+        else ctypes.cast(handle, ctypes.c_void_p).value
+    )
+    if raw_handle is None:
+        raise OSError(errno.EBADF, "Windows file handle is invalid")
+    return msvcrt.open_osfhandle(raw_handle, os.O_RDONLY | _O_BINARY)
+
+
+def _windows_clear_readonly_path(
+    path: Path,
+    *,
+    expected_device: int,
+    expected_inode: int,
+    allowed_link_counts: tuple[int, ...],
+    error_message: str = "Windows cleanup path identity is unsafe",
+) -> None:
+    """Clear READONLY only on the exact no-reparse cleanup identity."""
     kernel32 = _windows_kernel32()
     handle = kernel32.CreateFileW(
         str(path),
@@ -843,28 +869,45 @@ def _windows_clear_readonly_path(path: Path) -> None:
     invalid_handle = ctypes.c_void_p(-1).value
     if handle in (None, invalid_handle):
         raise ctypes.WinError(ctypes.get_last_error())
+    descriptor = -1
     try:
+        descriptor = _windows_adopt_handle_descriptor(handle)
+        handle = None  # descriptor owns and closes the native handle now
+        observed = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(observed.st_mode)
+            or observed.st_dev != expected_device
+            or observed.st_ino != expected_inode
+            or observed.st_nlink not in allowed_link_counts
+        ):
+            raise ValueError(error_message)
+        native_handle = _windows_os_handle(descriptor)
         information = _WindowsFileBasicInfo()
         if not kernel32.GetFileInformationByHandleEx(
-            handle,
+            native_handle,
             0,
             ctypes.byref(information),
             ctypes.sizeof(information),
         ):
             raise ctypes.WinError(ctypes.get_last_error())
+        if information.FileAttributes & 0x00000400:  # FILE_ATTRIBUTE_REPARSE_POINT
+            raise ValueError(error_message)
         if information.FileAttributes & 0x00000001:
             information.FileAttributes &= ~0x00000001
             if information.FileAttributes == 0:
                 information.FileAttributes = 0x00000080
             if not kernel32.SetFileInformationByHandle(
-                handle,
+                native_handle,
                 0,
                 ctypes.byref(information),
                 ctypes.sizeof(information),
             ):
                 raise ctypes.WinError(ctypes.get_last_error())
     finally:
-        kernel32.CloseHandle(handle)
+        if descriptor >= 0:
+            os.close(descriptor)
+        elif handle not in (None, invalid_handle):
+            kernel32.CloseHandle(handle)
 
 
 def _atomic_exchange_paths(first: Path, second: Path) -> None:
@@ -1023,7 +1066,13 @@ def _remove_path_identity_no_clobber(
             _move_path_no_replace(quarantine, path)
         raise ValueError(error_message)
     if os.name == "nt":
-        _windows_clear_readonly_path(quarantine)
+        _windows_clear_readonly_path(
+            quarantine,
+            expected_device=expected_device,
+            expected_inode=expected_inode,
+            allowed_link_counts=allowed_link_counts,
+            error_message=error_message,
+        )
         current = os.lstat(quarantine)
         if (
             not stat.S_ISREG(current.st_mode)
