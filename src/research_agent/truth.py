@@ -5,6 +5,7 @@ import ctypes
 import errno
 import hashlib
 import json
+import mmap
 import os
 import secrets
 import sqlite3
@@ -1512,7 +1513,286 @@ def _canonicalize_sqlite_projection(
                 canonical_identity = None
         if canonical_identity is not None:
             _unlink_source_identity(canonical, canonical_identity)
+    _normalize_sqlite_unused_regions(database, authority)
     _normalize_sqlite_header(database, authority)
+
+
+def _normalize_sqlite_unused_regions(
+    database: Path,
+    authority: _CandidateAuthority,
+) -> None:
+    """Zero validated non-live B-tree/overflow bytes after a fresh VACUUM."""
+    authority.validate()
+    connection = _connect_sqlite(database, mode="ro", authority=authority)
+    try:
+        if connection.execute("PRAGMA freelist_count").fetchone() != (0,):
+            raise ValueError("canonicalized projection retains free-list pages")
+        roots = {
+            1,
+            *(
+                int(row[0])
+                for row in connection.execute(
+                    "SELECT rootpage FROM sqlite_schema WHERE rootpage > 0"
+                )
+            ),
+        }
+    finally:
+        connection.close()
+    descriptor = os.open(database, os.O_RDWR | _O_NOFOLLOW | _O_BINARY)
+    try:
+        information = os.fstat(descriptor)
+        if (
+            information.st_dev != authority.candidate_device
+            or information.st_ino != authority.candidate_inode
+            or information.st_size < 512
+        ):
+            raise ValueError("projection stamp candidate identity is unsafe")
+        with mmap.mmap(descriptor, 0, access=mmap.ACCESS_WRITE) as content:
+            if bytes(content[:16]) != _SQLITE_HEADER:
+                raise ValueError("canonicalized projection has an invalid SQLite header")
+            encoded_page_size = int.from_bytes(content[16:18], "big")
+            page_size = 65536 if encoded_page_size == 1 else encoded_page_size
+            reserved = content[20]
+            if (
+                page_size != _SQLITE_PORTABLE_PAGE_SIZE
+                or reserved != 0
+                or len(content) % page_size
+            ):
+                raise ValueError("canonicalized projection has an invalid page layout")
+            usable_size = page_size - reserved
+            page_count = len(content) // page_size
+            pending = sorted(roots, reverse=True)
+            visited_btree: set[int] = set()
+            visited_overflow: set[int] = set()
+            while pending:
+                page_number = pending.pop()
+                if page_number in visited_btree:
+                    continue
+                _validate_canonical_page_number(page_number, page_count)
+                if page_number in visited_overflow:
+                    raise ValueError("canonical SQLite page roles overlap")
+                visited_btree.add(page_number)
+                page_start = (page_number - 1) * page_size
+                header_start = page_start + (100 if page_number == 1 else 0)
+                page_type = content[header_start]
+                if page_type not in {0x02, 0x05, 0x0A, 0x0D}:
+                    raise ValueError("canonical SQLite traversal reached a non-B-tree page")
+                header_size = 12 if page_type in {0x02, 0x05} else 8
+                cell_count = int.from_bytes(
+                    content[header_start + 3 : header_start + 5],
+                    "big",
+                )
+                pointer_start = header_start + header_size
+                pointer_end = pointer_start + 2 * cell_count
+                page_end = page_start + usable_size
+                if pointer_end > page_end:
+                    raise ValueError("canonical SQLite cell pointer array is invalid")
+                children: list[int] = []
+                if page_type in {0x02, 0x05}:
+                    children.append(
+                        int.from_bytes(
+                            content[header_start + 8 : header_start + 12],
+                            "big",
+                        )
+                    )
+                offsets = tuple(
+                    int.from_bytes(content[offset : offset + 2], "big")
+                    for offset in range(pointer_start, pointer_end, 2)
+                )
+                if len(set(offsets)) != len(offsets):
+                    raise ValueError("canonical SQLite has duplicate cell pointers")
+                preserved: list[tuple[int, int]] = []
+                occupied: list[tuple[int, int]] = []
+                for relative in offsets:
+                    cell_start = page_start + relative
+                    if not pointer_end <= cell_start < page_end:
+                        raise ValueError("canonical SQLite cell offset is invalid")
+                    cell_end, child, overflow = _canonical_sqlite_cell_extent(
+                        content,
+                        cell_start=cell_start,
+                        page_type=page_type,
+                        page_end=page_end,
+                        usable_size=usable_size,
+                    )
+                    if child is not None:
+                        children.append(child)
+                    preserved.append((cell_start, cell_end))
+                    occupied.append((cell_start, cell_end))
+                    _normalize_sqlite_overflow_tail(
+                        content,
+                        overflow=overflow,
+                        page_size=page_size,
+                        usable_size=usable_size,
+                        page_count=page_count,
+                        visited_btree=visited_btree,
+                        visited_overflow=visited_overflow,
+                    )
+                freeblock = int.from_bytes(
+                    content[header_start + 1 : header_start + 3],
+                    "big",
+                )
+                previous_freeblock = 0
+                while freeblock:
+                    block_start = page_start + freeblock
+                    if (
+                        freeblock <= previous_freeblock
+                        or block_start < pointer_end
+                        or block_start + 4 > page_end
+                    ):
+                        raise ValueError("canonical SQLite freeblock chain is invalid")
+                    next_freeblock = int.from_bytes(
+                        content[block_start : block_start + 2],
+                        "big",
+                    )
+                    block_size = int.from_bytes(
+                        content[block_start + 2 : block_start + 4],
+                        "big",
+                    )
+                    if block_size < 4 or block_start + block_size > page_end:
+                        raise ValueError("canonical SQLite freeblock extent is invalid")
+                    preserved.append((block_start, block_start + 4))
+                    occupied.append((block_start, block_start + block_size))
+                    previous_freeblock = freeblock
+                    freeblock = next_freeblock
+                occupied_end = pointer_end
+                for region_start, region_end in sorted(occupied):
+                    if region_start < occupied_end or region_end > page_end:
+                        raise ValueError("canonical SQLite page regions overlap")
+                    occupied_end = region_end
+                cursor = pointer_end
+                for live_start, live_end in sorted(preserved):
+                    if live_start < cursor or live_end > page_end:
+                        raise ValueError("canonical SQLite page regions overlap")
+                    content[cursor:live_start] = b"\0" * (live_start - cursor)
+                    cursor = live_end
+                content[cursor : page_start + page_size] = b"\0" * (
+                    page_start + page_size - cursor
+                )
+                for child in sorted(children, reverse=True):
+                    _validate_canonical_page_number(child, page_count)
+                    if child not in visited_btree:
+                        pending.append(child)
+            if visited_btree | visited_overflow != set(range(1, page_count + 1)):
+                raise ValueError("canonical SQLite contains unreachable pages")
+            content.flush()
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    authority.validate()
+
+
+def _canonical_sqlite_cell_extent(
+    content: mmap.mmap,
+    *,
+    cell_start: int,
+    page_type: int,
+    page_end: int,
+    usable_size: int,
+) -> tuple[int, int | None, tuple[int, int] | None]:
+    cursor = cell_start
+    child: int | None = None
+    if page_type in {0x02, 0x05}:
+        if cursor + 4 > page_end:
+            raise ValueError("canonical SQLite interior cell is truncated")
+        child = int.from_bytes(content[cursor : cursor + 4], "big")
+        cursor += 4
+    if page_type == 0x05:
+        _rowid, cursor = _canonical_sqlite_varint(content, cursor, page_end)
+        return cursor, child, None
+    payload_size, cursor = _canonical_sqlite_varint(content, cursor, page_end)
+    if page_type == 0x0D:
+        _rowid, cursor = _canonical_sqlite_varint(content, cursor, page_end)
+    local_size = _canonical_sqlite_local_payload_size(
+        payload_size,
+        usable_size=usable_size,
+        table_leaf=page_type == 0x0D,
+    )
+    payload_end = cursor + local_size
+    if payload_end > page_end:
+        raise ValueError("canonical SQLite cell payload is truncated")
+    if local_size == payload_size:
+        return payload_end, child, None
+    if payload_end + 4 > page_end:
+        raise ValueError("canonical SQLite overflow pointer is truncated")
+    overflow_page = int.from_bytes(content[payload_end : payload_end + 4], "big")
+    return payload_end + 4, child, (overflow_page, payload_size - local_size)
+
+
+def _canonical_sqlite_varint(
+    content: mmap.mmap,
+    offset: int,
+    limit: int,
+) -> tuple[int, int]:
+    value = 0
+    for index in range(9):
+        if offset >= limit:
+            raise ValueError("canonical SQLite varint is truncated")
+        byte = content[offset]
+        offset += 1
+        if index == 8:
+            return (value << 8) | byte, offset
+        value = (value << 7) | (byte & 0x7F)
+        if byte < 0x80:
+            return value, offset
+    raise AssertionError("SQLite varint loop did not terminate")
+
+
+def _canonical_sqlite_local_payload_size(
+    payload_size: int,
+    *,
+    usable_size: int,
+    table_leaf: bool,
+) -> int:
+    minimum = ((usable_size - 12) * 32 // 255) - 23
+    maximum = (
+        usable_size - 35
+        if table_leaf
+        else ((usable_size - 12) * 64 // 255) - 23
+    )
+    if minimum < 0 or maximum < minimum:
+        raise ValueError("canonical SQLite usable page size is invalid")
+    if payload_size <= maximum:
+        return payload_size
+    local = minimum + (payload_size - minimum) % (usable_size - 4)
+    return minimum if local > maximum else local
+
+
+def _normalize_sqlite_overflow_tail(
+    content: mmap.mmap,
+    *,
+    overflow: tuple[int, int] | None,
+    page_size: int,
+    usable_size: int,
+    page_count: int,
+    visited_btree: set[int],
+    visited_overflow: set[int],
+) -> None:
+    if overflow is None:
+        return
+    page_number, remaining = overflow
+    while remaining:
+        _validate_canonical_page_number(page_number, page_count)
+        if page_number in visited_btree or page_number in visited_overflow:
+            raise ValueError("canonical SQLite overflow chain overlaps another page")
+        visited_overflow.add(page_number)
+        page_start = (page_number - 1) * page_size
+        chunk_size = min(remaining, usable_size - 4)
+        next_page = int.from_bytes(content[page_start : page_start + 4], "big")
+        tail_start = page_start + 4 + chunk_size
+        content[tail_start : page_start + page_size] = b"\0" * (
+            page_start + page_size - tail_start
+        )
+        remaining -= chunk_size
+        if remaining and next_page == 0:
+            raise ValueError("canonical SQLite overflow chain is truncated")
+        if not remaining and next_page != 0:
+            raise ValueError("canonical SQLite overflow chain is overlong")
+        page_number = next_page
+
+
+def _validate_canonical_page_number(page_number: int, page_count: int) -> None:
+    if page_number < 1 or page_number > page_count:
+        raise ValueError("canonical SQLite page number is out of range")
 
 
 class ArtifactRole(StrEnum):
