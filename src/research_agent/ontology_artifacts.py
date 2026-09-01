@@ -872,9 +872,11 @@ def _mask_live_sqlite_cells(path: Path, content: mmap.mmap) -> None:
             int.from_bytes(content[offset : offset + 2], "big")
             for offset in range(pointer_start, pointer_end, 2)
         )
-        content[header_start:pointer_end] = b"\x00" * (pointer_end - header_start)
-        if page_number == 1:
-            content[:100] = b"\x00" * 100
+        if len(set(cell_offsets)) != len(cell_offsets):
+            raise OntologyArtifactError("duplicate SQLite B-tree cell pointer")
+        cells: list[
+            tuple[int, int, int | None, int, int, tuple[int, int] | None]
+        ] = []
         for relative_offset in cell_offsets:
             if relative_offset == 0 and page_size == 65536:
                 relative_offset = 65536
@@ -892,6 +894,19 @@ def _mask_live_sqlite_cells(path: Path, content: mmap.mmap) -> None:
             )
             if child is not None:
                 children.append(child)
+            cells.append(
+                (cell_start, cell_end, child, payload_start, local_size, overflow)
+            )
+        previous_end = pointer_end
+        for cell_start, cell_end, *_rest in sorted(cells):
+            if cell_start < previous_end:
+                raise OntologyArtifactError("overlapping SQLite B-tree cells")
+            previous_end = cell_end
+
+        content[header_start:pointer_end] = b"\x00" * (pointer_end - header_start)
+        if page_number == 1:
+            content[:100] = b"\x00" * 100
+        for cell_start, cell_end, _child, payload_start, local_size, overflow in cells:
             _scan_and_mask_sqlite_payload(
                 path,
                 content,
@@ -1015,19 +1030,30 @@ def _scan_and_mask_sqlite_payload(
     types, so scan the exact contiguous record body without evaluating SQL or
     treating a separate physical layout as authority.
     """
-    payload_size = local_size + (overflow[1] if overflow is not None else 0)
+    overflow_segments = _sqlite_overflow_segments(
+        content,
+        overflow=overflow,
+        page_size=page_size,
+        usable_size=usable_size,
+        page_count=page_count,
+        visited_btree=visited_btree,
+    )
+    segments = (
+        ((payload_start, local_size),) if local_size else ()
+    ) + tuple((start, size) for _page_start, start, size in overflow_segments)
+    payload_size = sum(size for _start, size in segments)
+    expected_size = local_size + (overflow[1] if overflow is not None else 0)
+    if payload_size != expected_size:
+        raise OntologyArtifactError("SQLite record payload extent is invalid")
     if payload_size == 0:
+        if scan_payload:
+            raise OntologyArtifactError("SQLite index record payload is empty")
         return
-    header_size = 0
-    if scan_payload:
-        header_size, header_end = _read_sqlite_varint(
-            content,
-            payload_start,
-            payload_start + local_size,
-        )
-        header_prefix_size = header_end - payload_start
-        if not header_prefix_size <= header_size <= payload_size:
-            raise OntologyArtifactError("SQLite record header size is invalid")
+    header_size = (
+        _validate_sqlite_record(content, segments, payload_size)
+        if scan_payload
+        else 0
+    )
 
     # Binary assignment classification materializes at most 4 KiB. Keeping
     # twice that much overlap makes every cross-page candidate visible while
@@ -1054,11 +1080,26 @@ def _scan_and_mask_sqlite_payload(
         carry = window[-overlap_size:]
 
     scan_segment(payload_start, local_size)
-    if overflow is None:
-        return
+    for page_start, segment_start, segment_size in overflow_segments:
+        scan_segment(segment_start, segment_size)
+        mask_end = segment_start + segment_size
+        content[page_start:mask_end] = b"\x00" * (mask_end - page_start)
 
+
+def _sqlite_overflow_segments(
+    content: mmap.mmap,
+    *,
+    overflow: tuple[int, int] | None,
+    page_size: int,
+    usable_size: int,
+    page_count: int,
+    visited_btree: set[int],
+) -> tuple[tuple[int, int, int], ...]:
+    if overflow is None:
+        return ()
     page_number, remaining = overflow
     visited: set[int] = set()
+    segments: list[tuple[int, int, int]] = []
     while remaining:
         _validate_sqlite_page_number(page_number, page_count)
         if page_number in visited or page_number in visited_btree:
@@ -1066,16 +1107,80 @@ def _scan_and_mask_sqlite_payload(
         visited.add(page_number)
         page_start = (page_number - 1) * page_size
         next_page = int.from_bytes(content[page_start : page_start + 4], "big")
-        payload_size = min(remaining, usable_size - 4)
-        mask_end = page_start + 4 + payload_size
-        scan_segment(page_start + 4, payload_size)
-        content[page_start:mask_end] = b"\x00" * (4 + payload_size)
-        remaining -= payload_size
+        segment_size = min(remaining, usable_size - 4)
+        segments.append((page_start, page_start + 4, segment_size))
+        remaining -= segment_size
         if remaining and next_page == 0:
             raise OntologyArtifactError("SQLite overflow chain ended early")
         if not remaining and next_page != 0:
             raise OntologyArtifactError("SQLite overflow chain exceeds its payload")
         page_number = next_page
+    return tuple(segments)
+
+
+def _validate_sqlite_record(
+    content: mmap.mmap,
+    segments: tuple[tuple[int, int], ...],
+    payload_size: int,
+) -> int:
+    """Validate one complete SQLite record header and its declared body extent."""
+    segment_index = 0
+    segment_offset = 0
+    logical_offset = 0
+
+    def read_varint(limit: int) -> int:
+        nonlocal segment_index, segment_offset, logical_offset
+        value = 0
+        start = logical_offset
+        for index in range(9):
+            if logical_offset >= limit or segment_index >= len(segments):
+                raise OntologyArtifactError("SQLite record varint is truncated")
+            segment_start, segment_size = segments[segment_index]
+            byte = content[segment_start + segment_offset]
+            segment_offset += 1
+            logical_offset += 1
+            if segment_offset == segment_size:
+                segment_index += 1
+                segment_offset = 0
+            if index == 8:
+                value = (value << 8) | byte
+                break
+            value = (value << 7) | (byte & 0x7F)
+            if byte < 0x80:
+                break
+        consumed = logical_offset - start
+        if consumed != _sqlite_varint_size(value):
+            raise OntologyArtifactError("SQLite record varint is overlong")
+        return value
+
+    header_size = read_varint(payload_size)
+    if not logical_offset <= header_size <= payload_size:
+        raise OntologyArtifactError("SQLite record header size is invalid")
+    body_size = 0
+    available_body = payload_size - header_size
+    while logical_offset < header_size:
+        serial_type = read_varint(header_size)
+        body_size += _sqlite_serial_type_size(serial_type)
+        if body_size > available_body:
+            raise OntologyArtifactError("SQLite record body extent is invalid")
+    if logical_offset != header_size or body_size != available_body:
+        raise OntologyArtifactError("SQLite record body extent is invalid")
+    return header_size
+
+
+def _sqlite_varint_size(value: int) -> int:
+    if value > 0x00FFFFFFFFFFFFFF:
+        return 9
+    return max(1, (value.bit_length() + 6) // 7)
+
+
+def _sqlite_serial_type_size(serial_type: int) -> int:
+    fixed_sizes = (0, 1, 2, 3, 4, 6, 8, 8, 0, 0)
+    if serial_type < len(fixed_sizes):
+        return fixed_sizes[serial_type]
+    if serial_type in {10, 11}:
+        raise OntologyArtifactError("SQLite record serial type is reserved")
+    return (serial_type - 12) // 2
 
 
 def _validate_sqlite_page_number(page_number: int, page_count: int) -> None:

@@ -85,6 +85,30 @@ class MemoryArtifactStore:
         shutil.copyfile(source, destination)
 
 
+def _index_leaf_layout(
+    database: Path,
+    index_name: str,
+) -> tuple[bytearray, int, tuple[int, ...], tuple[int, ...]]:
+    with sqlite3.connect(database) as connection:
+        page_size = connection.execute("PRAGMA page_size").fetchone()[0]
+        root_page = connection.execute(
+            "SELECT rootpage FROM sqlite_schema WHERE type = 'index' AND name = ?",
+            (index_name,),
+        ).fetchone()[0]
+    content = bytearray(database.read_bytes())
+    page_start = (root_page - 1) * page_size
+    header_start = page_start + (100 if root_page == 1 else 0)
+    assert content[header_start] == 0x0A
+    cell_count = int.from_bytes(content[header_start + 3 : header_start + 5], "big")
+    pointer_start = header_start + 8
+    pointer_positions = tuple(pointer_start + 2 * index for index in range(cell_count))
+    cell_offsets = tuple(
+        page_start
+        + int.from_bytes(content[position : position + 2], "big")
+        for position in pointer_positions
+    )
+    return content, page_start, pointer_positions, cell_offsets
+
 def _library_database(path: Path) -> None:
     metadata = {
         "schema_version": 1,
@@ -673,6 +697,216 @@ def test_sqlite_expression_index_overflow_payload_rejects_without_upload(
             published_by="test:operator",
             storage_rights_basis="operator-confirmed private storage",
             source_library=database,
+        )
+
+    assert store.values == {}
+    assert tuple((tmp_path / "remote-assets").iterdir()) == ()
+    assert not (ontology / "artifacts.yaml").exists()
+
+
+def test_generated_sqlite_index_header_cannot_hide_credential_body(
+    tmp_path: Path,
+) -> None:
+    ontology = tmp_path / "routing"
+    ontology.mkdir()
+    database = tmp_path / "generated.sqlite"
+    assignment = b"FIRECRAWL_KEY=operator-secret-value-123"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "CREATE TABLE indexed_parts(prefix TEXT NOT NULL, suffix TEXT NOT NULL)"
+        )
+        connection.execute(
+            "CREATE INDEX indexed_assignment "
+            "ON indexed_parts(prefix || '=' || suffix)"
+        )
+        connection.execute(
+            "INSERT INTO indexed_parts VALUES (?, ?)",
+            ("FIRECRAWL_KEY", "operator-secret-value-123"),
+        )
+    content, _page_start, _pointer_positions, cell_offsets = _index_leaf_layout(
+        database,
+        "indexed_assignment",
+    )
+    cell_start = cell_offsets[0]
+    payload_size = content[cell_start]
+    assert payload_size < 0x80
+    payload_start = cell_start + 1
+    content[payload_start] = payload_size
+    database.write_bytes(content)
+    assert assignment in content
+    store = MemoryArtifactStore().use_root(tmp_path / "remote-assets")
+
+    with pytest.raises(OntologyArtifactError, match="SQLite record"):
+        OntologyArtifactManager(ontology).publish(
+            store=store,
+            published_by="test:operator",
+            storage_rights_basis="operator-confirmed private storage",
+            generated_content=database,
+        )
+
+    assert store.values == {}
+    assert tuple((tmp_path / "remote-assets").iterdir()) == ()
+    assert not (ontology / "artifacts.yaml").exists()
+
+
+@pytest.mark.parametrize(
+    ("serial_type", "message"),
+    ((0x0A, "SQLite record serial type"), (0x7F, "SQLite record body extent")),
+    ids=("reserved", "body-mismatch"),
+)
+def test_generated_sqlite_index_body_extent_must_match_serial_types(
+    tmp_path: Path,
+    serial_type: int,
+    message: str,
+) -> None:
+    ontology = tmp_path / "routing"
+    ontology.mkdir()
+    database = tmp_path / "generated.sqlite"
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE TABLE indexed_values(value TEXT NOT NULL)")
+        connection.execute("CREATE INDEX indexed_value ON indexed_values(value)")
+        connection.execute("INSERT INTO indexed_values VALUES ('public-data')")
+    content, _page_start, _pointer_positions, cell_offsets = _index_leaf_layout(
+        database,
+        "indexed_value",
+    )
+    cell_start = cell_offsets[0]
+    assert content[cell_start] < 0x80
+    payload_start = cell_start + 1
+    assert content[payload_start] == 3
+    content[payload_start + 1] = serial_type
+    database.write_bytes(content)
+    store = MemoryArtifactStore().use_root(tmp_path / "remote-assets")
+
+    with pytest.raises(OntologyArtifactError, match=message):
+        OntologyArtifactManager(ontology).publish(
+            store=store,
+            published_by="test:operator",
+            storage_rights_basis="operator-confirmed private storage",
+            generated_content=database,
+        )
+
+    assert store.values == {}
+    assert tuple((tmp_path / "remote-assets").iterdir()) == ()
+    assert not (ontology / "artifacts.yaml").exists()
+
+
+@pytest.mark.parametrize("malformation", ("truncated", "overlong"))
+def test_generated_sqlite_rejects_malformed_index_record_varint(
+    tmp_path: Path,
+    malformation: str,
+) -> None:
+    ontology = tmp_path / "routing"
+    ontology.mkdir()
+    database = tmp_path / "generated.sqlite"
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE TABLE indexed_values(value TEXT NOT NULL)")
+        connection.execute("CREATE INDEX indexed_value ON indexed_values(value)")
+        connection.execute("INSERT INTO indexed_values VALUES ('public-data')")
+    content, _page_start, _pointer_positions, cell_offsets = _index_leaf_layout(
+        database,
+        "indexed_value",
+    )
+    cell_start = cell_offsets[0]
+    assert content[cell_start] < 0x80
+    payload_start = cell_start + 1
+    assert content[payload_start] == 3
+    if malformation == "truncated":
+        content[payload_start + 2] = 0x80
+    else:
+        content[payload_start] = 4
+        content[payload_start + 1] = 33
+        content[payload_start + 2 : payload_start + 4] = b"\x80\x08"
+    database.write_bytes(content)
+    store = MemoryArtifactStore().use_root(tmp_path / "remote-assets")
+
+    with pytest.raises(OntologyArtifactError, match="SQLite record varint"):
+        OntologyArtifactManager(ontology).publish(
+            store=store,
+            published_by="test:operator",
+            storage_rights_basis="operator-confirmed private storage",
+            generated_content=database,
+        )
+
+    assert store.values == {}
+    assert tuple((tmp_path / "remote-assets").iterdir()) == ()
+    assert not (ontology / "artifacts.yaml").exists()
+
+
+def test_generated_sqlite_rejects_duplicate_index_cell_pointers(
+    tmp_path: Path,
+) -> None:
+    ontology = tmp_path / "routing"
+    ontology.mkdir()
+    database = tmp_path / "generated.sqlite"
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE TABLE indexed_values(value TEXT NOT NULL)")
+        connection.execute("CREATE INDEX indexed_value ON indexed_values(value)")
+        connection.executemany(
+            "INSERT INTO indexed_values VALUES (?)",
+            (("public-a",), ("public-b",)),
+        )
+    content, _page_start, pointer_positions, _cell_offsets = _index_leaf_layout(
+        database,
+        "indexed_value",
+    )
+    content[pointer_positions[1] : pointer_positions[1] + 2] = content[
+        pointer_positions[0] : pointer_positions[0] + 2
+    ]
+    database.write_bytes(content)
+    store = MemoryArtifactStore().use_root(tmp_path / "remote-assets")
+
+    with pytest.raises(OntologyArtifactError, match="duplicate SQLite B-tree cell"):
+        OntologyArtifactManager(ontology).publish(
+            store=store,
+            published_by="test:operator",
+            storage_rights_basis="operator-confirmed private storage",
+            generated_content=database,
+        )
+
+    assert store.values == {}
+    assert tuple((tmp_path / "remote-assets").iterdir()) == ()
+    assert not (ontology / "artifacts.yaml").exists()
+
+
+def test_generated_sqlite_rejects_overlapping_index_cell_ranges(
+    tmp_path: Path,
+) -> None:
+    ontology = tmp_path / "routing"
+    ontology.mkdir()
+    database = tmp_path / "generated.sqlite"
+    nested_cell = b"\x02\x02\x08"
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE TABLE indexed_values(value BLOB NOT NULL)")
+        connection.execute("CREATE INDEX indexed_value ON indexed_values(value)")
+        connection.executemany(
+            "INSERT INTO indexed_values VALUES (?)",
+            ((b"A" + nested_cell + b"Z",), (b"B-public",)),
+        )
+    content, page_start, pointer_positions, cell_offsets = _index_leaf_layout(
+        database,
+        "indexed_value",
+    )
+    nested_start = content.index(nested_cell, page_start)
+    owner_index = next(
+        index
+        for index, cell_start in enumerate(cell_offsets)
+        if cell_start < nested_start < cell_start + 1 + content[cell_start]
+    )
+    changed_index = 1 - owner_index
+    relative_nested = nested_start - page_start
+    content[pointer_positions[changed_index] : pointer_positions[changed_index] + 2] = (
+        relative_nested.to_bytes(2, "big")
+    )
+    database.write_bytes(content)
+    store = MemoryArtifactStore().use_root(tmp_path / "remote-assets")
+
+    with pytest.raises(OntologyArtifactError, match="overlapping SQLite B-tree cells"):
+        OntologyArtifactManager(ontology).publish(
+            store=store,
+            published_by="test:operator",
+            storage_rights_basis="operator-confirmed private storage",
+            generated_content=database,
         )
 
     assert store.values == {}
