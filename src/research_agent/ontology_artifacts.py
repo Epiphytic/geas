@@ -21,7 +21,6 @@ import yaml
 from pydantic import Field, field_validator, model_validator
 
 from research_agent.credential_scanning import (
-    binary_residue_matches_compacted_sqlite,
     contains_binary_credential_residue,
     contains_credential_assignment_marker,
     contains_fixed_credential,
@@ -792,52 +791,232 @@ def _scan_sensitive_content(path: Path) -> None:
         return
     with path.open("rb") as handle:
         sqlite_database = handle.read(16) == b"SQLite format 3\x00"
-    compacted: Path | None = None
-    temporary_root: Path | None = None
-    try:
+    if sqlite_database:
+        _scan_sqlite_values(path)
+    access = mmap.ACCESS_COPY if sqlite_database else mmap.ACCESS_READ
+    with path.open("rb") as handle, mmap.mmap(
+        handle.fileno(),
+        0,
+        access=access,
+    ) as content:
         if sqlite_database:
-            _scan_sqlite_values(path)
-            temporary_root = Path(tempfile.mkdtemp(prefix="geas-sqlite-scan-"))
-            compacted = temporary_root / "compacted.sqlite"
-            _compact_sqlite_for_scanning(path, compacted)
-        with path.open("rb") as handle, mmap.mmap(
-            handle.fileno(),
-            0,
-            access=mmap.ACCESS_READ,
-        ) as content:
-            sensitive = (
-                contains_binary_credential_residue(content)
-                if sqlite_database
-                else contains_possible_credential(content)
+            _mask_live_sqlite_cells(path, content)
+            sensitive = contains_binary_credential_residue(content)
+        else:
+            sensitive = contains_possible_credential(content)
+        if sensitive:
+            raise OntologyArtifactError(
+                f"possible credential detected in ontology artifact: {path}"
             )
-            reconciled = False
-            if sensitive and compacted is not None:
-                with compacted.open("rb") as compacted_handle, mmap.mmap(
-                    compacted_handle.fileno(),
-                    0,
-                    access=mmap.ACCESS_READ,
-                ) as compacted_content:
-                    reconciled = binary_residue_matches_compacted_sqlite(
-                        content,
-                        compacted_content,
-                    )
-            if sensitive and not reconciled:
-                raise OntologyArtifactError(
-                    f"possible credential detected in ontology artifact: {path}"
-                )
-    finally:
-        if temporary_root is not None:
-            shutil.rmtree(temporary_root, ignore_errors=True)
 
 
-def _compact_sqlite_for_scanning(source: Path, destination: Path) -> None:
+def _mask_live_sqlite_cells(path: Path, content: mmap.mmap) -> None:
+    """Mask only reachable live B-tree structures in a private scan view."""
+    if len(content) < 100 or bytes(content[:16]) != b"SQLite format 3\x00":
+        raise OntologyArtifactError(f"invalid SQLite ontology artifact: {path}")
+    encoded_page_size = int.from_bytes(content[16:18], "big")
+    page_size = 65536 if encoded_page_size == 1 else encoded_page_size
+    reserved = content[20]
+    if (
+        page_size < 512
+        or page_size > 65536
+        or page_size & (page_size - 1)
+        or reserved >= page_size
+        or len(content) % page_size
+    ):
+        raise OntologyArtifactError(f"invalid SQLite page layout: {path}")
+    usable_size = page_size - reserved
+    page_count = len(content) // page_size
     try:
-        with sqlite3.connect(f"file:{source}?mode=ro", uri=True) as connection:
-            connection.execute("VACUUM INTO ?", (str(destination),))
-    except sqlite3.Error as error:
+        with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as connection:
+            roots = {
+                1,
+                *(
+                    int(row[0])
+                    for row in connection.execute(
+                        "SELECT rootpage FROM sqlite_schema WHERE rootpage > 0"
+                    )
+                ),
+            }
+    except (sqlite3.Error, TypeError, ValueError) as error:
         raise OntologyArtifactError(
-            f"could not compact SQLite ontology artifact for scanning: {source}"
+            f"could not inventory live SQLite pages: {path}"
         ) from error
+
+    pending = sorted(roots, reverse=True)
+    visited: set[int] = set()
+    while pending:
+        page_number = pending.pop()
+        if page_number in visited:
+            continue
+        _validate_sqlite_page_number(page_number, page_count)
+        visited.add(page_number)
+        page_start = (page_number - 1) * page_size
+        header_start = page_start + (100 if page_number == 1 else 0)
+        page_type = content[header_start]
+        if page_type not in {0x02, 0x05, 0x0A, 0x0D}:
+            raise OntologyArtifactError("SQLite root traversal reached a non-B-tree page")
+        header_size = 12 if page_type in {0x02, 0x05} else 8
+        cell_count = int.from_bytes(content[header_start + 3 : header_start + 5], "big")
+        pointer_start = header_start + header_size
+        pointer_end = pointer_start + 2 * cell_count
+        page_usable_end = page_start + usable_size
+        if pointer_end > page_usable_end:
+            raise OntologyArtifactError("SQLite B-tree cell pointer array is invalid")
+        children: list[int] = []
+        if page_type in {0x02, 0x05}:
+            children.append(
+                int.from_bytes(content[header_start + 8 : header_start + 12], "big")
+            )
+        cell_offsets = tuple(
+            int.from_bytes(content[offset : offset + 2], "big")
+            for offset in range(pointer_start, pointer_end, 2)
+        )
+        content[header_start:pointer_end] = b"\x00" * (pointer_end - header_start)
+        if page_number == 1:
+            content[:100] = b"\x00" * 100
+        for relative_offset in cell_offsets:
+            if relative_offset == 0 and page_size == 65536:
+                relative_offset = 65536
+            cell_start = page_start + relative_offset
+            if not pointer_end <= cell_start < page_usable_end:
+                raise OntologyArtifactError("SQLite B-tree cell offset is invalid")
+            cell_end, child, overflow = _sqlite_live_cell_extent(
+                content,
+                cell_start=cell_start,
+                page_type=page_type,
+                page_usable_end=page_usable_end,
+                usable_size=usable_size,
+            )
+            if child is not None:
+                children.append(child)
+            content[cell_start:cell_end] = b"\x00" * (cell_end - cell_start)
+            if overflow is not None:
+                overflow_page, remaining = overflow
+                _mask_sqlite_overflow_chain(
+                    content,
+                    page_number=overflow_page,
+                    remaining=remaining,
+                    page_size=page_size,
+                    usable_size=usable_size,
+                    page_count=page_count,
+                    visited_btree=visited,
+                )
+        for child in sorted(children, reverse=True):
+            _validate_sqlite_page_number(child, page_count)
+            if child not in visited:
+                pending.append(child)
+
+
+def _sqlite_live_cell_extent(
+    content: mmap.mmap,
+    *,
+    cell_start: int,
+    page_type: int,
+    page_usable_end: int,
+    usable_size: int,
+) -> tuple[int, int | None, tuple[int, int] | None]:
+    cursor = cell_start
+    child: int | None = None
+    if page_type in {0x02, 0x05}:
+        if cursor + 4 > page_usable_end:
+            raise OntologyArtifactError("SQLite interior cell is truncated")
+        child = int.from_bytes(content[cursor : cursor + 4], "big")
+        cursor += 4
+    if page_type == 0x05:
+        _rowid, cursor = _read_sqlite_varint(content, cursor, page_usable_end)
+        return cursor, child, None
+
+    payload_size, cursor = _read_sqlite_varint(content, cursor, page_usable_end)
+    if page_type == 0x0D:
+        _rowid, cursor = _read_sqlite_varint(content, cursor, page_usable_end)
+    local_size = _sqlite_local_payload_size(
+        payload_size,
+        usable_size=usable_size,
+        table_leaf=page_type == 0x0D,
+    )
+    payload_end = cursor + local_size
+    if payload_end > page_usable_end:
+        raise OntologyArtifactError("SQLite B-tree payload is truncated")
+    if local_size == payload_size:
+        return payload_end, child, None
+    if payload_end + 4 > page_usable_end:
+        raise OntologyArtifactError("SQLite overflow pointer is truncated")
+    overflow_page = int.from_bytes(content[payload_end : payload_end + 4], "big")
+    return payload_end + 4, child, (overflow_page, payload_size - local_size)
+
+
+def _read_sqlite_varint(
+    content: mmap.mmap,
+    offset: int,
+    limit: int,
+) -> tuple[int, int]:
+    value = 0
+    for index in range(9):
+        if offset >= limit:
+            raise OntologyArtifactError("SQLite varint is truncated")
+        byte = content[offset]
+        offset += 1
+        if index == 8:
+            return (value << 8) | byte, offset
+        value = (value << 7) | (byte & 0x7F)
+        if byte < 0x80:
+            return value, offset
+    raise AssertionError("SQLite varint loop did not terminate")
+
+
+def _sqlite_local_payload_size(
+    payload_size: int,
+    *,
+    usable_size: int,
+    table_leaf: bool,
+) -> int:
+    minimum = ((usable_size - 12) * 32 // 255) - 23
+    maximum = (
+        usable_size - 35
+        if table_leaf
+        else ((usable_size - 12) * 64 // 255) - 23
+    )
+    if minimum < 0 or maximum < minimum:
+        raise OntologyArtifactError("SQLite usable page size is invalid")
+    if payload_size <= maximum:
+        return payload_size
+    local = minimum + (payload_size - minimum) % (usable_size - 4)
+    return minimum if local > maximum else local
+
+
+def _mask_sqlite_overflow_chain(
+    content: mmap.mmap,
+    *,
+    page_number: int,
+    remaining: int,
+    page_size: int,
+    usable_size: int,
+    page_count: int,
+    visited_btree: set[int],
+) -> None:
+    visited: set[int] = set()
+    while remaining:
+        _validate_sqlite_page_number(page_number, page_count)
+        if page_number in visited or page_number in visited_btree:
+            raise OntologyArtifactError("SQLite overflow page cycle is invalid")
+        visited.add(page_number)
+        page_start = (page_number - 1) * page_size
+        next_page = int.from_bytes(content[page_start : page_start + 4], "big")
+        payload_size = min(remaining, usable_size - 4)
+        mask_end = page_start + 4 + payload_size
+        content[page_start:mask_end] = b"\x00" * (4 + payload_size)
+        remaining -= payload_size
+        if remaining and next_page == 0:
+            raise OntologyArtifactError("SQLite overflow chain ended early")
+        if not remaining and next_page != 0:
+            raise OntologyArtifactError("SQLite overflow chain exceeds its payload")
+        page_number = next_page
+
+
+def _validate_sqlite_page_number(page_number: int, page_count: int) -> None:
+    if not 1 <= page_number <= page_count:
+        raise OntologyArtifactError("SQLite page number is outside the database")
 
 
 def _scan_sqlite_values(path: Path) -> None:
@@ -877,7 +1056,9 @@ def _scan_sqlite_values(path: Path) -> None:
 
 def _raise_for_sqlite_credential(path: Path, value: str | bytes) -> None:
     content = value.encode("utf-8") if isinstance(value, str) else bytes(value)
-    if contains_possible_credential(content):
+    if contains_possible_credential(content) or contains_binary_credential_residue(
+        content
+    ):
         raise OntologyArtifactError(
             f"possible credential detected in ontology artifact: {path}"
         )

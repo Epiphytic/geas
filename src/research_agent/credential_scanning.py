@@ -22,7 +22,6 @@ _CREDENTIAL_MARKER_CONTROL_BYTES = bytes(range(0x20)) + b"\x7f"
 _INERT_LITERAL = re.compile(rb"[A-Za-z0-9._/-]*")
 _MIN_CREDENTIAL_LENGTH = 12
 _MAX_BINARY_ASSIGNMENT_BYTES = 4096
-_MAX_COMPACTED_SQLITE_FINDINGS = 1024
 
 
 @dataclass(frozen=True)
@@ -72,39 +71,6 @@ def contains_binary_credential_residue(content: Buffer) -> bool:
     finding.
     """
     return next(_iter_binary_credential_findings(content), None) is not None
-
-
-def binary_residue_matches_compacted_sqlite(
-    content: Buffer,
-    compacted_content: Buffer,
-) -> bool:
-    """Return whether raw findings are reproduced by compacted live records.
-
-    The compacted database must be produced from the same valid SQLite input.
-    Its exact bounded finding multiset contains live record structure but no
-    deleted cells, freelist content, or page slack. Opaque findings can never
-    be reconciled.
-    """
-    allowed: dict[bytes, int] = {}
-    allowed_count = 0
-    for finding in _iter_binary_credential_findings(compacted_content):
-        if finding.assignment is None:
-            continue
-        allowed_count += 1
-        if allowed_count > _MAX_COMPACTED_SQLITE_FINDINGS:
-            return False
-        allowed[finding.assignment] = allowed.get(finding.assignment, 0) + 1
-
-    found = False
-    for finding in _iter_binary_credential_findings(content):
-        found = True
-        if finding.assignment is None:
-            return False
-        remaining = allowed.get(finding.assignment, 0)
-        if remaining == 0:
-            return False
-        allowed[finding.assignment] = remaining - 1
-    return found
 
 
 def _iter_binary_credential_findings(
