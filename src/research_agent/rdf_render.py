@@ -51,6 +51,115 @@ _CLAIM_FIELDS = frozenset(
         "review_state",
     }
 )
+_CLAIM_ROW_FIELDS = _CLAIM_FIELDS | _EVIDENCE_FIELDS | frozenset({"acquired_at", "license"})
+_CONCEPT_FIELDS = frozenset(
+    {
+        "id",
+        "label",
+        "description",
+        "broader",
+        "synonyms",
+        "recorded_at",
+        "recorded_by",
+        "review_state",
+    }
+)
+_SOURCE_STABLE_FIELDS = frozenset(
+    {
+        "id",
+        "source_uri",
+        "content_sha256",
+        "acquired_at",
+        "media_type",
+        "byte_length",
+        "connector_id",
+        "trust_zone",
+        "license",
+    }
+)
+_SOURCE_FIELDS = _SOURCE_STABLE_FIELDS | frozenset(
+    {
+        "roles_json",
+        "associated_at",
+        "associated_by",
+        "metadata_id",
+        "original_locator",
+        "title",
+        "authors_json",
+        "authorship_status",
+        "publisher",
+        "published_at",
+        "license_status",
+        "usage_conditions_json",
+        "usage_conditions_status",
+        "usage_permissions_json",
+        "rights_basis",
+        "rights_basis_status",
+        "provenance_note",
+        "provenance_status",
+    }
+)
+_CONTROVERSY_FIELDS = frozenset(
+    {
+        "id",
+        "topic_concept_id",
+        "question",
+        "description",
+        "status",
+        "recorded_at",
+        "recorded_by",
+        "review_state",
+        "claim_ids",
+    }
+)
+_GAP_FIELDS = frozenset(
+    {
+        "id",
+        "topic_concept_id",
+        "question",
+        "rationale",
+        "kind",
+        "status",
+        "priority",
+        "freshness_deadline",
+        "recorded_at",
+        "recorded_by",
+        "review_state",
+        "related_claim_ids",
+    }
+)
+_THREAT_FIELDS = frozenset(
+    {
+        "id",
+        "source_version",
+        "source_uri",
+        "threat_type",
+        "status",
+        "severity",
+        "detected_at",
+        "detector_kind",
+        "detector_id",
+        "policy_rule",
+    }
+)
+_REFERENCE_FIELDS = frozenset(
+    {
+        "id",
+        "relation",
+        "signal",
+        "start",
+        "end",
+        "structural_anchor_id",
+        "identifier_kind",
+        "identifier_value",
+        "canonical_locator",
+        "source_id",
+        "source_uri",
+        "page_number",
+        "resolved_discovery_hit_ids",
+        "resolved_open_access_resolution_ids",
+    }
+)
 
 
 def _iri(kind: str, identifier: object) -> str:
@@ -71,6 +180,12 @@ def _split_ids(value: object) -> tuple[str, ...]:
     if value is None or value == "":
         return ()
     if isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+        except json.JSONDecodeError:
+            decoded = None
+        if isinstance(decoded, list) and all(isinstance(item, str) for item in decoded):
+            return tuple(decoded)
         return tuple(item.strip() for item in value.split(",") if item.strip())
     if isinstance(value, Iterable):
         return tuple(str(item) for item in value)
@@ -104,12 +219,34 @@ def _records_by_id(
     return tuple(unique[key] for key in sorted(unique))
 
 
+def _validate_fields(record: Mapping[str, Any], allowed: frozenset[str], record_type: str) -> None:
+    unexpected = sorted(set(record) - allowed)
+    if unexpected:
+        raise ValueError(f"unexpected {record_type} fields: {', '.join(unexpected)}")
+
+
+def _source_rows(records: Iterable[Mapping[str, Any]]) -> tuple[dict[str, Any], ...]:
+    """Keep distinct association/metadata rows while rejecting immutable source conflicts."""
+    rows = tuple(dict(record) for record in records)
+    stable: dict[str, dict[str, Any]] = {}
+    for record in rows:
+        _validate_fields(record, _SOURCE_FIELDS, "source")
+        identifier = str(record["id"])
+        identity = {key: record.get(key) for key in _SOURCE_STABLE_FIELDS}
+        prior = stable.get(identifier)
+        if prior is not None and _canonical(prior) != _canonical(identity):
+            raise ValueError(f"conflicting duplicate source: {identifier}")
+        stable[identifier] = identity
+    return tuple(sorted(rows, key=_canonical))
+
+
 def _claim_rows(records: Iterable[Mapping[str, Any]]) -> tuple[dict[str, Any], ...]:
     """Merge one claim's evidence join rows while retaining every distinct evidence row."""
     source_rows = tuple(dict(record) for record in records)
     claims: dict[str, dict[str, Any]] = {}
     evidence: dict[str, dict[str, Any]] = {}
     for record in source_rows:
+        _validate_fields(record, _CLAIM_ROW_FIELDS, "claim")
         identifier = str(record["id"])
         statement = {key: record.get(key) for key in _CLAIM_FIELDS}
         existing = claims.get(identifier)
@@ -134,8 +271,7 @@ def _claim_rows(records: Iterable[Mapping[str, Any]]) -> tuple[dict[str, Any], .
             for key in sorted(evidence)
             if evidence[key].get("evidence_id") is not None
             and any(
-                str(item.get("id")) == identifier
-                and str(item.get("evidence_id")) == key
+                str(item.get("id")) == identifier and str(item.get("evidence_id")) == key
                 for item in source_rows
             )
         )
@@ -216,6 +352,17 @@ def _tbox() -> set[tuple[str, str, str]]:
         "usageConditions": "Inert serialized source usage conditions.",
         "usageConditionsStatus": "Source usage-conditions status.",
         "usagePermissions": "Inert serialized source usage permissions.",
+        "byteLength": "Source byte length.",
+        "descendantConcept": "Concept included by the topic projection traversal.",
+        "freshnessDeadline": "Knowledge-gap freshness deadline.",
+        "mediaType": "Source media type.",
+        "metadataId": "Source metadata record identity.",
+        "recordedAt": "Record observation time.",
+        "recordedBy": "Record observation actor.",
+        "reviewState": "Accepted record review state.",
+        "topicConcept": "Topic concept for this projection record.",
+        "validFrom": "Claim valid-time lower bound.",
+        "validUntil": "Claim valid-time upper bound.",
     }
     triples: set[tuple[str, str, str]] = set()
     for name, comment in classes.items():
@@ -249,18 +396,25 @@ def render_topic_turtle(topic: TopicView) -> str:
     _add_literal(triples, snapshot, "geas:asOf", topic.as_of.isoformat() if topic.as_of else None)
     _add_literal(triples, snapshot, "geas:queryMode", topic.query_mode)
     _add_literal(triples, snapshot, "rdfs:comment", _NOTICE)
+    triples.add((snapshot, "geas:topicConcept", _iri("concept", topic.topic_concept_id)))
+    for concept_id in sorted(topic.descendant_concept_ids):
+        triples.add((snapshot, "geas:descendantConcept", _iri("concept", concept_id)))
 
     for record in _records_by_id(topic.concepts, "concept"):
+        _validate_fields(record, _CONCEPT_FIELDS, "concept")
         subject = _iri("concept", record["id"])
         _add_type(triples, subject, "skos:Concept", "geas:Concept")
         _add_literal(triples, subject, "skos:prefLabel", record.get("label"))
         _add_literal(triples, subject, "skos:definition", record.get("description"))
+        _add_literal(triples, subject, "geas:recordedAt", record.get("recorded_at"))
+        _add_literal(triples, subject, "geas:recordedBy", record.get("recorded_by"))
+        _add_literal(triples, subject, "geas:reviewState", record.get("review_state"))
         for parent in _split_ids(record.get("broader")):
             triples.add((subject, "skos:broader", _iri("concept", parent)))
         for synonym in _split_ids(record.get("synonyms")):
             _add_literal(triples, subject, "skos:altLabel", synonym)
 
-    for record in _records_by_id(topic.sources, "source"):
+    for record in _source_rows(topic.sources):
         subject = _iri("source", record["id"])
         _add_type(triples, subject, "geas:Source", "prov:Entity")
         for predicate, field in (
@@ -272,6 +426,9 @@ def render_topic_turtle(topic: TopicView) -> str:
             ("dcterms:publisher", "publisher"),
             ("dcterms:issued", "published_at"),
             ("dcterms:license", "license"),
+            ("geas:mediaType", "media_type"),
+            ("geas:byteLength", "byte_length"),
+            ("geas:metadataId", "metadata_id"),
             ("geas:authorshipStatus", "authorship_status"),
             ("geas:acquiredAt", "acquired_at"),
             ("geas:licenseStatus", "license_status"),
@@ -305,6 +462,10 @@ def render_topic_turtle(topic: TopicView) -> str:
             ("geas:epistemicStatus", "epistemic_status"),
             ("geas:assertedBy", "asserted_by"),
             ("geas:qualifiers", "qualifiers_json"),
+            ("geas:validFrom", "valid_from"),
+            ("geas:validUntil", "valid_until"),
+            ("geas:recordedAt", "recorded_at"),
+            ("geas:reviewState", "review_state"),
         ):
             _add_literal(triples, subject, predicate, claim.get(field))
         for evidence in claim["evidence"]:
@@ -327,18 +488,25 @@ def render_topic_turtle(topic: TopicView) -> str:
                 _add_literal(triples, evidence_subject, predicate, evidence.get(field))
 
     for record in _records_by_id(topic.controversies, "controversy"):
+        _validate_fields(record, _CONTROVERSY_FIELDS, "controversy")
         subject = _iri("controversy", record["id"])
         _add_type(triples, subject, "geas:Controversy")
+        if (topic_id := record.get("topic_concept_id")) is not None:
+            triples.add((subject, "geas:topicConcept", _iri("concept", topic_id)))
         for predicate, field in (
             ("geas:question", "question"),
             ("geas:description", "description"),
             ("geas:status", "status"),
+            ("geas:recordedAt", "recorded_at"),
+            ("geas:recordedBy", "recorded_by"),
+            ("geas:reviewState", "review_state"),
         ):
             _add_literal(triples, subject, predicate, record.get(field))
         for claim_id in _split_ids(record.get("claim_ids")):
             triples.add((subject, "geas:disputes", _iri("claim", claim_id)))
 
     for record in _records_by_id(topic.gaps, "knowledge gap"):
+        _validate_fields(record, _GAP_FIELDS, "knowledge gap")
         subject = _iri("gap", record["id"])
         _add_type(triples, subject, "geas:KnowledgeGap")
         for predicate, field in (
@@ -347,6 +515,10 @@ def render_topic_turtle(topic: TopicView) -> str:
             ("geas:kind", "kind"),
             ("geas:status", "status"),
             ("geas:priority", "priority"),
+            ("geas:freshnessDeadline", "freshness_deadline"),
+            ("geas:recordedAt", "recorded_at"),
+            ("geas:recordedBy", "recorded_by"),
+            ("geas:reviewState", "review_state"),
         ):
             _add_literal(triples, subject, predicate, record.get(field))
         if (topic_id := record.get("topic_concept_id")) is not None:
@@ -355,6 +527,7 @@ def render_topic_turtle(topic: TopicView) -> str:
             triples.add((subject, "geas:relatedClaim", _iri("claim", claim_id)))
 
     for record in _records_by_id(topic.threats, "threat observation"):
+        _validate_fields(record, _THREAT_FIELDS, "threat observation")
         subject = _iri("threat", record["id"])
         _add_type(triples, subject, "geas:ThreatObservation")
         if (source_id := record.get("source_version")) is not None:
@@ -372,6 +545,7 @@ def render_topic_turtle(topic: TopicView) -> str:
             _add_literal(triples, subject, predicate, record.get(field))
 
     for record in _records_by_id(topic.references, "bibliographic reference"):
+        _validate_fields(record, _REFERENCE_FIELDS, "bibliographic reference")
         subject = _iri("reference", record["id"])
         _add_type(triples, subject, "geas:BibliographicReference")
         if (source_id := record.get("source_id")) is not None:

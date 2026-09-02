@@ -1077,7 +1077,14 @@ def _csv_values(value: object) -> list[str]:
         return []
     if isinstance(value, (tuple, list)):
         return sorted(str(item) for item in value if str(item))
-    return sorted(item for item in str(value).split(",") if item)
+    if isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+        except json.JSONDecodeError:
+            return sorted(item for item in value.split(",") if item)
+        if isinstance(decoded, list) and all(isinstance(item, str) for item in decoded):
+            return sorted(item for item in decoded if item)
+    return [str(value)] if str(value) else []
 
 
 def _quoted_lines(value: object) -> tuple[str, ...]:

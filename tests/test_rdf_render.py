@@ -19,6 +19,9 @@ def _topic(*, reverse: bool = False) -> TopicView:
                 "description": "Root definition",
                 "broader": "",
                 "synonyms": "root term",
+                "recorded_at": "2026-08-01T00:00:00+00:00",
+                "recorded_by": "operator",
+                "review_state": "accepted",
             },
             {
                 "id": "concept:child",
@@ -31,7 +34,7 @@ def _topic(*, reverse: bool = False) -> TopicView:
         "sources": (
             {
                 "id": "source:one",
-                "title": 'Source \\\"title\\\"',
+                "title": 'Source \\"title\\"',
                 "authorship_status": "verified",
                 "source_uri": "https://archive.example.test/one",
                 "original_locator": "https://origin.example.test/one",
@@ -41,6 +44,9 @@ def _topic(*, reverse: bool = False) -> TopicView:
                 "published_at": "2026-08-01T12:00:00+00:00",
                 "acquired_at": "2026-08-02T12:00:00+00:00",
                 "license": "CC-BY-4.0",
+                "media_type": "text/plain",
+                "byte_length": 123,
+                "metadata_id": "metadata:one",
                 "license_status": "confirmed",
                 "usage_conditions_json": '{"attribution":true}',
                 "usage_conditions_status": "confirmed",
@@ -65,6 +71,10 @@ def _topic(*, reverse: bool = False) -> TopicView:
                 "epistemic_status": "observed",
                 "asserted_by": "source:one",
                 "qualifiers_json": "{}",
+                "valid_from": "2026-01-01T00:00:00+00:00",
+                "valid_until": "2027-01-01T00:00:00+00:00",
+                "recorded_at": "2026-08-01T00:00:00+00:00",
+                "review_state": "accepted",
                 "evidence_id": "evidence:one",
                 "source_id": "source:one",
                 "source_uri": "https://origin.example.test/one",
@@ -80,6 +90,10 @@ def _topic(*, reverse: bool = False) -> TopicView:
                 "description": "Competing evidence",
                 "status": "open",
                 "claim_ids": "claim:one",
+                "topic_concept_id": "concept:root",
+                "recorded_at": "2026-08-01T00:00:00+00:00",
+                "recorded_by": "operator",
+                "review_state": "accepted",
             },
         ),
         "gaps": (
@@ -92,6 +106,10 @@ def _topic(*, reverse: bool = False) -> TopicView:
                 "status": "open",
                 "priority": 1,
                 "related_claim_ids": "claim:one",
+                "freshness_deadline": "2027-01-01T00:00:00+00:00",
+                "recorded_at": "2026-08-01T00:00:00+00:00",
+                "recorded_by": "operator",
+                "review_state": "accepted",
             },
         ),
         "threats": (
@@ -157,33 +175,37 @@ def test_render_topic_turtle_maps_the_complete_topic_projection_deterministicall
     assert "geas:BibliographicReference" in rendered
     assert "urn:geas:snapshot:truth%3Asnapshot%2Fone" in rendered
     assert "urn:geas:reference:reference%3Adoi%2F10.1000" in rendered
-    assert 'dcterms:creator "[\\\"Ada\\\"]"' in rendered
+    assert 'dcterms:creator "[\\"Ada\\"]"' in rendered
     statement = (
-        '"{\\\"object\\\":{\\\"name\\\":\\\"child\\\",\\\"rank\\\":1},'
-        '\\\"predicate\\\":\\\"supports\\\",\\\"subject\\\":\\\"concept:root\\\"}"'
+        '"{\\"object\\":{\\"name\\":\\"child\\",\\"rank\\":1},'
+        '\\"predicate\\":\\"supports\\",\\"subject\\":\\"concept:root\\"}"'
     )
     assert statement in rendered
 
 
 def test_render_topic_turtle_maps_current_source_threat_and_reference_fields_as_literals() -> None:
     """Catches projection fields silently disappearing from the RDF ABox."""
-    from research_agent.rdf_render import render_topic_turtle
+    from research_agent.rdf_render import (
+        _SOURCE_FIELDS,
+        _SOURCE_STABLE_FIELDS,
+        render_topic_turtle,
+    )
 
     rendered = render_topic_turtle(_topic())
 
     source = "<urn:geas:source:source%3Aone>"
     threat = "<urn:geas:threat:threat%3Aone>"
     reference = "<urn:geas:reference:reference%3Adoi%2F10.1000>"
-    assert f'{source} dcterms:creator "[\\\"Ada\\\"]" .' in rendered
+    assert f'{source} dcterms:creator "[\\"Ada\\"]" .' in rendered
     assert f'{source} geas:authorshipStatus "verified" .' in rendered
     assert f'{source} dcterms:issued "2026-08-01T12:00:00+00:00" .' in rendered
     assert f'{source} geas:acquiredAt "2026-08-02T12:00:00+00:00" .' in rendered
     assert f'{source} geas:licenseStatus "confirmed" .' in rendered
     assert f'{source} geas:connectorId "local_file" .' in rendered
-    assert f'{source} geas:topicRoles "[\\\"primary\\\"]" .' in rendered
-    assert f'{source} geas:usageConditions "{{\\\"attribution\\\":true}}" .' in rendered
+    assert f'{source} geas:topicRoles "[\\"primary\\"]" .' in rendered
+    assert f'{source} geas:usageConditions "{{\\"attribution\\":true}}" .' in rendered
     assert f'{source} geas:usageConditionsStatus "confirmed" .' in rendered
-    assert f'{source} geas:usagePermissions "{{\\\"store\\\":true}}" .' in rendered
+    assert f'{source} geas:usagePermissions "{{\\"store\\":true}}" .' in rendered
     assert f'{source} geas:rightsBasis "license" .' in rendered
     assert f'{source} geas:rightsBasisStatus "confirmed" .' in rendered
     assert f'{source} geas:provenanceNote "operator supplied" .' in rendered
@@ -195,6 +217,125 @@ def test_render_topic_turtle_maps_current_source_threat_and_reference_fields_as_
     assert f'{reference} geas:pageNumber "4" .' in rendered
     assert f'{reference} geas:resolvedDiscoveryHitIds "discovery:one" .' in rendered
     assert f'{reference} geas:resolvedOpenAccessResolutionIds "resolution:one" .' in rendered
+    assert _SOURCE_STABLE_FIELDS | {
+        "roles_json",
+        "associated_at",
+        "associated_by",
+        "metadata_id",
+        "original_locator",
+        "title",
+        "authors_json",
+        "authorship_status",
+        "publisher",
+        "published_at",
+        "license_status",
+        "usage_conditions_json",
+        "usage_conditions_status",
+        "usage_permissions_json",
+        "rights_basis",
+        "rights_basis_status",
+        "provenance_note",
+        "provenance_status",
+    } == _SOURCE_FIELDS
+
+
+def test_render_topic_turtle_maps_every_current_record_field() -> None:
+    """Catches accepted projection fields omitted from the read-only RDF projection."""
+    from research_agent.rdf_render import render_topic_turtle
+
+    rendered = render_topic_turtle(_topic())
+
+    assert (
+        "<urn:geas:snapshot:truth%3Asnapshot%2Fone> geas:topicConcept "
+        "<urn:geas:concept:concept%3Aroot> ."
+        in rendered
+    )
+    assert (
+        "<urn:geas:snapshot:truth%3Asnapshot%2Fone> geas:descendantConcept "
+        "<urn:geas:concept:concept%3Achild> ."
+        in rendered
+    )
+    assert '<urn:geas:concept:concept%3Aroot> geas:recordedBy "operator" .' in rendered
+    assert (
+        '<urn:geas:concept:concept%3Aroot> geas:recordedAt "2026-08-01T00:00:00+00:00" .'
+        in rendered
+    )
+    assert '<urn:geas:concept:concept%3Aroot> geas:reviewState "accepted" .' in rendered
+    assert '<urn:geas:source:source%3Aone> geas:mediaType "text/plain" .' in rendered
+    assert '<urn:geas:source:source%3Aone> geas:byteLength "123" .' in rendered
+    assert '<urn:geas:source:source%3Aone> geas:metadataId "metadata:one" .' in rendered
+    assert '<urn:geas:claim:claim%3Aone> geas:validFrom "2026-01-01T00:00:00+00:00" .' in rendered
+    assert '<urn:geas:claim:claim%3Aone> geas:validUntil "2027-01-01T00:00:00+00:00" .' in rendered
+    assert (
+        "<urn:geas:controversy:controversy%3Aone> geas:topicConcept "
+        "<urn:geas:concept:concept%3Aroot> ."
+        in rendered
+    )
+    assert (
+        '<urn:geas:gap:gap%3Aone> geas:freshnessDeadline "2027-01-01T00:00:00+00:00" .' in rendered
+    )
+
+
+@pytest.mark.parametrize(
+    ("attribute", "record_type"),
+    (
+        ("concepts", "concept"),
+        ("sources", "source"),
+        ("claims", "claim"),
+        ("controversies", "controversy"),
+        ("gaps", "knowledge gap"),
+        ("threats", "threat observation"),
+        ("references", "bibliographic reference"),
+    ),
+)
+def test_render_topic_turtle_rejects_unknown_projection_fields(
+    attribute: str, record_type: str
+) -> None:
+    """Catches an unreviewed future TopicView field silently acquiring RDF meaning."""
+    from research_agent.rdf_render import render_topic_turtle
+
+    original = _topic()
+    records = getattr(original, attribute)
+    topic = original.model_copy(
+        update={attribute: ({**records[0], "future_field": "unsafe"}, *records[1:])}
+    )
+
+    with pytest.raises(ValueError, match=f"unexpected {record_type} fields"):
+        render_topic_turtle(topic)
+
+
+def test_render_topic_turtle_merges_multiple_source_associations_and_metadata() -> None:
+    """Catches join fan-out being mistaken for conflicting immutable source identity."""
+    from research_agent.rdf_render import render_topic_turtle
+
+    source = _topic().sources[0]
+    alternate = {
+        **source,
+        "roles_json": '["secondary"]',
+        "associated_at": "2026-08-04T00:00:00+00:00",
+        "metadata_id": "metadata:two",
+        "title": "Alternate metadata title",
+    }
+    topic = _topic().model_copy(update={"sources": (alternate, source)})
+
+    rendered = render_topic_turtle(topic)
+
+    subject = "<urn:geas:source:source%3Aone>"
+    assert f'{subject} geas:topicRoles "[\\"primary\\"]" .' in rendered
+    assert f'{subject} geas:topicRoles "[\\"secondary\\"]" .' in rendered
+    assert f'{subject} dcterms:title "Alternate metadata title" .' in rendered
+
+
+def test_render_topic_turtle_rejects_conflicting_stable_source_identity() -> None:
+    """Catches incompatible source bytes being merged solely because IDs match."""
+    from research_agent.rdf_render import render_topic_turtle
+
+    source = _topic().sources[0]
+    conflict = {**source, "content_sha256": "2" * 64}
+    topic = _topic().model_copy(update={"sources": (source, conflict)})
+
+    with pytest.raises(ValueError, match="conflicting duplicate source"):
+        render_topic_turtle(topic)
 
 
 def test_render_topic_turtle_declares_every_geas_term_used_by_an_abox_row() -> None:
@@ -206,9 +347,7 @@ def test_render_topic_turtle_declares_every_geas_term_used_by_an_abox_row() -> N
     used_terms = {
         term
         for line in instance_lines
-        for term in re.findall(
-            r"(?<!urn:)\bgeas:[A-Za-z][A-Za-z0-9]*", line.partition("> ")[2]
-        )
+        for term in re.findall(r"(?<!urn:)\bgeas:[A-Za-z][A-Za-z0-9]*", line.partition("> ")[2])
     }
 
     assert used_terms
@@ -236,8 +375,7 @@ def test_render_topic_turtle_uses_concrete_abox_subjects_for_every_record_type()
     assert "<urn:geas:gap:gap%3Aone> rdf:type geas:KnowledgeGap ." in rendered
     assert "<urn:geas:threat:threat%3Aone> rdf:type geas:ThreatObservation ." in rendered
     assert (
-        "<urn:geas:reference:reference%3Adoi%2F10.1000> "
-        "rdf:type geas:BibliographicReference ."
+        "<urn:geas:reference:reference%3Adoi%2F10.1000> rdf:type geas:BibliographicReference ."
     ) in rendered
     assert "<urn:geas:snapshot:truth%3Asnapshot%2Fone> rdf:type geas:Snapshot ." in rendered
 
@@ -248,7 +386,7 @@ def test_render_topic_turtle_matches_the_fixed_golden_byte_snapshot() -> None:
 
     digest = hashlib.sha256(render_topic_turtle(_topic()).encode()).hexdigest()
 
-    assert digest == "3d323697e12195209f99c5f7edd9d46ca8c7eb77054423492193b05093b67162"
+    assert digest == "e6f023f3e686e668b6d85b177d97e726af116879d49cf8498b228906cb8366b1"
 
 
 def test_render_topic_turtle_keeps_hostile_text_and_locators_inert_literals() -> None:
@@ -262,7 +400,7 @@ def test_render_topic_turtle_keeps_hostile_text_and_locators_inert_literals() ->
     quote_line = next(line for line in quote_lines if line.startswith("<urn:geas:evidence:"))
     assert quote_line.count(chr(92) + '"') >= 3
     assert chr(92) + "n> injected <urn:evil> a <urn:Bad> ." in quote_line
-    assert '<https://archive.example.test/one>' not in rendered
+    assert "<https://archive.example.test/one>" not in rendered
     assert '"https://archive.example.test/one"' in rendered
     assert '"https://doi.org/10.1000/example"' in rendered
 

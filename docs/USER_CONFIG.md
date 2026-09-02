@@ -382,10 +382,10 @@ uv run geas topic-export \
   --format turtle
 ```
 
-You can load the resulting `.ttl` file directly in Ontosphere using its file
-picker, or by dragging the file into the application. For a browser URL,
-serve the output directory from an HTTP(S) server that permits CORS. This
-stdlib-only example serves the directory and adds the required header:
+You can load the resulting `.ttl` file directly in Ontosphere using its File
+picker. For a browser URL, serve the output directory from an HTTP(S) server
+that permits CORS. This stdlib-only example serves the directory and adds the
+required header:
 
 ```bash
 python - <<'PY'
@@ -408,10 +408,10 @@ Then open the Ontosphere deployment or local app (the outer URL below) with a
 percent-encoded `rdfUrl` pointing at the served RDF resource:
 
 ```text
-http://localhost:3000/?rdfUrl=http%3A%2F%2F127.0.0.1%3A8000%2Ffluoridation.ttl
+http://localhost:8080/?rdfUrl=http%3A%2F%2F127.0.0.1%3A8000%2Ffluoridation.ttl
 ```
 
-Replace `http://localhost:3000/` with the URL of the Ontosphere deployment or
+Replace `http://localhost:8080/` with the URL of the Ontosphere deployment or
 local app you are using; the `rdfUrl` value must remain an HTTP(S) URL, not a
 `file://` URL.
 
