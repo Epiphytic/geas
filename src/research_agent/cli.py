@@ -150,6 +150,7 @@ from research_agent.projection import (
 )
 from research_agent.promotion import GitPromotionManager
 from research_agent.providers import ModelClient, load_provider_configs
+from research_agent.rdf_render import render_topic_turtle
 from research_agent.remote_acquisition import LicenseGatedAcquirer
 from research_agent.render import (
     render_agent_instructions,
@@ -1757,7 +1758,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     topic_export = subparsers.add_parser(
         "topic-export",
-        help="generate a deterministic agent-readable Markdown topic projection",
+        help="generate a deterministic topic projection",
     )
     topic_export.add_argument("concept_id")
     topic_export.add_argument("output", type=Path)
@@ -1765,9 +1766,9 @@ def _build_parser() -> argparse.ArgumentParser:
     topic_export.add_argument("--as-of", type=datetime.fromisoformat)
     topic_export.add_argument(
         "--format",
-        choices=("markdown", "obsidian", "agent-instructions"),
+        choices=("markdown", "obsidian", "agent-instructions", "turtle"),
         default="markdown",
-        help="topic page, cross-linked Obsidian vault, or project agent handoff",
+        help="topic page, cross-linked Obsidian vault, project agent handoff, or Turtle RDF",
     )
     topic_export.add_argument(
         "--force",
@@ -3610,8 +3611,12 @@ def main() -> None:
         return
 
     if args.command == "topic-export":
+        if args.format == "turtle" and args.vault_link is not None:
+            raise ValueError("--vault-link does not apply to --format turtle")
         if args.vault_link and args.format != "agent-instructions":
             raise ValueError("--vault-link requires --format agent-instructions")
+        if args.force and args.format == "turtle":
+            raise ValueError("--force does not apply to --format turtle")
         database = _resolve_portable_database(
             args,
             args.database,
@@ -3631,6 +3636,20 @@ def main() -> None:
                 {
                     **receipt,
                     "format": "obsidian",
+                    "snapshot_id": topic.projection_snapshot_id,
+                    "topic_concept_id": topic.topic_concept_id,
+                }
+            )
+        elif args.format == "turtle":
+            rendered = render_topic_turtle(topic)
+            rendered_bytes = rendered.encode("utf-8")
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            args.output.write_bytes(rendered_bytes)
+            _json(
+                {
+                    "output": str(args.output.resolve()),
+                    "bytes": len(rendered_bytes),
+                    "format": args.format,
                     "snapshot_id": topic.projection_snapshot_id,
                     "topic_concept_id": topic.topic_concept_id,
                 }

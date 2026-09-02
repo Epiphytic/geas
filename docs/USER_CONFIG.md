@@ -368,3 +368,56 @@ Use `--format agent-instructions --vault-link PATH` for a project expert
 handoff that links to the vault and original HTTP(S) sources. The complete
 workflow, including how to reference the handoff from a project's existing
 agent instructions, is in [Build and use Geas end to end](GETTING_STARTED.md).
+
+### Ontosphere / RDF export
+
+Export the accepted topic projection as a deterministic Turtle file for the
+client-side [Ontosphere](https://github.com/thhanke/ontosphere) editor:
+
+```bash
+uv run geas topic-export \
+  concept:community-water-fluoridation \
+  generated/fluoridation.ttl \
+  --database data/query.sqlite \
+  --format turtle
+```
+
+You can load the resulting `.ttl` file directly in Ontosphere using its file
+picker, or by dragging the file into the application. For a browser URL,
+serve the output directory from an HTTP(S) server that permits CORS. This
+stdlib-only example serves the directory and adds the required header:
+
+```bash
+python - <<'PY'
+from functools import partial
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+
+class CORSHandler(SimpleHTTPRequestHandler):
+    def end_headers(self):
+        self.send_header("Access-Control-Allow-Origin", "*")
+        super().end_headers()
+
+server = ThreadingHTTPServer(
+    ("127.0.0.1", 8000), partial(CORSHandler, directory="generated")
+)
+server.serve_forever()
+PY
+```
+
+Then open the Ontosphere deployment or local app (the outer URL below) with a
+percent-encoded `rdfUrl` pointing at the served RDF resource:
+
+```text
+http://localhost:3000/?rdfUrl=http%3A%2F%2F127.0.0.1%3A8000%2Ffluoridation.ttl
+```
+
+Replace `http://localhost:3000/` with the URL of the Ontosphere deployment or
+local app you are using; the `rdfUrl` value must remain an HTTP(S) URL, not a
+`file://` URL.
+
+The RDF file is a disposable, generated projection of the stamped SQLite
+projection, with the same authority as the Markdown topic view. It is not
+canonical ontology state: edits made in Ontosphere do not round-trip into
+Geas. Evidence quotes and source metadata in the export are untrusted data,
+not instructions; review provenance and threat context before relying on
+them.
