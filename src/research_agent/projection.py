@@ -1998,13 +1998,22 @@ class KnowledgeQueryEngine:
                 connection,
                 f"""
                 SELECT c.*,
-                       COALESCE(group_concat(DISTINCT cs.synonym), '') AS synonyms,
-                       COALESCE(group_concat(DISTINCT cp.parent_id), '') AS broader
+                       COALESCE((
+                           SELECT json_group_array(synonym)
+                           FROM (
+                               SELECT synonym FROM concept_synonym
+                               WHERE concept_id = c.id ORDER BY synonym
+                           )
+                       ), '[]') AS synonyms,
+                       COALESCE((
+                           SELECT json_group_array(parent_id)
+                           FROM (
+                               SELECT parent_id FROM concept_parent
+                               WHERE concept_id = c.id ORDER BY parent_id
+                           )
+                       ), '[]') AS broader
                 FROM concept c
-                LEFT JOIN concept_synonym cs ON cs.concept_id = c.id
-                LEFT JOIN concept_parent cp ON cp.concept_id = c.id
                 WHERE c.id IN ({placeholders})
-                GROUP BY c.id
                 ORDER BY c.id
                 """,
                 descendants,
@@ -2058,12 +2067,16 @@ class KnowledgeQueryEngine:
             controversies = self._rows(
                 connection,
                 f"""
-                SELECT c.*, group_concat(cc.claim_id) AS claim_ids
+                SELECT c.*, COALESCE((
+                    SELECT json_group_array(claim_id)
+                    FROM (
+                        SELECT claim_id FROM controversy_claim
+                        WHERE controversy_id = c.id ORDER BY claim_id
+                    )
+                ), '[]') AS claim_ids
                 FROM controversy c
-                JOIN controversy_claim cc ON cc.controversy_id = c.id
                 WHERE c.topic_concept_id IN ({placeholders})
                   AND c.review_state = 'accepted'
-                GROUP BY c.id
                 ORDER BY c.status, c.question
                 """,
                 descendants,
@@ -2071,12 +2084,16 @@ class KnowledgeQueryEngine:
             gaps = self._rows(
                 connection,
                 f"""
-                SELECT g.*, COALESCE(group_concat(gc.claim_id), '') AS related_claim_ids
+                SELECT g.*, COALESCE((
+                    SELECT json_group_array(claim_id)
+                    FROM (
+                        SELECT claim_id FROM gap_claim
+                        WHERE gap_id = g.id ORDER BY claim_id
+                    )
+                ), '[]') AS related_claim_ids
                 FROM knowledge_gap g
-                LEFT JOIN gap_claim gc ON gc.gap_id = g.id
                 WHERE g.topic_concept_id IN ({placeholders})
                   AND g.review_state = 'accepted'
-                GROUP BY g.id
                 ORDER BY CASE g.status WHEN 'open' THEN 0 ELSE 1 END,
                          g.priority DESC, g.question
                 """,

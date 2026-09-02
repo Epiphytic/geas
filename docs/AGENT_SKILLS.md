@@ -39,13 +39,28 @@ configuration-root copy remains the canonical generated snapshot.
 
 ## Ontology export and updates
 
-An active profile must configure a trusted ontology Git URL/branch and the
-ontology checkout must have a verified portable knowledge-projection artifact.
-Export an accepted ontology by name:
+The selected profile must resolve a trusted Git-backed ontology through a
+named subscription or its legacy profile repository, and the checkout must
+have a verified portable knowledge-projection artifact. A repository-local
+catalog alone can drive named ontology operations, but skill export requires a
+declaring subscription so its update provenance is complete. Export an
+accepted ontology by name:
 
 ```bash
 geas skill-export research-agents --link
 ```
+
+The complete export syntax is:
+
+```text
+geas skill-export ONTOLOGY [--name NAME] [--link] [--repo PATH] [--force]
+```
+
+`--name` selects the generated skill name, `--link` adds detected user-agent
+links, and `--repo` creates a reviewable snapshot inside a Git worktree and
+links detected repository-scoped agents automatically. `--force` is only for
+an intentional replacement after the managed-content checks reject a modified
+or conflicting destination.
 
 The user-scoped snapshot is `<config-root>/skills/research-agents/` and includes
 `SKILL.md`, `geas-skill.json`, and `references/`. `--link` adds only exact
@@ -61,6 +76,8 @@ not make it trusted automatically. Skill references generally preserve original
 source URLs and bounded evidence/provenance; they are not a download of every
 acquired document. The portable projection artifact is a verified cache, not
 canonical truth.
+See [repository-backed ontologies](REPOSITORY_ONTOLOGIES.md) for catalog
+discovery, exact refs, subscriptions, trust, and synchronization.
 
 For a project-local snapshot:
 

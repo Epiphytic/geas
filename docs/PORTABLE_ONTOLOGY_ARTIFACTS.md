@@ -168,7 +168,9 @@ scripts to pass to `library-query`, `library-context`, `topic-show`, or
 
 Read-only database commands also accept an ontology name in place of an
 explicit database path. This performs the freshness check, hydrates only the
-required role, and opens the verified cache:
+required role, and opens the verified cache. For repository-local catalogs and
+named subscriptions, resolution first applies the catalog integrity and trust
+rules in [repository-backed ontologies](REPOSITORY_ONTOLOGIES.md):
 
 ```bash
 geas library-show \

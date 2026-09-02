@@ -22,6 +22,8 @@ The project is developed at
 | Discover scholarly material and acquire eligible open access copies | Crossref, OpenAlex, Europe PMC, and Unpaywall commands | Normalized discovery metadata, license-aware resolution, and immutable parsed documents |
 | Review and promote model-generated knowledge through Git | `promotion-stage`, `promotion-verify`, and `promotion-apply` | A patch/PR/MR workflow in which models propose but cannot publish canonical truth |
 | Detect ontology/database drift | `truth-snapshot`, `truth-check`, and `projection-check` | A reproducible authority boundary between Git/immutable records and disposable SQLite indexes |
+| Share trusted ontology configuration through Git | repository `geas.yaml`, `geas list`, or `ontology-subscribe` | Hash-verified repository-local catalogs, named subscriptions, or pinned immutable snapshots |
+| Visualize accepted knowledge as RDF | `topic-export --format turtle` | A deterministic, one-way Turtle projection for Ontosphere or other RDF tools |
 
 Start with the [use-case guide](docs/USE_CASES.md) to choose a workflow, or use
 the [end-to-end getting-started guide](docs/GETTING_STARTED.md) for building,
@@ -86,6 +88,8 @@ slice:
 - deterministic cross-linked Obsidian-style Markdown vault projections;
 - OS-standard per-user ontology profiles with modular secrets and optional
   private Git synchronization;
+- strict repository `geas.yaml` catalogs with cumulative local discovery,
+  named Git subscriptions, scoped trust, and immutable snapshot installation;
 - format-neutral original preservation with versioned text derivations for
   text, JSON, HTML, XML, OpenDocument/OpenXML office files, and PDF;
 - immutable document/page/section/heading/block anchors with exact offsets,
@@ -233,28 +237,34 @@ Only artifact roles whose embedded input revision changed are uploaded. See
 and per-ontology freshness settings, lazy paths, rights checks, and the
 non-canonical cache boundary.
 
-### Install the maintained sample ontology
+### Use a repository-backed ontology
 
 The repository itself is a catalog containing the maintained
-`open-source-research-agents` ontology. Subscribe to it with an explicit ref:
+`open-source-research-agents` ontology. From this checkout, Geas discovers its
+root `geas.yaml` automatically:
+
+```bash
+geas list
+```
+
+Repository-local candidates can be used by named ontology operations after
+authorization. To use the same catalog from any directory—or export its
+portable skill with complete update provenance—subscribe with an explicit ref:
 
 ```bash
 geas ontology-subscribe geas-samples https://github.com/Epiphytic/geas.git \
   --ref refs/heads/main
 geas list
 geas skill-export open-source-research-agents --link
-geas ontology-unsubscribe geas-samples
-geas ontology-snapshot-remove open-source-research-agents BUNDLE_SHA256
 ```
 
 The first command announces that it is synchronizing a subscription and asks
 whether to trust its catalog. `--yolo` is an invocation-only alternative for
-one command; it never records trust. See [repository catalogs, trust, and
-subscriptions](docs/USER_CONFIG.md#repository-catalogs-trust-and-subscriptions)
-for the four choices, snapshots, update and removal behavior. Replace
-`BUNDLE_SHA256` with the exact digest shown by the snapshot receipt;
-`ontology-unsubscribe` preserves the checkout unless `--remove-checkout` is
-requested. Installing Geas itself remains optional; use this repository's
+one command; it never records trust. The complete
+[repository-backed ontology guide](docs/REPOSITORY_ONTOLOGIES.md) covers
+authoring and refreshing `geas.yaml`, nested catalog discovery, the four trust
+choices, scoped manual trust, exact refs, updates, skill export, and safe
+removal. Installing Geas itself remains optional; use this repository's
 [installation instructions](#installation) when you want its CLI.
 
 Ontology acceptance defaults to `auto`: Git-backed profile ontologies use

@@ -11,7 +11,10 @@ Choose the shortest path that matches the work:
   new configuration to a resumable ontology build.
 - [User configuration, shared ontologies, and Git sync](USER_CONFIG.md) covers
   OS-standard locations, team profiles, modular secrets, private Git, and
-  Obsidian-style export.
+  Markdown/RDF exports.
+- [Repository-backed ontologies](REPOSITORY_ONTOLOGIES.md) is the complete
+  `geas.yaml` authoring, local discovery, trust, subscription, synchronization,
+  use, and removal workflow.
 - [Portable ontology artifacts](PORTABLE_ONTOLOGY_ARTIFACTS.md) covers
   freshness-throttled pulls, content-addressed SQLite and generated-content
   release assets, lazy hydration, and storage-rights checks.

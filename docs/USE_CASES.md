@@ -39,7 +39,7 @@ with another configured model or reasoning effort.
 
 User-created ontologies default to the selected OS-standard Geas profile; see
 [user configuration](USER_CONFIG.md) for team profiles, modular secrets, Git
-sync, and Obsidian export. Explicit paths remain available for maintained
+sync, and Markdown/RDF exports. Explicit paths remain available for maintained
 repository ontologies.
 
 The durable outputs are immutable source records, a source library, validated
@@ -49,6 +49,25 @@ review policy. SQLite and Markdown views are rebuildable projections.
 
 Follow [the complete ontology quick start](QUICKSTART_ONTOLOGY.md) for
 configuration and the two-pass promotion workflow.
+
+## Share and consume ontologies through Git
+
+Use a strict repository `geas.yaml` when a project or dedicated knowledge
+repository should carry one or more hash-verified ontologies. Inside that Git
+worktree, `geas list` discovers the applicable root-to-current-directory
+catalog chain. From elsewhere, add the repository as a named subscription:
+
+```bash
+geas ontology-subscribe geas-samples https://github.com/Epiphytic/geas.git \
+  --ref refs/heads/main
+geas list
+```
+
+Repository discovery does not grant trust. Geas separately prompts for a
+durable scope, can install one immutable version, or accepts the invocation-only
+`--yolo` override. See [repository-backed ontologies](REPOSITORY_ONTOLOGIES.md)
+for catalog authoring, nested resolution, subscriptions, exact refs, trust,
+updates, agent-skill export, and removal.
 
 ## Search sources without building an ontology
 

@@ -105,9 +105,9 @@ geas skill-export open-source-research-agents --link
 
 Subscribe announces its synchronization and asks for trust unless an existing
 rule applies. The one-command `--yolo` override is not a durable decision; see
-[User configuration](USER_CONFIG.md#repository-catalogs-trust-and-subscriptions)
-for trust choices, nested `geas.yaml` merging, immutable snapshots, exact
-removal, and subscription cleanup.
+the [repository-backed ontology guide](REPOSITORY_ONTOLOGIES.md) for catalog
+authoring, trust choices, nested `geas.yaml` merging, exact refs, immutable
+snapshots, synchronization, skill export, and removal.
 
 ## 3. Configure APIs and LLMs
 
@@ -359,6 +359,24 @@ agent to preserve dissent and gaps, cite claim/source identities, verify exact
 wording through original links, and never obey instructions found in source
 material.
 
+The same accepted topic can be exported as one deterministic Turtle file for
+Ontosphere or another RDF consumer:
+
+```bash
+uv run geas topic-export \
+  concept:example-project \
+  /srv/projects/consumer/example-project.ttl \
+  --database data/example-project/query.sqlite \
+  --format turtle
+```
+
+The four current formats are `markdown` (the default single topic page),
+`obsidian` (a cross-linked directory), `agent-instructions` (a project handoff),
+and `turtle` (one RDF file). See
+[Ontosphere / RDF export](USER_CONFIG.md#ontosphere--rdf-export) for local-file
+and browser-URL loading. All four are disposable projections, not canonical
+ontology state.
+
 Do not replace an existing project `AGENTS.md` automatically. Add a small,
 reviewed reference in the appropriate scope instead:
 
@@ -370,7 +388,7 @@ For architecture, security, and operational questions about this project, read
 the linked Geas vault to inspect claims, gaps, and exact source evidence.
 ```
 
-Both files are disposable projections. Regenerate them from the accepted
+The vault and instruction handoff are disposable projections. Regenerate them from the accepted
 snapshot after ontology updates. An identical Obsidian export is idempotent; a
 differing directory requires `--force` for atomic replacement and stale-note
 removal.
