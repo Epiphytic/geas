@@ -30,8 +30,11 @@ The project and its installed CLI are both named Geas; invoke the CLI as
 Repository-local ontologies may instead be selected from strict `geas.yaml`
 catalogs. These catalogs are discovered from the Git root through the current
 directory, merged cumulatively, and trusted separately from their integrity
-checks. The maintained sample subscription and the four-choice trust flow are
-documented in [User configuration](USER_CONFIG.md#repository-catalogs-trust-and-subscriptions).
+checks. Use `geas list` inside the repository, or
+`geas ontology-subscribe NAME URL --ref REF` to maintain a named checkout that
+works from any directory. The catalog format, maintained sample, four-choice
+trust flow, synchronization, and removal lifecycle are documented in
+[Repository-backed ontologies](REPOSITORY_ONTOLOGIES.md).
 `--yolo` is a one-invocation override only; it never persists trust or relaxes
 catalog hashes and path confinement.
 

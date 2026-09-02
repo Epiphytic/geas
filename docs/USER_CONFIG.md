@@ -216,6 +216,12 @@ it never creates a secret value.
 
 ## Repository catalogs, trust, and subscriptions
 
+For the complete operator workflow—including authoring and refreshing
+`geas.yaml`, local nested discovery, all current CLI options, exact Git refs,
+skill export, synchronization, and safe removal—see
+[Repository-backed ontologies](REPOSITORY_ONTOLOGIES.md). This section defines
+how those repositories interact with the selected user profile.
+
 A Git repository may declare one or more ontologies in a strict `geas.yaml`.
 Entries name only a confined relative ontology directory and a closed, hashed
 file inventory; they cannot configure providers, credentials, policies, or
@@ -238,6 +244,11 @@ geas ontology-subscribe geas-samples https://github.com/Epiphytic/geas.git \
 geas ontology-sync geas-samples --pull
 geas list
 ```
+
+Use `--catalog path/to/geas.yaml` when the subscription catalog is below the
+repository root. The checkout remains the repository root, and Geas still
+merges every `geas.yaml` on the direct path from that root through the
+configured catalog's containing directory.
 
 Subscriptions use a credential-free HTTPS or Git SSH URL and one exact branch,
 tag, or commit ref. `ontology-sync` with no names processes all configured
@@ -309,7 +320,7 @@ uv run geas ontology-sync --pull
 Commit and push ontology-directory changes:
 
 ```bash
-uv run geas ontology-sync --push --message "geas: update routing ontology"
+uv run geas ontology-sync --pull --push
 ```
 
 Use both flags to fast-forward before pushing. Pull refuses a dirty checkout,
@@ -317,6 +328,9 @@ uses a fixed configured remote and branch, and permits only fast-forward
 integration. Push stages only the selected scope, rejects unrelated previously
 staged paths, scans file names and contents for common credential forms, then
 commits and pushes without placing credentials in the repository URL.
+Subscription pushes currently use the fixed `geas: update ontologies` commit
+message; although the parser exposes `--message`, the subscription service does
+not yet forward it.
 
 The checkout receives a conservative `.gitignore` that excludes `.env` files,
 private-key formats, credential- and secret-named paths, SQLite databases,
@@ -414,6 +428,9 @@ http://localhost:8080/?rdfUrl=http%3A%2F%2F127.0.0.1%3A8000%2Ffluoridation.ttl
 Replace `http://localhost:8080/` with the URL of the Ontosphere deployment or
 local app you are using; the `rdfUrl` value must remain an HTTP(S) URL, not a
 `file://` URL.
+
+`--vault-link` requires `--format agent-instructions`. Both `--vault-link` and
+`--force` are rejected for `--format turtle`, which writes one file.
 
 The RDF file is a disposable, generated projection of the stamped SQLite
 projection, with the same authority as the Markdown topic view. It is not
