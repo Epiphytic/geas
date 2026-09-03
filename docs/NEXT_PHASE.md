@@ -43,7 +43,7 @@ Use the first permitted route that provides the required information:
 2. Domain index such as Crossref, OpenAlex, Europe PMC, or a regulator catalog.
 3. General search API for candidate discovery.
 4. Common Crawl index and WARC records for historical or otherwise unavailable
-   public pages.
+   public pages (planned, not implemented).
 5. Lawfully accessible alternate representations, located through identifier
    resolution such as DOI plus Unpaywall.
 6. A user-deposited file or browser export obtained under the user's access.
@@ -169,9 +169,12 @@ Implement in this order:
    locations.
 5. **Unpaywall** — lawful open-access location resolution from DOI.
 6. **Europe PMC** — life-sciences metadata, references, and permitted full text.
-7. **Common Crawl** — URL discovery followed by exact WARC-record acquisition.
-8. **RSS/Atom and sitemap** — standing searches on explicitly configured sites.
-9. **General search provider** — pluggable API used only for discovery.
+7. **Common Crawl** — URL discovery followed by exact WARC-record acquisition
+   (future work).
+8. **RSS/Atom and sitemap** — standing searches on explicitly configured sites
+   (implemented for bounded trusted source intent).
+9. **General search provider** — pluggable API used only for discovery
+   (implemented for Mojeek under local capability and request policy).
 10. **User deposit** — local PDF, HTML, email export, Zotero export, or browser
     save with user-supplied provenance.
 
@@ -295,11 +298,22 @@ reported without blocking a lawful alternate copy.
 
 ### M3 — open-web and archived acquisition
 
-- Add RSS/Atom, sitemap, and Common Crawl connectors.
-- Add bounded HTTP acquisition for allowlisted sources.
-- Enforce redirect, DNS, size, type, timeout, and decompression policies.
-- Add access-constraint and retry scheduling.
-- Add a pluggable general-search API interface.
+**Status: partially implemented.** Bounded HTTPS, RSS/Atom, sitemap, official
+GitHub, deterministic HTML/JSON document parsing, and Mojeek discovery run
+through capability and policy gates with immutable resumable source work.
+
+- [x] Add RSS/Atom and sitemap connectors.
+- [ ] Add a Common Crawl connector.
+- [x] Add bounded HTTP acquisition for allowlisted sources.
+- [x] Enforce redirect, DNS, size, type, timeout, and decompression policies.
+- [x] Add access-constraint and retry scheduling.
+- [x] Add a pluggable general-search API interface.
+
+Common Crawl remains future, and browser automation remains future. Browser
+exports may still enter as explicit user deposits with their provenance and
+storage basis; Geas does not drive an authenticated browser. The automated
+forge approval policy is operator-managed, remains outside source acquisition,
+and has no authority over ontology semantics.
 
 **Acceptance:** a blocked live page can remain metadata-only or resolve to a
 specific archived snapshot without bypassing access controls, and every route

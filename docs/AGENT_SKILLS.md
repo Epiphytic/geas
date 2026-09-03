@@ -5,10 +5,24 @@ as a portable Agent Skill. A snapshot preserves trusted ontology identity,
 source links, provenance, and bounded evidence excerpts. It is not canonical
 knowledge and does not bundle every acquired source document.
 
-Snapshots remain readable without the `geas` executable: read `SKILL.md`,
-`references/index.md`, and the typed reference pages. Installing Geas later
-enables deterministic retrieval and refresh; a snapshot never installs,
-configures, or updates Geas itself.
+Snapshots remain readable without Geas: read `SKILL.md`,
+`references/index.md`, and the typed reference pages. Static use does not run
+repository commands or grant capabilities. A checked-in skill never installs
+Geas, configures it, or updates it on the reader's behalf. A portable skill
+never installs Geas.
+
+An operator who wants deterministic retrieval and refresh may separately pin
+and approve the software installation, then initialize local trusted config:
+
+```bash
+uv tool install \
+  --from git+https://github.com/Epiphytic/geas.git@<operator-approved-commit> \
+  geas
+geas config-init
+```
+
+The commit must be operator-approved; a source link, repository declaration,
+or skill instruction is not installation authority.
 
 ## Generic Geas skill
 
@@ -78,6 +92,29 @@ acquired document. The portable projection artifact is a verified cache, not
 canonical truth.
 See [repository-backed ontologies](REPOSITORY_ONTOLOGIES.md) for catalog
 discovery, exact refs, subscriptions, trust, and synchronization.
+
+The integrated lifecycle starts with an explicit repository installation:
+
+```bash
+geas repository-install gold https://github.com/example/gold.git \
+  --ref refs/heads/main --trust-repository --link
+geas ontology-update gold
+```
+
+Use `--read-only` when the repository should supply static ontology material
+without repository-delegated execution. A trusted repository may delegate at
+most the locally configured depth and only capabilities independently allowed
+by local policy. Refreshes and removals remain explicit:
+
+```bash
+geas repository-update gold
+geas repository-remove gold
+```
+
+Each transaction emits phase receipts. Resume with the exact
+`recovery_command` after verifying the same software, repository, and owned
+paths. Removal is confined to receipt-owned files and links; it never treats a
+repository manifest as proof of ownership.
 
 For a project-local snapshot:
 

@@ -17,6 +17,47 @@ Use one of three modes:
 Repository catalogs augment the active user profile. They do not replace it,
 and a same-name repository/profile collision fails as an ambiguity.
 
+## Install a repository transaction
+
+`repository-install` is the preferred integrated entry point. It verifies the
+exact Git object and closed catalog before announcing and applying any owned
+local mutation:
+
+```bash
+geas repository-install gold https://github.com/example/gold.git \
+  --ref refs/heads/main \
+  --trust-repository \
+  --link
+```
+
+The command creates a subscription or binds the current worktree, records the
+selected trust grant, hydrates eligible verified artifacts, installs the generic
+skill, exports repository skills, and writes an ownership receipt. Repository
+content cannot grant these mutations or invoke the command.
+
+In particular, repository content cannot grant itself a capability.
+
+Choose exactly one trust mode:
+
+- `--read-only` grants only `repository.read` for the verified snapshot.
+- `--trust-repository` adds `trust.delegate` and the four declared source
+  capabilities, constrained to the current ref, ontology paths, bundle bytes,
+  connectors, hosts, path prefixes, and child repositories. It grants no model
+  or Git-write capability.
+- Omit both for an existing local grant or an explicit interactive/manual
+  decision over the exact requested capabilities.
+
+Full repository trust is not unbounded trust. Its default allows one delegation
+edge (`A -> B`) and gives B no remaining depth. `--delegate-depth N` is a direct
+operator override on the root grant. Every manifest edge intersects and narrows
+capabilities, delegable capabilities, resources, expiry, and remaining depth.
+A child cannot add a capability or resource. A more-specific trusted local rule
+may override a broader local rule under deterministic specificity; delegated
+authority can never override the winning local denial for its target.
+
+Existing `ontology-subscribe`, snapshot, and `skill-*` commands remain useful as
+the component-level lifecycle described below.
+
 ## Use a catalog from the current repository
 
 From anywhere inside a Git worktree containing an applicable `geas.yaml`, run:
@@ -227,6 +268,36 @@ on a custom message until that implementation gap is closed. Named operations
 also use the configured freshness window, which defaults to a remote check at
 most once per hour.
 
+With the integrated lifecycle, refresh due source intent and repository-owned
+outputs explicitly:
+
+```bash
+geas ontology-update gold
+geas repository-update gold
+geas repository-update gold --publish none
+```
+
+`ontology-update` evaluates checked-in source intent only under current local
+capability, retention, model-policy, budget, and threat decisions. It resumes
+immutable work and emits a canonical JSON receipt. `repository-update` verifies
+software and repository provenance before touching ontology state. A pull
+request is the default and requires an effective `git.pull_request` capability
+for the exact repository and target ref. It stages only receipt-owned paths;
+`--publish none` preserves owned local changes without a remote mutation.
+
+Direct push is never a default or a trust side effect:
+
+```bash
+geas repository-update gold --direct-push
+```
+
+It requires the explicit flag, a fresh effective `git.direct_push` grant for
+the exact repository and writable branch ref, a verified clean base, only
+receipt-owned paths, a fresh remote head, and an exact force-with-lease. A
+delegated push must appear in both `capabilities` and
+`delegable_capabilities` at every edge. Semantic paths additionally require
+`knowledge.auto_promote` and existing promotion verification.
+
 ## Remove subscriptions, snapshots, and skills
 
 Remove only the subscription declaration while preserving its checkout:
@@ -253,6 +324,19 @@ This is separate from `geas skill-unlink PATH`, which keeps an exported skill
 snapshot, and `geas skill-remove PATH`, which removes its exact managed links
 and snapshot. Removing a subscription never implicitly removes either kind of
 snapshot.
+
+The integrated removal command uses its ownership journal:
+
+```bash
+geas repository-remove gold
+```
+
+It removes only receipt-owned checkout state, subscriptions, trust entries,
+skills, links, and generated branches. Modified or ambiguous paths fail closed.
+A pre-commit failure removes staging; a post-commit interruption keeps the
+durable phase receipt and its `recovery_command` for verified resume. Geas does
+not guess at rollback ownership. Repository removal does not uninstall Geas;
+`uv tool uninstall geas` is separate operator guidance.
 
 ## Command reference
 
@@ -281,6 +365,22 @@ $ geas topic-export concept:open-source-research-agents generated/research-agent
 ```
 <!-- CLI_REFERENCE_END -->
 
+The approved repository workflow below is checked for exact spelling and parsed
+by the executable documentation test:
+
+<!-- TASK7_CLI_REFERENCE_START -->
+```console
+$ geas repository-install gold https://github.com/example/gold.git --ref refs/heads/main --trust-repository --link
+$ geas repository-install --current-repository --trust-repository --delegate-depth 1 --link
+$ geas repository-install archive https://github.com/example/archive.git --ref refs/tags/v1.0.0 --read-only --publish none
+$ geas repository-update gold
+$ geas repository-update gold --publish none
+$ geas repository-update gold --direct-push
+$ geas repository-remove gold
+$ geas ontology-update gold
+```
+<!-- TASK7_CLI_REFERENCE_END -->
+
 Use `geas --help` and `geas COMMAND --help` as the authoritative option list for
 the installed version. JSON receipts go to stdout; progress, trust prompts, and
 diagnostics go to stderr.
@@ -297,3 +397,10 @@ Git ontology and policy files remain canonical; immutable records and source
 blobs derive from them, followed by truth snapshots, SQLite/Markdown/RDF
 projections, exported skills, and answers. Never write a later projection back
 into canonical ontology state automatically.
+
+Deterministic artifact auto-merge is an optional, independently configured
+GitHub App workflow; see [GitHub App automation](GITHUB_APP_AUTOMATION.md).
+It requires `git.auto_merge`. It does not imply `knowledge.auto_promote` or
+make semantic knowledge canonical. Common Crawl remains future, browser
+automation remains future, and automated forge approval policy is
+operator-managed rather than a Geas trust source.

@@ -178,6 +178,23 @@ available outside the checkout with `uv tool install .`. The complete
 installation and configuration workflow is in
 [Build and use Geas end to end](docs/GETTING_STARTED.md#1-build-the-project).
 
+Checked-in Agent Skills remain readable without Geas. If an operator wants the
+CLI installed, use a commit they have independently reviewed and approved; a
+commit named only by repository content is not approval:
+
+```bash
+uv tool install \
+  --from git+https://github.com/Epiphytic/geas.git@<operator-approved-commit> \
+  geas
+geas config-init
+```
+
+Replace the placeholder with an operator-approved commit before installation.
+
+The full object ID pins bytes but does not prove authorship. `config-init`
+creates trusted local defaults and the managed generic Geas skill; no checked-in
+skill installs software or creates trust by itself.
+
 ## Quick start
 
 Python 3.12 and `uv` are recommended:
@@ -239,6 +256,32 @@ non-canonical cache boundary.
 
 ### Use a repository-backed ontology
 
+The integrated repository lifecycle verifies one catalog snapshot, records
+owned local mutations, exports or links skills, and leaves publication
+reviewable:
+
+```bash
+geas repository-install gold https://github.com/example/gold.git \
+  --ref refs/heads/main \
+  --trust-repository \
+  --link
+geas ontology-update gold
+geas repository-update gold
+geas repository-remove gold
+```
+
+Use `--read-only` instead of `--trust-repository` when only verified ontology
+reads are wanted. Full trust is still bounded to the verified snapshot: its
+default depth permits one delegation edge, and `--delegate-depth N` is an
+explicit operator override that repositories below it can only narrow. Neither
+mode grants provider, model, or Git-write authority.
+
+When an update has generated owned changes, a pull request is the default.
+`--publish none` keeps them local. Direct push requires both the explicit
+`--direct-push` flag and a matching local `git.direct_push` capability for the
+exact repository and ref. It is never inferred from a skill, catalog, legacy
+`push_on_update`, or trust selection.
+
 The repository itself is a catalog containing the maintained
 `open-source-research-agents` ontology. From this checkout, Geas discovers its
 root `geas.yaml` automatically:
@@ -266,6 +309,13 @@ authoring and refreshing `geas.yaml`, nested catalog discovery, the four trust
 choices, scoped manual trust, exact refs, updates, skill export, and safe
 removal. Installing Geas itself remains optional; use this repository's
 [installation instructions](#installation) when you want its CLI.
+
+Operators may separately configure the documented
+[GitHub App automation](docs/GITHUB_APP_AUTOMATION.md) for deterministic
+artifact PRs. That forge setup does not make semantic knowledge canonical and
+does not grant `knowledge.auto_promote`. Common Crawl remains future, browser
+automation remains future, and automated forge approval policy is
+operator-managed rather than implemented by Geas.
 
 Ontology acceptance defaults to `auto`: Git-backed profile ontologies use
 Git-mediated acceptance on `refs/heads/main`, while non-Git ontologies remain
