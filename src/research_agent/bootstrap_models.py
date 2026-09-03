@@ -82,6 +82,221 @@ class ManagedPath(StrictModel):
         return _relative_path(value, label="managed path")
 
 
+_BOOTSTRAP_OPERATION_KEY = (
+    r"^repository-bootstrap-(?:operation|update-operation|removal-operation):"
+    r"sha256:[0-9a-f]{64}$"
+)
+_BOOTSTRAP_NAME = r"^[A-Za-z0-9][A-Za-z0-9._-]*$"
+
+
+class BootstrapConfigMutationReceipt(StrictModel):
+    """Exact before/after identity for one scoped user-config mutation."""
+
+    version: Literal[1] = 1
+    operation_key: str = Field(pattern=_BOOTSTRAP_OPERATION_KEY)
+    profile_name: str = Field(pattern=_BOOTSTRAP_NAME)
+    bootstrap_name: str = Field(pattern=_BOOTSTRAP_NAME)
+    kind: Literal[
+        "grant_record",
+        "grant_replace",
+        "grant_remove",
+        "subscription_ensure",
+        "subscription_replace",
+        "subscription_remove",
+    ]
+    before_config_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    after_config_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class BootstrapGrantOwnershipReceipt(StrictModel):
+    """Active ownership of one exact capability-grant identity."""
+
+    version: Literal[1] = 1
+    owner_operation_key: str = Field(pattern=_BOOTSTRAP_OPERATION_KEY)
+    operation_key: str = Field(pattern=_BOOTSTRAP_OPERATION_KEY)
+    profile_name: str = Field(pattern=_BOOTSTRAP_NAME)
+    bootstrap_name: str = Field(pattern=_BOOTSTRAP_NAME)
+    grant_id: str = Field(pattern=r"^capability-grant:sha256:[0-9a-f]{64}$")
+    config_mutation: BootstrapConfigMutationReceipt
+
+    @model_validator(mode="after")
+    def mutation_matches_ownership(self) -> BootstrapGrantOwnershipReceipt:
+        mutation = self.config_mutation
+        if (
+            mutation.operation_key != self.operation_key
+            or mutation.profile_name != self.profile_name
+            or mutation.bootstrap_name != self.bootstrap_name
+            or mutation.kind not in {"grant_record", "grant_replace"}
+        ):
+            raise ValueError("grant ownership does not match its config mutation")
+        return self
+
+
+class BootstrapGrantMutationReceipt(StrictModel):
+    """Result of one stable-keyed exact grant record, replacement, or removal."""
+
+    version: Literal[1] = 1
+    operation_key: str = Field(pattern=_BOOTSTRAP_OPERATION_KEY)
+    profile_name: str = Field(pattern=_BOOTSTRAP_NAME)
+    bootstrap_name: str = Field(pattern=_BOOTSTRAP_NAME)
+    action: Literal["record", "replace", "remove"]
+    old_grant_id: str | None = Field(
+        default=None, pattern=r"^capability-grant:sha256:[0-9a-f]{64}$"
+    )
+    new_grant_id: str | None = Field(
+        default=None, pattern=r"^capability-grant:sha256:[0-9a-f]{64}$"
+    )
+    config_mutation: BootstrapConfigMutationReceipt
+    ownership: BootstrapGrantOwnershipReceipt | None = None
+
+    @model_validator(mode="after")
+    def identities_match_action(self) -> BootstrapGrantMutationReceipt:
+        mutation = self.config_mutation
+        expected_kind = f"grant_{self.action}"
+        if (
+            mutation.operation_key != self.operation_key
+            or mutation.profile_name != self.profile_name
+            or mutation.bootstrap_name != self.bootstrap_name
+            or mutation.kind != expected_kind
+        ):
+            raise ValueError("grant mutation operation does not match its config mutation")
+        if self.action == "record":
+            valid_identity = self.old_grant_id is None and self.new_grant_id is not None
+        elif self.action == "replace":
+            valid_identity = self.old_grant_id is not None
+        else:
+            valid_identity = self.old_grant_id is not None and self.new_grant_id is None
+        if not valid_identity:
+            raise ValueError("grant mutation identities do not match its action")
+        if self.new_grant_id is None:
+            if self.ownership is not None:
+                raise ValueError("removed grant mutation cannot retain ownership")
+        elif (
+            self.ownership is None
+            or self.ownership.operation_key != self.operation_key
+            or self.ownership.profile_name != self.profile_name
+            or self.ownership.bootstrap_name != self.bootstrap_name
+            or self.ownership.grant_id != self.new_grant_id
+            or self.ownership.config_mutation != mutation
+        ):
+            raise ValueError("grant mutation ownership does not match its operation")
+        return self
+
+
+class BootstrapSubscriptionOwnershipReceipt(StrictModel):
+    """Exact directory and config ownership for one bootstrap subscription."""
+
+    version: Literal[1] = 1
+    owner_operation_key: str = Field(pattern=_BOOTSTRAP_OPERATION_KEY)
+    operation_key: str = Field(pattern=_BOOTSTRAP_OPERATION_KEY)
+    profile_name: str = Field(pattern=_BOOTSTRAP_NAME)
+    bootstrap_name: str = Field(pattern=_BOOTSTRAP_NAME)
+    subscription_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    checkout: str
+    checkout_created: bool
+    verified_commit: str = Field(pattern=r"^[0-9a-f]{40}$")
+    checkout_device: int = Field(ge=0)
+    checkout_inode: int = Field(gt=0)
+    evidence_path: str
+    config_mutation: BootstrapConfigMutationReceipt
+
+    @field_validator("checkout", "evidence_path", mode="before")
+    @classmethod
+    def paths_are_relative(cls, value: object) -> str:
+        return _relative_path(value, label="bootstrap ownership path")
+
+    @model_validator(mode="after")
+    def mutation_and_paths_match_ownership(self) -> BootstrapSubscriptionOwnershipReceipt:
+        mutation = self.config_mutation
+        if (
+            mutation.operation_key != self.operation_key
+            or mutation.profile_name != self.profile_name
+            or mutation.bootstrap_name != self.bootstrap_name
+            or mutation.kind not in {"subscription_ensure", "subscription_replace"}
+        ):
+            raise ValueError("subscription ownership does not match its config mutation")
+        expected_checkout = f"subscriptions/{self.profile_name}/{self.bootstrap_name}"
+        if self.checkout != expected_checkout:
+            raise ValueError("bootstrap subscription must use its fixed checkout")
+        operation_digest = self.operation_key.rsplit(":", 1)[-1]
+        expected_evidence = (
+            "repository-bootstrap/subscription-ownership/"
+            f"{self.profile_name}/{self.bootstrap_name}/{operation_digest}.json"
+        )
+        if self.evidence_path != expected_evidence:
+            raise ValueError("subscription ownership evidence path does not match its operation")
+        return self
+
+
+class BootstrapSubscriptionMutationReceipt(StrictModel):
+    """Stable-keyed result for one exact bootstrap subscription mutation."""
+
+    version: Literal[1] = 1
+    operation_key: str = Field(pattern=_BOOTSTRAP_OPERATION_KEY)
+    profile_name: str = Field(pattern=_BOOTSTRAP_NAME)
+    bootstrap_name: str = Field(pattern=_BOOTSTRAP_NAME)
+    action: Literal["ensure", "replace", "remove"]
+    old_subscription_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    new_subscription_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    config_mutation: BootstrapConfigMutationReceipt
+    ownership: BootstrapSubscriptionOwnershipReceipt | None = None
+    managed_paths: tuple[ManagedPath, ...] = ()
+
+    @field_validator("managed_paths")
+    @classmethod
+    def unique_managed_paths(cls, value: tuple[ManagedPath, ...]) -> tuple[ManagedPath, ...]:
+        ordered = tuple(sorted(value, key=lambda item: item.path))
+        if len({item.path for item in ordered}) != len(ordered):
+            raise ValueError("subscription mutation paths must be unique")
+        return ordered
+
+    @model_validator(mode="after")
+    def identities_and_evidence_match_action(self) -> BootstrapSubscriptionMutationReceipt:
+        mutation = self.config_mutation
+        expected_kind = f"subscription_{self.action}"
+        if (
+            mutation.operation_key != self.operation_key
+            or mutation.profile_name != self.profile_name
+            or mutation.bootstrap_name != self.bootstrap_name
+            or mutation.kind != expected_kind
+        ):
+            raise ValueError("subscription mutation operation does not match config mutation")
+        if self.action == "ensure":
+            valid_identity = (
+                self.old_subscription_sha256 is None
+                and self.new_subscription_sha256 is not None
+            )
+        elif self.action == "replace":
+            valid_identity = (
+                self.old_subscription_sha256 is not None
+                and self.new_subscription_sha256 is not None
+            )
+        else:
+            valid_identity = (
+                self.old_subscription_sha256 is not None
+                and self.new_subscription_sha256 is None
+            )
+        if not valid_identity:
+            raise ValueError("subscription mutation identities do not match its action")
+        if self.new_subscription_sha256 is None:
+            if self.ownership is not None or self.managed_paths:
+                raise ValueError("removed subscription cannot retain ownership evidence")
+            return self
+        if (
+            self.ownership is None
+            or self.ownership.operation_key != self.operation_key
+            or self.ownership.profile_name != self.profile_name
+            or self.ownership.bootstrap_name != self.bootstrap_name
+            or self.ownership.subscription_sha256 != self.new_subscription_sha256
+            or self.ownership.config_mutation != mutation
+            or len(self.managed_paths) != 1
+            or self.managed_paths[0].path != self.ownership.evidence_path
+            or self.managed_paths[0].role != "receipt"
+        ):
+            raise ValueError("subscription mutation requires exact regular receipt evidence")
+        return self
+
+
 class RepositoryUpdateEffectReceipt(StrictModel):
     """Durable result of one stable-keyed update effect."""
 
@@ -92,6 +307,8 @@ class RepositoryUpdateEffectReceipt(StrictModel):
     )
     mutation_performed: bool
     affected_paths: tuple[ManagedPath, ...] = ()
+    grant_mutation: BootstrapGrantMutationReceipt | None = None
+    subscription_mutation: BootstrapSubscriptionMutationReceipt | None = None
 
     @field_validator("affected_paths")
     @classmethod
@@ -100,6 +317,28 @@ class RepositoryUpdateEffectReceipt(StrictModel):
         if len({item.path for item in ordered}) != len(ordered):
             raise ValueError("update effect paths must be unique")
         return ordered
+
+    @model_validator(mode="after")
+    def state_mutation_matches_effect(self) -> RepositoryUpdateEffectReceipt:
+        if self.grant_mutation is not None and (
+            self.effect is not RepositoryUpdateEffect.TRUST
+            or self.grant_mutation.operation_key != self.idempotency_key
+        ):
+            raise ValueError("grant mutation does not match its update effect")
+        if self.subscription_mutation is not None and (
+            self.effect is not RepositoryUpdateEffect.SUBSCRIPTION
+            or self.subscription_mutation.operation_key != self.idempotency_key
+            or self.subscription_mutation.managed_paths != self.affected_paths
+        ):
+            raise ValueError("subscription mutation does not match its update effect")
+        if self.effect is not RepositoryUpdateEffect.TRUST and self.grant_mutation is not None:
+            raise ValueError("only a trust effect may carry a grant mutation")
+        if (
+            self.effect is not RepositoryUpdateEffect.SUBSCRIPTION
+            and self.subscription_mutation is not None
+        ):
+            raise ValueError("only a subscription effect may carry a subscription mutation")
+        return self
 
 
 _UPDATE_PHASE_EFFECT_COUNT = {
@@ -394,6 +633,10 @@ class RepositoryBootstrapReceipt(StrictModel):
     removal_phase: RepositoryRemovalPhase | None = None
     removed: bool = False
     trust_grant: CapabilityGrant | None = None
+    grant_ownership: BootstrapGrantOwnershipReceipt | None = None
+    subscription_ownership: BootstrapSubscriptionOwnershipReceipt | None = None
+    grant_mutation: BootstrapGrantMutationReceipt | None = None
+    subscription_mutation: BootstrapSubscriptionMutationReceipt | None = None
     managed_paths: tuple[ManagedPath, ...] = ()
     created_at: datetime
     updated_at: datetime
@@ -436,6 +679,31 @@ class RepositoryBootstrapReceipt(StrictModel):
             raise ValueError("removed receipt cannot retain a pending operation")
         if self.removal_pending != (self.removal_phase is not None):
             raise ValueError("removal_pending and removal_phase must agree")
+        if self.grant_ownership is not None and (
+            self.trust_grant is None
+            or self.grant_ownership.grant_id != self.trust_grant.id
+            or self.grant_ownership.bootstrap_name != self.request.name
+        ):
+            raise ValueError("grant ownership does not match bootstrap receipt")
+        if self.subscription_ownership is not None and (
+            self.subscription_ownership.bootstrap_name != self.request.name
+            or (
+                self.verified is not None
+                and self.subscription_ownership.verified_commit
+                != self.verified.commit_sha256
+            )
+        ):
+            raise ValueError("subscription ownership does not match bootstrap receipt")
+        if self.grant_mutation is not None and (
+            self.grant_mutation.bootstrap_name != self.request.name
+            or self.grant_mutation.ownership != self.grant_ownership
+        ):
+            raise ValueError("grant mutation does not match bootstrap ownership")
+        if self.subscription_mutation is not None and (
+            self.subscription_mutation.bootstrap_name != self.request.name
+            or self.subscription_mutation.ownership != self.subscription_ownership
+        ):
+            raise ValueError("subscription mutation does not match bootstrap ownership")
         return self
 
     @field_validator("managed_paths")
@@ -466,9 +734,15 @@ class RepositoryUpdateJournal(StrictModel):
     old_request: RepositoryBootstrapRequest
     old_managed_paths: tuple[ManagedPath, ...]
     old_grant: CapabilityGrant | None = None
+    old_grant_ownership: BootstrapGrantOwnershipReceipt | None = None
+    old_subscription_ownership: BootstrapSubscriptionOwnershipReceipt | None = None
     candidate_request: RepositoryBootstrapRequest
     candidate_verified: VerifiedRepositoryBootstrap
     candidate_grant: CapabilityGrant | None = None
+    candidate_grant_ownership: BootstrapGrantOwnershipReceipt | None = None
+    candidate_subscription_ownership: BootstrapSubscriptionOwnershipReceipt | None = None
+    candidate_grant_mutation: BootstrapGrantMutationReceipt | None = None
+    candidate_subscription_mutation: BootstrapSubscriptionMutationReceipt | None = None
     candidate_managed_paths: tuple[ManagedPath, ...] = ()
     effect_receipts: tuple[RepositoryUpdateEffectReceipt, ...] = ()
     phase: RepositoryUpdatePhase
@@ -500,6 +774,32 @@ class RepositoryUpdateJournal(StrictModel):
             raise ValueError("candidate verified identity does not match candidate request")
         if self.old_request.name != self.candidate_request.name:
             raise ValueError("update journal bootstrap names must match")
+        if self.old_grant_ownership is not None and (
+            self.old_grant is None
+            or self.old_grant_ownership.grant_id != self.old_grant.id
+            or self.old_grant_ownership.bootstrap_name != self.old_request.name
+        ):
+            raise ValueError("old grant ownership does not match update journal")
+        if self.old_subscription_ownership is not None and (
+            self.old_subscription_ownership.bootstrap_name != self.old_request.name
+            or self.old_subscription_ownership.verified_commit
+            != self.old_request.commit_sha256
+        ):
+            raise ValueError("old subscription ownership does not match update journal")
+        if self.candidate_grant_ownership is not None and (
+            self.candidate_grant is None
+            or self.candidate_grant_ownership.grant_id != self.candidate_grant.id
+            or self.candidate_grant_ownership.bootstrap_name
+            != self.candidate_request.name
+        ):
+            raise ValueError("candidate grant ownership does not match update journal")
+        if self.candidate_subscription_ownership is not None and (
+            self.candidate_subscription_ownership.bootstrap_name
+            != self.candidate_request.name
+            or self.candidate_subscription_ownership.verified_commit
+            != self.candidate_verified.commit_sha256
+        ):
+            raise ValueError("candidate subscription ownership does not match update journal")
         expected_effects = tuple(RepositoryUpdateEffect)[
             : _UPDATE_PHASE_EFFECT_COUNT[self.phase]
         ]
@@ -520,6 +820,18 @@ class RepositoryUpdateJournal(StrictModel):
                     raise ValueError("trust effect cannot own managed paths")
                 if receipt.mutation_performed != (self.old_grant != self.candidate_grant):
                     raise ValueError("trust effect does not match the grant replacement")
+                if receipt.grant_mutation is not None:
+                    expected_old = None if self.old_grant is None else self.old_grant.id
+                    expected_new = (
+                        None if self.candidate_grant is None else self.candidate_grant.id
+                    )
+                    if (
+                        receipt.grant_mutation.old_grant_id != expected_old
+                        or receipt.grant_mutation.new_grant_id != expected_new
+                        or receipt.grant_mutation.ownership
+                        != self.candidate_grant_ownership
+                    ):
+                        raise ValueError("grant update mutation has the wrong identities")
             elif receipt.effect is RepositoryUpdateEffect.OBSOLETE_PATHS:
                 continue
             elif not receipt.mutation_performed:
@@ -530,6 +842,15 @@ class RepositoryUpdateJournal(StrictModel):
                     if previous is not None and previous != item:
                         raise ValueError("update effects disagree about a managed path")
                     produced[item.path] = item
+            if (
+                receipt.effect is RepositoryUpdateEffect.SUBSCRIPTION
+                and receipt.subscription_mutation is not None
+                and receipt.subscription_mutation.ownership
+                != self.candidate_subscription_ownership
+            ):
+                raise ValueError(
+                    "subscription update mutation has the wrong ownership"
+                )
         expected_paths = tuple(produced[path] for path in sorted(produced))
         if self.candidate_managed_paths != expected_paths:
             raise ValueError("candidate managed paths are not produced by update effects")
@@ -547,6 +868,26 @@ class RepositoryUpdateJournal(StrictModel):
                 raise ValueError("obsolete-path effect does not match old ownership")
             if receipt.mutation_performed != bool(obsolete):
                 raise ValueError("obsolete-path effect has an invalid mutation result")
+        if self.candidate_grant_mutation is not None and (
+            self.candidate_grant_mutation.ownership != self.candidate_grant_ownership
+            or not any(
+                receipt.grant_mutation == self.candidate_grant_mutation
+                for receipt in self.effect_receipts
+            )
+        ):
+            raise ValueError("candidate grant mutation is not recorded by an update effect")
+        if self.candidate_subscription_mutation is not None and (
+            self.candidate_subscription_mutation.ownership
+            != self.candidate_subscription_ownership
+            or not any(
+                receipt.subscription_mutation
+                == self.candidate_subscription_mutation
+                for receipt in self.effect_receipts
+            )
+        ):
+            raise ValueError(
+                "candidate subscription mutation is not recorded by an update effect"
+            )
         return self
 
 
