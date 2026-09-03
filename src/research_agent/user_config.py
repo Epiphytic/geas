@@ -95,7 +95,7 @@ class _BootstrapGrantJournal(StrictModel):
     """Private write-ahead record for one exact grant mutation."""
 
     version: Literal[1] = 1
-    phase: Literal["prepared", "completed"]
+    phase: Literal["prepared", "applied", "completed"]
     operation_key: str = Field(
         pattern=(
             r"^repository-bootstrap-(?:operation|update-operation|removal-operation):"
@@ -545,8 +545,37 @@ class UserConfigManager:
         expected_config_sha256: str,
         mutate: Callable[[GeasProfile], GeasProfile],
         upgrade_version: bool = False,
+        applied_state_path: Path | None = None,
+        applied_state: _BootstrapGrantJournal | None = None,
     ) -> BootstrapConfigMutationReceipt:
         """Lock and replace one profile only when exact config bytes still match."""
+        if (applied_state_path is None) != (applied_state is None):
+            raise ValueError("applied state path and value must be provided together")
+        if applied_state_path is not None:
+            assert applied_state is not None
+            try:
+                relative_applied_state = applied_state_path.relative_to(self.root)
+            except ValueError as error:
+                raise ValueError("applied state path escapes the config root") from error
+            if self._confined_state_path(relative_applied_state) != applied_state_path:
+                raise ValueError("applied state path is not canonical")
+            expected_action = {
+                "grant_record": "record",
+                "grant_replace": "replace",
+                "grant_remove": "remove",
+            }.get(kind)
+            if (
+                expected_action is None
+                or applied_state.phase != "applied"
+                or applied_state.operation_key != operation_key
+                or applied_state.profile_name != profile_name
+                or applied_state.bootstrap_name != bootstrap_name
+                or applied_state.action != expected_action
+                or applied_state.before_config_sha256 != expected_config_sha256
+                or applied_state_path
+                != self._grant_journal_path(profile_name, bootstrap_name, operation_key)
+            ):
+                raise ValueError("applied grant state does not match its scoped mutation")
         BootstrapConfigMutationReceipt(
             operation_key=operation_key,
             profile_name=profile_name,
@@ -556,6 +585,16 @@ class UserConfigManager:
             after_config_sha256=expected_config_sha256,
         )
         with self._config_lock():
+            if applied_state_path is not None:
+                assert applied_state is not None
+                prepared_state = applied_state.model_copy(update={"phase": "prepared"})
+                expected_prepared = (
+                    canonical_json(prepared_state.model_dump(mode="json")) + b"\n"
+                )
+                if self._load_bootstrap_state(applied_state_path) != expected_prepared:
+                    raise RuntimeError(
+                        "bootstrap grant journal changed before scoped mutation"
+                    )
             before, config = self._validated_config_bytes()
             before_sha256 = _sha256(before)
             if before_sha256 != expected_config_sha256:
@@ -568,8 +607,16 @@ class UserConfigManager:
             )
             if self.path.read_bytes() != before:
                 raise RuntimeError("Geas user config changed before atomic replacement")
+            if (
+                applied_state is not None
+                and applied_state.after_config_sha256 != _sha256(after)
+            ):
+                raise ValueError("applied grant state does not match config after-state")
             if after != before:
                 _atomic_write(self.path, after)
+            if applied_state_path is not None:
+                assert applied_state is not None
+                self._write_bootstrap_state(applied_state_path, applied_state)
             return BootstrapConfigMutationReceipt(
                 operation_key=operation_key,
                 profile_name=profile_name,
@@ -681,7 +728,13 @@ class UserConfigManager:
             self._assert_live_grant_ownership(journal.receipt, grant)
             return journal.receipt
         current_sha256 = self.config_sha256()
-        if current_sha256 == journal.before_config_sha256:
+        if journal.phase == "prepared":
+            if current_sha256 == journal.after_config_sha256:
+                raise RuntimeError(
+                    "matching grant config has no applied marker for this operation"
+                )
+            if current_sha256 != journal.before_config_sha256:
+                raise RuntimeError("Geas user config changed during bootstrap grant recovery")
 
             def append_grant(profile: GeasProfile) -> GeasProfile:
                 if any(item.id == grant.id for item in profile.capability_grants):
@@ -690,6 +743,7 @@ class UserConfigManager:
                     update={"capability_grants": (*profile.capability_grants, grant)}
                 )
 
+            applied = journal.model_copy(update={"phase": "applied"})
             mutation = self.mutate_profile_expected(
                 operation_key=journal.operation_key,
                 profile_name=journal.profile_name,
@@ -698,10 +752,15 @@ class UserConfigManager:
                 expected_config_sha256=journal.before_config_sha256,
                 mutate=append_grant,
                 upgrade_version=True,
+                applied_state_path=journal_path,
+                applied_state=applied,
             )
             if mutation.after_config_sha256 != journal.after_config_sha256:
                 raise RuntimeError("bootstrap grant config result changed during mutation")
-        elif current_sha256 == journal.after_config_sha256:
+            journal = applied
+        elif journal.phase == "applied":
+            if current_sha256 != journal.after_config_sha256:
+                raise RuntimeError("Geas user config changed after bootstrap grant application")
             mutation = BootstrapConfigMutationReceipt(
                 operation_key=journal.operation_key,
                 profile_name=journal.profile_name,
@@ -711,7 +770,7 @@ class UserConfigManager:
                 after_config_sha256=journal.after_config_sha256,
             )
         else:
-            raise RuntimeError("Geas user config changed during bootstrap grant recovery")
+            raise ValueError("bootstrap grant journal phase is invalid")
         self._assert_grant_present(journal.profile_name, grant.id)
         ownership = BootstrapGrantOwnershipReceipt(
             owner_operation_key=journal.owner_operation_key,
@@ -832,7 +891,15 @@ class UserConfigManager:
             self._assert_completed_grant_replacement(journal.receipt, new_grant)
             return journal.receipt
         current_sha256 = self.config_sha256()
-        if current_sha256 == journal.before_config_sha256:
+        if journal.phase == "prepared":
+            if current_sha256 == journal.after_config_sha256:
+                raise RuntimeError(
+                    "matching grant config has no applied marker for this operation"
+                )
+            if current_sha256 != journal.before_config_sha256:
+                raise RuntimeError(
+                    "Geas user config changed during bootstrap grant replacement"
+                )
             if self._load_grant_ownership(journal.profile_name, journal.bootstrap_name) != (
                 prior_ownership
             ):
@@ -854,6 +921,7 @@ class UserConfigManager:
                     }
                 )
 
+            applied = journal.model_copy(update={"phase": "applied"})
             mutation = self.mutate_profile_expected(
                 operation_key=journal.operation_key,
                 profile_name=journal.profile_name,
@@ -862,10 +930,17 @@ class UserConfigManager:
                 expected_config_sha256=journal.before_config_sha256,
                 mutate=replace_grant,
                 upgrade_version=True,
+                applied_state_path=journal_path,
+                applied_state=applied,
             )
             if mutation.after_config_sha256 != journal.after_config_sha256:
                 raise RuntimeError("bootstrap grant replacement config identity changed")
-        elif current_sha256 == journal.after_config_sha256:
+            journal = applied
+        elif journal.phase == "applied":
+            if current_sha256 != journal.after_config_sha256:
+                raise RuntimeError(
+                    "Geas user config changed after bootstrap grant replacement"
+                )
             mutation = BootstrapConfigMutationReceipt(
                 operation_key=journal.operation_key,
                 profile_name=journal.profile_name,
@@ -875,7 +950,7 @@ class UserConfigManager:
                 after_config_sha256=journal.after_config_sha256,
             )
         else:
-            raise RuntimeError("Geas user config changed during bootstrap grant replacement")
+            raise ValueError("bootstrap grant replacement journal phase is invalid")
         self._assert_grant_absent(journal.profile_name, old_grant.id)
         resulting_ownership: BootstrapGrantOwnershipReceipt | None = None
         if new_grant is not None:
@@ -1015,7 +1090,15 @@ class UserConfigManager:
             self._assert_grant_absent(journal.profile_name, grant.id)
             return journal.receipt
         current_sha256 = self.config_sha256()
-        if current_sha256 == journal.before_config_sha256:
+        if journal.phase == "prepared":
+            if current_sha256 == journal.after_config_sha256:
+                raise RuntimeError(
+                    "matching grant config has no applied marker for this operation"
+                )
+            if current_sha256 != journal.before_config_sha256:
+                raise RuntimeError(
+                    "Geas user config changed during bootstrap grant removal"
+                )
             if (
                 self._load_grant_ownership(
                     journal.profile_name, journal.bootstrap_name
@@ -1036,6 +1119,7 @@ class UserConfigManager:
                     }
                 )
 
+            applied = journal.model_copy(update={"phase": "applied"})
             mutation = self.mutate_profile_expected(
                 operation_key=journal.operation_key,
                 profile_name=journal.profile_name,
@@ -1044,10 +1128,17 @@ class UserConfigManager:
                 expected_config_sha256=journal.before_config_sha256,
                 mutate=remove_grant,
                 upgrade_version=True,
+                applied_state_path=journal_path,
+                applied_state=applied,
             )
             if mutation.after_config_sha256 != journal.after_config_sha256:
                 raise RuntimeError("bootstrap grant removal config identity changed")
-        elif current_sha256 == journal.after_config_sha256:
+            journal = applied
+        elif journal.phase == "applied":
+            if current_sha256 != journal.after_config_sha256:
+                raise RuntimeError(
+                    "Geas user config changed after bootstrap grant removal"
+                )
             mutation = BootstrapConfigMutationReceipt(
                 operation_key=journal.operation_key,
                 profile_name=journal.profile_name,
@@ -1057,7 +1148,7 @@ class UserConfigManager:
                 after_config_sha256=journal.after_config_sha256,
             )
         else:
-            raise RuntimeError("Geas user config changed during bootstrap grant removal")
+            raise ValueError("bootstrap grant removal journal phase is invalid")
         self._assert_grant_absent(journal.profile_name, grant.id)
         active_path = self._grant_ownership_path(journal.profile_name, journal.bootstrap_name)
         active = self._load_grant_ownership(journal.profile_name, journal.bootstrap_name)
