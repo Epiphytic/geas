@@ -12,6 +12,12 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
+from research_agent.capabilities import (
+    Capability,
+    CapabilityGrant,
+    CapabilityResources,
+    CapabilitySubject,
+)
 from research_agent.ontology_resolution import resolve_ontology_catalog
 from research_agent.ontology_trust import (
     TrustContext,
@@ -305,6 +311,82 @@ class FakePrompt:
         return ontology.name in self.selected
 
 
+def test_version_two_repository_read_grant_authorizes_without_prompt(
+    tmp_path: Path, resolved_catalog: ResolvedRepositoryCatalog
+) -> None:
+    assert resolved_catalog.repository_identity is not None
+    manager = _manager(tmp_path)
+    profile = manager.load().profiles["default"].model_copy(
+        update={
+            "trust_rules": (),
+            "capability_grants": (
+                CapabilityGrant(
+                    decision="allow",
+                    subject=CapabilitySubject(
+                        repository=resolved_catalog.repository_identity,
+                        refs="*",
+                        paths="*",
+                        bundle_sha256="*",
+                    ),
+                    capabilities=(Capability.REPOSITORY_READ,),
+                    delegable_capabilities=(),
+                    resources=CapabilityResources(),
+                    max_delegation_depth=0,
+                    expires_at=None,
+                    created_at=datetime(2026, 9, 2, tzinfo=UTC),
+                    created_via="manual",
+                ),
+            ),
+        }
+    )
+    v2 = manager.load().model_copy(
+        update={"version": 2, "profiles": {"default": profile}}
+    )
+    manager.replace(v2, upgrade_version=True)
+    prompt = FakePrompt("4")
+
+    authorized = authorize_repository_catalog(
+        resolved_catalog,
+        manager=manager,
+        profile_name="default",
+        yolo=False,
+        prompt=prompt,
+    )
+
+    assert [item.ontology.name for item in authorized] == ["alpha", "beta"]
+    assert all(item.authorization == "rule" for item in authorized)
+    assert prompt.actions == 0
+
+
+def test_version_two_choice_four_persists_capability_denial_only(
+    tmp_path: Path, resolved_catalog: ResolvedRepositoryCatalog
+) -> None:
+    manager = _manager(tmp_path)
+    current = manager.load()
+    manager.replace(
+        current.model_copy(update={"version": 2}),
+        upgrade_version=True,
+    )
+
+    authorized = authorize_repository_catalog(
+        resolved_catalog,
+        manager=manager,
+        profile_name="default",
+        yolo=False,
+        prompt=FakePrompt("4"),
+    )
+    profile = manager.load().profiles["default"]
+
+    assert authorized == ()
+    assert profile.trust_rules == ()
+    assert profile.capability_grants
+    assert all(grant.decision == "deny" for grant in profile.capability_grants)
+    assert all(
+        grant.capabilities == (Capability.REPOSITORY_READ,)
+        for grant in profile.capability_grants
+    )
+
+
 def test_interactive_choice_one_persists_repository_allow(
     tmp_path: Path, resolved_catalog: ResolvedRepositoryCatalog
 ) -> None:
@@ -564,6 +646,26 @@ def test_yolo_authorizes_only_this_process_without_prompt_or_config_write(
     assert [item.authorization for item in authorized] == ["yolo", "yolo"]
     assert prompt.actions == 0
     assert manager.path.read_bytes() == before
+
+
+def test_yolo_does_not_override_explicit_repository_read_denial(
+    tmp_path: Path, resolved_catalog: ResolvedRepositoryCatalog
+) -> None:
+    manager = _manager(tmp_path)
+    profile = manager.load().profiles["default"].model_copy(
+        update={"trust_rules": (_rule(False),)}
+    )
+    _replace_profile(manager, "default", profile)
+
+    authorized = authorize_repository_catalog(
+        resolved_catalog,
+        manager=manager,
+        profile_name="default",
+        yolo=True,
+        prompt=None,
+    )
+
+    assert authorized == ()
 
 
 def test_integrity_failure_precedes_prompt_and_configuration_write(

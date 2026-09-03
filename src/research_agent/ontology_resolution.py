@@ -13,10 +13,9 @@ from research_agent.ontology_recovery import recover_managed_removals
 from research_agent.ontology_subscriptions import OntologySubscription
 from research_agent.ontology_trust import (
     InstalledOntologySnapshot,
-    TrustContext,
     TrustPrompt,
     authorize_repository_catalog,
-    evaluate_trust,
+    evaluate_repository_read,
 )
 from research_agent.repository_catalog import (
     CatalogFile,
@@ -284,7 +283,7 @@ def _repository_candidates(
 ) -> list[OntologyCandidate]:
     authorization: dict[tuple[str, Path], str] = {}
     installed_names: set[str] = set()
-    if yolo:
+    if yolo and not manager.path.exists():
         if catalog.discovery_start is None:
             raise ValueError("repository catalog has no discovery start")
         fresh = resolve_repository_catalog(catalog.discovery_start)
@@ -294,12 +293,12 @@ def _repository_candidates(
             (ontology.name, ontology.ontology_path): "yolo"
             for ontology in catalog.ontologies
         }
-    elif prompt is not None:
+    elif yolo or prompt is not None:
         authorized = authorize_repository_catalog(
             catalog,
             manager=manager,
             profile_name=profile_name,
-            yolo=False,
+            yolo=yolo,
             prompt=prompt,
         )
         authorization = {
@@ -357,16 +356,7 @@ def _trust_status(
 ) -> tuple[Literal["trusted", "untrusted", "denied"], str | None]:
     if catalog.repository_identity is None or catalog.active_ref is None:
         raise ValueError("repository catalog has incomplete trust metadata")
-    decision = evaluate_trust(
-        TrustContext(
-            repository=catalog.repository_identity,
-            ref=catalog.active_ref,
-            path=_repository_relative_path(catalog, ontology),
-            bundle_sha256=ontology.bundle_sha256,
-            dirty=ontology.dirty,
-        ),
-        profile.trust_rules,
-    )
+    decision = evaluate_repository_read(catalog, ontology, profile)
     if not decision.matched:
         return "untrusted", None
     if decision.allowed:

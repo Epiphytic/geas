@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import ipaddress
 import re
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 from typing import Literal, Protocol
@@ -53,7 +55,7 @@ def _https_url(value: object, *, label: str) -> str:
         pass
     else:
         raise ValueError(f"{label} must name a hostname, not an IP address")
-    path = parsed.path.rstrip("/")
+    path = parsed.path.rstrip("/").removesuffix(".git")
     if not path or "/../" in f"/{path}/" or "//" in path:
         raise ValueError(f"{label} path is unsafe")
     return urlunsplit(("https", parsed.hostname.lower(), path, "", ""))
@@ -172,18 +174,20 @@ class CapabilitySubject(StrictModel):
 
 class CapabilityResources(StrictModel):
     version: Literal[1] = 1
-    delegated_repositories: tuple[str, ...] = ()
-    hosts: tuple[str, ...] = ()
+    delegated_repositories: tuple[str, ...] | Literal["*"] = ()
+    hosts: tuple[str, ...] | Literal["*"] = ()
     path_prefixes: tuple[str, ...] | Literal["*"] = ()
-    connectors: tuple[str, ...] = ()
-    providers: tuple[str, ...] = ()
-    models: tuple[str, ...] = ()
-    data_classes: tuple[str, ...] = ()
+    connectors: tuple[str, ...] | Literal["*"] = ()
+    providers: tuple[str, ...] | Literal["*"] = ()
+    models: tuple[str, ...] | Literal["*"] = ()
+    data_classes: tuple[str, ...] | Literal["*"] = ()
     git_refs: tuple[str, ...] | Literal["*"] = ()
 
     @field_validator("delegated_repositories", mode="before")
     @classmethod
-    def normalize_repositories(cls, value: object) -> tuple[str, ...]:
+    def normalize_repositories(cls, value: object) -> tuple[str, ...] | Literal["*"]:
+        if value == "*":
+            return "*"
         repositories = tuple(
             _https_url(item, label="delegated repository")
             for item in value  # type: ignore[arg-type]
@@ -192,7 +196,9 @@ class CapabilityResources(StrictModel):
 
     @field_validator("hosts", mode="before")
     @classmethod
-    def normalize_hosts(cls, value: object) -> tuple[str, ...]:
+    def normalize_hosts(cls, value: object) -> tuple[str, ...] | Literal["*"]:
+        if value == "*":
+            return "*"
         return _ordered(tuple(_host(item) for item in value), label="hosts")  # type: ignore[arg-type]
 
     @field_validator("path_prefixes", mode="before")
@@ -211,7 +217,9 @@ class CapabilityResources(StrictModel):
 
     @field_validator("connectors", "providers", "models", "data_classes", mode="before")
     @classmethod
-    def normalize_identifiers(cls, value: object) -> tuple[str, ...]:
+    def normalize_identifiers(cls, value: object) -> tuple[str, ...] | Literal["*"]:
+        if value == "*":
+            return "*"
         values = tuple(str(item) for item in value)  # type: ignore[arg-type]
         if any(not item or item.strip() != item for item in values):
             raise ValueError("resource identifiers must be non-empty normalized strings")
@@ -264,6 +272,7 @@ class CapabilityRequest(StrictModel):
     connector: str | None = None
     host: str | None = None
     target: str | None = None
+    dirty: bool = False
     requested_at: datetime
 
     @field_validator("authority_repository", "target_repository", mode="before")
@@ -313,6 +322,9 @@ class CapabilityDecision(StrictModel):
     reason: str
     evaluator_version: str
     decided_at: datetime
+    manifest_ids: tuple[str, ...] = ()
+    effective_resources: CapabilityResources = Field(default_factory=CapabilityResources)
+    effective_remaining_depth: int = Field(default=0, ge=0, le=32)
 
     @field_validator("effective_capabilities")
     @classmethod
@@ -321,7 +333,7 @@ class CapabilityDecision(StrictModel):
     ) -> tuple[Capability, ...]:
         return tuple(sorted(set(value), key=lambda item: item.value))
 
-    @field_validator("grant_ids")
+    @field_validator("grant_ids", "manifest_ids")
     @classmethod
     def normalize_grant_ids(cls, value: tuple[str, ...]) -> tuple[str, ...]:
         return _ordered(value, label="receipt identities")
@@ -360,6 +372,10 @@ class CapabilityDecision(StrictModel):
     @property
     def sha256(self) -> str:
         return self.id.rsplit(":", 1)[-1]
+
+    @property
+    def allowed(self) -> bool:
+        return self.decision == "allow"
 
 
 class DelegationEntry(StrictModel):
@@ -400,11 +416,12 @@ class DelegationManifest(StrictModel):
     def sorted_unique_subjects(
         cls, value: tuple[DelegationEntry, ...]
     ) -> tuple[DelegationEntry, ...]:
-        ordered = tuple(sorted(value, key=lambda entry: entry.subject.repository))
-        repositories = [entry.subject.repository for entry in ordered]
+        repositories = [entry.subject.repository for entry in value]
         if len(repositories) != len(set(repositories)):
             raise ValueError("delegations must have unique child repositories")
-        return ordered
+        if repositories != sorted(repositories, key=lambda item: item.encode("utf-8")):
+            raise ValueError("delegations must be in ascending repository order")
+        return value
 
     @property
     def id(self) -> str:
@@ -413,3 +430,556 @@ class DelegationManifest(StrictModel):
 
 class CapabilityEvaluator(Protocol):
     def evaluate(self, request: CapabilityRequest) -> CapabilityDecision: ...
+
+
+def _subject_matches(
+    subject: CapabilitySubject,
+    request: CapabilityRequest,
+    *,
+    repository: str,
+    decision: Literal["allow", "deny"] = "allow",
+) -> bool:
+    if subject.repository != repository:
+        return False
+    if subject.refs != "*" and request.ref not in subject.refs:
+        return False
+    if subject.paths != "*" and request.path not in subject.paths:
+        return False
+    if (
+        subject.bundle_sha256 != "*"
+        and (
+            request.bundle_sha256 is None
+            or request.bundle_sha256 not in subject.bundle_sha256
+        )
+    ):
+        return False
+    return not (
+        request.dirty
+        and decision == "allow"
+        and subject.refs != "*"
+        and subject.paths == "*"
+        and subject.bundle_sha256 == "*"
+    )
+
+
+def _subject_specificity(subject: CapabilitySubject) -> int:
+    return (
+        (0 if subject.bundle_sha256 == "*" else 4)
+        + (0 if subject.paths == "*" else 2)
+        + (0 if subject.refs == "*" else 1)
+    )
+
+
+def _resource_specificity(resources: CapabilityResources) -> tuple[int, int]:
+    values: tuple[tuple[str, ...] | Literal["*"], ...] = (
+        resources.delegated_repositories,
+        resources.hosts,
+        resources.path_prefixes,
+        resources.connectors,
+        resources.providers,
+        resources.models,
+        resources.data_classes,
+        resources.git_refs,
+    )
+    constrained = sum(value != "*" and bool(value) for value in values)
+    cardinality = sum(len(value) for value in values if value != "*")
+    return constrained, -cardinality
+
+
+def _bounded_values(
+    child: tuple[str, ...] | Literal["*"],
+    parent: tuple[str, ...] | Literal["*"],
+    *,
+    prefixes: bool = False,
+) -> bool:
+    if parent == "*":
+        return True
+    if child == "*":
+        return False
+    if not prefixes:
+        return set(child).issubset(parent)
+    return all(any(item.startswith(bound) for bound in parent) for item in child)
+
+
+def _resources_narrow(
+    child: CapabilityResources,
+    parent: CapabilityResources,
+) -> bool:
+    fields = (
+        (child.delegated_repositories, parent.delegated_repositories, False),
+        (child.hosts, parent.hosts, False),
+        (child.path_prefixes, parent.path_prefixes, True),
+        (child.connectors, parent.connectors, False),
+        (child.providers, parent.providers, False),
+        (child.models, parent.models, False),
+        (child.data_classes, parent.data_classes, False),
+        (child.git_refs, parent.git_refs, False),
+    )
+    return all(
+        _bounded_values(child_value, parent_value, prefixes=prefixes)
+        for child_value, parent_value, prefixes in fields
+    )
+
+
+def _intersect_values(
+    left: tuple[str, ...] | Literal["*"],
+    right: tuple[str, ...] | Literal["*"],
+    *,
+    prefixes: bool = False,
+) -> tuple[str, ...] | Literal["*"]:
+    if left == "*":
+        return right
+    if right == "*":
+        return left
+    if not prefixes:
+        return tuple(sorted(set(left).intersection(right)))
+    selected: set[str] = set()
+    for first in left:
+        for second in right:
+            if first.startswith(second):
+                selected.add(first)
+            elif second.startswith(first):
+                selected.add(second)
+    return tuple(sorted(selected))
+
+
+def _selected(value: tuple[str, ...] | Literal["*"], item: str) -> bool:
+    return value == "*" or item in value
+
+
+def _resources_match(
+    resources: CapabilityResources,
+    capability: Capability,
+    request: CapabilityRequest,
+) -> bool:
+    if capability is Capability.TRUST_DELEGATE:
+        return _selected(resources.delegated_repositories, request.target_repository)
+    if capability in {
+        Capability.SOURCE_DISCOVER,
+        Capability.SOURCE_FETCH,
+        Capability.SOURCE_ARCHIVE,
+        Capability.SOURCE_EXTRACT,
+    }:
+        if request.connector is not None and not _selected(
+            resources.connectors, request.connector
+        ):
+            return False
+        if request.host is not None and not _selected(resources.hosts, request.host):
+            return False
+        if request.target is not None:
+            parsed = urlsplit(request.target)
+            path = parsed.path if parsed.scheme else request.target
+            prefixes = resources.path_prefixes
+            if prefixes != "*" and not any(path.startswith(prefix) for prefix in prefixes):
+                return False
+    if capability is Capability.MODEL_EXTERNAL and request.target is not None:
+        scopes = (resources.providers, resources.models, resources.data_classes)
+        return any(_selected(scope, request.target) for scope in scopes)
+    if capability in {
+        Capability.GIT_PULL_REQUEST,
+        Capability.GIT_AUTO_MERGE,
+        Capability.GIT_DIRECT_PUSH,
+    }:
+        return _selected(resources.git_refs, request.ref)
+    return True
+
+
+def _intersect_resources(
+    left: CapabilityResources,
+    right: CapabilityResources,
+) -> CapabilityResources:
+    return CapabilityResources(
+        delegated_repositories=_intersect_values(
+            left.delegated_repositories, right.delegated_repositories
+        ),
+        hosts=_intersect_values(left.hosts, right.hosts),
+        path_prefixes=_intersect_values(
+            left.path_prefixes, right.path_prefixes, prefixes=True
+        ),
+        connectors=_intersect_values(left.connectors, right.connectors),
+        providers=_intersect_values(left.providers, right.providers),
+        models=_intersect_values(left.models, right.models),
+        data_classes=_intersect_values(left.data_classes, right.data_classes),
+        git_refs=_intersect_values(left.git_refs, right.git_refs),
+    )
+
+
+@dataclass(frozen=True)
+class _EffectiveGrant:
+    capabilities: frozenset[Capability]
+    delegable_capabilities: frozenset[Capability]
+    resources: CapabilityResources
+    remaining_depth: int
+    grant_ids: tuple[str, ...]
+    manifest_ids: tuple[str, ...]
+    chain: tuple[str, ...]
+
+
+class DeterministicCapabilityEvaluator:
+    """Resolve trusted local grants without deriving authority from requested data."""
+
+    version = "1"
+
+    def __init__(
+        self,
+        grants: Sequence[CapabilityGrant],
+        manifests: Mapping[str, DelegationManifest],
+        *,
+        clock: Callable[[], datetime],
+        yolo: bool = False,
+    ) -> None:
+        self.grants = tuple(grants)
+        normalized_manifests: dict[str, DelegationManifest] = {}
+        for repository, manifest in manifests.items():
+            normalized = _https_url(repository, label="delegation repository")
+            if normalized in normalized_manifests:
+                raise ValueError("duplicate normalized delegation repository")
+            normalized_manifests[normalized] = manifest
+        self.manifests = normalized_manifests
+        self.clock = clock
+        self.yolo = yolo
+        self._reject_manifest_cycles()
+
+    def evaluate(self, request: CapabilityRequest) -> CapabilityDecision:
+        now = self.clock()
+        if now.tzinfo is None or now.utcoffset() is None:
+            raise ValueError("capability evaluator clock must be timezone-aware")
+        effective_states: list[_EffectiveGrant] = []
+        for capability in request.capabilities:
+            winner = self._winning_local(
+                request,
+                capability,
+                repository=request.target_repository,
+                now=now,
+            )
+            if winner is not None and winner.decision == "deny":
+                return self._decision(
+                    request,
+                    allowed=False,
+                    grants=(winner,),
+                    now=now,
+                    reason="winning target-local capability grant denies the request",
+                )
+            if winner is not None:
+                effective_states.append(self._direct_state(winner))
+                continue
+            if request.authority_repository != request.target_repository:
+                delegated = self._delegated_state(request, capability, now=now)
+                if delegated is not None:
+                    effective_states.append(delegated)
+                    continue
+            if self.yolo and capability is Capability.REPOSITORY_READ:
+                effective_states.append(
+                    _EffectiveGrant(
+                        capabilities=frozenset((Capability.REPOSITORY_READ,)),
+                        delegable_capabilities=frozenset(),
+                        resources=CapabilityResources(),
+                        remaining_depth=0,
+                        grant_ids=(),
+                        manifest_ids=(),
+                        chain=(),
+                    )
+                )
+                continue
+            return self._decision(
+                request,
+                allowed=False,
+                grants=(),
+                now=now,
+                reason="no matching local or delegated capability grant",
+            )
+        chains = {state.chain for state in effective_states if state.chain}
+        if len(chains) > 1:
+            return self._decision(
+                request,
+                allowed=False,
+                grants=(),
+                now=now,
+                reason="requested capabilities require incompatible delegation chains",
+            )
+        effective_resources = CapabilityResources(
+            delegated_repositories="*",
+            hosts="*",
+            path_prefixes="*",
+            connectors="*",
+            providers="*",
+            models="*",
+            data_classes="*",
+            git_refs="*",
+        )
+        for state in effective_states:
+            effective_resources = _intersect_resources(effective_resources, state.resources)
+        state_grant_ids = tuple(
+            sorted({identifier for state in effective_states for identifier in state.grant_ids})
+        )
+        state_manifest_ids = tuple(
+            sorted({identifier for state in effective_states for identifier in state.manifest_ids})
+        )
+        return CapabilityDecision(
+            request=request,
+            decision="allow",
+            effective_capabilities=request.capabilities,
+            grant_ids=state_grant_ids,
+            delegation_chain=min(chains) if chains else (),
+            reason=(
+                "unresolved repository.read allowed for this invocation by --yolo"
+                if not state_grant_ids
+                else "all requested capabilities have deterministic authority"
+            ),
+            evaluator_version=self.version,
+            decided_at=now,
+            manifest_ids=state_manifest_ids,
+            effective_resources=effective_resources,
+            effective_remaining_depth=min(
+                (state.remaining_depth for state in effective_states), default=0
+            ),
+        )
+
+    def _direct_state(self, grant: CapabilityGrant) -> _EffectiveGrant:
+        return _EffectiveGrant(
+            capabilities=frozenset(grant.capabilities),
+            delegable_capabilities=frozenset(grant.delegable_capabilities),
+            resources=grant.resources,
+            remaining_depth=grant.max_delegation_depth,
+            grant_ids=(grant.id,),
+            manifest_ids=(),
+            chain=(),
+        )
+
+    def _delegated_state(
+        self,
+        request: CapabilityRequest,
+        capability: Capability,
+        *,
+        now: datetime,
+    ) -> _EffectiveGrant | None:
+        root_candidates = tuple(
+            grant
+            for grant in self.grants
+            if grant.decision == "allow"
+            and (grant.expires_at is None or now < grant.expires_at)
+            and _subject_matches(
+                grant.subject,
+                request,
+                repository=request.authority_repository,
+                decision=grant.decision,
+            )
+            and capability in grant.capabilities
+            and Capability.TRUST_DELEGATE in grant.capabilities
+            and capability in grant.delegable_capabilities
+            and grant.max_delegation_depth > 0
+        )
+        origin_winner = self._winning_local(
+            request,
+            capability,
+            repository=request.authority_repository,
+            now=now,
+        )
+        delegate_winner = self._winning_local(
+            request,
+            Capability.TRUST_DELEGATE,
+            repository=request.authority_repository,
+            now=now,
+        )
+        if (
+            origin_winner is None
+            or delegate_winner is None
+            or origin_winner.decision == "deny"
+            or delegate_winner.decision == "deny"
+        ):
+            return None
+        candidates: list[_EffectiveGrant] = []
+        for grant in root_candidates:
+            state = _EffectiveGrant(
+                capabilities=frozenset(grant.capabilities),
+                delegable_capabilities=frozenset(grant.delegable_capabilities),
+                resources=grant.resources,
+                remaining_depth=grant.max_delegation_depth,
+                grant_ids=(grant.id,),
+                manifest_ids=(),
+                chain=(request.authority_repository,),
+            )
+            assert origin_winner is not None
+            assert delegate_winner is not None
+            state = self._intersect_local(state, origin_winner)
+            state = self._intersect_local(state, delegate_winner)
+            if capability in state.delegable_capabilities:
+                candidates.extend(self._walk(request, capability, state, now=now))
+        return min(candidates, key=lambda item: item.chain) if candidates else None
+
+    @staticmethod
+    def _intersect_local(
+        state: _EffectiveGrant,
+        grant: CapabilityGrant,
+    ) -> _EffectiveGrant:
+        return _EffectiveGrant(
+            capabilities=state.capabilities,
+            delegable_capabilities=state.delegable_capabilities.intersection(
+                grant.delegable_capabilities
+            ),
+            resources=_intersect_resources(state.resources, grant.resources),
+            remaining_depth=min(state.remaining_depth, grant.max_delegation_depth),
+            grant_ids=(*state.grant_ids, grant.id),
+            manifest_ids=state.manifest_ids,
+            chain=state.chain,
+        )
+
+    def _walk(
+        self,
+        request: CapabilityRequest,
+        capability: Capability,
+        state: _EffectiveGrant,
+        *,
+        now: datetime,
+    ) -> tuple[_EffectiveGrant, ...]:
+        parent = state.chain[-1]
+        manifest = self.manifests.get(parent)
+        if manifest is None or state.remaining_depth <= 0:
+            return ()
+        if Capability.TRUST_DELEGATE not in state.capabilities:
+            return ()
+        if capability not in state.delegable_capabilities:
+            return ()
+        candidates: list[_EffectiveGrant] = []
+        for entry in manifest.delegations:
+            child = entry.subject.repository
+            if child in state.chain:
+                continue
+            if not _selected(state.resources.delegated_repositories, child):
+                continue
+            if entry.expires_at is not None and now >= entry.expires_at:
+                continue
+            if not _subject_matches(entry.subject, request, repository=child):
+                continue
+            if not set(entry.capabilities).issubset(state.delegable_capabilities):
+                continue
+            if not set(entry.delegable_capabilities).issubset(state.delegable_capabilities):
+                continue
+            if not _resources_narrow(entry.resources, state.resources):
+                continue
+            next_state = _EffectiveGrant(
+                capabilities=frozenset(entry.capabilities).intersection(
+                    state.delegable_capabilities
+                ),
+                delegable_capabilities=(
+                    frozenset(entry.delegable_capabilities)
+                    .intersection(entry.capabilities)
+                    .intersection(state.delegable_capabilities)
+                ),
+                resources=_intersect_resources(state.resources, entry.resources),
+                remaining_depth=min(
+                    state.remaining_depth - 1,
+                    entry.max_delegation_depth,
+                ),
+                grant_ids=state.grant_ids,
+                manifest_ids=(*state.manifest_ids, manifest.id),
+                chain=(*state.chain, child),
+            )
+            local = self._winning_local(
+                request,
+                capability,
+                repository=child,
+                now=now,
+            )
+            if local is not None:
+                if local.decision == "deny":
+                    continue
+                next_state = self._intersect_local(next_state, local)
+            if capability not in next_state.capabilities:
+                continue
+            if child == request.target_repository:
+                candidates.append(next_state)
+            else:
+                local_delegate = self._winning_local(
+                    request,
+                    Capability.TRUST_DELEGATE,
+                    repository=child,
+                    now=now,
+                )
+                if local_delegate is not None:
+                    if local_delegate.decision == "deny":
+                        continue
+                    next_state = self._intersect_local(next_state, local_delegate)
+                if capability not in next_state.delegable_capabilities:
+                    continue
+                candidates.extend(self._walk(request, capability, next_state, now=now))
+        return tuple(candidates)
+
+    def _reject_manifest_cycles(self) -> None:
+        visiting: set[str] = set()
+        visited: set[str] = set()
+
+        def visit(repository: str) -> None:
+            if repository in visiting:
+                raise ValueError("delegation manifests contain a cycle or repeated identity")
+            if repository in visited:
+                return
+            visiting.add(repository)
+            manifest = self.manifests.get(repository)
+            if manifest is not None:
+                for entry in manifest.delegations:
+                    if entry.subject.repository in self.manifests:
+                        visit(entry.subject.repository)
+            visiting.remove(repository)
+            visited.add(repository)
+
+        for repository in sorted(self.manifests):
+            visit(repository)
+
+    def _winning_local(
+        self,
+        request: CapabilityRequest,
+        capability: Capability,
+        *,
+        repository: str,
+        now: datetime,
+    ) -> CapabilityGrant | None:
+        matching = tuple(
+            grant
+            for grant in self.grants
+            if capability in grant.capabilities
+            and (grant.expires_at is None or now < grant.expires_at)
+            and _subject_matches(
+                grant.subject,
+                request,
+                repository=repository,
+                decision=grant.decision,
+            )
+            and _resources_match(grant.resources, capability, request)
+        )
+        if not matching:
+            return None
+        return max(
+            matching,
+            key=lambda grant: (
+                _subject_specificity(grant.subject),
+                -len(grant.capabilities),
+                _resource_specificity(grant.resources),
+                grant.decision == "deny",
+                grant.id,
+            ),
+        )
+
+    def _decision(
+        self,
+        request: CapabilityRequest,
+        *,
+        allowed: bool,
+        grants: Sequence[CapabilityGrant],
+        now: datetime,
+        reason: str,
+    ) -> CapabilityDecision:
+        return CapabilityDecision(
+            request=request,
+            decision="allow" if allowed else "deny",
+            effective_capabilities=request.capabilities if allowed else (),
+            grant_ids=tuple(grant.id for grant in grants),
+            reason=reason,
+            evaluator_version=self.version,
+            decided_at=now,
+            effective_remaining_depth=(
+                min((grant.max_delegation_depth for grant in grants), default=0)
+                if allowed
+                else 0
+            ),
+        )

@@ -14,6 +14,12 @@ import yaml
 from pydantic import Field, field_validator, model_validator
 
 from research_agent.agent_skills import BuiltinSkillReceipt, install_builtin_geas_skill
+from research_agent.capabilities import (
+    Capability,
+    CapabilityGrant,
+    CapabilityResources,
+    CapabilitySubject,
+)
 from research_agent.models import StrictModel
 from research_agent.ontology_config import OntologyBuildDefaults
 from research_agent.ontology_subscriptions import (
@@ -38,6 +44,30 @@ DEFAULT_CONFIG_FILENAMES = (
     "query-vocabulary.yaml",
 )
 _PROFILE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+
+
+def _compatibility_grant(rule: TrustRule) -> CapabilityGrant:
+    """Expose legacy repository trust as read-only, non-delegable authority."""
+    return CapabilityGrant(
+        decision=rule.decision,
+        subject=CapabilitySubject(
+            repository=rule.repository,
+            refs=rule.refs,
+            paths=(
+                "*"
+                if rule.paths == "*"
+                else tuple(path.as_posix() for path in rule.paths)
+            ),
+            bundle_sha256=rule.bundle_sha256,
+        ),
+        capabilities=(Capability.REPOSITORY_READ,),
+        delegable_capabilities=(),
+        resources=CapabilityResources(),
+        max_delegation_depth=0,
+        expires_at=None,
+        created_at=rule.created_at,
+        created_via=rule.created_via,
+    )
 
 
 class ManagedDefaultFile(StrictModel):
@@ -102,6 +132,7 @@ class GeasProfile(StrictModel):
     ontology_git: OntologyGitConfig | None = None
     subscriptions: dict[str, OntologySubscription] = Field(default_factory=dict)
     trust_rules: tuple[TrustRule, ...] = ()
+    capability_grants: tuple[CapabilityGrant, ...] = ()
     installed_ontologies: tuple[InstalledOntologySnapshot, ...] = ()
 
     @field_validator("ontology_directory")
@@ -125,12 +156,31 @@ class GeasProfile(StrictModel):
         ]
         if len(selectors) != len(set(selectors)):
             raise ValueError("duplicate trust rule selectors")
+        grant_selectors = [
+            (
+                grant.subject.repository,
+                grant.subject.refs,
+                grant.subject.paths,
+                grant.subject.bundle_sha256,
+                grant.capabilities,
+                grant.delegable_capabilities,
+                grant.resources.model_dump_json(),
+            )
+            for grant in self.capability_grants
+        ]
+        if len(grant_selectors) != len(set(grant_selectors)):
+            raise ValueError("duplicate capability grant selectors")
         snapshots = [
             (snapshot.name, snapshot.bundle_sha256) for snapshot in self.installed_ontologies
         ]
         if len(snapshots) != len(set(snapshots)):
             raise ValueError("duplicate installed ontology snapshot")
         return self
+
+    def effective_capability_grants(self) -> tuple[CapabilityGrant, ...]:
+        if self.capability_grants:
+            return self.capability_grants
+        return tuple(_compatibility_grant(rule) for rule in self.trust_rules)
 
     def normalized_subscriptions(
         self,
@@ -153,7 +203,7 @@ class GeasProfile(StrictModel):
 
 
 class GeasUserConfig(StrictModel):
-    version: Literal[1] = 1
+    version: Literal[1, 2] = 1
     default_profile: str = "default"
     ontology_freshness: OntologyFreshnessConfig = Field(default_factory=OntologyFreshnessConfig)
     ontology_defaults: OntologyBuildDefaults = Field(default_factory=OntologyBuildDefaults)
@@ -175,6 +225,10 @@ class GeasUserConfig(StrictModel):
             raise ValueError(f"invalid profile names: {', '.join(invalid)}")
         checkouts: list[tuple[str, Path]] = []
         for profile_name, profile in sorted(self.profiles.items()):
+            if self.version == 1 and profile.capability_grants:
+                raise ValueError("version 1 configuration cannot contain capability_grants")
+            if self.version == 2 and profile.trust_rules:
+                raise ValueError("version 2 configuration cannot contain trust_rules")
             normalized = profile.normalized_subscriptions(freshness=self.ontology_freshness)
             for subscription_name, subscription in normalized.items():
                 validate_removal_journal_namespace(subscription.checkout)
@@ -209,10 +263,19 @@ class GeasUserConfig(StrictModel):
 
     def explicit_yaml(self) -> str:
         return yaml.safe_dump(
-            self.model_dump(mode="json", exclude_none=False),
+            self.explicit_dict(),
             sort_keys=False,
             allow_unicode=True,
         )
+
+    def explicit_dict(self) -> dict[str, object]:
+        value = self.model_dump(mode="json", exclude_none=False)
+        for profile in value["profiles"].values():  # type: ignore[union-attr]
+            if self.version == 1:
+                profile.pop("capability_grants", None)
+            else:
+                profile.pop("trust_rules", None)
+        return value
 
     def profile(self, name: str | None = None) -> tuple[str, GeasProfile]:
         selected = name or self.default_profile
@@ -247,7 +310,7 @@ class UserConfigManager:
             raw = yaml.safe_load(self.path.read_text())
             config = GeasUserConfig.model_validate(raw)
             self.validate_subscription_layout(config)
-            explicit = config.model_dump(mode="json", exclude_none=False)
+            explicit = config.explicit_dict()
             if _fill_missing(raw, explicit):
                 _atomic_write(
                     self.path,
@@ -403,9 +466,26 @@ class UserConfigManager:
         config = self.load_or_create() if create else self.load()
         return config.profile(name)
 
-    def replace(self, config: GeasUserConfig) -> None:
+    def replace(self, config: GeasUserConfig, *, upgrade_version: bool = False) -> None:
         """Atomically replace trusted user configuration with a validated value."""
         validated = GeasUserConfig.model_validate(config.model_dump(mode="python"))
+        if upgrade_version and validated.version == 1:
+            validated = GeasUserConfig.model_validate(
+                {
+                    **validated.model_dump(mode="python"),
+                    "version": 2,
+                    "profiles": {
+                        name: {
+                            **profile.model_dump(mode="python"),
+                            "trust_rules": (),
+                            "capability_grants": profile.effective_capability_grants(),
+                        }
+                        for name, profile in validated.profiles.items()
+                    },
+                }
+            )
+        elif validated.version == 2 and not upgrade_version:
+            raise ValueError("writing version 2 capability grants requires upgrade_version=True")
         self.validate_subscription_layout(validated)
         if self.path.is_symlink():
             raise ValueError("Geas user config cannot be a symbolic link")

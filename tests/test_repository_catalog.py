@@ -18,6 +18,7 @@ from research_agent.repository_catalog import (
     _workspace_ontology_path,
     discover_catalogs,
     load_catalog,
+    load_delegation_manifest,
     refresh_catalog,
     resolve_repository_catalog,
     verify_catalog,
@@ -137,6 +138,127 @@ def test_catalog_models_forbid_extra_fields_and_invalid_names() -> None:
                 ],
             }
         )
+
+
+def test_catalog_pins_and_resolves_delegation_manifest(git_repo: Path) -> None:
+    entry = _entry(git_repo)
+    manifest = (
+        b"version: 1\n"
+        b"delegations:\n"
+        b"  - subject:\n"
+        b"      repository: https://github.com/example/child\n"
+        b"      refs: '*'\n"
+        b"      paths: '*'\n"
+        b"      bundle_sha256: '*'\n"
+        b"    capabilities: [repository.read]\n"
+        b"    delegable_capabilities: []\n"
+        b"    resources: {}\n"
+        b"    max_delegation_depth: 0\n"
+        b"    expires_at: null\n"
+    )
+    (git_repo / "geas-delegations.yaml").write_bytes(manifest)
+    declaration = {
+        "path": "geas-delegations.yaml",
+        "sha256": _sha256(manifest),
+        "size_bytes": len(manifest),
+    }
+    (git_repo / "geas.yaml").write_text(
+        yaml.safe_dump(
+            {"version": 1, "ontologies": [entry], "delegations": declaration},
+            sort_keys=False,
+        )
+    )
+    _git(git_repo, "add", ".")
+    _git(git_repo, "commit", "-m", "catalog with delegation")
+
+    catalog = load_catalog(git_repo / "geas.yaml")
+    loaded = load_delegation_manifest(git_repo / "geas.yaml", catalog.delegations)
+    resolved = resolve_repository_catalog(git_repo)
+
+    assert loaded.delegations[0].subject.repository == (
+        "https://github.com/example/child"
+    )
+    assert resolved.delegation_manifest == loaded
+    assert resolved.delegation_manifest_sha256 == _sha256(manifest)
+    assert resolved.delegation_manifest_path == git_repo / "geas-delegations.yaml"
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (lambda declaration: declaration.update({"path": "other.yaml"}), "geas-delegations"),
+        (lambda declaration: declaration.update({"sha256": "0" * 64}), "sha256"),
+        (lambda declaration: declaration.update({"size_bytes": 1}), "size"),
+    ],
+)
+def test_delegation_declaration_rejects_bad_name_hash_or_size(
+    tmp_path: Path, mutation: object, message: str
+) -> None:
+    entry = _entry(tmp_path)
+    manifest = b"version: 1\ndelegations: []\n"
+    (tmp_path / "geas-delegations.yaml").write_bytes(manifest)
+    declaration = {
+        "path": "geas-delegations.yaml",
+        "sha256": _sha256(manifest),
+        "size_bytes": len(manifest),
+    }
+    mutation(declaration)  # type: ignore[operator]
+    (tmp_path / "geas.yaml").write_text(
+        yaml.safe_dump(
+            {"version": 1, "ontologies": [entry], "delegations": declaration},
+            sort_keys=False,
+        )
+    )
+
+    with pytest.raises(ValueError, match=message):
+        catalog = load_catalog(tmp_path / "geas.yaml")
+        load_delegation_manifest(tmp_path / "geas.yaml", catalog.delegations)
+
+
+def test_delegation_manifest_rejects_symlink_and_unsorted_entries(tmp_path: Path) -> None:
+    entry = _entry(tmp_path)
+    manifest = (
+        b"version: 1\n"
+        b"delegations:\n"
+        b"  - subject: {repository: https://github.com/example/z, refs: '*', "
+        b"paths: '*', bundle_sha256: '*'}\n"
+        b"    capabilities: [repository.read]\n"
+        b"    delegable_capabilities: []\n"
+        b"    resources: {}\n"
+        b"    max_delegation_depth: 0\n"
+        b"    expires_at: null\n"
+        b"  - subject: {repository: https://github.com/example/a, refs: '*', "
+        b"paths: '*', bundle_sha256: '*'}\n"
+        b"    capabilities: [repository.read]\n"
+        b"    delegable_capabilities: []\n"
+        b"    resources: {}\n"
+        b"    max_delegation_depth: 0\n"
+        b"    expires_at: null\n"
+    )
+    real = tmp_path / "real-delegations.yaml"
+    real.write_bytes(manifest)
+    linked = tmp_path / "geas-delegations.yaml"
+    linked.symlink_to(real)
+    declaration = {
+        "path": "geas-delegations.yaml",
+        "sha256": _sha256(manifest),
+        "size_bytes": len(manifest),
+    }
+    (tmp_path / "geas.yaml").write_text(
+        yaml.safe_dump(
+            {"version": 1, "ontologies": [entry], "delegations": declaration},
+            sort_keys=False,
+        )
+    )
+    catalog = load_catalog(tmp_path / "geas.yaml")
+
+    with pytest.raises(ValueError, match="symbolic link"):
+        load_delegation_manifest(tmp_path / "geas.yaml", catalog.delegations)
+
+    linked.unlink()
+    linked.write_bytes(manifest)
+    with pytest.raises(ValueError, match="ascending|sorted"):
+        load_delegation_manifest(tmp_path / "geas.yaml", catalog.delegations)
 
 
 def test_catalog_digest_is_portable_and_metadata_sensitive(tmp_path: Path) -> None:
