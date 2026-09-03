@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 from collections.abc import Callable
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Literal
 from uuid import uuid4
@@ -14,13 +15,18 @@ import yaml
 from pydantic import Field, field_validator, model_validator
 
 from research_agent.agent_skills import BuiltinSkillReceipt, install_builtin_geas_skill
+from research_agent.bootstrap_models import (
+    BootstrapConfigMutationReceipt,
+    BootstrapGrantMutationReceipt,
+    BootstrapGrantOwnershipReceipt,
+)
 from research_agent.capabilities import (
     Capability,
     CapabilityGrant,
     CapabilityResources,
     CapabilitySubject,
 )
-from research_agent.models import StrictModel
+from research_agent.models import StrictModel, canonical_json
 from research_agent.ontology_config import OntologyBuildDefaults
 from research_agent.ontology_subscriptions import (
     NormalizedProfile,
@@ -30,6 +36,11 @@ from research_agent.ontology_subscriptions import (
 from research_agent.ontology_trust import InstalledOntologySnapshot, TrustRule
 from research_agent.paths import geas_config_home
 from research_agent.removal_journal import validate_removal_journal_namespace
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
 
 DEFAULT_ONTOLOGY_REPOSITORY = "https://github.com/liamhelmer-bel/ontologies.git"
 DEFAULT_CONFIG_FILENAMES = (
@@ -78,6 +89,52 @@ class ManagedDefaultFile(StrictModel):
 class ManagedDefaultsState(StrictModel):
     version: Literal[1] = 1
     files: dict[str, ManagedDefaultFile] = Field(default_factory=dict)
+
+
+class _BootstrapGrantJournal(StrictModel):
+    """Private write-ahead record for one exact grant mutation."""
+
+    version: Literal[1] = 1
+    phase: Literal["prepared", "completed"]
+    operation_key: str = Field(
+        pattern=(
+            r"^repository-bootstrap-(?:operation|update-operation|removal-operation):"
+            r"sha256:[0-9a-f]{64}$"
+        )
+    )
+    profile_name: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+    bootstrap_name: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+    action: Literal["record", "replace", "remove"]
+    owner_operation_key: str = Field(
+        pattern=(
+            r"^repository-bootstrap-(?:operation|update-operation|removal-operation):"
+            r"sha256:[0-9a-f]{64}$"
+        )
+    )
+    old_grant_id: str | None = Field(
+        default=None, pattern=r"^capability-grant:sha256:[0-9a-f]{64}$"
+    )
+    new_grant_id: str | None = Field(
+        default=None, pattern=r"^capability-grant:sha256:[0-9a-f]{64}$"
+    )
+    before_config_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    after_config_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    receipt: BootstrapGrantMutationReceipt | None = None
+
+    @model_validator(mode="after")
+    def receipt_matches_phase(self) -> _BootstrapGrantJournal:
+        if (self.phase == "completed") != (self.receipt is not None):
+            raise ValueError("grant journal completion and receipt must agree")
+        if self.receipt is not None and (
+            self.receipt.operation_key != self.operation_key
+            or self.receipt.profile_name != self.profile_name
+            or self.receipt.bootstrap_name != self.bootstrap_name
+            or self.receipt.action != self.action
+            or self.receipt.old_grant_id != self.old_grant_id
+            or self.receipt.new_grant_id != self.new_grant_id
+        ):
+            raise ValueError("grant journal receipt does not match its intent")
+        return self
 
 
 class DefaultConfigReceipt(StrictModel):
@@ -466,6 +523,709 @@ class UserConfigManager:
         config = self.load_or_create() if create else self.load()
         return config.profile(name)
 
+    def config_sha256(self) -> str:
+        """Return the exact identity of the current validated config bytes."""
+        value, _config = self._validated_config_bytes()
+        return _sha256(value)
+
+    def mutate_profile_expected(
+        self,
+        *,
+        operation_key: str,
+        profile_name: str,
+        bootstrap_name: str,
+        kind: Literal[
+            "grant_record",
+            "grant_replace",
+            "grant_remove",
+            "subscription_ensure",
+            "subscription_replace",
+            "subscription_remove",
+        ],
+        expected_config_sha256: str,
+        mutate: Callable[[GeasProfile], GeasProfile],
+        upgrade_version: bool = False,
+    ) -> BootstrapConfigMutationReceipt:
+        """Lock and replace one profile only when exact config bytes still match."""
+        BootstrapConfigMutationReceipt(
+            operation_key=operation_key,
+            profile_name=profile_name,
+            bootstrap_name=bootstrap_name,
+            kind=kind,
+            before_config_sha256=expected_config_sha256,
+            after_config_sha256=expected_config_sha256,
+        )
+        with self._config_lock():
+            before, config = self._validated_config_bytes()
+            before_sha256 = _sha256(before)
+            if before_sha256 != expected_config_sha256:
+                raise RuntimeError("Geas user config changed before scoped mutation")
+            _updated, after = self._profile_mutation_bytes(
+                config,
+                profile_name=profile_name,
+                mutate=mutate,
+                upgrade_version=upgrade_version,
+            )
+            if self.path.read_bytes() != before:
+                raise RuntimeError("Geas user config changed before atomic replacement")
+            if after != before:
+                _atomic_write(self.path, after)
+            return BootstrapConfigMutationReceipt(
+                operation_key=operation_key,
+                profile_name=profile_name,
+                bootstrap_name=bootstrap_name,
+                kind=kind,
+                before_config_sha256=before_sha256,
+                after_config_sha256=_sha256(after),
+            )
+
+    def _profile_mutation_bytes(
+        self,
+        config: GeasUserConfig,
+        *,
+        profile_name: str,
+        mutate: Callable[[GeasProfile], GeasProfile],
+        upgrade_version: bool,
+    ) -> tuple[GeasUserConfig, bytes]:
+        writable = _upgrade_config_to_v2(config) if upgrade_version else config
+        if writable.version == 2 and not upgrade_version:
+            raise ValueError("writing version 2 capability grants requires upgrade_version=True")
+        _, profile = writable.profile(profile_name)
+        updated_profile = GeasProfile.model_validate(mutate(profile).model_dump(mode="python"))
+        updated = GeasUserConfig.model_validate(
+            writable.model_copy(
+                update={
+                    "profiles": {
+                        **writable.profiles,
+                        profile_name: updated_profile,
+                    }
+                }
+            ).model_dump(mode="python")
+        )
+        self.validate_subscription_layout(updated)
+        return updated, updated.explicit_yaml().encode()
+
+    def record_bootstrap_grant(
+        self,
+        *,
+        operation_key: str,
+        profile_name: str,
+        bootstrap_name: str,
+        grant: CapabilityGrant,
+    ) -> BootstrapGrantMutationReceipt:
+        """Record one absent grant without adopting equivalent operator state."""
+        self._validate_bootstrap_grant_selector(
+            operation_key, profile_name, bootstrap_name, "grant_record"
+        )
+        validated_grant = CapabilityGrant.model_validate(grant.model_dump(mode="python"))
+        journal_path = self._grant_journal_path(
+            profile_name, bootstrap_name, operation_key
+        )
+        journal = self._load_grant_journal(journal_path)
+        if journal is not None:
+            self._validate_grant_journal(
+                journal,
+                operation_key=operation_key,
+                profile_name=profile_name,
+                bootstrap_name=bootstrap_name,
+                action="record",
+                old_grant_id=None,
+                new_grant_id=validated_grant.id,
+            )
+            return self._resume_grant_record(journal_path, journal, validated_grant)
+
+        active = self._load_grant_ownership(profile_name, bootstrap_name)
+        if active is not None:
+            raise ValueError("bootstrap grant name is already owned by another operation")
+        before, config = self._validated_config_bytes()
+        before_sha256 = _sha256(before)
+        writable = _upgrade_config_to_v2(config)
+        _, profile = writable.profile(profile_name)
+        if any(item.id == validated_grant.id for item in profile.capability_grants):
+            raise ValueError("refusing to adopt a pre-existing capability grant")
+
+        def append_grant(current: GeasProfile) -> GeasProfile:
+            return current.model_copy(
+                update={"capability_grants": (*current.capability_grants, validated_grant)}
+            )
+
+        _updated, after = self._profile_mutation_bytes(
+            config,
+            profile_name=profile_name,
+            mutate=append_grant,
+            upgrade_version=True,
+        )
+        prepared = _BootstrapGrantJournal(
+            phase="prepared",
+            operation_key=operation_key,
+            profile_name=profile_name,
+            bootstrap_name=bootstrap_name,
+            action="record",
+            owner_operation_key=operation_key,
+            old_grant_id=None,
+            new_grant_id=validated_grant.id,
+            before_config_sha256=before_sha256,
+            after_config_sha256=_sha256(after),
+        )
+        self._write_bootstrap_state(journal_path, prepared)
+        return self._resume_grant_record(journal_path, prepared, validated_grant)
+
+    def _resume_grant_record(
+        self,
+        journal_path: Path,
+        journal: _BootstrapGrantJournal,
+        grant: CapabilityGrant,
+    ) -> BootstrapGrantMutationReceipt:
+        if journal.phase == "completed":
+            assert journal.receipt is not None
+            self._assert_live_grant_ownership(journal.receipt, grant)
+            return journal.receipt
+        current_sha256 = self.config_sha256()
+        if current_sha256 == journal.before_config_sha256:
+
+            def append_grant(profile: GeasProfile) -> GeasProfile:
+                if any(item.id == grant.id for item in profile.capability_grants):
+                    raise ValueError("refusing to adopt a pre-existing capability grant")
+                return profile.model_copy(
+                    update={"capability_grants": (*profile.capability_grants, grant)}
+                )
+
+            mutation = self.mutate_profile_expected(
+                operation_key=journal.operation_key,
+                profile_name=journal.profile_name,
+                bootstrap_name=journal.bootstrap_name,
+                kind="grant_record",
+                expected_config_sha256=journal.before_config_sha256,
+                mutate=append_grant,
+                upgrade_version=True,
+            )
+            if mutation.after_config_sha256 != journal.after_config_sha256:
+                raise RuntimeError("bootstrap grant config result changed during mutation")
+        elif current_sha256 == journal.after_config_sha256:
+            mutation = BootstrapConfigMutationReceipt(
+                operation_key=journal.operation_key,
+                profile_name=journal.profile_name,
+                bootstrap_name=journal.bootstrap_name,
+                kind="grant_record",
+                before_config_sha256=journal.before_config_sha256,
+                after_config_sha256=journal.after_config_sha256,
+            )
+        else:
+            raise RuntimeError("Geas user config changed during bootstrap grant recovery")
+        self._assert_grant_present(journal.profile_name, grant.id)
+        ownership = BootstrapGrantOwnershipReceipt(
+            owner_operation_key=journal.owner_operation_key,
+            operation_key=journal.operation_key,
+            profile_name=journal.profile_name,
+            bootstrap_name=journal.bootstrap_name,
+            grant_id=grant.id,
+            config_mutation=mutation,
+        )
+        receipt = BootstrapGrantMutationReceipt(
+            operation_key=journal.operation_key,
+            profile_name=journal.profile_name,
+            bootstrap_name=journal.bootstrap_name,
+            action="record",
+            old_grant_id=None,
+            new_grant_id=grant.id,
+            config_mutation=mutation,
+            ownership=ownership,
+        )
+        self._write_bootstrap_state(
+            self._grant_ownership_path(journal.profile_name, journal.bootstrap_name),
+            ownership,
+        )
+        self._write_bootstrap_state(
+            journal_path,
+            journal.model_copy(update={"phase": "completed", "receipt": receipt}),
+        )
+        return receipt
+
+    def replace_bootstrap_grant(
+        self,
+        *,
+        operation_key: str,
+        profile_name: str,
+        bootstrap_name: str,
+        ownership: BootstrapGrantOwnershipReceipt,
+        old_grant: CapabilityGrant,
+        new_grant: CapabilityGrant | None,
+    ) -> BootstrapGrantMutationReceipt:
+        """Atomically replace one exactly owned grant, including replacement by none."""
+        self._validate_bootstrap_grant_selector(
+            operation_key, profile_name, bootstrap_name, "grant_replace"
+        )
+        old = CapabilityGrant.model_validate(old_grant.model_dump(mode="python"))
+        new = (
+            None
+            if new_grant is None
+            else CapabilityGrant.model_validate(new_grant.model_dump(mode="python"))
+        )
+        if ownership.profile_name != profile_name or ownership.bootstrap_name != bootstrap_name:
+            raise ValueError("bootstrap grant ownership selector changed")
+        if ownership.grant_id != old.id:
+            raise ValueError("bootstrap grant ownership does not match the exact old grant")
+        journal_path = self._grant_journal_path(
+            profile_name, bootstrap_name, operation_key
+        )
+        journal = self._load_grant_journal(journal_path)
+        if journal is not None:
+            self._validate_grant_journal(
+                journal,
+                operation_key=operation_key,
+                profile_name=profile_name,
+                bootstrap_name=bootstrap_name,
+                action="replace",
+                old_grant_id=old.id,
+                new_grant_id=None if new is None else new.id,
+            )
+            if journal.owner_operation_key != ownership.owner_operation_key:
+                raise ValueError("bootstrap grant replacement owner changed")
+            return self._resume_grant_replace(journal_path, journal, ownership, old, new)
+
+        active = self._load_grant_ownership(profile_name, bootstrap_name)
+        if active != ownership:
+            raise ValueError("bootstrap grant is not owned by the expected operation")
+        self._assert_grant_present(profile_name, old.id)
+        before, config = self._validated_config_bytes()
+
+        def replace_grant(profile: GeasProfile) -> GeasProfile:
+            matches = tuple(item for item in profile.capability_grants if item.id == old.id)
+            if len(matches) != 1:
+                raise RuntimeError("exact old bootstrap grant changed before replacement")
+            retained = tuple(item for item in profile.capability_grants if item.id != old.id)
+            return profile.model_copy(
+                update={"capability_grants": retained + (() if new is None else (new,))}
+            )
+
+        _updated, after = self._profile_mutation_bytes(
+            config,
+            profile_name=profile_name,
+            mutate=replace_grant,
+            upgrade_version=True,
+        )
+        prepared = _BootstrapGrantJournal(
+            phase="prepared",
+            operation_key=operation_key,
+            profile_name=profile_name,
+            bootstrap_name=bootstrap_name,
+            action="replace",
+            owner_operation_key=ownership.owner_operation_key,
+            old_grant_id=old.id,
+            new_grant_id=None if new is None else new.id,
+            before_config_sha256=_sha256(before),
+            after_config_sha256=_sha256(after),
+        )
+        self._write_bootstrap_state(journal_path, prepared)
+        return self._resume_grant_replace(journal_path, prepared, ownership, old, new)
+
+    def _resume_grant_replace(
+        self,
+        journal_path: Path,
+        journal: _BootstrapGrantJournal,
+        prior_ownership: BootstrapGrantOwnershipReceipt,
+        old_grant: CapabilityGrant,
+        new_grant: CapabilityGrant | None,
+    ) -> BootstrapGrantMutationReceipt:
+        if journal.phase == "completed":
+            assert journal.receipt is not None
+            self._assert_completed_grant_replacement(journal.receipt, new_grant)
+            return journal.receipt
+        current_sha256 = self.config_sha256()
+        if current_sha256 == journal.before_config_sha256:
+            if self._load_grant_ownership(journal.profile_name, journal.bootstrap_name) != (
+                prior_ownership
+            ):
+                raise ValueError("bootstrap grant ownership changed before replacement")
+
+            def replace_grant(profile: GeasProfile) -> GeasProfile:
+                matches = tuple(
+                    item for item in profile.capability_grants if item.id == old_grant.id
+                )
+                if len(matches) != 1:
+                    raise RuntimeError("exact old bootstrap grant changed before replacement")
+                retained = tuple(
+                    item for item in profile.capability_grants if item.id != old_grant.id
+                )
+                return profile.model_copy(
+                    update={
+                        "capability_grants": retained
+                        + (() if new_grant is None else (new_grant,))
+                    }
+                )
+
+            mutation = self.mutate_profile_expected(
+                operation_key=journal.operation_key,
+                profile_name=journal.profile_name,
+                bootstrap_name=journal.bootstrap_name,
+                kind="grant_replace",
+                expected_config_sha256=journal.before_config_sha256,
+                mutate=replace_grant,
+                upgrade_version=True,
+            )
+            if mutation.after_config_sha256 != journal.after_config_sha256:
+                raise RuntimeError("bootstrap grant replacement config identity changed")
+        elif current_sha256 == journal.after_config_sha256:
+            mutation = BootstrapConfigMutationReceipt(
+                operation_key=journal.operation_key,
+                profile_name=journal.profile_name,
+                bootstrap_name=journal.bootstrap_name,
+                kind="grant_replace",
+                before_config_sha256=journal.before_config_sha256,
+                after_config_sha256=journal.after_config_sha256,
+            )
+        else:
+            raise RuntimeError("Geas user config changed during bootstrap grant replacement")
+        self._assert_grant_absent(journal.profile_name, old_grant.id)
+        resulting_ownership: BootstrapGrantOwnershipReceipt | None = None
+        if new_grant is not None:
+            self._assert_grant_present(journal.profile_name, new_grant.id)
+            resulting_ownership = BootstrapGrantOwnershipReceipt(
+                owner_operation_key=journal.owner_operation_key,
+                operation_key=journal.operation_key,
+                profile_name=journal.profile_name,
+                bootstrap_name=journal.bootstrap_name,
+                grant_id=new_grant.id,
+                config_mutation=mutation,
+            )
+            self._write_bootstrap_state(
+                self._grant_ownership_path(journal.profile_name, journal.bootstrap_name),
+                resulting_ownership,
+            )
+        else:
+            self._remove_exact_bootstrap_state(
+                self._grant_ownership_path(journal.profile_name, journal.bootstrap_name),
+                prior_ownership,
+            )
+        receipt = BootstrapGrantMutationReceipt(
+            operation_key=journal.operation_key,
+            profile_name=journal.profile_name,
+            bootstrap_name=journal.bootstrap_name,
+            action="replace",
+            old_grant_id=old_grant.id,
+            new_grant_id=None if new_grant is None else new_grant.id,
+            config_mutation=mutation,
+            ownership=resulting_ownership,
+        )
+        self._write_bootstrap_state(
+            journal_path,
+            journal.model_copy(update={"phase": "completed", "receipt": receipt}),
+        )
+        return receipt
+
+    def _assert_completed_grant_replacement(
+        self,
+        receipt: BootstrapGrantMutationReceipt,
+        new_grant: CapabilityGrant | None,
+    ) -> None:
+        if new_grant is None:
+            if self._load_grant_ownership(receipt.profile_name, receipt.bootstrap_name) is not None:
+                raise ValueError("removed bootstrap grant retained ownership state")
+            assert receipt.old_grant_id is not None
+            self._assert_grant_absent(receipt.profile_name, receipt.old_grant_id)
+            return
+        self._assert_live_grant_ownership(receipt, new_grant)
+
+    def remove_bootstrap_grant(
+        self,
+        *,
+        operation_key: str,
+        profile_name: str,
+        bootstrap_name: str,
+        ownership: BootstrapGrantOwnershipReceipt,
+        grant: CapabilityGrant,
+    ) -> BootstrapGrantMutationReceipt:
+        """Remove one exact owned grant and retain a stable-keyed tombstone journal."""
+        self._validate_bootstrap_grant_selector(
+            operation_key, profile_name, bootstrap_name, "grant_remove"
+        )
+        validated = CapabilityGrant.model_validate(grant.model_dump(mode="python"))
+        if (
+            ownership.profile_name != profile_name
+            or ownership.bootstrap_name != bootstrap_name
+            or ownership.grant_id != validated.id
+        ):
+            raise ValueError("bootstrap grant ownership does not match removal request")
+        journal_path = self._grant_journal_path(
+            profile_name, bootstrap_name, operation_key
+        )
+        journal = self._load_grant_journal(journal_path)
+        if journal is not None:
+            self._validate_grant_journal(
+                journal,
+                operation_key=operation_key,
+                profile_name=profile_name,
+                bootstrap_name=bootstrap_name,
+                action="remove",
+                old_grant_id=validated.id,
+                new_grant_id=None,
+            )
+            if journal.owner_operation_key != ownership.owner_operation_key:
+                raise ValueError("bootstrap grant removal owner changed")
+            return self._resume_grant_removal(journal_path, journal, ownership, validated)
+        if self._load_grant_ownership(profile_name, bootstrap_name) != ownership:
+            raise ValueError("bootstrap grant is not owned by the expected operation")
+        self._assert_grant_present(profile_name, validated.id)
+        before, config = self._validated_config_bytes()
+
+        def remove_grant(profile: GeasProfile) -> GeasProfile:
+            matches = tuple(item for item in profile.capability_grants if item.id == validated.id)
+            if len(matches) != 1:
+                raise RuntimeError("exact owned bootstrap grant changed before removal")
+            return profile.model_copy(
+                update={
+                    "capability_grants": tuple(
+                        item for item in profile.capability_grants if item.id != validated.id
+                    )
+                }
+            )
+
+        _updated, after = self._profile_mutation_bytes(
+            config,
+            profile_name=profile_name,
+            mutate=remove_grant,
+            upgrade_version=True,
+        )
+        prepared = _BootstrapGrantJournal(
+            phase="prepared",
+            operation_key=operation_key,
+            profile_name=profile_name,
+            bootstrap_name=bootstrap_name,
+            action="remove",
+            owner_operation_key=ownership.owner_operation_key,
+            old_grant_id=validated.id,
+            new_grant_id=None,
+            before_config_sha256=_sha256(before),
+            after_config_sha256=_sha256(after),
+        )
+        self._write_bootstrap_state(journal_path, prepared)
+        return self._resume_grant_removal(journal_path, prepared, ownership, validated)
+
+    def _resume_grant_removal(
+        self,
+        journal_path: Path,
+        journal: _BootstrapGrantJournal,
+        ownership: BootstrapGrantOwnershipReceipt,
+        grant: CapabilityGrant,
+    ) -> BootstrapGrantMutationReceipt:
+        if journal.phase == "completed":
+            assert journal.receipt is not None
+            if self._load_grant_ownership(journal.profile_name, journal.bootstrap_name) is not None:
+                raise ValueError("removed bootstrap grant retained ownership state")
+            self._assert_grant_absent(journal.profile_name, grant.id)
+            return journal.receipt
+        current_sha256 = self.config_sha256()
+        if current_sha256 == journal.before_config_sha256:
+            if (
+                self._load_grant_ownership(
+                    journal.profile_name, journal.bootstrap_name
+                )
+                != ownership
+            ):
+                raise ValueError("bootstrap grant ownership changed before removal")
+
+            def remove_grant(profile: GeasProfile) -> GeasProfile:
+                matches = tuple(item for item in profile.capability_grants if item.id == grant.id)
+                if len(matches) != 1:
+                    raise RuntimeError("exact owned bootstrap grant changed before removal")
+                return profile.model_copy(
+                    update={
+                        "capability_grants": tuple(
+                            item for item in profile.capability_grants if item.id != grant.id
+                        )
+                    }
+                )
+
+            mutation = self.mutate_profile_expected(
+                operation_key=journal.operation_key,
+                profile_name=journal.profile_name,
+                bootstrap_name=journal.bootstrap_name,
+                kind="grant_remove",
+                expected_config_sha256=journal.before_config_sha256,
+                mutate=remove_grant,
+                upgrade_version=True,
+            )
+            if mutation.after_config_sha256 != journal.after_config_sha256:
+                raise RuntimeError("bootstrap grant removal config identity changed")
+        elif current_sha256 == journal.after_config_sha256:
+            mutation = BootstrapConfigMutationReceipt(
+                operation_key=journal.operation_key,
+                profile_name=journal.profile_name,
+                bootstrap_name=journal.bootstrap_name,
+                kind="grant_remove",
+                before_config_sha256=journal.before_config_sha256,
+                after_config_sha256=journal.after_config_sha256,
+            )
+        else:
+            raise RuntimeError("Geas user config changed during bootstrap grant removal")
+        self._assert_grant_absent(journal.profile_name, grant.id)
+        active_path = self._grant_ownership_path(journal.profile_name, journal.bootstrap_name)
+        active = self._load_grant_ownership(journal.profile_name, journal.bootstrap_name)
+        if active is not None:
+            if active != ownership:
+                raise ValueError("bootstrap grant ownership changed before state removal")
+            self._remove_exact_bootstrap_state(active_path, ownership)
+        receipt = BootstrapGrantMutationReceipt(
+            operation_key=journal.operation_key,
+            profile_name=journal.profile_name,
+            bootstrap_name=journal.bootstrap_name,
+            action="remove",
+            old_grant_id=grant.id,
+            new_grant_id=None,
+            config_mutation=mutation,
+            ownership=None,
+        )
+        self._write_bootstrap_state(
+            journal_path,
+            journal.model_copy(update={"phase": "completed", "receipt": receipt}),
+        )
+        return receipt
+
+    def _assert_grant_absent(self, profile_name: str, grant_id: str) -> None:
+        config = self.load()
+        _, profile = config.profile(profile_name)
+        if any(item.id == grant_id for item in profile.capability_grants):
+            raise RuntimeError("removed bootstrap grant is still present")
+
+    def _assert_grant_present(self, profile_name: str, grant_id: str) -> None:
+        config = self.load()
+        _, profile = config.profile(profile_name)
+        matches = tuple(item for item in profile.capability_grants if item.id == grant_id)
+        if len(matches) != 1:
+            raise RuntimeError("owned bootstrap grant is missing or ambiguous")
+
+    def _assert_live_grant_ownership(
+        self,
+        receipt: BootstrapGrantMutationReceipt,
+        grant: CapabilityGrant,
+    ) -> None:
+        if receipt.ownership is None or receipt.new_grant_id != grant.id:
+            raise ValueError("bootstrap grant receipt does not match the requested grant")
+        active = self._load_grant_ownership(receipt.profile_name, receipt.bootstrap_name)
+        if active != receipt.ownership:
+            raise ValueError("bootstrap grant ownership state changed")
+        self._assert_grant_present(receipt.profile_name, grant.id)
+
+    def _grant_journal_path(
+        self, profile_name: str, bootstrap_name: str, operation_key: str
+    ) -> Path:
+        digest = operation_key.rsplit(":", 1)[-1]
+        relative = (
+            Path("repository-bootstrap")
+            / "grant-mutations"
+            / profile_name
+            / bootstrap_name
+            / f"{digest}.json"
+        )
+        return self._confined_state_path(relative)
+
+    @staticmethod
+    def _validate_bootstrap_grant_selector(
+        operation_key: str,
+        profile_name: str,
+        bootstrap_name: str,
+        kind: Literal["grant_record", "grant_replace", "grant_remove"],
+    ) -> None:
+        BootstrapConfigMutationReceipt(
+            operation_key=operation_key,
+            profile_name=profile_name,
+            bootstrap_name=bootstrap_name,
+            kind=kind,
+            before_config_sha256="0" * 64,
+            after_config_sha256="0" * 64,
+        )
+
+    def _grant_ownership_path(self, profile_name: str, bootstrap_name: str) -> Path:
+        return self._confined_state_path(
+            Path("repository-bootstrap")
+            / "grant-ownership"
+            / profile_name
+            / f"{bootstrap_name}.json"
+        )
+
+    def _load_grant_journal(self, path: Path) -> _BootstrapGrantJournal | None:
+        value = self._load_bootstrap_state(path)
+        if value is None:
+            return None
+        try:
+            return _BootstrapGrantJournal.model_validate_json(value)
+        except ValueError as error:
+            raise ValueError("bootstrap grant mutation journal is invalid") from error
+
+    def _load_grant_ownership(
+        self, profile_name: str, bootstrap_name: str
+    ) -> BootstrapGrantOwnershipReceipt | None:
+        value = self._load_bootstrap_state(
+            self._grant_ownership_path(profile_name, bootstrap_name)
+        )
+        if value is None:
+            return None
+        try:
+            return BootstrapGrantOwnershipReceipt.model_validate_json(value)
+        except ValueError as error:
+            raise ValueError("bootstrap grant ownership state is invalid") from error
+
+    @staticmethod
+    def _validate_grant_journal(
+        journal: _BootstrapGrantJournal,
+        *,
+        operation_key: str,
+        profile_name: str,
+        bootstrap_name: str,
+        action: Literal["record", "replace", "remove"],
+        old_grant_id: str | None,
+        new_grant_id: str | None,
+    ) -> None:
+        if (
+            journal.operation_key != operation_key
+            or journal.profile_name != profile_name
+            or journal.bootstrap_name != bootstrap_name
+            or journal.action != action
+            or journal.old_grant_id != old_grant_id
+            or journal.new_grant_id != new_grant_id
+        ):
+            raise ValueError("bootstrap grant operation conflicts with its journal")
+
+    def _confined_state_path(self, relative: Path) -> Path:
+        if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
+            raise ValueError("bootstrap state path must be normalized and relative")
+        candidate = self.root / relative
+        try:
+            candidate.relative_to(self.root)
+        except ValueError as error:
+            raise ValueError("bootstrap state path escapes the config root") from error
+        _reject_symlink_ancestry(candidate.parent)
+        return candidate
+
+    @staticmethod
+    def _load_bootstrap_state(path: Path) -> bytes | None:
+        _reject_symlink_ancestry(path.parent)
+        if path.is_symlink():
+            raise ValueError("bootstrap state must be a regular file")
+        if not path.exists():
+            return None
+        if not path.is_file():
+            raise ValueError("bootstrap state must be a regular file")
+        return path.read_bytes()
+
+    @staticmethod
+    def _write_bootstrap_state(path: Path, value: StrictModel) -> None:
+        _reject_symlink_ancestry(path.parent)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _reject_symlink_ancestry(path.parent)
+        if path.is_symlink() or (path.exists() and not path.is_file()):
+            raise ValueError("bootstrap state must be a regular file")
+        _atomic_write(path, canonical_json(value.model_dump(mode="json")) + b"\n")
+
+    @staticmethod
+    def _remove_exact_bootstrap_state(path: Path, expected: StrictModel) -> None:
+        value = UserConfigManager._load_bootstrap_state(path)
+        expected_bytes = canonical_json(expected.model_dump(mode="json")) + b"\n"
+        if value != expected_bytes:
+            raise ValueError("bootstrap ownership state changed before removal")
+        path.unlink()
+        _fsync_directory(path.parent)
+
     def replace(self, config: GeasUserConfig, *, upgrade_version: bool = False) -> None:
         """Atomically replace trusted user configuration with a validated value."""
         validated = GeasUserConfig.model_validate(config.model_dump(mode="python"))
@@ -490,6 +1250,26 @@ class UserConfigManager:
         if self.path.is_symlink():
             raise ValueError("Geas user config cannot be a symbolic link")
         _atomic_write(self.path, validated.explicit_yaml().encode())
+
+    def _validated_config_bytes(self) -> tuple[bytes, GeasUserConfig]:
+        if self.path.is_symlink() or not self.path.is_file():
+            raise ValueError(f"Geas user config does not exist or is unsafe: {self.path}")
+        value = self.path.read_bytes()
+        try:
+            config = GeasUserConfig.model_validate(yaml.safe_load(value))
+        except (ValueError, yaml.YAMLError) as error:
+            raise ValueError("invalid Geas user configuration bytes") from error
+        self.validate_subscription_layout(config)
+        return value, config
+
+    @contextmanager
+    def _config_lock(self):
+        self.root.mkdir(parents=True, exist_ok=True)
+        lock_path = self.path.with_name(f".{self.path.name}.lock")
+        if lock_path.is_symlink():
+            raise ValueError("Geas user config lock cannot be a symbolic link")
+        with _exclusive_file_lock(lock_path):
+            yield
 
     def restore_bytes(self, value: bytes) -> None:
         """Atomically restore an exact previously validated configuration snapshot."""
@@ -606,6 +1386,25 @@ def _sha256(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
+def _upgrade_config_to_v2(config: GeasUserConfig) -> GeasUserConfig:
+    if config.version == 2:
+        return config
+    return GeasUserConfig.model_validate(
+        {
+            **config.model_dump(mode="python"),
+            "version": 2,
+            "profiles": {
+                name: {
+                    **profile.model_dump(mode="python"),
+                    "trust_rules": (),
+                    "capability_grants": profile.effective_capability_grants(),
+                }
+                for name, profile in config.profiles.items()
+            },
+        }
+    )
+
+
 def _fill_missing(target: object, defaults: object) -> bool:
     """Materialize only absent config defaults without changing operator values."""
     if not isinstance(target, dict) or not isinstance(defaults, dict):
@@ -624,7 +1423,49 @@ def _atomic_write(path: Path, value: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.tmp-{uuid4().hex}")
     try:
-        temporary.write_bytes(value)
+        with temporary.open("xb") as handle:
+            handle.write(value)
+            handle.flush()
+            os.fsync(handle.fileno())
         os.replace(temporary, path)
+        _fsync_directory(path.parent)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+@contextmanager
+def _exclusive_file_lock(path: Path):
+    with path.open("a+b") as lock:
+        if os.name == "nt":
+            if lock.seek(0, os.SEEK_END) == 0:
+                lock.write(b"\0")
+                lock.flush()
+            lock.seek(0)
+            msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if os.name == "nt":
+                lock.seek(0)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _reject_symlink_ancestry(path: Path) -> None:
+    absolute = Path(os.path.abspath(os.fspath(path)))
+    current = Path(absolute.anchor)
+    for part in absolute.parts[1:]:
+        current /= part
+        if current.is_symlink():
+            raise ValueError("bootstrap state must not traverse symbolic links")

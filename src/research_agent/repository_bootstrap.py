@@ -10,7 +10,11 @@ from datetime import datetime
 from pathlib import Path
 
 from research_agent.bootstrap_models import (
+    BootstrapGrantMutationReceipt,
+    BootstrapGrantOwnershipReceipt,
     BootstrapPhase,
+    BootstrapSubscriptionMutationReceipt,
+    BootstrapSubscriptionOwnershipReceipt,
     ManagedPath,
     RepositoryBootstrapReceipt,
     RepositoryBootstrapRequest,
@@ -56,6 +60,33 @@ class BootstrapOperation:
     phase: BootstrapPhase
     idempotency_key: str
     owned_paths: tuple[ManagedPath, ...] = ()
+    grant_ownership: BootstrapGrantOwnershipReceipt | None = None
+    subscription_ownership: BootstrapSubscriptionOwnershipReceipt | None = None
+
+
+def remove_obsolete_paths(root: Path, operation: BootstrapOperation) -> None:
+    """Unlink only exact confined file/link leaves named by update ownership."""
+    confined_root = Path(os.path.abspath(os.fspath(root.expanduser())))
+    verified: list[Path] = []
+    for item in operation.owned_paths:
+        candidate = _confined_owned_path(confined_root, item.path)
+        if item.role == "link":
+            if not candidate.is_symlink():
+                raise ValueError(f"managed link is missing or unsafe: {item.path}")
+            target = os.readlink(candidate)
+            target_path = Path(target)
+            if target_path.is_absolute() or ".." in target_path.parts:
+                raise ValueError(f"managed link target escapes bootstrap root: {item.path}")
+            if hashlib.sha256(target.encode()).hexdigest() != item.sha256:
+                raise ValueError(f"managed link was modified: {item.path}")
+        elif candidate.is_symlink() or not candidate.is_file():
+            raise ValueError(f"managed path is missing or unsafe: {item.path}")
+        elif hashlib.sha256(candidate.read_bytes()).hexdigest() != item.sha256:
+            raise ValueError(f"managed path was modified: {item.path}")
+        verified.append(candidate)
+    for candidate in verified:
+        candidate.unlink()
+        _fsync_directory(candidate.parent)
 
 
 def repository_trust_grant(
@@ -122,14 +153,23 @@ class RepositoryBootstrapManager:
         announce: Callable[[str], None],
         now: Callable[[], datetime] = utc_now,
         verify: Callable[[RepositoryBootstrapRequest], VerifiedRepositoryBootstrap] | None = None,
-        record_trust: Callable[[BootstrapOperation, CapabilityGrant], None] | None = None,
-        replace_trust: Callable[
-            [BootstrapOperation, CapabilityGrant | None, CapabilityGrant | None], None
+        record_trust: Callable[
+            [BootstrapOperation, CapabilityGrant], BootstrapGrantMutationReceipt | None
         ]
         | None = None,
-        subscribe: Callable[[BootstrapOperation], tuple[ManagedPath, ...]] | None = None,
+        replace_trust: Callable[
+            [BootstrapOperation, CapabilityGrant | None, CapabilityGrant | None],
+            BootstrapGrantMutationReceipt | None,
+        ]
+        | None = None,
+        subscribe: Callable[
+            [BootstrapOperation],
+            BootstrapSubscriptionMutationReceipt | tuple[ManagedPath, ...],
+        ]
+        | None = None,
         replace_subscription: Callable[
-            [BootstrapOperation, BootstrapOperation], tuple[ManagedPath, ...]
+            [BootstrapOperation, BootstrapOperation],
+            BootstrapSubscriptionMutationReceipt | tuple[ManagedPath, ...],
         ]
         | None = None,
         hydrate_artifacts: Callable[[BootstrapOperation], tuple[ManagedPath, ...]] | None = None,
@@ -138,8 +178,14 @@ class RepositoryBootstrapManager:
         export_catalog_skills: Callable[[BootstrapOperation], tuple[ManagedPath, ...]]
         | None = None,
         link_agents: Callable[[BootstrapOperation], tuple[ManagedPath, ...]] | None = None,
-        remove_trust: Callable[[BootstrapOperation, CapabilityGrant], None] | None = None,
-        unsubscribe: Callable[[BootstrapOperation], None] | None = None,
+        remove_trust: Callable[
+            [BootstrapOperation, CapabilityGrant], BootstrapGrantMutationReceipt | None
+        ]
+        | None = None,
+        unsubscribe: Callable[
+            [BootstrapOperation], BootstrapSubscriptionMutationReceipt | None
+        ]
+        | None = None,
         remove_skills: Callable[[BootstrapOperation], None] | None = None,
         remove_obsolete_paths: Callable[[BootstrapOperation], None] | None = None,
         verify_software_provenance: Callable[[], None] | None = None,
@@ -209,9 +255,16 @@ class RepositoryBootstrapManager:
                 old_request=existing.request,
                 old_managed_paths=existing.managed_paths,
                 old_grant=existing.trust_grant,
+                old_grant_ownership=existing.grant_ownership,
+                old_subscription_ownership=existing.subscription_ownership,
                 candidate_request=request,
                 candidate_verified=candidate,
                 candidate_grant=candidate_grant,
+                candidate_grant_ownership=(
+                    existing.grant_ownership
+                    if existing.trust_grant == candidate_grant
+                    else None
+                ),
                 phase=RepositoryUpdatePhase.VERIFIED,
                 created_at=now,
                 updated_at=now,
@@ -288,9 +341,29 @@ class RepositoryBootstrapManager:
             remaining = _non_skill_paths(receipt.managed_paths)
             self._assert_paths_absent(_skill_paths(receipt.managed_paths))
             self._assert_paths_exact_or_absent(remaining)
-            self.unsubscribe(
-                self._removal_operation(receipt, "subscription", owned_paths=remaining)
+            subscription_operation = self._removal_operation(
+                receipt, "subscription", owned_paths=remaining
             )
+            subscription_mutation = self.unsubscribe(subscription_operation)
+            if subscription_mutation is not None:
+                _paths, validated_mutation = self._subscription_result(
+                    subscription_operation,
+                    subscription_mutation,
+                    action="remove",
+                )
+                assert validated_mutation is not None
+                if (
+                    receipt.subscription_ownership is None
+                    or validated_mutation.old_subscription_sha256
+                    != receipt.subscription_ownership.subscription_sha256
+                ):
+                    raise ValueError("subscription removal did not bind old ownership")
+                receipt = receipt.model_copy(
+                    update={
+                        "subscription_ownership": None,
+                        "subscription_mutation": validated_mutation,
+                    }
+                )
             self._assert_paths_absent(receipt.managed_paths)
             receipt = receipt.model_copy(
                 update={
@@ -303,10 +376,27 @@ class RepositoryBootstrapManager:
             self._assert_paths_absent(receipt.managed_paths)
             if receipt.trust_grant is not None:
                 assert self.remove_trust is not None
-                self.remove_trust(
-                    self._removal_operation(receipt, "trust", owned_paths=()),
+                trust_operation = self._removal_operation(
+                    receipt, "trust", owned_paths=()
+                )
+                grant_mutation = self.remove_trust(
+                    trust_operation,
                     receipt.trust_grant,
                 )
+                if grant_mutation is not None:
+                    self._validate_grant_mutation(
+                        trust_operation,
+                        grant_mutation,
+                        action="remove",
+                        old_grant=receipt.trust_grant,
+                        new_grant=None,
+                    )
+                    receipt = receipt.model_copy(
+                        update={
+                            "grant_ownership": None,
+                            "grant_mutation": grant_mutation,
+                        }
+                    )
             receipt = receipt.model_copy(
                 update={
                     "removal_phase": RepositoryRemovalPhase.TRUST_REMOVED,
@@ -325,6 +415,8 @@ class RepositoryBootstrapManager:
                 "removed": True,
                 "managed_paths": (),
                 "trust_grant": None,
+                "grant_ownership": None,
+                "subscription_ownership": None,
                 "updated_at": self.now(),
             }
         )
@@ -344,6 +436,8 @@ class RepositoryBootstrapManager:
             phase=BootstrapPhase.SUBSCRIBED,
             step="subscription",
             owned_paths=journal.old_managed_paths,
+            grant_ownership=journal.old_grant_ownership,
+            subscription_ownership=journal.old_subscription_ownership,
         )
         candidate_operation = self._update_operation(
             journal,
@@ -351,6 +445,8 @@ class RepositoryBootstrapManager:
             verified=candidate,
             phase=BootstrapPhase.SUBSCRIBED,
             step="subscription",
+            grant_ownership=journal.candidate_grant_ownership,
+            subscription_ownership=journal.old_subscription_ownership,
         )
 
         if self._update_before(journal, RepositoryUpdatePhase.TRUST_REPLACED):
@@ -359,36 +455,81 @@ class RepositoryBootstrapManager:
                 journal = self._prepare_update(journal, RepositoryUpdatePhase.TRUST_PENDING)
                 self._assert_update_journal_files(journal)
                 assert self.replace_trust is not None
-                self.replace_trust(
-                    self._update_operation(
-                        journal,
-                        request=journal.candidate_request,
-                        verified=candidate,
-                        phase=BootstrapPhase.TRUST_COMMITTED,
-                        step="trust",
-                    ),
+                trust_operation = self._update_operation(
+                    journal,
+                    request=journal.candidate_request,
+                    verified=candidate,
+                    phase=BootstrapPhase.TRUST_COMMITTED,
+                    step="trust",
+                    grant_ownership=journal.old_grant_ownership,
+                    subscription_ownership=journal.old_subscription_ownership,
+                )
+                grant_mutation = self.replace_trust(
+                    trust_operation,
                     journal.old_grant,
                     journal.candidate_grant,
                 )
+                if grant_mutation is not None:
+                    self._validate_grant_mutation(
+                        trust_operation,
+                        grant_mutation,
+                        action="replace",
+                        old_grant=journal.old_grant,
+                        new_grant=journal.candidate_grant,
+                    )
+                    journal = journal.model_copy(
+                        update={
+                            "candidate_grant_ownership": grant_mutation.ownership,
+                            "candidate_grant_mutation": grant_mutation,
+                        }
+                    )
+            else:
+                grant_mutation = None
             journal = self._commit_update_effect(
                 journal,
                 phase=RepositoryUpdatePhase.TRUST_REPLACED,
                 effect=RepositoryUpdateEffect.TRUST,
                 affected_paths=(),
                 mutation_performed=trust_changed,
+                grant_mutation=grant_mutation,
             )
 
         if self._update_before(journal, RepositoryUpdatePhase.SUBSCRIPTION_REPLACED):
             journal = self._prepare_update(journal, RepositoryUpdatePhase.SUBSCRIPTION_PENDING)
             self._assert_update_journal_files(journal)
             assert self.replace_subscription is not None
-            produced = self.replace_subscription(old_operation, candidate_operation)
+            subscription_result = self.replace_subscription(
+                old_operation, candidate_operation
+            )
+            produced, subscription_mutation = self._subscription_result(
+                candidate_operation,
+                subscription_result,
+                action="replace",
+            )
+            if subscription_mutation is not None:
+                if (
+                    journal.old_subscription_ownership is None
+                    or subscription_mutation.old_subscription_sha256
+                    != journal.old_subscription_ownership.subscription_sha256
+                ):
+                    raise ValueError(
+                        "subscription replacement did not bind old ownership"
+                    )
+                journal = journal.model_copy(
+                    update={
+                        "candidate_subscription_ownership": (
+                            subscription_mutation.ownership
+                        ),
+                        "candidate_subscription_mutation": subscription_mutation,
+                    }
+                )
             journal = self._commit_update_effect(
                 journal,
                 phase=RepositoryUpdatePhase.SUBSCRIPTION_REPLACED,
                 effect=RepositoryUpdateEffect.SUBSCRIPTION,
                 affected_paths=produced,
                 mutation_performed=True,
+                subscription_mutation=subscription_mutation,
             )
 
         journal = self._run_update_path_step(
@@ -459,6 +600,10 @@ class RepositoryBootstrapManager:
             verified=journal.candidate_verified,
             completed_phases=_PHASES,
             trust_grant=journal.candidate_grant,
+            grant_ownership=journal.candidate_grant_ownership,
+            subscription_ownership=journal.candidate_subscription_ownership,
+            grant_mutation=journal.candidate_grant_mutation,
+            subscription_mutation=journal.candidate_subscription_mutation,
             managed_paths=journal.candidate_managed_paths,
             created_at=old_receipt.created_at,
             updated_at=self.now(),
@@ -508,6 +653,8 @@ class RepositoryBootstrapManager:
         effect: RepositoryUpdateEffect,
         affected_paths: tuple[ManagedPath, ...],
         mutation_performed: bool,
+        grant_mutation: BootstrapGrantMutationReceipt | None = None,
+        subscription_mutation: BootstrapSubscriptionMutationReceipt | None = None,
     ) -> RepositoryUpdateJournal:
         paths = {item.path: item for item in journal.candidate_managed_paths}
         if effect is not RepositoryUpdateEffect.OBSOLETE_PATHS:
@@ -526,6 +673,8 @@ class RepositoryBootstrapManager:
             ),
             mutation_performed=mutation_performed,
             affected_paths=affected_paths,
+            grant_mutation=grant_mutation,
+            subscription_mutation=subscription_mutation,
         )
         updated = journal.model_copy(
             update={
@@ -605,6 +754,9 @@ class RepositoryBootstrapManager:
                 receipt.request != journal.old_request
                 or receipt.managed_paths != journal.old_managed_paths
                 or receipt.trust_grant != journal.old_grant
+                or receipt.grant_ownership != journal.old_grant_ownership
+                or receipt.subscription_ownership
+                != journal.old_subscription_ownership
             ):
                 raise ValueError("repository update old ownership receipt changed")
             self._assert_complete_install(receipt)
@@ -626,6 +778,12 @@ class RepositoryBootstrapManager:
             receipt.request == journal.candidate_request
             and receipt.verified == journal.candidate_verified
             and receipt.trust_grant == journal.candidate_grant
+            and receipt.grant_ownership == journal.candidate_grant_ownership
+            and receipt.subscription_ownership
+            == journal.candidate_subscription_ownership
+            and receipt.grant_mutation == journal.candidate_grant_mutation
+            and receipt.subscription_mutation
+            == journal.candidate_subscription_mutation
             and receipt.managed_paths == journal.candidate_managed_paths
             and not receipt.removed
         )
@@ -648,6 +806,8 @@ class RepositoryBootstrapManager:
         phase: BootstrapPhase,
         step: str,
         owned_paths: tuple[ManagedPath, ...] = (),
+        grant_ownership: BootstrapGrantOwnershipReceipt | None = None,
+        subscription_ownership: BootstrapSubscriptionOwnershipReceipt | None = None,
     ) -> BootstrapOperation:
         if verified is None:
             raise ValueError("repository update is missing verified old ownership")
@@ -663,6 +823,8 @@ class RepositoryBootstrapManager:
             phase=phase,
             idempotency_key=key,
             owned_paths=owned_paths,
+            grant_ownership=grant_ownership,
+            subscription_ownership=subscription_ownership,
         )
 
     def _removal_operation(
@@ -687,6 +849,8 @@ class RepositoryBootstrapManager:
             phase=BootstrapPhase.COMPLETED,
             idempotency_key=key,
             owned_paths=receipt.managed_paths if owned_paths is None else owned_paths,
+            grant_ownership=receipt.grant_ownership,
+            subscription_ownership=receipt.subscription_ownership,
         )
 
     def _resume(
@@ -706,11 +870,37 @@ class RepositoryBootstrapManager:
                 )
                 if grant is not None:
                     assert self.record_trust is not None
-                    self.record_trust(operation, grant)
+                    grant_mutation = self.record_trust(operation, grant)
+                    if grant_mutation is not None:
+                        self._validate_grant_mutation(
+                            operation,
+                            grant_mutation,
+                            action="record",
+                            old_grant=None,
+                            new_grant=grant,
+                        )
+                        receipt = receipt.model_copy(
+                            update={
+                                "grant_ownership": grant_mutation.ownership,
+                                "grant_mutation": grant_mutation,
+                            }
+                        )
                 receipt = receipt.model_copy(update={"trust_grant": grant})
             elif phase is BootstrapPhase.SUBSCRIBED:
                 assert self.subscribe is not None
-                produced = self.subscribe(operation)
+                subscription_result = self.subscribe(operation)
+                produced, subscription_mutation = self._subscription_result(
+                    operation,
+                    subscription_result,
+                    action="ensure",
+                )
+                if subscription_mutation is not None:
+                    receipt = receipt.model_copy(
+                        update={
+                            "subscription_ownership": subscription_mutation.ownership,
+                            "subscription_mutation": subscription_mutation,
+                        }
+                    )
             elif phase is BootstrapPhase.SKILLS_INSTALLED:
                 assert self.hydrate_artifacts is not None and self.install_generic_skill is not None
                 assert self.export_catalog_skills is not None and self.link_agents is not None
@@ -779,7 +969,56 @@ class RepositoryBootstrapManager:
             phase=phase,
             idempotency_key=key,
             owned_paths=receipt.managed_paths,
+            grant_ownership=receipt.grant_ownership,
+            subscription_ownership=receipt.subscription_ownership,
         )
+
+    @staticmethod
+    def _validate_grant_mutation(
+        operation: BootstrapOperation,
+        mutation: BootstrapGrantMutationReceipt,
+        *,
+        action: str,
+        old_grant: CapabilityGrant | None,
+        new_grant: CapabilityGrant | None,
+    ) -> None:
+        if (
+            mutation.operation_key != operation.idempotency_key
+            or mutation.bootstrap_name != operation.request.name
+            or mutation.action != action
+            or mutation.old_grant_id
+            != (None if old_grant is None else old_grant.id)
+            or mutation.new_grant_id
+            != (None if new_grant is None else new_grant.id)
+        ):
+            raise ValueError("grant adapter returned an unbound mutation receipt")
+
+    @staticmethod
+    def _subscription_result(
+        operation: BootstrapOperation,
+        result: BootstrapSubscriptionMutationReceipt | tuple[ManagedPath, ...],
+        *,
+        action: str,
+    ) -> tuple[tuple[ManagedPath, ...], BootstrapSubscriptionMutationReceipt | None]:
+        if isinstance(result, BootstrapSubscriptionMutationReceipt):
+            if (
+                result.operation_key != operation.idempotency_key
+                or result.bootstrap_name != operation.request.name
+                or result.action != action
+                or (
+                    result.ownership is not None
+                    and result.ownership.verified_commit
+                    != operation.verified.commit_sha256
+                )
+            ):
+                raise ValueError(
+                    "subscription adapter returned an unbound mutation receipt"
+                )
+            return result.managed_paths, result
+        paths = tuple(result)
+        if any(not isinstance(item, ManagedPath) for item in paths):
+            raise TypeError("subscription adapter must return managed-path evidence")
+        return paths, None
 
     def _require_install_dependencies(self) -> None:
         required = {
