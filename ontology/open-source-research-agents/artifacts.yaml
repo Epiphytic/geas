@@ -2,16 +2,16 @@
 # Verify hashes and embedded SQLite projection stamps before use.
 version: 1
 ontology: open-source-research-agents
-published_at: '2026-09-03T12:53:39.266365Z'
+published_at: '2026-09-03T14:00:03.902329Z'
 published_by: operator:demo
 artifacts:
 - role: knowledge-projection
   format: sqlite
-  input_revision: 2740d98dc802d0c5acf9dc75576e44cdb9d4d6d91b04faf068ead0c4fcde1efe
-  content_sha256: a029c2efc81da02e8216865640b0d740e51df5d47bd67ba79898882e4c71f84f
+  input_revision: d82a7e9cfaad58f551f2af2b28152624e8d285c61ea292eae0c6be8c2b01177d
+  content_sha256: 6f86dffca41155be247dcee307726cd6af80395d888bc8f6b6adc35739bf0f3a
   size_bytes: 1495040
-  asset_name: geas-knowledge-projection-a029c2efc81da02e8216865640b0d740e51df5d47bd67ba79898882e4c71f84f.sqlite
-  release_tag: geas-artifact-a029c2efc81da02e8216865640b0d740e51df5d47bd67ba79898882e4c71f84f
+  asset_name: geas-knowledge-projection-6f86dffca41155be247dcee307726cd6af80395d888bc8f6b6adc35739bf0f3a.sqlite
+  release_tag: geas-artifact-6f86dffca41155be247dcee307726cd6af80395d888bc8f6b6adc35739bf0f3a
   contains_source_text: true
   storage_rights_basis: Offline deterministic demo projection over accepted project-authored
     source cards and accepted, license-recorded official-repository source extracts.
