@@ -885,10 +885,14 @@ class RepositoryUpdateJournal(StrictModel):
 
     @model_validator(mode="after")
     def candidate_identity_matches_request(self) -> RepositoryUpdateJournal:
-        values = ("repository", "ref", "catalog", "commit_sha256", "current_worktree")
+        values = ("repository", "ref", "catalog", "commit_sha256")
         if any(
             getattr(self.candidate_request, field) != getattr(self.candidate_verified, field)
             for field in values
+        ) or (
+            self.candidate_request.current_worktree is not None
+            and self.candidate_request.current_worktree
+            != self.candidate_verified.current_worktree
         ):
             raise ValueError("candidate verified identity does not match candidate request")
         if self.old_request.name != self.candidate_request.name:

@@ -249,17 +249,16 @@ class RepositoryBootstrapManager:
         self._announce_install(request)
         self._require_install_dependencies()
         verified = self._verified(request)
+        self._assert_verified_managed_root_target(verified)
         if self._load_update(request.name) is not None:
             raise ValueError("repository update transaction is active; resume it before install")
         existing = self._load(request.name)
-        self._assert_verified_managed_root(
-            verified,
-            require_clean=existing is None or existing.removed,
-        )
         if existing is not None and not existing.removed:
             if existing.request != request or existing.verified != verified:
                 raise ValueError("repository bootstrap name is already owned by another snapshot")
+            self._assert_install_resume_managed_root(existing, verified)
             return self._resume(existing, verified)
+        self._assert_new_install_managed_root(request, verified)
         now = self.now()
         return self._resume(
             RepositoryBootstrapReceipt(
@@ -276,12 +275,16 @@ class RepositoryBootstrapManager:
             raise ValueError("repository bootstrap dependency is missing: software provenance")
         self.verify_software_provenance()
         candidate = self._verified(request)
+        self._assert_verified_managed_root_target(candidate)
         existing = self._load(request.name)
         if existing is None or existing.removed or existing.verified is None:
             raise ValueError("unknown active repository bootstrap")
         journal = self._load_update(request.name)
-        self._assert_verified_managed_root(candidate, require_clean=journal is None)
         if journal is None:
+            if self._is_deferred_subscription(request):
+                self._assert_verified_managed_root(existing.verified, require_clean=False)
+            else:
+                self._assert_verified_managed_root(candidate, require_clean=True)
             self._assert_complete_install(existing)
             self._assert_owned_paths(existing.managed_paths)
             if existing.request == request and existing.verified == candidate:
@@ -319,8 +322,10 @@ class RepositoryBootstrapManager:
         else:
             completed = self._validate_loaded_update(existing, journal, request, candidate)
             if completed is not None:
+                self._assert_update_phase_managed_root(existing, journal)
                 self._remove_update_journal(request.name)
                 return completed
+            self._assert_update_phase_managed_root(existing, journal)
             self._assert_update_journal_files(journal)
             if (
                 self._update_before(journal, RepositoryUpdatePhase.TRUST_REPLACED)
@@ -497,6 +502,7 @@ class RepositoryBootstrapManager:
         )
 
         if self._update_before(journal, RepositoryUpdatePhase.TRUST_REPLACED):
+            self._assert_update_old_managed_root(old_receipt, journal)
             trust_changed = journal.old_grant != journal.candidate_grant
             if trust_changed:
                 journal = self._prepare_update(journal, RepositoryUpdatePhase.TRUST_PENDING)
@@ -542,6 +548,7 @@ class RepositoryBootstrapManager:
             )
 
         if self._update_before(journal, RepositoryUpdatePhase.SUBSCRIPTION_REPLACED):
+            self._assert_update_old_managed_root(old_receipt, journal)
             journal = self._prepare_update(journal, RepositoryUpdatePhase.SUBSCRIPTION_PENDING)
             self._assert_update_journal_files(journal)
             assert self.replace_subscription is not None
@@ -553,6 +560,13 @@ class RepositoryBootstrapManager:
                 subscription_result,
                 action="replace",
             )
+            if self._is_deferred_subscription(journal.candidate_request):
+                self._assert_subscription_managed_root(
+                    subscription_mutation,
+                    verified=candidate,
+                    action="replace",
+                )
+            self._assert_verified_managed_root(candidate, require_clean=True)
             if subscription_mutation is not None:
                 if (
                     journal.old_subscription_ownership is None
@@ -613,6 +627,7 @@ class RepositoryBootstrapManager:
         )
 
         if self._update_before(journal, RepositoryUpdatePhase.OBSOLETE_PATHS_REMOVED):
+            self._assert_verified_managed_root(candidate, require_clean=False)
             journal = self._prepare_update(journal, RepositoryUpdatePhase.OBSOLETE_PATHS_PENDING)
             current = {item.path for item in journal.candidate_managed_paths}
             obsolete = tuple(
@@ -641,6 +656,7 @@ class RepositoryBootstrapManager:
             )
 
         journal = self._prepare_update(journal, RepositoryUpdatePhase.FINALIZING)
+        self._assert_verified_managed_root(candidate, require_clean=False)
         self._assert_update_journal_files(journal)
         replacement = RepositoryBootstrapReceipt(
             request=journal.candidate_request,
@@ -672,6 +688,10 @@ class RepositoryBootstrapManager:
         if not self._update_before(journal, completed):
             return journal
         journal = self._prepare_update(journal, pending)
+        self._assert_verified_managed_root(
+            journal.candidate_verified,
+            require_clean=pending is RepositoryUpdatePhase.ARTIFACTS_PENDING,
+        )
         self._assert_update_journal_files(journal)
         assert callback is not None
         produced = callback(
@@ -683,6 +703,10 @@ class RepositoryBootstrapManager:
                 step=step,
                 owned_paths=journal.candidate_managed_paths,
             )
+        )
+        self._assert_verified_managed_root(
+            journal.candidate_verified,
+            require_clean=False,
         )
         return self._commit_update_effect(
             journal,
@@ -908,6 +932,7 @@ class RepositoryBootstrapManager:
         for phase in _PHASES:
             if phase in receipt.completed_phases:
                 continue
+            self._assert_install_phase_managed_root(receipt, verified, phase)
             receipt = self._prepare(receipt, phase)
             operation = self._operation(receipt, verified, phase)
             produced: tuple[ManagedPath, ...] = ()
@@ -941,6 +966,13 @@ class RepositoryBootstrapManager:
                     subscription_result,
                     action="ensure",
                 )
+                if self._is_deferred_subscription(receipt.request):
+                    self._assert_subscription_managed_root(
+                        subscription_mutation,
+                        verified=verified,
+                        action="ensure",
+                    )
+                self._assert_verified_managed_root(verified, require_clean=True)
                 if subscription_mutation is not None:
                     receipt = receipt.model_copy(
                         update={
@@ -1006,16 +1038,11 @@ class RepositoryBootstrapManager:
         """Bind explicit repository outputs to one exact verified Git worktree."""
         if not self._requires_managed_worktree_binding:
             return
-        verified_worktree = verified.current_worktree
-        if verified_worktree is None:
-            raise ValueError("verified managed Git worktree identity is missing")
+        self._assert_verified_managed_root_target(verified)
         try:
             managed = self.managed_root.resolve(strict=True)
-            expected = verified_worktree.resolve(strict=True)
         except (FileNotFoundError, OSError) as error:
             raise ValueError("verified managed Git worktree is missing") from error
-        if managed != expected:
-            raise ValueError("managed root differs from the verified Git worktree")
         if not managed.is_dir():
             raise ValueError("verified managed root is not a safe Git worktree")
         declared_git_directory, declared_common_directory = _local_git_directories(
@@ -1086,6 +1113,185 @@ class RepositoryBootstrapManager:
             ("status", "--porcelain=v1", "-z", "--untracked-files=all")
         ):
             raise ValueError("verified managed Git worktree has local changes")
+
+    def _assert_verified_managed_root_target(
+        self,
+        verified: VerifiedRepositoryBootstrap,
+    ) -> None:
+        """Bind an absent or present candidate to the configured output root."""
+        if not self._requires_managed_worktree_binding:
+            return
+        if verified.current_worktree is None:
+            raise ValueError("verified managed Git worktree identity is missing")
+        expected = _authority_root(verified.current_worktree, label="managed")
+        if expected != self.managed_root:
+            raise ValueError("managed root differs from the verified Git worktree")
+
+    def _is_deferred_subscription(self, request: RepositoryBootstrapRequest) -> bool:
+        return self._requires_managed_worktree_binding and request.current_worktree is None
+
+    def _assert_managed_root_absent(self) -> None:
+        if self.managed_root.exists() or self.managed_root.is_symlink():
+            raise ValueError(
+                "remote repository bootstrap managed checkout already exists without ownership"
+            )
+
+    def _assert_new_install_managed_root(
+        self,
+        request: RepositoryBootstrapRequest,
+        verified: VerifiedRepositoryBootstrap,
+    ) -> None:
+        if not self._requires_managed_worktree_binding:
+            return
+        if self._is_deferred_subscription(request):
+            self._assert_managed_root_absent()
+            return
+        self._assert_verified_managed_root(verified, require_clean=True)
+
+    def _assert_install_resume_managed_root(
+        self,
+        receipt: RepositoryBootstrapReceipt,
+        verified: VerifiedRepositoryBootstrap,
+    ) -> None:
+        if not self._requires_managed_worktree_binding:
+            return
+        if not self._is_deferred_subscription(receipt.request):
+            self._assert_verified_managed_root(
+                verified,
+                require_clean=(
+                    BootstrapPhase.SKILLS_INSTALLED not in receipt.completed_phases
+                    and receipt.pending_phase is not BootstrapPhase.SKILLS_INSTALLED
+                ),
+            )
+            return
+        if BootstrapPhase.SUBSCRIBED in receipt.completed_phases:
+            self._assert_subscription_managed_root(
+                receipt.subscription_mutation,
+                verified=verified,
+                action="ensure",
+            )
+            self._assert_verified_managed_root(
+                verified,
+                require_clean=(
+                    BootstrapPhase.SKILLS_INSTALLED not in receipt.completed_phases
+                    and receipt.pending_phase is not BootstrapPhase.SKILLS_INSTALLED
+                ),
+            )
+        elif receipt.pending_phase is not BootstrapPhase.SUBSCRIBED:
+            self._assert_managed_root_absent()
+
+    def _assert_install_phase_managed_root(
+        self,
+        receipt: RepositoryBootstrapReceipt,
+        verified: VerifiedRepositoryBootstrap,
+        phase: BootstrapPhase,
+    ) -> None:
+        if not self._requires_managed_worktree_binding:
+            return
+        if not self._is_deferred_subscription(receipt.request):
+            self._assert_verified_managed_root(
+                verified,
+                require_clean=(
+                    phase is not BootstrapPhase.COMPLETED
+                    and (
+                        phase is not BootstrapPhase.SKILLS_INSTALLED
+                        or receipt.pending_phase is not BootstrapPhase.SKILLS_INSTALLED
+                    )
+                ),
+            )
+            return
+        if phase in {BootstrapPhase.VERIFIED, BootstrapPhase.TRUST_COMMITTED}:
+            self._assert_managed_root_absent()
+        elif phase is BootstrapPhase.SUBSCRIBED:
+            if receipt.pending_phase is not BootstrapPhase.SUBSCRIBED:
+                self._assert_managed_root_absent()
+        else:
+            self._assert_subscription_managed_root(
+                receipt.subscription_mutation,
+                verified=verified,
+                action="ensure",
+            )
+            self._assert_verified_managed_root(
+                verified,
+                require_clean=(
+                    phase is BootstrapPhase.SKILLS_INSTALLED
+                    and receipt.pending_phase is not BootstrapPhase.SKILLS_INSTALLED
+                ),
+            )
+
+    def _assert_subscription_managed_root(
+        self,
+        mutation: BootstrapSubscriptionMutationReceipt | None,
+        *,
+        verified: VerifiedRepositoryBootstrap,
+        action: str,
+    ) -> None:
+        if mutation is None or mutation.ownership is None:
+            raise ValueError(
+                "deferred managed checkout requires a typed subscription ownership receipt"
+            )
+        ownership = mutation.ownership
+        if mutation.action != action or ownership.verified_commit != verified.commit_sha256:
+            raise ValueError("subscription ownership receipt does not match managed checkout")
+        checkout = _confined_owned_path(self.state_root, ownership.checkout)
+        if checkout != self.managed_root:
+            raise ValueError("owned subscription checkout differs from managed root")
+        try:
+            resolved = checkout.resolve(strict=True)
+        except (FileNotFoundError, OSError) as error:
+            raise ValueError("owned subscription managed checkout is missing") from error
+        if resolved != self.managed_root.resolve(strict=True):
+            raise ValueError("owned subscription checkout differs from managed root")
+
+    def _assert_update_old_managed_root(
+        self,
+        old_receipt: RepositoryBootstrapReceipt,
+        journal: RepositoryUpdateJournal,
+    ) -> None:
+        if old_receipt.verified is None:
+            raise ValueError("repository update is missing verified old ownership")
+        if self._is_deferred_subscription(journal.candidate_request):
+            if journal.phase is RepositoryUpdatePhase.SUBSCRIPTION_PENDING:
+                return
+            self._assert_verified_managed_root(old_receipt.verified, require_clean=False)
+        else:
+            self._assert_verified_managed_root(
+                journal.candidate_verified,
+                require_clean=True,
+            )
+
+    def _assert_update_phase_managed_root(
+        self,
+        old_receipt: RepositoryBootstrapReceipt,
+        journal: RepositoryUpdateJournal,
+    ) -> None:
+        if not self._requires_managed_worktree_binding:
+            return
+        if not self._is_deferred_subscription(journal.candidate_request):
+            self._assert_verified_managed_root(
+                journal.candidate_verified,
+                require_clean=self._update_before(
+                    journal, RepositoryUpdatePhase.ARTIFACTS_PENDING
+                ),
+            )
+            return
+        if self._update_before(journal, RepositoryUpdatePhase.SUBSCRIPTION_PENDING):
+            if old_receipt.verified is None:
+                raise ValueError("repository update is missing verified old ownership")
+            self._assert_verified_managed_root(old_receipt.verified, require_clean=False)
+        elif journal.phase is RepositoryUpdatePhase.SUBSCRIPTION_PENDING:
+            # The exact subscription adapter owns the old/staged/candidate layout.
+            return
+        else:
+            self._assert_subscription_managed_root(
+                journal.candidate_subscription_mutation,
+                verified=journal.candidate_verified,
+                action="replace",
+            )
+            self._assert_verified_managed_root(
+                journal.candidate_verified,
+                require_clean=journal.phase is RepositoryUpdatePhase.SUBSCRIPTION_REPLACED,
+            )
 
     def _managed_git(
         self,
