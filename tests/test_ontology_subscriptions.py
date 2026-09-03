@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -822,6 +823,85 @@ def test_subscribe_installs_verified_checkout_then_records_subscription(tmp_path
     assert [event[0] for event in events] == ["verify", "authorize"]
 
 
+def test_competing_subscribe_cannot_register_then_lose_its_checkout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A losing install may fail, but it cannot delete the winner's checkout."""
+    manager = _configured_manager(tmp_path)
+    subscription = _subscription()
+    destination = manager.subscription_checkout(subscription)
+    contender_started = threading.Event()
+    contender_finished = threading.Event()
+    contender_errors: list[BaseException] = []
+
+    class ExistingRepository:
+        def pull(self) -> dict[str, object]:
+            contender_started.set()
+            return {"commit": "a" * 40}
+
+        def assert_removable(self) -> None:
+            return None
+
+    contender = SubscriptionManager(
+        config_manager=UserConfigManager(manager.path),
+        profile_name="default",
+        catalog_verifier=lambda path: path,
+        authorizer=lambda verified: verified,
+        repository_factory=lambda checkout, configured: ExistingRepository(),
+    )
+
+    def subscribe_contender() -> None:
+        try:
+            contender.subscribe("sample", subscription)
+        except BaseException as error:
+            contender_errors.append(error)
+        finally:
+            contender_finished.set()
+
+    real_replace = manager.replace
+    contender_thread: threading.Thread | None = None
+
+    def race_before_first_config_cas(
+        config: GeasUserConfig,
+        *,
+        upgrade_version: bool = False,
+        expected_config_sha256: str | None = None,
+    ) -> None:
+        nonlocal contender_thread
+        contender_thread = threading.Thread(target=subscribe_contender)
+        contender_thread.start()
+        contender_started.wait(timeout=0.25)
+        contender_finished.wait(timeout=0.25)
+        real_replace(
+            config,
+            upgrade_version=upgrade_version,
+            expected_config_sha256=expected_config_sha256,
+        )
+
+    monkeypatch.setattr(manager, "replace", race_before_first_config_cas)
+    first_errors: list[BaseException] = []
+    try:
+        SubscriptionManager(
+            config_manager=manager,
+            profile_name="default",
+            catalog_verifier=lambda path: path,
+            authorizer=lambda verified: verified,
+            repository_factory=_StagingRepository,
+        ).subscribe("sample", subscription)
+    except BaseException as error:
+        first_errors.append(error)
+
+    assert contender_thread is not None
+    contender_thread.join(timeout=5)
+    assert not contender_thread.is_alive()
+    assert contender_errors == []
+    configured = "sample" in manager.load().profiles["default"].subscriptions
+    assert configured is destination.is_dir()
+    assert configured
+    assert first_errors == []
+
+
 def test_subscribe_update_uses_new_checkout_and_preserves_previous_checkout(
     tmp_path: Path,
 ) -> None:
@@ -913,6 +993,72 @@ def test_unsubscribe_removes_only_exact_clean_identity_matched_checkout(
     assert "sample" not in manager.load().profiles["default"].subscriptions
     assert not checkout.exists()
     assert receipt.checkout_removed is True
+
+
+def test_subscribe_update_cannot_race_unsubscribe_into_missing_checkout(
+    tmp_path: Path,
+) -> None:
+    """An updater that observed an existing checkout cannot outlive its removal."""
+    manager, subscription, checkout = _manager_with_subscription(tmp_path)
+    update_started = threading.Event()
+    release_update = threading.Event()
+    removal_finished = threading.Event()
+    errors: list[BaseException] = []
+
+    class PausedExistingRepository:
+        def pull(self) -> dict[str, object]:
+            update_started.set()
+            if not release_update.wait(timeout=5):
+                raise RuntimeError("timed out waiting to resume subscription update")
+            return {"commit": "a" * 40}
+
+        def assert_removable(self) -> None:
+            return None
+
+    updater = SubscriptionManager(
+        config_manager=UserConfigManager(manager.path),
+        profile_name="default",
+        catalog_verifier=lambda path: path,
+        authorizer=lambda verified: verified,
+        repository_factory=lambda path, configured: PausedExistingRepository(),
+    )
+    remover = SubscriptionManager(
+        config_manager=UserConfigManager(manager.path),
+        profile_name="default",
+        catalog_verifier=lambda path: path,
+        authorizer=lambda verified: verified,
+    )
+
+    def update() -> None:
+        try:
+            updater.subscribe("sample", subscription)
+        except BaseException as error:
+            errors.append(error)
+
+    def remove() -> None:
+        try:
+            remover.unsubscribe("sample", remove_checkout=True)
+        except BaseException as error:
+            errors.append(error)
+        finally:
+            removal_finished.set()
+
+    update_thread = threading.Thread(target=update)
+    update_thread.start()
+    assert update_started.wait(timeout=5)
+    remove_thread = threading.Thread(target=remove)
+    remove_thread.start()
+    removal_finished.wait(timeout=0.25)
+    release_update.set()
+    update_thread.join(timeout=5)
+    remove_thread.join(timeout=5)
+
+    assert not update_thread.is_alive()
+    assert not remove_thread.is_alive()
+    assert errors == []
+    configured = "sample" in manager.load().profiles["default"].subscriptions
+    assert configured is checkout.is_dir()
+    assert not configured
 
 
 @pytest.mark.parametrize("problem", ("dirty", "dirty_gitignore", "origin"))

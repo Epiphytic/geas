@@ -5,6 +5,7 @@ import json
 import os
 import re
 import shutil
+import threading
 from collections.abc import Callable
 from contextlib import contextmanager
 from pathlib import Path
@@ -55,6 +56,9 @@ DEFAULT_CONFIG_FILENAMES = (
     "query-vocabulary.yaml",
 )
 _PROFILE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+_CONFIG_LOCKS_GUARD = threading.Lock()
+_CONFIG_LOCKS: dict[str, threading.RLock] = {}
+_CONFIG_LOCK_DEPTH = threading.local()
 
 
 def _compatibility_grant(rule: TrustRule) -> CapabilityGrant:
@@ -1413,10 +1417,29 @@ class UserConfigManager:
     def _config_lock(self):
         self.root.mkdir(parents=True, exist_ok=True)
         lock_path = self.path.with_name(f".{self.path.name}.lock")
-        if lock_path.is_symlink():
-            raise ValueError("Geas user config lock cannot be a symbolic link")
-        with _exclusive_file_lock(lock_path):
-            yield
+        lock_key = os.fspath(lock_path)
+        with _CONFIG_LOCKS_GUARD:
+            process_lock = _CONFIG_LOCKS.setdefault(lock_key, threading.RLock())
+        with process_lock:
+            depths = getattr(_CONFIG_LOCK_DEPTH, "paths", None)
+            if depths is None:
+                depths = {}
+                _CONFIG_LOCK_DEPTH.paths = depths
+            depth = depths.get(lock_key, 0)
+            depths[lock_key] = depth + 1
+            try:
+                if lock_path.is_symlink():
+                    raise ValueError("Geas user config lock cannot be a symbolic link")
+                if depth:
+                    yield
+                else:
+                    with _exclusive_file_lock(lock_path):
+                        yield
+            finally:
+                if depth:
+                    depths[lock_key] = depth
+                else:
+                    depths.pop(lock_key, None)
 
     def restore_bytes(
         self,
