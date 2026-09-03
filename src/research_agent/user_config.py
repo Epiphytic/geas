@@ -363,25 +363,25 @@ class UserConfigManager:
         return config
 
     def load_or_create(self, *, update_defaults: bool = False) -> GeasUserConfig:
-        if self.path.exists():
-            raw = yaml.safe_load(self.path.read_text())
-            config = GeasUserConfig.model_validate(raw)
-            self.validate_subscription_layout(config)
-            explicit = config.explicit_dict()
-            if _fill_missing(raw, explicit):
-                _atomic_write(
-                    self.path,
-                    yaml.safe_dump(
-                        raw,
-                        sort_keys=False,
-                        allow_unicode=True,
-                    ).encode(),
-                )
-        else:
-            self.root.mkdir(parents=True, exist_ok=True)
-            config = GeasUserConfig.default()
-            self.validate_subscription_layout(config)
-            _atomic_write(self.path, config.explicit_yaml().encode())
+        with self._config_lock():
+            if self.path.exists():
+                raw = yaml.safe_load(self.path.read_text())
+                config = GeasUserConfig.model_validate(raw)
+                self.validate_subscription_layout(config)
+                explicit = config.explicit_dict()
+                if _fill_missing(raw, explicit):
+                    _atomic_write(
+                        self.path,
+                        yaml.safe_dump(
+                            raw,
+                            sort_keys=False,
+                            allow_unicode=True,
+                        ).encode(),
+                    )
+            else:
+                config = GeasUserConfig.default()
+                self.validate_subscription_layout(config)
+                _atomic_write(self.path, config.explicit_yaml().encode())
         self._ensure_secret_scaffold()
         self.last_defaults_receipt = self.install_defaults(update=update_defaults)
         return config
@@ -1338,9 +1338,10 @@ class UserConfigManager:
         elif validated.version == 2 and not upgrade_version:
             raise ValueError("writing version 2 capability grants requires upgrade_version=True")
         self.validate_subscription_layout(validated)
-        if self.path.is_symlink():
-            raise ValueError("Geas user config cannot be a symbolic link")
-        _atomic_write(self.path, validated.explicit_yaml().encode())
+        with self._config_lock():
+            if self.path.is_symlink():
+                raise ValueError("Geas user config cannot be a symbolic link")
+            _atomic_write(self.path, validated.explicit_yaml().encode())
 
     def _validated_config_bytes(self) -> tuple[bytes, GeasUserConfig]:
         if self.path.is_symlink() or not self.path.is_file():
@@ -1368,9 +1369,10 @@ class UserConfigManager:
             GeasUserConfig.model_validate(yaml.safe_load(value))
         except (ValueError, yaml.YAMLError) as error:
             raise ValueError("cannot restore invalid Geas user configuration bytes") from error
-        if self.path.is_symlink():
-            raise ValueError("Geas user config cannot be a symbolic link")
-        _atomic_write(self.path, value)
+        with self._config_lock():
+            if self.path.is_symlink():
+                raise ValueError("Geas user config cannot be a symbolic link")
+            _atomic_write(self.path, value)
 
     def ontology_root(self, profile: GeasProfile) -> Path:
         return self._confined(profile.ontology_directory)

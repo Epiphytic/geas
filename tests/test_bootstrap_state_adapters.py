@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import subprocess
+import threading
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -1108,6 +1109,78 @@ def test_remove_subscription_fresh_retry_reverifies_quarantine_after_config_comm
         assert authorizer_calls
 
 
+def test_remove_subscription_serializes_final_delete_against_config_reregistration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches config being re-registered after validation but before rmtree."""
+    manager = _config_manager(tmp_path)
+    service = SubscriptionManager(
+        config_manager=manager,
+        profile_name="default",
+        catalog_verifier=lambda path: path,
+        authorizer=lambda verified: verified,
+        repository_factory=_BootstrapRepository,
+    )
+    subscription = _subscription()
+    installed = service.ensure_bootstrap_subscription(
+        "gold",
+        subscription,
+        operation_key=_INSTALL_KEY,
+        verified_commit="d" * 40,
+    )
+    assert installed.ownership is not None
+    registered_config = manager.path.read_bytes()
+
+    import research_agent.ontology_subscriptions as subscriptions
+
+    original_rmtree = subscriptions.shutil.rmtree
+    writer_started = threading.Event()
+    writer_finished = threading.Event()
+    writer_errors: list[BaseException] = []
+    writes: list[str] = []
+    writer: threading.Thread | None = None
+
+    def race_config_writer(path: object) -> None:
+        nonlocal writer
+        quarantine = Path(path)
+
+        def write_if_checkout_is_still_owned() -> None:
+            contender = UserConfigManager(manager.path)
+            writer_started.set()
+            try:
+                with contender._config_lock():
+                    if quarantine.is_dir():
+                        contender.path.write_bytes(registered_config)
+                        writes.append("registered")
+            except BaseException as error:
+                writer_errors.append(error)
+            finally:
+                writer_finished.set()
+
+        writer = threading.Thread(target=write_if_checkout_is_still_owned)
+        writer.start()
+        assert writer_started.wait(timeout=5)
+        writer_finished.wait(timeout=0.25)
+        original_rmtree(quarantine)
+
+    monkeypatch.setattr(subscriptions.shutil, "rmtree", race_config_writer)
+    removed = service.remove_bootstrap_subscription(
+        "gold",
+        subscription,
+        operation_key=_REMOVE_KEY,
+        ownership=installed.ownership,
+    )
+    assert removed.action == "remove"
+    assert writer is not None
+    writer.join(timeout=5)
+    assert not writer.is_alive()
+    assert writer_errors == []
+    assert writes == []
+    assert "gold" not in manager.load().profiles["default"].subscriptions
+    assert not manager.subscription_checkout(subscription).exists()
+
+
 def test_subscription_staged_replay_reverifies_exact_commit_before_swap(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1895,6 +1968,77 @@ def test_explicit_managed_root_must_equal_verified_worktree(tmp_path: Path) -> N
     assert not (tmp_path / "state" / "repository-bootstrap").exists()
 
 
+def test_explicit_managed_root_rejects_repository_environment_spoof(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches sibling Git metadata authorizing a non-Git managed directory."""
+    sibling = tmp_path / "sibling"
+    commit = _initialize_managed_repository(sibling)
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    (managed / "geas.yaml").write_text("version: 1\nontologies: []\n")
+    request = _bootstrap_request(commit=commit)
+    verified = _verified_request(request).model_copy(
+        update={"current_worktree": managed.resolve()}
+    )
+    monkeypatch.setenv("GIT_DIR", str(sibling / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(managed))
+    effects: list[str] = []
+    manager = RepositoryBootstrapManager(
+        managed_root=managed,
+        state_root=tmp_path / "state",
+        announce=lambda message: None,
+        now=lambda: _NOW,
+        verify=lambda candidate: verified,
+        record_trust=lambda operation, grant: effects.append("trust"),
+        subscribe=lambda operation: effects.append("subscription") or (),
+        hydrate_artifacts=lambda operation: (),
+        install_generic_skill=lambda operation: (),
+        export_catalog_skills=lambda operation: (),
+        link_agents=lambda operation: (),
+    )
+
+    with pytest.raises(ValueError, match="local Git metadata|Git worktree"):
+        manager.install(request)
+
+    assert effects == []
+    assert not (tmp_path / "state" / "repository-bootstrap").exists()
+
+
+def test_explicit_managed_root_accepts_bound_linked_worktree(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    commit = _initialize_managed_repository(repository)
+    managed = tmp_path / "linked"
+    subprocess.run(
+        ("git", "worktree", "add", "-q", "-b", "fixture-linked", str(managed)),
+        cwd=repository,
+        check=True,
+    )
+    request = _bootstrap_request(ref="refs/heads/fixture-linked", commit=commit)
+    verified = _verified_request(request).model_copy(
+        update={"current_worktree": managed.resolve()}
+    )
+    manager = RepositoryBootstrapManager(
+        managed_root=managed,
+        state_root=tmp_path / "state",
+        announce=lambda message: None,
+        now=lambda: _NOW,
+        verify=lambda candidate: verified,
+        record_trust=lambda operation, grant: None,
+        subscribe=lambda operation: (),
+        hydrate_artifacts=lambda operation: (),
+        install_generic_skill=lambda operation: (),
+        export_catalog_skills=lambda operation: (),
+        link_agents=lambda operation: (),
+    )
+
+    receipt = manager.install(request)
+
+    assert receipt.completed_phases[-1] is BootstrapPhase.COMPLETED
+    assert (managed / ".git").is_file()
+
+
 @pytest.mark.parametrize("drift", ("head", "ref", "remote"))
 def test_explicit_managed_root_rechecks_exact_git_identity_before_mutation(
     tmp_path: Path,
@@ -1940,6 +2084,55 @@ def test_explicit_managed_root_rechecks_exact_git_identity_before_mutation(
         manager.install(request)
 
     assert not (tmp_path / "state" / "repository-bootstrap").exists()
+
+
+@pytest.mark.parametrize("relationship", ("equal", "state-below-managed"))
+def test_explicit_state_root_cannot_live_inside_managed_repository(
+    tmp_path: Path,
+    relationship: str,
+) -> None:
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    state = managed if relationship == "equal" else managed / ".geas-state"
+
+    with pytest.raises(ValueError, match="state root.*managed root"):
+        RepositoryBootstrapManager(
+            managed_root=managed,
+            state_root=state,
+            announce=lambda message: None,
+        )
+
+    assert not (managed / "repository-bootstrap").exists()
+    assert not (managed / ".geas-state").exists()
+
+
+def test_explicit_managed_root_may_live_below_state_root(tmp_path: Path) -> None:
+    state = tmp_path / "state"
+    managed = state / "subscriptions/default/gold"
+    commit = _initialize_managed_repository(managed)
+    request = _bootstrap_request(commit=commit)
+    verified = _verified_request(request).model_copy(
+        update={"current_worktree": managed.resolve()}
+    )
+    manager = RepositoryBootstrapManager(
+        managed_root=managed,
+        state_root=state,
+        announce=lambda message: None,
+        now=lambda: _NOW,
+        verify=lambda candidate: verified,
+        record_trust=lambda operation, grant: None,
+        subscribe=lambda operation: (),
+        hydrate_artifacts=lambda operation: (),
+        install_generic_skill=lambda operation: (),
+        export_catalog_skills=lambda operation: (),
+        link_agents=lambda operation: (),
+    )
+
+    receipt = manager.install(request)
+
+    assert receipt.completed_phases[-1] is BootstrapPhase.COMPLETED
+    assert (state / "repository-bootstrap/gold.json").is_file()
+    assert not (managed / "repository-bootstrap").exists()
 
 
 @pytest.mark.parametrize("linked_root", ["managed", "state"])

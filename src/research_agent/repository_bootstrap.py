@@ -212,6 +212,13 @@ class RepositoryBootstrapManager:
         self.managed_root = _authority_root(selected_managed_root, label="managed")
         self.state_root = _authority_root(selected_state_root, label="state")
         self._requires_managed_worktree_binding = managed_root is not None
+        if self._requires_managed_worktree_binding and (
+            self.state_root == self.managed_root
+            or self.state_root.is_relative_to(self.managed_root)
+        ):
+            raise ValueError(
+                "repository bootstrap state root cannot equal or live below managed root"
+            )
         self.root = self.managed_root
         self.announce, self.now, self.verify = announce, now, verify
         self.record_trust, self.replace_trust = record_trust, replace_trust
@@ -997,8 +1004,9 @@ class RepositoryBootstrapManager:
             raise ValueError("verified managed Git worktree is missing") from error
         if managed != expected:
             raise ValueError("managed root differs from the verified Git worktree")
-        if not managed.is_dir() or (managed / ".git").is_symlink():
+        if not managed.is_dir():
             raise ValueError("verified managed root is not a safe Git worktree")
+        declared_git_directory = _local_git_directory(managed)
 
         top = self._managed_git(("rev-parse", "--show-toplevel"))
         try:
@@ -1007,6 +1015,15 @@ class RepositoryBootstrapManager:
             raise ValueError("verified managed root is not a Git worktree") from error
         if top_level != managed:
             raise ValueError("managed root is not the verified Git worktree root")
+        actual_git_directory_value = self._managed_git(
+            ("rev-parse", "--absolute-git-dir")
+        )
+        try:
+            actual_git_directory = Path(actual_git_directory_value).resolve(strict=True)
+        except (FileNotFoundError, OSError) as error:
+            raise ValueError("verified managed root has unsafe local Git metadata") from error
+        if actual_git_directory != declared_git_directory:
+            raise ValueError("verified managed root local Git metadata identity changed")
         head = self._managed_git(("rev-parse", "--verify", "HEAD^{commit}"))
         if head != verified.commit_sha256:
             raise ValueError("managed Git worktree HEAD differs from verified commit")
@@ -1052,17 +1069,26 @@ class RepositoryBootstrapManager:
         *,
         check: bool = True,
     ) -> str:
-        completed = subprocess.run(
-            ("git", "-C", str(self.managed_root), *arguments),
-            env={
-                **os.environ,
+        environment = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.upper().startswith("GIT_")
+        }
+        environment.update(
+            {
                 "GIT_TERMINAL_PROMPT": "0",
                 "GIT_NO_REPLACE_OBJECTS": "1",
                 "GIT_OPTIONAL_LOCKS": "0",
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_CONFIG_GLOBAL": os.devnull,
                 "GIT_CONFIG_COUNT": "1",
                 "GIT_CONFIG_KEY_0": "core.hooksPath",
                 "GIT_CONFIG_VALUE_0": os.devnull,
-            },
+            }
+        )
+        completed = subprocess.run(
+            ("git", "-C", str(self.managed_root), *arguments),
+            env=environment,
             text=True,
             capture_output=True,
             check=False,
@@ -1357,6 +1383,41 @@ def _authority_root(path: Path, *, label: str) -> Path:
         if current.is_symlink():
             raise ValueError(f"repository bootstrap {label} root cannot be a symbolic link")
     return absolute
+
+
+def _local_git_directory(worktree: Path) -> Path:
+    """Resolve only Git metadata declared by this exact worktree root."""
+    metadata = worktree / ".git"
+    if metadata.is_symlink():
+        raise ValueError("verified managed root local Git metadata cannot be a symlink")
+    if metadata.is_dir():
+        return metadata.resolve(strict=True)
+    if not metadata.is_file():
+        raise ValueError("verified managed Git worktree has no local metadata")
+    try:
+        value = metadata.read_bytes()
+    except OSError as error:
+        raise ValueError("verified managed root Git metadata cannot be read") from error
+    if len(value) > 4096 or b"\x00" in value:
+        raise ValueError("verified managed root Git metadata file is invalid")
+    try:
+        text = value.decode("utf-8").strip()
+    except UnicodeDecodeError as error:
+        raise ValueError("verified managed root Git metadata file is invalid") from error
+    prefix = "gitdir: "
+    if not text.startswith(prefix) or "\n" in text or "\r" in text:
+        raise ValueError("verified managed root Git metadata file is invalid")
+    declared = Path(text.removeprefix(prefix))
+    if not declared.is_absolute():
+        declared = worktree / declared
+    _reject_symlink_ancestry(declared)
+    try:
+        resolved = declared.resolve(strict=True)
+    except (FileNotFoundError, OSError) as error:
+        raise ValueError("verified managed root linked Git metadata is missing") from error
+    if not resolved.is_dir():
+        raise ValueError("verified managed root linked Git metadata is unsafe")
+    return resolved
 
 
 def _confined_owned_path(root: Path, relative: str) -> Path:
