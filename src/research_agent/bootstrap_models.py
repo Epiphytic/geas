@@ -28,6 +28,36 @@ class BootstrapPhase(StrEnum):
     RECOVERY_REQUIRED = "recovery_required"
 
 
+class RepositoryUpdatePhase(StrEnum):
+    """Durable before/after markers for every update-side mutation."""
+
+    VERIFIED = "verified"
+    TRUST_PENDING = "trust_pending"
+    TRUST_REPLACED = "trust_replaced"
+    SUBSCRIPTION_PENDING = "subscription_pending"
+    SUBSCRIPTION_REPLACED = "subscription_replaced"
+    ARTIFACTS_PENDING = "artifacts_pending"
+    ARTIFACTS_HYDRATED = "artifacts_hydrated"
+    GENERIC_SKILL_PENDING = "generic_skill_pending"
+    GENERIC_SKILL_INSTALLED = "generic_skill_installed"
+    CATALOG_SKILLS_PENDING = "catalog_skills_pending"
+    CATALOG_SKILLS_EXPORTED = "catalog_skills_exported"
+    AGENT_LINKS_PENDING = "agent_links_pending"
+    AGENT_LINKS_INSTALLED = "agent_links_installed"
+    OBSOLETE_PATHS_PENDING = "obsolete_paths_pending"
+    OBSOLETE_PATHS_REMOVED = "obsolete_paths_removed"
+    FINALIZING = "finalizing"
+
+
+class RepositoryRemovalPhase(StrEnum):
+    """Durable removal progress over the original ownership receipt."""
+
+    PENDING = "pending"
+    SKILLS_REMOVED = "skills_removed"
+    SUBSCRIPTION_REMOVED = "subscription_removed"
+    TRUST_REMOVED = "trust_removed"
+
+
 class ManagedPath(StrictModel):
     version: Literal[1] = 1
     path: str
@@ -309,6 +339,7 @@ class RepositoryBootstrapReceipt(StrictModel):
     pending_phase: BootstrapPhase | None = None
     update_candidate: VerifiedRepositoryBootstrap | None = None
     removal_pending: bool = False
+    removal_phase: RepositoryRemovalPhase | None = None
     removed: bool = False
     trust_grant: CapabilityGrant | None = None
     managed_paths: tuple[ManagedPath, ...] = ()
@@ -347,9 +378,12 @@ class RepositoryBootstrapReceipt(StrictModel):
         if self.removed and (
             self.pending_phase is not None
             or self.removal_pending
+            or self.removal_phase is not None
             or self.update_candidate is not None
         ):
             raise ValueError("removed receipt cannot retain a pending operation")
+        if self.removal_pending != (self.removal_phase is not None):
+            raise ValueError("removal_pending and removal_phase must agree")
         return self
 
     @field_validator("managed_paths")
@@ -383,10 +417,20 @@ class RepositoryUpdateJournal(StrictModel):
     candidate_request: RepositoryBootstrapRequest
     candidate_verified: VerifiedRepositoryBootstrap
     candidate_grant: CapabilityGrant | None = None
-    phase: BootstrapPhase
+    candidate_managed_paths: tuple[ManagedPath, ...] = ()
+    phase: RepositoryUpdatePhase
     created_at: datetime
+    updated_at: datetime
 
-    @field_validator("created_at")
+    @field_validator("old_managed_paths", "candidate_managed_paths")
+    @classmethod
+    def unique_managed_paths(cls, value: tuple[ManagedPath, ...]) -> tuple[ManagedPath, ...]:
+        ordered = tuple(sorted(value, key=lambda item: item.path))
+        if len({item.path for item in ordered}) != len(ordered):
+            raise ValueError("update journal managed paths must be unique")
+        return ordered
+
+    @field_validator("created_at", "updated_at")
     @classmethod
     def timezone_aware(cls, value: datetime) -> datetime:
         if value.tzinfo is None or value.utcoffset() is None:
@@ -395,12 +439,14 @@ class RepositoryUpdateJournal(StrictModel):
 
     @model_validator(mode="after")
     def candidate_identity_matches_request(self) -> RepositoryUpdateJournal:
-        values = ("repository", "ref", "catalog", "commit_sha256")
+        values = ("repository", "ref", "catalog", "commit_sha256", "current_worktree")
         if any(
             getattr(self.candidate_request, field) != getattr(self.candidate_verified, field)
             for field in values
         ):
             raise ValueError("candidate verified identity does not match candidate request")
+        if self.old_request.name != self.candidate_request.name:
+            raise ValueError("update journal bootstrap names must match")
         return self
 
 
