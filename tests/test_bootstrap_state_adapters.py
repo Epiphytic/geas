@@ -801,6 +801,86 @@ def test_replace_bootstrap_subscription_requires_exact_old_state_and_replays(
     assert replaced.ownership.checkout == installed.ownership.checkout
 
 
+def test_replace_subscription_rebases_unrelated_config_change_after_checkout_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fresh recovery preserves unrelated config and completes the exact replacement."""
+    manager = _config_manager(tmp_path)
+    _BootstrapRepository.pulls = 0
+    service = SubscriptionManager(
+        config_manager=manager,
+        profile_name="default",
+        catalog_verifier=lambda path: path,
+        authorizer=lambda verified: verified,
+        repository_factory=_BootstrapRepository,
+    )
+    old = _subscription()
+    installed = service.ensure_bootstrap_subscription(
+        "gold",
+        old,
+        operation_key=_INSTALL_KEY,
+        verified_commit="d" * 40,
+    )
+    assert installed.ownership is not None
+    candidate = _subscription(active_ref="refs/heads/stable")
+
+    def change_unrelated_config_then_stop(**_kwargs: object) -> BootstrapConfigMutationReceipt:
+        contender = UserConfigManager(manager.path)
+        concurrent = contender.load().model_copy(update={"default_profile": "other"})
+        contender.replace(concurrent)
+        raise RuntimeError("stop after checkout swap and unrelated config change")
+
+    monkeypatch.setattr(
+        manager,
+        "mutate_profile_expected",
+        change_unrelated_config_then_stop,
+    )
+    with pytest.raises(RuntimeError, match="unrelated config change"):
+        service.replace_bootstrap_subscription(
+            "gold",
+            old,
+            candidate,
+            operation_key=_UPDATE_KEY,
+            verified_commit="e" * 40,
+            ownership=installed.ownership,
+        )
+
+    fresh = SubscriptionManager(
+        config_manager=UserConfigManager(manager.path),
+        profile_name="default",
+        catalog_verifier=lambda path: path,
+        authorizer=lambda verified: verified,
+        repository_factory=_BootstrapRepository,
+    )
+    replaced = fresh.replace_bootstrap_subscription(
+        "gold",
+        old,
+        candidate,
+        operation_key=_UPDATE_KEY,
+        verified_commit="e" * 40,
+        ownership=installed.ownership,
+    )
+    replayed = fresh.replace_bootstrap_subscription(
+        "gold",
+        old,
+        candidate,
+        operation_key=_UPDATE_KEY,
+        verified_commit="e" * 40,
+        ownership=installed.ownership,
+    )
+
+    assert replayed == replaced
+    assert _BootstrapRepository.pulls == 2
+    current = manager.load()
+    assert current.default_profile == "other"
+    assert current.profiles["default"].subscriptions["gold"] == candidate
+    checkout = manager.subscription_checkout(candidate)
+    assert (checkout / ".bootstrap-commit").read_text() == "e" * 40
+    assert not tuple(checkout.parent.glob(".gold.bootstrap-*.old"))
+    assert not tuple(checkout.parent.glob(".gold.bootstrap-*.stage"))
+
+
 def test_replace_bootstrap_subscription_rejects_changed_old_config_before_pull(
     tmp_path: Path,
 ) -> None:
@@ -2274,6 +2354,23 @@ def test_legacy_root_with_explicit_nested_state_root_uses_split_root_guards(
         )
 
     assert not (managed / ".geas-state").exists()
+
+
+def test_legacy_root_with_explicit_equal_state_root_uses_split_root_guards(
+    tmp_path: Path,
+) -> None:
+    """An explicit state_root is never treated as the omitted legacy argument."""
+    managed = tmp_path / "managed"
+    managed.mkdir()
+
+    with pytest.raises(ValueError, match="state root.*managed root"):
+        RepositoryBootstrapManager(
+            root=managed,
+            state_root=managed,
+            announce=lambda message: None,
+        )
+
+    assert not (managed / "repository-bootstrap").exists()
 
 
 def test_explicit_managed_root_may_live_below_state_root(tmp_path: Path) -> None:

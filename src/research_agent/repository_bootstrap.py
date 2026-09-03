@@ -53,6 +53,13 @@ _UPDATE_PHASES = tuple(RepositoryUpdatePhase)
 _UPDATE_PHASE_INDEX = {phase: index for index, phase in enumerate(_UPDATE_PHASES)}
 
 
+class _OmittedStateRoot:
+    pass
+
+
+_STATE_ROOT_OMITTED = _OmittedStateRoot()
+
+
 @dataclass(frozen=True)
 class BootstrapOperation:
     """Immutable input to one idempotent external mutation adapter."""
@@ -162,7 +169,7 @@ class RepositoryBootstrapManager:
         *,
         root: Path | None = None,
         managed_root: Path | None = None,
-        state_root: Path | None = None,
+        state_root: Path | None | _OmittedStateRoot = _STATE_ROOT_OMITTED,
         announce: Callable[[str], None],
         now: Callable[[], datetime] = utc_now,
         verify: Callable[[RepositoryBootstrapRequest], VerifiedRepositoryBootstrap] | None = None,
@@ -203,16 +210,19 @@ class RepositoryBootstrapManager:
         remove_obsolete_paths: Callable[[BootstrapOperation], None] | None = None,
         verify_software_provenance: Callable[[], None] | None = None,
     ) -> None:
+        state_root_was_provided = state_root is not _STATE_ROOT_OMITTED
         selected_managed_root = managed_root if managed_root is not None else root
-        selected_state_root = state_root if state_root is not None else root
+        selected_state_root = root if not state_root_was_provided else state_root
         if selected_managed_root is None or selected_state_root is None:
             raise ValueError(
                 "repository bootstrap requires both managed_root and state_root"
             )
+        if isinstance(selected_state_root, _OmittedStateRoot):
+            raise AssertionError("omitted state root was not resolved")
         self.managed_root = _authority_root(selected_managed_root, label="managed")
         self.state_root = _authority_root(selected_state_root, label="state")
         self._requires_managed_worktree_binding = (
-            managed_root is not None or self.state_root != self.managed_root
+            managed_root is not None or state_root_was_provided
         )
         if self._requires_managed_worktree_binding and (
             self.state_root == self.managed_root
