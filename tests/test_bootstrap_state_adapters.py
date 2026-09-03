@@ -511,6 +511,90 @@ def test_normal_subscribe_cannot_stale_write_after_checkout_is_removed(
     assert not destination.exists()
 
 
+def test_bootstrap_ensure_serializes_checkout_rollback_with_ordinary_subscribe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A losing bootstrap writer cannot remove an ordinarily registered checkout."""
+    manager = _config_manager(tmp_path)
+    subscription = _subscription()
+    destination = manager.subscription_checkout(subscription)
+    bootstrap_paused = threading.Event()
+    release_bootstrap = threading.Event()
+    ordinary_entered = threading.Event()
+    ordinary_finished = threading.Event()
+    errors: list[BaseException] = []
+
+    original_mutate = manager.mutate_profile_expected
+
+    def pause_before_config_mutation(**kwargs: object) -> BootstrapConfigMutationReceipt:
+        bootstrap_paused.set()
+        if not release_bootstrap.wait(timeout=5):
+            raise RuntimeError("timed out waiting to resume bootstrap subscription")
+        return original_mutate(**kwargs)  # type: ignore[arg-type]
+
+    class ExistingRepository:
+        def pull(self) -> dict[str, object]:
+            ordinary_entered.set()
+            return {"commit": "d" * 40}
+
+        def assert_removable(self) -> None:
+            return None
+
+    monkeypatch.setattr(manager, "mutate_profile_expected", pause_before_config_mutation)
+    bootstrap = SubscriptionManager(
+        config_manager=manager,
+        profile_name="default",
+        catalog_verifier=lambda path: path,
+        authorizer=lambda verified: verified,
+        repository_factory=_BootstrapRepository,
+    )
+    ordinary = SubscriptionManager(
+        config_manager=UserConfigManager(manager.path),
+        profile_name="default",
+        catalog_verifier=lambda path: path,
+        authorizer=lambda verified: verified,
+        repository_factory=lambda path, configured: ExistingRepository(),
+    )
+
+    def install_bootstrap() -> None:
+        try:
+            bootstrap.ensure_bootstrap_subscription(
+                "gold",
+                subscription,
+                operation_key=_INSTALL_KEY,
+                verified_commit="d" * 40,
+            )
+        except BaseException as error:
+            errors.append(error)
+
+    def install_ordinary() -> None:
+        try:
+            ordinary.subscribe("gold", subscription)
+        except BaseException as error:
+            errors.append(error)
+        finally:
+            ordinary_finished.set()
+
+    bootstrap_thread = threading.Thread(target=install_bootstrap)
+    bootstrap_thread.start()
+    assert bootstrap_paused.wait(timeout=5)
+    ordinary_thread = threading.Thread(target=install_ordinary)
+    ordinary_thread.start()
+    if ordinary_entered.wait(timeout=0.25):
+        assert ordinary_finished.wait(timeout=5)
+    release_bootstrap.set()
+    bootstrap_thread.join(timeout=5)
+    ordinary_thread.join(timeout=5)
+
+    assert not bootstrap_thread.is_alive()
+    assert not ordinary_thread.is_alive()
+    assert errors == []
+    configured = "gold" in manager.load().profiles["default"].subscriptions
+    assert configured is destination.is_dir()
+    assert configured
+
+
 def test_record_bootstrap_grant_migrates_only_intended_v1_state(
     tmp_path: Path,
 ) -> None:
@@ -876,6 +960,93 @@ def test_replace_subscription_rebases_unrelated_config_change_after_checkout_swa
     assert current.default_profile == "other"
     assert current.profiles["default"].subscriptions["gold"] == candidate
     checkout = manager.subscription_checkout(candidate)
+    assert (checkout / ".bootstrap-commit").read_text() == "e" * 40
+    assert not tuple(checkout.parent.glob(".gold.bootstrap-*.old"))
+    assert not tuple(checkout.parent.glob(".gold.bootstrap-*.stage"))
+
+
+def test_replace_subscription_crash_persists_scoped_config_commit_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A caller crash cannot separate the named config write from its durable marker."""
+    manager = _config_manager(tmp_path)
+    service = SubscriptionManager(
+        config_manager=manager,
+        profile_name="default",
+        catalog_verifier=lambda path: path,
+        authorizer=lambda verified: verified,
+        repository_factory=_BootstrapRepository,
+    )
+    old = _subscription()
+    installed = service.ensure_bootstrap_subscription(
+        "gold",
+        old,
+        operation_key=_INSTALL_KEY,
+        verified_commit="d" * 40,
+    )
+    assert installed.ownership is not None
+    candidate = _subscription(active_ref="refs/heads/stable")
+    original_mutate = manager.mutate_profile_expected
+
+    def mutate_then_crash(**kwargs: object) -> BootstrapConfigMutationReceipt:
+        original_mutate(**kwargs)  # type: ignore[arg-type]
+        raise RuntimeError("crash after scoped replacement mutation")
+
+    monkeypatch.setattr(manager, "mutate_profile_expected", mutate_then_crash)
+    with pytest.raises(RuntimeError, match="crash after scoped replacement mutation"):
+        service.replace_bootstrap_subscription(
+            "gold",
+            old,
+            candidate,
+            operation_key=_UPDATE_KEY,
+            verified_commit="e" * 40,
+            ownership=installed.ownership,
+        )
+
+    digest = _UPDATE_KEY.rsplit(":", 1)[-1]
+    journal_path = (
+        manager.root
+        / "repository-bootstrap/subscription-mutations/default/gold"
+        / f"{digest}.json"
+    )
+    assert json.loads(journal_path.read_text())["phase"] == "config_committed"
+
+    contender = UserConfigManager(manager.path)
+    concurrent = contender.load().model_copy(update={"default_profile": "other"})
+    contender.replace(concurrent)
+    fresh = SubscriptionManager(
+        config_manager=UserConfigManager(manager.path),
+        profile_name="default",
+        catalog_verifier=lambda path: path,
+        authorizer=lambda verified: verified,
+        repository_factory=_BootstrapRepository,
+    )
+
+    replaced = fresh.replace_bootstrap_subscription(
+        "gold",
+        old,
+        candidate,
+        operation_key=_UPDATE_KEY,
+        verified_commit="e" * 40,
+        ownership=installed.ownership,
+    )
+    replayed = fresh.replace_bootstrap_subscription(
+        "gold",
+        old,
+        candidate,
+        operation_key=_UPDATE_KEY,
+        verified_commit="e" * 40,
+        ownership=installed.ownership,
+    )
+
+    assert replayed == replaced
+    assert replaced.ownership is not None
+    current = manager.load()
+    assert current.default_profile == "other"
+    assert current.profiles["default"].subscriptions["gold"] == candidate
+    checkout = manager.subscription_checkout(candidate)
+    assert checkout.is_dir()
     assert (checkout / ".bootstrap-commit").read_text() == "e" * 40
     assert not tuple(checkout.parent.glob(".gold.bootstrap-*.old"))
     assert not tuple(checkout.parent.glob(".gold.bootstrap-*.stage"))

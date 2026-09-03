@@ -552,11 +552,12 @@ class UserConfigManager:
         mutate: Callable[[GeasProfile], GeasProfile],
         upgrade_version: bool = False,
         applied_state_path: Path | None = None,
-        applied_state: _BootstrapGrantJournal | None = None,
+        applied_state: StrictModel | None = None,
     ) -> BootstrapConfigMutationReceipt:
-        """Lock and replace one profile only when exact config bytes still match."""
+        """Lock-couple an exact profile replacement and optional operation marker."""
         if (applied_state_path is None) != (applied_state is None):
             raise ValueError("applied state path and value must be provided together")
+        prior_state: StrictModel | None = None
         if applied_state_path is not None:
             assert applied_state is not None
             try:
@@ -565,23 +566,36 @@ class UserConfigManager:
                 raise ValueError("applied state path escapes the config root") from error
             if self._confined_state_path(relative_applied_state) != applied_state_path:
                 raise ValueError("applied state path is not canonical")
-            expected_action = {
-                "grant_record": "record",
-                "grant_replace": "replace",
-                "grant_remove": "remove",
-            }.get(kind)
+            is_grant = kind.startswith("grant_")
+            expected_action = kind.removeprefix(
+                "grant_" if is_grant else "subscription_"
+            )
+            expected_phase = "applied" if is_grant else "config_committed"
+            prior_phase = "prepared" if is_grant else "checkout_swapped"
+            operation_digest = operation_key.rsplit(":", 1)[-1]
+            expected_state_path = (
+                self._grant_journal_path(profile_name, bootstrap_name, operation_key)
+                if is_grant
+                else self._confined_state_path(
+                    Path("repository-bootstrap")
+                    / "subscription-mutations"
+                    / profile_name
+                    / bootstrap_name
+                    / f"{operation_digest}.json"
+                )
+            )
+            state = applied_state.model_dump(mode="json")
             if (
-                expected_action is None
-                or applied_state.phase != "applied"
-                or applied_state.operation_key != operation_key
-                or applied_state.profile_name != profile_name
-                or applied_state.bootstrap_name != bootstrap_name
-                or applied_state.action != expected_action
-                or applied_state.before_config_sha256 != expected_config_sha256
-                or applied_state_path
-                != self._grant_journal_path(profile_name, bootstrap_name, operation_key)
+                state.get("phase") != expected_phase
+                or state.get("operation_key") != operation_key
+                or state.get("profile_name") != profile_name
+                or state.get("bootstrap_name") != bootstrap_name
+                or state.get("action") != expected_action
+                or state.get("before_config_sha256") != expected_config_sha256
+                or applied_state_path != expected_state_path
             ):
-                raise ValueError("applied grant state does not match its scoped mutation")
+                raise ValueError("applied state does not match its scoped mutation")
+            prior_state = applied_state.model_copy(update={"phase": prior_phase})
         BootstrapConfigMutationReceipt(
             operation_key=operation_key,
             profile_name=profile_name,
@@ -593,13 +607,12 @@ class UserConfigManager:
         with self._config_lock():
             if applied_state_path is not None:
                 assert applied_state is not None
-                prepared_state = applied_state.model_copy(update={"phase": "prepared"})
                 expected_prepared = (
-                    canonical_json(prepared_state.model_dump(mode="json")) + b"\n"
+                    canonical_json(prior_state.model_dump(mode="json")) + b"\n"
                 )
                 if self._load_bootstrap_state(applied_state_path) != expected_prepared:
                     raise RuntimeError(
-                        "bootstrap grant journal changed before scoped mutation"
+                        "bootstrap mutation journal changed before scoped mutation"
                     )
             before, config = self._validated_config_bytes()
             before_sha256 = _sha256(before)
@@ -615,9 +628,10 @@ class UserConfigManager:
                 raise RuntimeError("Geas user config changed before atomic replacement")
             if (
                 applied_state is not None
-                and applied_state.after_config_sha256 != _sha256(after)
+                and applied_state.model_dump(mode="json").get("after_config_sha256")
+                != _sha256(after)
             ):
-                raise ValueError("applied grant state does not match config after-state")
+                raise ValueError("applied state does not match config after-state")
             if after != before:
                 _atomic_write(self.path, after)
             if applied_state_path is not None:

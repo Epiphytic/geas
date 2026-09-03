@@ -380,6 +380,22 @@ class SubscriptionManager:
         verified_commit: str,
     ) -> BootstrapSubscriptionMutationReceipt:
         """Create only an absent fixed bootstrap subscription under a stable key."""
+        with self.config_manager._config_lock():
+            return self._ensure_bootstrap_subscription_locked(
+                name,
+                subscription,
+                operation_key=operation_key,
+                verified_commit=verified_commit,
+            )
+
+    def _ensure_bootstrap_subscription_locked(
+        self,
+        name: str,
+        subscription: OntologySubscription,
+        *,
+        operation_key: str,
+        verified_commit: str,
+    ) -> BootstrapSubscriptionMutationReceipt:
         self._recover_all_removals()
         validate_subscription_name(name)
         self._validate_bootstrap_operation(
@@ -936,15 +952,7 @@ class SubscriptionManager:
                     }
                 )
 
-            if configured_sha256 == journal.new_subscription_sha256:
-                if current_sha256 != journal.after_config_sha256:
-                    raise RuntimeError(
-                        "matching replacement config has no operation identity"
-                    )
-                mutation = self._subscription_config_receipt(
-                    journal, "subscription_replace"
-                )
-            elif configured_sha256 == journal.old_subscription_sha256:
+            if configured_sha256 == journal.old_subscription_sha256:
                 _updated, rebased_after = self.config_manager._profile_mutation_bytes(
                     config,
                     profile_name=journal.profile_name,
@@ -960,6 +968,9 @@ class SubscriptionManager:
                 if rebased != journal:
                     self.config_manager._write_bootstrap_state(journal_path, rebased)
                     journal = rebased
+                config_committed = journal.model_copy(
+                    update={"phase": "config_committed"}
+                )
                 try:
                     mutation = self.config_manager.mutate_profile_expected(
                         operation_key=journal.operation_key,
@@ -969,11 +980,14 @@ class SubscriptionManager:
                         expected_config_sha256=journal.before_config_sha256,
                         mutate=replace_subscription,
                         upgrade_version=config.version == 2,
+                        applied_state_path=journal_path,
+                        applied_state=config_committed,
                     )
                     if mutation.after_config_sha256 != journal.after_config_sha256:
                         raise RuntimeError(
                             "bootstrap subscription replacement config identity changed"
                         )
+                    journal = config_committed
                 except BaseException:
                     if self.config_manager.config_sha256() == journal.before_config_sha256:
                         self._rollback_subscription_replacement(
@@ -988,12 +1002,14 @@ class SubscriptionManager:
                         journal = journal.model_copy(update={"phase": "staged"})
                         self.config_manager._write_bootstrap_state(journal_path, journal)
                     raise
+            elif configured_sha256 == journal.new_subscription_sha256:
+                raise RuntimeError(
+                    "matching replacement config has no operation identity"
+                )
             else:
                 raise ValueError(
                     "owned bootstrap subscription config identity changed"
                 )
-            journal = journal.model_copy(update={"phase": "config_committed"})
-            self.config_manager._write_bootstrap_state(journal_path, journal)
         else:
             raise ValueError("bootstrap subscription replacement journal has an invalid phase")
         self._remove_replaced_checkout(
