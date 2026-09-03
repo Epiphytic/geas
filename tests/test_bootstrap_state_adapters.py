@@ -987,6 +987,127 @@ def test_remove_subscription_rejects_catalog_symlink_drift(tmp_path: Path) -> No
     assert outside.is_file()
 
 
+@pytest.mark.parametrize(
+    "tamper",
+    ("commit", "removability", "catalog-symlink", "authorization"),
+)
+def test_remove_subscription_fresh_retry_reverifies_quarantine_after_config_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tamper: str,
+) -> None:
+    """Catches generic recovery deleting a drifted owned checkout before exact replay."""
+    manager = _config_manager(tmp_path)
+    service = SubscriptionManager(
+        config_manager=manager,
+        profile_name="default",
+        catalog_verifier=lambda path: path,
+        authorizer=lambda verified: verified,
+        repository_factory=_BootstrapRepository,
+    )
+    subscription = _subscription()
+    installed = service.ensure_bootstrap_subscription(
+        "gold",
+        subscription,
+        operation_key=_INSTALL_KEY,
+        verified_commit="d" * 40,
+    )
+    assert installed.ownership is not None
+
+    import research_agent.ontology_subscriptions as subscriptions
+
+    original_rmtree = subscriptions.shutil.rmtree
+
+    def stop_after_config_commit(path: object) -> None:
+        if ".remove-" in Path(path).name:
+            raise OSError("stop after subscription config commit")
+        original_rmtree(path)
+
+    monkeypatch.setattr(subscriptions.shutil, "rmtree", stop_after_config_commit)
+    with pytest.raises(OSError, match="config commit"):
+        service.remove_bootstrap_subscription(
+            "gold",
+            subscription,
+            operation_key=_REMOVE_KEY,
+            ownership=installed.ownership,
+        )
+    monkeypatch.setattr(subscriptions.shutil, "rmtree", original_rmtree)
+
+    assert "gold" not in manager.load().profiles["default"].subscriptions
+    quarantine = next((manager.root / "subscriptions/default").glob(".gold.remove-*"))
+    removal_journal = (
+        manager.root
+        / "repository-bootstrap/subscription-mutations/default/gold"
+        / f"{_REMOVE_KEY.rsplit(':', 1)[-1]}.json"
+    )
+    assert removal_journal.is_file()
+    journal_bytes = removal_journal.read_bytes()
+    evidence = manager.root / installed.ownership.evidence_path
+    evidence_bytes = evidence.read_bytes()
+    authorizer_calls: list[object] = []
+    if tamper == "commit":
+        (quarantine / ".bootstrap-commit").write_text("f" * 40)
+
+        def authorize(verified: object) -> object:
+            authorizer_calls.append(verified)
+            return verified
+
+        expected = "verified commit"
+        repository_factory = _BootstrapRepository
+    elif tamper == "removability":
+
+        def authorize(verified: object) -> object:
+            authorizer_calls.append(verified)
+            return verified
+
+        expected = "local changes"
+        repository_factory = _DirtyBootstrapRepository
+    elif tamper == "catalog-symlink":
+        catalog = quarantine / subscription.catalog
+        catalog.unlink()
+        outside = tmp_path / "outside-geas.yaml"
+        outside.write_text("version: 1\nontologies: []\n")
+        catalog.symlink_to(outside)
+
+        def authorize(verified: object) -> object:
+            authorizer_calls.append(verified)
+            return verified
+
+        expected = "catalog"
+        repository_factory = _BootstrapRepository
+    else:
+
+        def authorize(verified: object) -> object:
+            authorizer_calls.append(verified)
+            raise PermissionError("catalog authorization was revoked")
+
+        expected = "authorization was revoked"
+        repository_factory = _BootstrapRepository
+
+    fresh = SubscriptionManager(
+        config_manager=UserConfigManager(manager.path),
+        profile_name="default",
+        catalog_verifier=lambda path: path,
+        authorizer=authorize,
+        repository_factory=repository_factory,
+    )
+
+    with pytest.raises((ValueError, PermissionError, RuntimeError), match=expected):
+        fresh.remove_bootstrap_subscription(
+            "gold",
+            subscription,
+            operation_key=_REMOVE_KEY,
+            ownership=installed.ownership,
+        )
+
+    assert quarantine.is_dir()
+    assert removal_journal.read_bytes() == journal_bytes
+    assert evidence.read_bytes() == evidence_bytes
+    assert not (manager.root / "state/removal-transactions/subscriptions").exists()
+    if tamper == "authorization":
+        assert authorizer_calls
+
+
 def test_subscription_staged_replay_reverifies_exact_commit_before_swap(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1389,6 +1510,42 @@ def _verified_request(request: RepositoryBootstrapRequest) -> VerifiedRepository
     )
 
 
+def _initialize_managed_repository(
+    repository: Path,
+    *,
+    tracked: tuple[tuple[str, bytes], ...] = (),
+) -> str:
+    repository.mkdir(parents=True, exist_ok=True)
+    subprocess.run(("git", "init", "-q", "-b", "main"), cwd=repository, check=True)
+    subprocess.run(
+        ("git", "config", "user.email", "fixture@example.test"),
+        cwd=repository,
+        check=True,
+    )
+    subprocess.run(
+        ("git", "config", "user.name", "Fixture"), cwd=repository, check=True
+    )
+    (repository / "geas.yaml").write_text("version: 1\nontologies: []\n")
+    for relative, value in tracked:
+        path = repository / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(value)
+    subprocess.run(("git", "add", "."), cwd=repository, check=True)
+    subprocess.run(("git", "commit", "-q", "-m", "fixture"), cwd=repository, check=True)
+    subprocess.run(
+        ("git", "remote", "add", "origin", "https://example.test/gold.git"),
+        cwd=repository,
+        check=True,
+    )
+    return subprocess.run(
+        ("git", "rev-parse", "HEAD"),
+        cwd=repository,
+        text=True,
+        capture_output=True,
+        check=True,
+    ).stdout.strip()
+
+
 def _operation_subscription(operation: BootstrapOperation) -> OntologySubscription:
     return OntologySubscription(
         url=operation.verified.repository,
@@ -1621,10 +1778,12 @@ def test_bootstrap_manager_separates_operational_state_from_managed_repository(
 ) -> None:
     """Catches receipts polluting the repository whose managed skills are publishable."""
     repository = tmp_path / "repository"
-    repository.mkdir()
-    subprocess.run(("git", "init", "-q"), cwd=repository, check=True)
+    commit = _initialize_managed_repository(repository)
     state_root = tmp_path / "state"
-    request = _bootstrap_request()
+    request = _bootstrap_request(commit=commit)
+    verified = _verified_request(request).model_copy(
+        update={"current_worktree": repository.resolve()}
+    )
 
     def install_skill(operation: BootstrapOperation) -> tuple[ManagedPath, ...]:
         relative = Path(".agents/skills/gold/SKILL.md")
@@ -1645,7 +1804,7 @@ def test_bootstrap_manager_separates_operational_state_from_managed_repository(
         state_root=state_root,
         announce=lambda message: None,
         now=lambda: _NOW,
-        verify=_verified_request,
+        verify=lambda candidate: verified,
         record_trust=lambda operation, grant: None,
         subscribe=lambda operation: (),
         hydrate_artifacts=lambda operation: (),
@@ -1666,6 +1825,121 @@ def test_bootstrap_manager_separates_operational_state_from_managed_repository(
         env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
     ).stdout.splitlines()
     assert status == ["?? .agents/"]
+
+
+@pytest.mark.parametrize("repository_state", ("non-git", "dirty"))
+def test_explicit_managed_root_requires_exact_clean_verified_git_worktree_before_mutation(
+    tmp_path: Path,
+    repository_state: str,
+) -> None:
+    """Catches bootstrap state or callbacks mutating an unverified managed root."""
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    commit = "d" * 40
+    if repository_state == "dirty":
+        commit = _initialize_managed_repository(repository)
+        (repository / "operator-dirty.txt").write_text("preserve\n")
+    request = _bootstrap_request(commit=commit)
+    verified = _verified_request(request).model_copy(
+        update={"current_worktree": repository.resolve()}
+    )
+    effects: list[str] = []
+    manager = RepositoryBootstrapManager(
+        managed_root=repository,
+        state_root=tmp_path / "state",
+        announce=lambda message: None,
+        now=lambda: _NOW,
+        verify=lambda candidate: verified,
+        record_trust=lambda operation, grant: effects.append("trust"),
+        subscribe=lambda operation: effects.append("subscription") or (),
+        hydrate_artifacts=lambda operation: effects.append("artifacts") or (),
+        install_generic_skill=lambda operation: effects.append("generic-skill") or (),
+        export_catalog_skills=lambda operation: effects.append("catalog-skills") or (),
+        link_agents=lambda operation: effects.append("links") or (),
+    )
+
+    with pytest.raises(ValueError, match="Git worktree|local changes"):
+        manager.install(request)
+
+    assert effects == []
+    assert not (tmp_path / "state" / "repository-bootstrap").exists()
+
+
+def test_explicit_managed_root_must_equal_verified_worktree(tmp_path: Path) -> None:
+    """Catches a verified checkout being used to authorize writes in a sibling root."""
+    managed = tmp_path / "managed"
+    verified_root = tmp_path / "verified"
+    managed.mkdir()
+    verified_root.mkdir()
+    request = _bootstrap_request()
+    verified = _verified_request(request).model_copy(
+        update={"current_worktree": verified_root.resolve()}
+    )
+    manager = RepositoryBootstrapManager(
+        managed_root=managed,
+        state_root=tmp_path / "state",
+        announce=lambda message: None,
+        now=lambda: _NOW,
+        verify=lambda candidate: verified,
+        record_trust=lambda operation, grant: None,
+        subscribe=lambda operation: (),
+        hydrate_artifacts=lambda operation: (),
+        install_generic_skill=lambda operation: (),
+        export_catalog_skills=lambda operation: (),
+        link_agents=lambda operation: (),
+    )
+
+    with pytest.raises(ValueError, match="verified.*worktree"):
+        manager.install(request)
+
+    assert not (tmp_path / "state" / "repository-bootstrap").exists()
+
+
+@pytest.mark.parametrize("drift", ("head", "ref", "remote"))
+def test_explicit_managed_root_rechecks_exact_git_identity_before_mutation(
+    tmp_path: Path,
+    drift: str,
+) -> None:
+    """Catches a stale verification result authorizing a changed clean worktree."""
+    managed = tmp_path / "managed"
+    commit = _initialize_managed_repository(managed)
+    request = _bootstrap_request(commit=commit)
+    verified = _verified_request(request).model_copy(
+        update={"current_worktree": managed.resolve()}
+    )
+    if drift == "head":
+        (managed / "second.txt").write_text("second\n")
+        subprocess.run(("git", "add", "second.txt"), cwd=managed, check=True)
+        subprocess.run(("git", "commit", "-q", "-m", "second"), cwd=managed, check=True)
+        expected = "HEAD differs"
+    elif drift == "ref":
+        subprocess.run(("git", "checkout", "-q", "-b", "other"), cwd=managed, check=True)
+        expected = "wrong branch"
+    else:
+        subprocess.run(
+            ("git", "remote", "set-url", "origin", "https://example.test/other.git"),
+            cwd=managed,
+            check=True,
+        )
+        expected = "remote differs"
+    manager = RepositoryBootstrapManager(
+        managed_root=managed,
+        state_root=tmp_path / "state",
+        announce=lambda message: None,
+        now=lambda: _NOW,
+        verify=lambda candidate: verified,
+        record_trust=lambda operation, grant: None,
+        subscribe=lambda operation: (),
+        hydrate_artifacts=lambda operation: (),
+        install_generic_skill=lambda operation: (),
+        export_catalog_skills=lambda operation: (),
+        link_agents=lambda operation: (),
+    )
+
+    with pytest.raises(ValueError, match=expected):
+        manager.install(request)
+
+    assert not (tmp_path / "state" / "repository-bootstrap").exists()
 
 
 @pytest.mark.parametrize("linked_root", ["managed", "state"])
@@ -1715,10 +1989,18 @@ def test_bootstrap_manager_never_resolves_owned_evidence_from_the_other_root(
     managed.mkdir()
     state.mkdir()
     wrong_root = state if role == "skill" else managed
-    wrong_path = wrong_root / relative
-    wrong_path.parent.mkdir(parents=True)
     value = b"owned only in the wrong root\n"
-    wrong_path.write_bytes(value)
+    tracked = ((relative, value),) if role == "receipt" else ()
+    if role == "skill":
+        wrong_path = wrong_root / relative
+        wrong_path.parent.mkdir(parents=True)
+        wrong_path.write_bytes(value)
+    commit = _initialize_managed_repository(managed, tracked=tracked)
+    wrong_path = wrong_root / relative
+    request = _bootstrap_request(commit=commit)
+    verified = _verified_request(request).model_copy(
+        update={"current_worktree": managed.resolve()}
+    )
     evidence = ManagedPath(
         path=relative,
         sha256=hashlib.sha256(value).hexdigest(),
@@ -1731,7 +2013,7 @@ def test_bootstrap_manager_never_resolves_owned_evidence_from_the_other_root(
         state_root=state,
         announce=lambda message: None,
         now=lambda: _NOW,
-        verify=_verified_request,
+        verify=lambda candidate: verified,
         record_trust=lambda operation, grant: None,
         subscribe=lambda operation: subscription_result,
         hydrate_artifacts=lambda operation: (),
@@ -1741,6 +2023,6 @@ def test_bootstrap_manager_never_resolves_owned_evidence_from_the_other_root(
     )
 
     with pytest.raises(ValueError, match="missing or unsafe"):
-        manager.install(_bootstrap_request())
+        manager.install(request)
 
     assert wrong_path.read_bytes() == value

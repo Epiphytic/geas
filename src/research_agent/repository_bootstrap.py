@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
@@ -33,6 +34,7 @@ from research_agent.capabilities import (
     CapabilitySubject,
 )
 from research_agent.models import canonical_json, content_id, utc_now
+from research_agent.repository_catalog import normalized_repository_identity
 
 _PHASES = (
     BootstrapPhase.VERIFIED,
@@ -209,6 +211,7 @@ class RepositoryBootstrapManager:
             )
         self.managed_root = _authority_root(selected_managed_root, label="managed")
         self.state_root = _authority_root(selected_state_root, label="state")
+        self._requires_managed_worktree_binding = managed_root is not None
         self.root = self.managed_root
         self.announce, self.now, self.verify = announce, now, verify
         self.record_trust, self.replace_trust = record_trust, replace_trust
@@ -230,6 +233,10 @@ class RepositoryBootstrapManager:
         if self._load_update(request.name) is not None:
             raise ValueError("repository update transaction is active; resume it before install")
         existing = self._load(request.name)
+        self._assert_verified_managed_root(
+            verified,
+            require_clean=existing is None or existing.removed,
+        )
         if existing is not None and not existing.removed:
             if existing.request != request or existing.verified != verified:
                 raise ValueError("repository bootstrap name is already owned by another snapshot")
@@ -254,6 +261,7 @@ class RepositoryBootstrapManager:
         if existing is None or existing.removed or existing.verified is None:
             raise ValueError("unknown active repository bootstrap")
         journal = self._load_update(request.name)
+        self._assert_verified_managed_root(candidate, require_clean=journal is None)
         if journal is None:
             self._assert_complete_install(existing)
             self._assert_owned_paths(existing.managed_paths)
@@ -326,6 +334,7 @@ class RepositoryBootstrapManager:
         if receipt.trust_grant is not None and self.remove_trust is None:
             raise ValueError("repository bootstrap dependency is missing: trust removal")
         if not receipt.removal_pending:
+            self._assert_verified_managed_root(receipt.verified, require_clean=False)
             self._assert_owned_paths(receipt.managed_paths)
             receipt = receipt.model_copy(
                 update={
@@ -968,6 +977,99 @@ class RepositoryBootstrapManager:
         verified = self.verify(request)
         _verify_identity(request, verified)
         return verified
+
+    def _assert_verified_managed_root(
+        self,
+        verified: VerifiedRepositoryBootstrap,
+        *,
+        require_clean: bool,
+    ) -> None:
+        """Bind explicit repository outputs to one exact verified Git worktree."""
+        if not self._requires_managed_worktree_binding:
+            return
+        verified_worktree = verified.current_worktree
+        if verified_worktree is None:
+            raise ValueError("verified managed Git worktree identity is missing")
+        try:
+            managed = self.managed_root.resolve(strict=True)
+            expected = verified_worktree.resolve(strict=True)
+        except (FileNotFoundError, OSError) as error:
+            raise ValueError("verified managed Git worktree is missing") from error
+        if managed != expected:
+            raise ValueError("managed root differs from the verified Git worktree")
+        if not managed.is_dir() or (managed / ".git").is_symlink():
+            raise ValueError("verified managed root is not a safe Git worktree")
+
+        top = self._managed_git(("rev-parse", "--show-toplevel"))
+        try:
+            top_level = Path(top).resolve(strict=True)
+        except (FileNotFoundError, OSError) as error:
+            raise ValueError("verified managed root is not a Git worktree") from error
+        if top_level != managed:
+            raise ValueError("managed root is not the verified Git worktree root")
+        head = self._managed_git(("rev-parse", "--verify", "HEAD^{commit}"))
+        if head != verified.commit_sha256:
+            raise ValueError("managed Git worktree HEAD differs from verified commit")
+        ref_commit = self._managed_git(
+            ("rev-parse", "--verify", f"{verified.ref}^{{commit}}")
+        )
+        if ref_commit != verified.commit_sha256:
+            raise ValueError("managed Git worktree ref differs from verified commit")
+        symbolic_ref = self._managed_git(
+            ("symbolic-ref", "-q", "HEAD"),
+            check=False,
+        )
+        if verified.ref.startswith("refs/heads/"):
+            if symbolic_ref != verified.ref:
+                raise ValueError("managed Git worktree is on the wrong branch")
+        elif symbolic_ref:
+            raise ValueError("managed Git worktree must be detached for a read-only ref")
+
+        origin = self._managed_git(
+            ("config", "--get", "remote.origin.url"),
+            check=False,
+        )
+        try:
+            normalized_origin = normalized_repository_identity(origin)
+        except ValueError as error:
+            raise ValueError(
+                "managed Git worktree remote differs from verified repository"
+            ) from error
+        if normalized_origin != verified.repository:
+            raise ValueError("managed Git worktree remote differs from verified repository")
+
+        catalog = _confined_owned_path(self.managed_root, verified.catalog)
+        if catalog.is_symlink() or not catalog.is_file():
+            raise ValueError("verified managed Git worktree catalog is missing or unsafe")
+        if require_clean and self._managed_git(
+            ("status", "--porcelain=v1", "-z", "--untracked-files=all")
+        ):
+            raise ValueError("verified managed Git worktree has local changes")
+
+    def _managed_git(
+        self,
+        arguments: tuple[str, ...],
+        *,
+        check: bool = True,
+    ) -> str:
+        completed = subprocess.run(
+            ("git", "-C", str(self.managed_root), *arguments),
+            env={
+                **os.environ,
+                "GIT_TERMINAL_PROMPT": "0",
+                "GIT_NO_REPLACE_OBJECTS": "1",
+                "GIT_OPTIONAL_LOCKS": "0",
+                "GIT_CONFIG_COUNT": "1",
+                "GIT_CONFIG_KEY_0": "core.hooksPath",
+                "GIT_CONFIG_VALUE_0": os.devnull,
+            },
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if check and completed.returncode != 0:
+            raise ValueError("verified managed root is not a Git worktree")
+        return completed.stdout.strip() if completed.returncode == 0 else ""
 
     def _operation(
         self,
