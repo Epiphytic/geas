@@ -381,3 +381,37 @@ def test_conditional_transport_accepts_secure_xml_media_family_and_rejects_unsol
         transport.fetch(request)
 
     assert xml.media_type == "application/rss+xml"
+
+
+def test_conditional_transport_rejects_opaque_octet_stream_and_malformed_xml() -> None:
+    """Opaque data and a leading '<' must not become eligible evidence."""
+    transport = ConditionalHttpsTransport(
+        dns_resolver=lambda _: ("8.8.8.8",),
+        http_client=_ConditionalClient(
+            [
+                ConditionalHttpResponse(
+                    status=200,
+                    headers={"Content-Type": "application/octet-stream"},
+                    body=b"\x00\x81\x82\x83",
+                ),
+                ConditionalHttpResponse(
+                    status=200,
+                    headers={"Content-Type": "application/rss+xml"},
+                    body=b"<rss><broken></rss>",
+                ),
+            ]
+        ),
+        capability_evaluator=_AllowEvaluator(),
+    )
+    octet_request = _source_request().model_copy(
+        update={"accepted_media_types": ("application/octet-stream",)}
+    )
+    xml_request = _source_request().model_copy(
+        update={"accepted_media_types": ("application/rss+xml",)}
+    )
+
+    opaque = transport.fetch(octet_request)
+    malformed = transport.fetch(xml_request)
+
+    assert opaque.constraint is SourceFetchConstraint.UNSUPPORTED_MEDIA_TYPE
+    assert malformed.constraint is SourceFetchConstraint.UNSUPPORTED_MEDIA_TYPE

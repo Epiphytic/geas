@@ -69,7 +69,7 @@ def _source_url(value: object) -> str:
         or any(segment in {".", ".."} for segment in decoded_path.split("/"))
     ):
         raise ValueError("locator path is unsafe")
-    canonical_path = quote(decoded_path, safe="/%:@!$&'()*+,;=-._~")
+    canonical_path = quote(decoded_path, safe="/:@!$&'()*+,;=-._~")
     if unquote(canonical_path) != decoded_path:
         raise ValueError("locator path is not canonically encodable")
     return urlunsplit(("https", parsed.hostname.lower(), canonical_path, parsed.query, ""))

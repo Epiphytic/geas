@@ -113,6 +113,14 @@ def test_candidate_rejects_encoded_or_backslash_path_ambiguity(locator: str) -> 
         _candidate(locator)
 
 
+def test_percent_normalization_is_idempotent_without_raw_percent() -> None:
+    """Leaving a raw percent in canonical output makes a second authorization differ."""
+    first = _candidate("https://issuer.example/a%25b.pdf")
+    second = _candidate(first.locator)
+    assert first.locator == "https://issuer.example/a%25b.pdf"
+    assert second.locator == first.locator
+
+
 def test_intent_normalizes_associations_and_rejects_invalid_document_glob() -> None:
     """Allowing unsafe globs makes path selection ambiguous and broadens authority."""
     assert _intent().associations.concepts == ("concept:a",)

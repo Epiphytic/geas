@@ -18,6 +18,7 @@ from email.utils import parsedate_to_datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import Protocol
+from xml.etree import ElementTree
 
 from pydantic import Field, field_validator
 
@@ -268,6 +269,16 @@ class ConditionalHttpsTransport:
             media_type = self._sniff_media(claimed, current, content)
             if self._is_xml_family(claimed) and media_type == "application/xml":
                 media_type = claimed.casefold()
+            if media_type == "application/octet-stream":
+                return SourceFetchResult(
+                    requested_url=requested,
+                    final_url=current,
+                    redirect_chain=tuple(redirects),
+                    status=response.status,
+                    media_type=media_type,
+                    validator=validator,
+                    constraint=SourceFetchConstraint.UNSUPPORTED_MEDIA_TYPE,
+                )
             if self._claimed_type_conflicts(claimed, media_type):
                 return SourceFetchResult(
                     requested_url=requested,
@@ -437,7 +448,11 @@ class ConditionalHttpsTransport:
         if stripped.startswith((b"{", b"[")):
             return "application/json"
         if stripped.startswith(b"<"):
-            return "application/xml"
+            return (
+                "application/xml"
+                if ConditionalHttpsTransport._secure_xml(content)
+                else "application/octet-stream"
+            )
         if content and all(byte in {9, 10, 13} or 32 <= byte < 127 for byte in content[:4096]):
             return "text/plain"
         return "application/octet-stream"
@@ -458,6 +473,25 @@ class ConditionalHttpsTransport:
             "application/rss+xml",
             "application/atom+xml",
         } or normalized.endswith("+xml")
+
+    @staticmethod
+    def _secure_xml(content: bytes) -> bool:
+        encoding = "utf-8"
+        if content.startswith((b"\xff\xfe\x00\x00", b"\x00\x00\xfe\xff")):
+            encoding = "utf-32"
+        elif content.startswith((b"\xff\xfe", b"\xfe\xff")):
+            encoding = "utf-16"
+        try:
+            text = content.decode(encoding)
+        except UnicodeDecodeError:
+            return False
+        if "<!DOCTYPE" in text.upper() or "<!ENTITY" in text.upper():
+            return False
+        try:
+            ElementTree.fromstring(text)
+        except ElementTree.ParseError:
+            return False
+        return True
 
     @staticmethod
     def _safe_metadata(value: str | None) -> str | None:
