@@ -1,0 +1,129 @@
+version: 1
+topic: Aurora Gold
+topic_concept_id: concept:aurora-gold
+description: Offline automatic-acquisition acceptance fixture.
+seed_bundles:
+  - ontology/bundle.yaml
+output_directory: data/generated/aurora-gold
+provider: fixture-local
+discovery_enabled: false
+source_work:
+  max_requests_per_run: 8
+  max_bytes_per_run: 1048576
+  max_depth: 1
+  refresh_interval_seconds: 900
+  max_run_seconds: 60.0
+  finalization_reserve_seconds: 5.0
+source_intent:
+  - id: aurora-constrained
+    role: regulatory_filing
+    discovery:
+      kind: direct_url
+      locator: https://sedar-plus.example.test/filings/pending.html
+    allowed_hosts:
+      - sedar-plus.example.test
+    allowed_path_prefixes:
+      - /filings/
+    accepted_media_types:
+      - text/html
+    document_patterns:
+      - /filings/*.html
+    refresh:
+      interval_seconds: 900
+      max_items: 1
+      max_depth: 0
+    required: false
+    priority: 40
+    associations:
+      concepts:
+        - concept:aurora-gold
+      topics:
+        - Aurora Gold
+    temporal:
+      field: observed_at
+      retention: append_only
+    created_at: 2026-09-03T12:00:00Z
+  - id: aurora-financials
+    role: issuer_financials
+    discovery:
+      kind: direct_url
+      locator: https://aurora-gold.example.test/financials/q2-2026.json
+    allowed_hosts:
+      - aurora-gold.example.test
+    allowed_path_prefixes:
+      - /financials/
+    accepted_media_types:
+      - application/json
+    document_patterns:
+      - /financials/*.json
+    refresh:
+      interval_seconds: 86400
+      max_items: 1
+      max_depth: 0
+    required: true
+    priority: 30
+    associations:
+      concepts:
+        - concept:aurora-gold
+      topics:
+        - Aurora Gold
+    temporal:
+      field: valid_at
+      retention: append_only
+    created_at: 2026-09-03T12:00:00Z
+  - id: aurora-news
+    role: issuer_news
+    discovery:
+      kind: rss_atom
+      locator: https://aurora-gold.example.test/news/feed.xml
+    allowed_hosts:
+      - aurora-gold.example.test
+    allowed_path_prefixes:
+      - /news/
+    accepted_media_types:
+      - text/html
+    document_patterns:
+      - /news/*.html
+    refresh:
+      interval_seconds: 900
+      max_items: 4
+      max_depth: 1
+    required: true
+    priority: 10
+    associations:
+      concepts:
+        - concept:aurora-gold
+      topics:
+        - Aurora Gold
+    temporal:
+      field: published_at
+      retention: append_only
+    created_at: 2026-09-03T12:00:00Z
+  - id: aurora-regulatory
+    role: regulatory_filing
+    discovery:
+      kind: direct_url
+      locator: https://sedar-plus.example.test/filings/ni-43-101.html
+    allowed_hosts:
+      - sedar-plus.example.test
+    allowed_path_prefixes:
+      - /filings/
+    accepted_media_types:
+      - text/html
+    document_patterns:
+      - /filings/*.html
+    refresh:
+      interval_seconds: 604800
+      max_items: 1
+      max_depth: 0
+    required: true
+    priority: 20
+    associations:
+      concepts:
+        - concept:aurora-gold
+      topics:
+        - Aurora Gold
+    temporal:
+      field: published_at
+      retention: append_only
+    created_at: 2026-09-03T12:00:00Z

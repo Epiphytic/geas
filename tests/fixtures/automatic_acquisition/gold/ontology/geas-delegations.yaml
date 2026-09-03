@@ -1,0 +1,34 @@
+version: 1
+delegations:
+  - subject:
+      repository: https://github.com/example/aurora-gold-sources
+      refs:
+        - refs/heads/main
+      paths:
+        - sources/aurora-gold
+      bundle_sha256: '*'
+    capabilities:
+      - source.archive
+      - source.discover
+      - source.extract
+      - source.fetch
+    delegable_capabilities: []
+    resources:
+      delegated_repositories: []
+      hosts:
+        - aurora-gold.example.test
+        - sedar-plus.example.test
+      path_prefixes:
+        - /filings/
+        - /financials/
+        - /news/
+      connectors:
+        - rss-atom
+        - direct-https
+      providers: []
+      models: []
+      data_classes: []
+      git_refs: []
+    max_delegation_depth: 0
+    expires_at: null
+    description: One-hop official-source access for the offline Aurora Gold fixture.

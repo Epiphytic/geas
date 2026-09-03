@@ -1,0 +1,9 @@
+version: 1
+id: library:aurora-gold
+title: Aurora Gold source library
+description: Deterministic issuer, regulatory, and financial fixture sources.
+repositories: []
+source_version_ids: []
+source_uri_prefixes: []
+connector_ids: []
+include_all_parsed_sources: true
