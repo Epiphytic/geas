@@ -1536,31 +1536,68 @@ class SourceWorkCoordinator:
                 for value in records
                 if value.get("target", {}).get("source_version") == target_id
             )
-            superseded = {
-                observation.supersedes
-                for observation in persisted
-                if observation.supersedes is not None
-            }
-            observations = tuple(
-                observation for observation in persisted if observation.id not in superseded
+            current_targets = self._current_threat_tips(persisted) or (
+                (ThreatTarget(source_version=target_id), ()),
             )
-            decision = self.source_policy.evaluate(
-                target=ThreatTarget(source_version=target_id),
-                workflow_id=item.lineage_id,
-                stage=PolicyStage.EXTRACTION,
-                observations=observations,
-            )
-            self.store.put_record("policy-decision", decision)
-            blocked_status = blocked_status or any(
-                observation.status in {ThreatStatus.SUSPECTED, ThreatStatus.CONFIRMED}
-                for observation in observations
-            )
-            blocked_action = blocked_action or decision.action in {
-                PolicyAction.DENY,
-                PolicyAction.QUARANTINE,
-                PolicyAction.ALLOW_METADATA_ONLY,
-            }
+            for target, observations in current_targets:
+                decision = self.source_policy.evaluate(
+                    target=target,
+                    workflow_id=item.lineage_id,
+                    stage=PolicyStage.EXTRACTION,
+                    observations=observations,
+                )
+                self.store.put_record("policy-decision", decision)
+                blocked_status = blocked_status or any(
+                    observation.status in {ThreatStatus.SUSPECTED, ThreatStatus.CONFIRMED}
+                    for observation in observations
+                )
+                blocked_action = blocked_action or decision.action in {
+                    PolicyAction.DENY,
+                    PolicyAction.QUARANTINE,
+                    PolicyAction.ALLOW_METADATA_ONLY,
+                }
         return blocked_status or blocked_action
+
+    @staticmethod
+    def _threat_target_key(target: ThreatTarget) -> bytes:
+        """Canonical identity over every current and future ThreatTarget field."""
+        return json.dumps(
+            target.model_dump(mode="json", exclude_none=False),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+
+    @classmethod
+    def _current_threat_tips(
+        cls,
+        observations: tuple[ThreatObservation, ...],
+    ) -> tuple[tuple[ThreatTarget, tuple[ThreatObservation, ...]], ...]:
+        grouped: dict[bytes, list[ThreatObservation]] = {}
+        for observation in observations:
+            grouped.setdefault(cls._threat_target_key(observation.target), []).append(observation)
+
+        current: list[tuple[ThreatTarget, tuple[ThreatObservation, ...]]] = []
+        for target_key in sorted(grouped):
+            target_observations = grouped[target_key]
+            target_ids = {observation.id for observation in target_observations}
+            superseded_ids = {
+                observation.supersedes
+                for observation in target_observations
+                if observation.supersedes in target_ids
+            }
+            tips = tuple(
+                sorted(
+                    (
+                        observation
+                        for observation in target_observations
+                        if observation.id not in superseded_ids
+                    ),
+                    key=lambda observation: observation.id,
+                )
+            )
+            current.append((target_observations[0].target, tips))
+        return tuple(current)
 
     @staticmethod
     def _authorization_fingerprint(decision: CapabilityDecision) -> str:

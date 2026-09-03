@@ -820,6 +820,143 @@ def test_new_threat_after_anchor_checkpoint_blocks_resumed_extraction(tmp_path: 
     assert receipt.complete is False
 
 
+def _anchored_source(tmp_path: Path) -> tuple[ImmutableStore, str]:
+    def interrupt(phase: SourceWorkPhase) -> None:
+        if phase is SourceWorkPhase.ANCHORS_SELECTED:
+            raise SourceWorkInterruption("fixture interruption")
+
+    with pytest.raises(SourceWorkInterruption):
+        _coordinator(tmp_path, after_phase=interrupt).run_due((_intent(),), now=NOW)
+
+    store = ImmutableStore(tmp_path)
+    selected = next(
+        value
+        for value in store.iter_records("source-work-result")
+        if "anchor_ids" in value
+    )
+    source_version_id = selected["derived_source_version_id"]
+    assert isinstance(source_version_id, str)
+    return store, source_version_id
+
+
+def _threat_observation(
+    target: ThreatTarget,
+    status: ThreatStatus,
+    *,
+    supersedes: str | None = None,
+) -> ThreatObservation:
+    fields = {
+        "target": target,
+        "threat_type": "reviewed_prompt_injection",
+        "status": status,
+        "detected_at": NOW + timedelta(seconds=1 if supersedes is None else 2),
+        "detector": Detector(
+            kind=DetectorKind.HUMAN,
+            id="reviewer:fixture",
+            version="1",
+        ),
+        "evidence": (f"evidence:{status}:{target.evidence_fragment}:{target.connector_id}",),
+        "severity": ThreatSeverity.HIGH,
+        "supersedes": supersedes,
+    }
+    return ThreatObservation(id=content_id("threat-observation", fields), **fields)
+
+
+@pytest.mark.parametrize(
+    (
+        "threat_status",
+        "successor_status",
+        "threat_fragment",
+        "successor_fragment",
+        "threat_connector",
+        "successor_connector",
+    ),
+    (
+        (
+            ThreatStatus.SUSPECTED,
+            ThreatStatus.FALSE_POSITIVE,
+            "evidence:fragment-a",
+            "evidence:fragment-b",
+            "connector:shared",
+            "connector:shared",
+        ),
+        (
+            ThreatStatus.CONFIRMED,
+            ThreatStatus.REMEDIATED,
+            "evidence:shared",
+            "evidence:shared",
+            "connector:a",
+            "connector:b",
+        ),
+    ),
+    ids=("different-fragment", "different-connector"),
+)
+def test_successor_for_different_exact_threat_target_cannot_resolve_threat(
+    tmp_path: Path,
+    threat_status: ThreatStatus,
+    successor_status: ThreatStatus,
+    threat_fragment: str,
+    successor_fragment: str,
+    threat_connector: str,
+    successor_connector: str,
+) -> None:
+    """Grouping only by source version lets an unrelated successor hide a threat."""
+    store, source_version_id = _anchored_source(tmp_path)
+    threat = _threat_observation(
+        ThreatTarget(
+            source_version=source_version_id,
+            evidence_fragment=threat_fragment,
+            connector_id=threat_connector,
+        ),
+        threat_status,
+    )
+    successor = _threat_observation(
+        ThreatTarget(
+            source_version=source_version_id,
+            evidence_fragment=successor_fragment,
+            connector_id=successor_connector,
+        ),
+        successor_status,
+        supersedes=threat.id,
+    )
+    store.put_record("threat-observation", successor)
+    store.put_record("threat-observation", threat)
+    extractor = _Extractor(store)
+
+    receipt = _coordinator(tmp_path, extractor=extractor).run_due((_intent(),), now=NOW)
+
+    assert extractor.calls == []
+    assert receipt.proposal_ids == ()
+    assert receipt.complete is False
+
+
+@pytest.mark.parametrize(
+    "successor_status",
+    (ThreatStatus.FALSE_POSITIVE, ThreatStatus.REMEDIATED),
+)
+def test_successor_for_same_exact_threat_target_can_resolve_threat(
+    tmp_path: Path,
+    successor_status: ThreatStatus,
+) -> None:
+    store, source_version_id = _anchored_source(tmp_path)
+    target = ThreatTarget(
+        source_version=source_version_id,
+        evidence_fragment="evidence:fragment-a",
+        connector_id="connector:a",
+    )
+    threat = _threat_observation(target, ThreatStatus.SUSPECTED)
+    successor = _threat_observation(target, successor_status, supersedes=threat.id)
+    store.put_record("threat-observation", successor)
+    store.put_record("threat-observation", threat)
+    extractor = _Extractor(store)
+
+    receipt = _coordinator(tmp_path, extractor=extractor).run_due((_intent(),), now=NOW)
+
+    assert len(extractor.calls) == 1
+    assert receipt.proposal_ids == ("extraction-proposal:sha256:" + "e" * 64,)
+    assert receipt.complete is True
+
+
 @pytest.mark.parametrize(
     "resume_phase",
     (
