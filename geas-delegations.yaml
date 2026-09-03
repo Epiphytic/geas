@@ -1,0 +1,40 @@
+version: 1
+delegations:
+  - version: 1
+    subject:
+      version: 1
+      repository: https://github.com/assafelovic/gpt-researcher
+      refs:
+        - refs/heads/main
+      paths:
+        - README.md
+      bundle_sha256: "*"
+    capabilities:
+      - repository.read
+      - source.archive
+      - source.discover
+      - source.extract
+      - source.fetch
+    delegable_capabilities: []
+    resources:
+      version: 1
+      delegated_repositories: []
+      hosts:
+        - api.github.com
+        - github.com
+      path_prefixes:
+        - /assafelovic/gpt-researcher
+        - /repos/assafelovic/gpt-researcher
+      connectors:
+        - source:github-repository
+      providers: []
+      models: []
+      data_classes: []
+      git_refs:
+        - refs/heads/main
+    max_delegation_depth: 0
+    expires_at: null
+    description: >-
+      Optional README acquisition from the already evidenced upstream project;
+      inert unless an exact local grant authorizes the parent repository and
+      one delegation edge.
