@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+import os
+import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -30,6 +34,12 @@ from research_agent.ontology_subscriptions import (
     SubscriptionManager,
 )
 from research_agent.ontology_trust import TrustRule
+from research_agent.removal_journal import (
+    RemovalJournal,
+    RemovalPhase,
+    removal_journal_path,
+    write_removal_journal,
+)
 from research_agent.repository_bootstrap import (
     BootstrapOperation,
     RepositoryBootstrapManager,
@@ -40,6 +50,7 @@ from research_agent.user_config import GeasProfile, GeasUserConfig, UserConfigMa
 _INSTALL_KEY = f"repository-bootstrap-operation:sha256:{'1' * 64}"
 _UPDATE_KEY = f"repository-bootstrap-update-operation:sha256:{'2' * 64}"
 _REMOVE_KEY = f"repository-bootstrap-removal-operation:sha256:{'3' * 64}"
+_OTHER_KEY = f"repository-bootstrap-operation:sha256:{'9' * 64}"
 _NOW = datetime(2026, 9, 3, tzinfo=UTC)
 
 
@@ -102,6 +113,7 @@ class _BootstrapRepository:
         (self.checkout / ".git").mkdir()
         (self.checkout / "geas.yaml").write_text("version: 1\nontologies: []\n")
         commit = "d" * 40 if self.subscription.active_ref == "refs/heads/main" else "e" * 40
+        (self.checkout / ".bootstrap-commit").write_text(commit)
         return {"commit": commit}
 
     def push(self) -> dict[str, object]:
@@ -109,6 +121,164 @@ class _BootstrapRepository:
 
     def assert_removable(self) -> None:
         return None
+
+    def assert_verified_commit(self, expected_commit: str) -> None:
+        if (self.checkout / ".bootstrap-commit").read_text() != expected_commit:
+            raise ValueError("checkout does not match the exact verified commit")
+
+
+def _stop_before_config_mutation(**kwargs: object) -> BootstrapConfigMutationReceipt:
+    raise RuntimeError("stop after prepared journal")
+
+
+def test_record_grant_retry_cannot_claim_matching_bytes_from_another_writer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches PREPARED record recovery treating matching config bytes as its write."""
+    manager = _config_manager(tmp_path)
+    grant = _grant()
+    preparing = UserConfigManager(manager.path)
+    monkeypatch.setattr(
+        preparing, "mutate_profile_expected", _stop_before_config_mutation
+    )
+    with pytest.raises(RuntimeError, match="prepared journal"):
+        preparing.record_bootstrap_grant(
+            operation_key=_INSTALL_KEY,
+            profile_name="default",
+            bootstrap_name="gold",
+            grant=grant,
+        )
+
+    manager.mutate_profile_expected(
+        operation_key=_OTHER_KEY,
+        profile_name="default",
+        bootstrap_name="other-writer",
+        kind="grant_record",
+        expected_config_sha256=manager.config_sha256(),
+        mutate=lambda profile: profile.model_copy(
+            update={"capability_grants": (*profile.capability_grants, grant)}
+        ),
+        upgrade_version=True,
+    )
+
+    with pytest.raises(RuntimeError, match="applied marker"):
+        UserConfigManager(manager.path).record_bootstrap_grant(
+            operation_key=_INSTALL_KEY,
+            profile_name="default",
+            bootstrap_name="gold",
+            grant=grant,
+        )
+
+
+def test_replace_grant_retry_cannot_claim_matching_bytes_from_another_writer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches PREPARED replacement recovery adopting another writer's result."""
+    manager = _config_manager(tmp_path)
+    old = _grant()
+    recorded = manager.record_bootstrap_grant(
+        operation_key=_INSTALL_KEY,
+        profile_name="default",
+        bootstrap_name="gold",
+        grant=old,
+    )
+    assert recorded.ownership is not None
+    new = _grant(created_at=datetime(2026, 9, 4, tzinfo=UTC))
+    preparing = UserConfigManager(manager.path)
+    monkeypatch.setattr(
+        preparing, "mutate_profile_expected", _stop_before_config_mutation
+    )
+    with pytest.raises(RuntimeError, match="prepared journal"):
+        preparing.replace_bootstrap_grant(
+            operation_key=_UPDATE_KEY,
+            profile_name="default",
+            bootstrap_name="gold",
+            ownership=recorded.ownership,
+            old_grant=old,
+            new_grant=new,
+        )
+
+    manager.mutate_profile_expected(
+        operation_key=_OTHER_KEY,
+        profile_name="default",
+        bootstrap_name="other-writer",
+        kind="grant_replace",
+        expected_config_sha256=manager.config_sha256(),
+        mutate=lambda profile: profile.model_copy(
+            update={
+                "capability_grants": tuple(
+                    item for item in profile.capability_grants if item.id != old.id
+                )
+                + (new,)
+            }
+        ),
+        upgrade_version=True,
+    )
+
+    with pytest.raises(RuntimeError, match="applied marker"):
+        UserConfigManager(manager.path).replace_bootstrap_grant(
+            operation_key=_UPDATE_KEY,
+            profile_name="default",
+            bootstrap_name="gold",
+            ownership=recorded.ownership,
+            old_grant=old,
+            new_grant=new,
+        )
+
+
+def test_remove_grant_retry_cannot_claim_matching_bytes_from_another_writer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches PREPARED removal recovery adopting another writer's deletion."""
+    manager = _config_manager(tmp_path)
+    grant = _grant()
+    recorded = manager.record_bootstrap_grant(
+        operation_key=_INSTALL_KEY,
+        profile_name="default",
+        bootstrap_name="gold",
+        grant=grant,
+    )
+    assert recorded.ownership is not None
+    preparing = UserConfigManager(manager.path)
+    monkeypatch.setattr(
+        preparing, "mutate_profile_expected", _stop_before_config_mutation
+    )
+    with pytest.raises(RuntimeError, match="prepared journal"):
+        preparing.remove_bootstrap_grant(
+            operation_key=_REMOVE_KEY,
+            profile_name="default",
+            bootstrap_name="gold",
+            ownership=recorded.ownership,
+            grant=grant,
+        )
+
+    manager.mutate_profile_expected(
+        operation_key=_OTHER_KEY,
+        profile_name="default",
+        bootstrap_name="other-writer",
+        kind="grant_remove",
+        expected_config_sha256=manager.config_sha256(),
+        mutate=lambda profile: profile.model_copy(
+            update={
+                "capability_grants": tuple(
+                    item for item in profile.capability_grants if item.id != grant.id
+                )
+            }
+        ),
+        upgrade_version=True,
+    )
+
+    with pytest.raises(RuntimeError, match="applied marker"):
+        UserConfigManager(manager.path).remove_bootstrap_grant(
+            operation_key=_REMOVE_KEY,
+            profile_name="default",
+            bootstrap_name="gold",
+            ownership=recorded.ownership,
+            grant=grant,
+        )
 
 
 def test_config_mutation_receipt_rejects_an_unbound_extra_field() -> None:
@@ -700,7 +870,9 @@ class _LifecycleBootstrapRepository(_BootstrapRepository):
         self.checkout.mkdir(parents=True)
         (self.checkout / ".git").mkdir()
         (self.checkout / "geas.yaml").write_text("version: 1\nontologies: []\n")
-        return {"commit": ("d" if type(self).pulls == 1 else "e") * 40}
+        commit = ("d" if type(self).pulls == 1 else "e") * 40
+        (self.checkout / ".bootstrap-commit").write_text(commit)
+        return {"commit": commit}
 
 
 def test_remove_bootstrap_subscription_retains_dirty_owned_checkout(
@@ -741,6 +913,265 @@ def test_remove_bootstrap_subscription_retains_dirty_owned_checkout(
 
     assert manager.subscription_checkout(subscription).is_dir()
     assert manager.path.read_bytes() == before
+
+
+def test_remove_subscription_rejects_checkout_advanced_beyond_owned_commit(
+    tmp_path: Path,
+) -> None:
+    """Catches an old ownership receipt deleting a later synchronized checkout."""
+    manager = _config_manager(tmp_path)
+    service = SubscriptionManager(
+        config_manager=manager,
+        profile_name="default",
+        catalog_verifier=lambda path: path,
+        authorizer=lambda verified: verified,
+        repository_factory=_BootstrapRepository,
+    )
+    subscription = _subscription()
+    installed = service.ensure_bootstrap_subscription(
+        "gold",
+        subscription,
+        operation_key=_INSTALL_KEY,
+        verified_commit="d" * 40,
+    )
+    assert installed.ownership is not None
+    checkout = manager.subscription_checkout(subscription)
+    (checkout / ".bootstrap-commit").write_text("f" * 40)
+
+    with pytest.raises(ValueError, match="verified commit"):
+        service.remove_bootstrap_subscription(
+            "gold",
+            subscription,
+            operation_key=_REMOVE_KEY,
+            ownership=installed.ownership,
+        )
+
+    assert checkout.is_dir()
+    assert "gold" in manager.load().profiles["default"].subscriptions
+
+
+def test_remove_subscription_rejects_catalog_symlink_drift(tmp_path: Path) -> None:
+    """Catches removal trusting a catalog path redirected after installation."""
+    manager = _config_manager(tmp_path)
+    service = SubscriptionManager(
+        config_manager=manager,
+        profile_name="default",
+        catalog_verifier=lambda path: path,
+        authorizer=lambda verified: verified,
+        repository_factory=_BootstrapRepository,
+    )
+    subscription = _subscription()
+    installed = service.ensure_bootstrap_subscription(
+        "gold",
+        subscription,
+        operation_key=_INSTALL_KEY,
+        verified_commit="d" * 40,
+    )
+    assert installed.ownership is not None
+    checkout = manager.subscription_checkout(subscription)
+    catalog = checkout / "geas.yaml"
+    catalog.unlink()
+    outside = tmp_path / "outside-geas.yaml"
+    outside.write_text("version: 1\nontologies: []\n")
+    catalog.symlink_to(outside)
+
+    with pytest.raises(ValueError, match="catalog"):
+        service.remove_bootstrap_subscription(
+            "gold",
+            subscription,
+            operation_key=_REMOVE_KEY,
+            ownership=installed.ownership,
+        )
+
+    assert checkout.is_dir()
+    assert outside.is_file()
+
+
+def test_subscription_staged_replay_reverifies_exact_commit_before_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches staged recovery swapping a checkout whose verified identity drifted."""
+    manager = _config_manager(tmp_path)
+    subscription = _subscription()
+    destination = manager.subscription_checkout(subscription)
+    digest = _INSTALL_KEY.rsplit(":", 1)[-1]
+    staging = destination.with_name(
+        f".{destination.name}.bootstrap-{digest}.stage"
+    )
+    original_replace = os.replace
+    interrupted = False
+
+    def stop_before_checkout_swap(source: object, target: object) -> None:
+        nonlocal interrupted
+        if not interrupted and Path(source) == staging and Path(target) == destination:
+            interrupted = True
+            raise RuntimeError("stop before checkout swap")
+        original_replace(source, target)
+
+    monkeypatch.setattr(
+        "research_agent.ontology_subscriptions.os.replace",
+        stop_before_checkout_swap,
+    )
+    service = SubscriptionManager(
+        config_manager=manager,
+        profile_name="default",
+        catalog_verifier=lambda path: path,
+        authorizer=lambda verified: verified,
+        repository_factory=_BootstrapRepository,
+    )
+
+    with pytest.raises(RuntimeError, match="stop before checkout swap"):
+        service.ensure_bootstrap_subscription(
+            "gold",
+            subscription,
+            operation_key=_INSTALL_KEY,
+            verified_commit="d" * 40,
+        )
+
+    assert staging.is_dir()
+    (staging / ".bootstrap-commit").write_text("f" * 40)
+    before = manager.path.read_bytes()
+    with pytest.raises(ValueError, match="verified commit"):
+        service.ensure_bootstrap_subscription(
+            "gold",
+            subscription,
+            operation_key=_INSTALL_KEY,
+            verified_commit="d" * 40,
+        )
+
+    assert staging.is_dir()
+    assert not destination.exists()
+    assert manager.path.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("profile_name", "other"),
+        ("staging", "subscriptions/default/.wrong.stage"),
+    ],
+)
+def test_subscription_ensure_rejects_misdirected_journal_before_repository_work(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: str,
+) -> None:
+    """Catches a valid-but-misdirected journal selecting a sibling state path."""
+    manager = _config_manager(tmp_path)
+    _BootstrapRepository.pulls = 0
+    preparing = SubscriptionManager(
+        config_manager=manager,
+        profile_name="default",
+        catalog_verifier=lambda path: path,
+        authorizer=lambda verified: verified,
+        repository_factory=_BootstrapRepository,
+    )
+
+    def stop_after_journal(*args: object) -> BootstrapSubscriptionMutationReceipt:
+        raise RuntimeError("stop after subscription journal")
+
+    monkeypatch.setattr(
+        preparing, "_resume_bootstrap_subscription_ensure", stop_after_journal
+    )
+    with pytest.raises(RuntimeError, match="subscription journal"):
+        preparing.ensure_bootstrap_subscription(
+            "gold",
+            _subscription(),
+            operation_key=_INSTALL_KEY,
+            verified_commit="d" * 40,
+        )
+    digest = _INSTALL_KEY.rsplit(":", 1)[-1]
+    journal_path = (
+        manager.root
+        / "repository-bootstrap/subscription-mutations/default/gold"
+        / f"{digest}.json"
+    )
+    payload = json.loads(journal_path.read_text())
+    payload[field] = value
+    journal_path.write_text(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n")
+
+    with pytest.raises(ValueError, match="journal"):
+        SubscriptionManager(
+            config_manager=manager,
+            profile_name="default",
+            catalog_verifier=lambda path: path,
+            authorizer=lambda verified: verified,
+            repository_factory=_BootstrapRepository,
+        ).ensure_bootstrap_subscription(
+            "gold",
+            _subscription(),
+            operation_key=_INSTALL_KEY,
+            verified_commit="d" * 40,
+        )
+
+    assert _BootstrapRepository.pulls == 0
+
+
+def test_subscription_replace_rejects_misdirected_quarantine_before_pull(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches replacement replay moving an old checkout to a sibling path."""
+    manager = _config_manager(tmp_path)
+    _BootstrapRepository.pulls = 0
+    preparing = SubscriptionManager(
+        config_manager=manager,
+        profile_name="default",
+        catalog_verifier=lambda path: path,
+        authorizer=lambda verified: verified,
+        repository_factory=_BootstrapRepository,
+    )
+    old = _subscription()
+    installed = preparing.ensure_bootstrap_subscription(
+        "gold", old, operation_key=_INSTALL_KEY, verified_commit="d" * 40
+    )
+    assert installed.ownership is not None
+
+    def stop_after_journal(*args: object) -> BootstrapSubscriptionMutationReceipt:
+        raise RuntimeError("stop after replacement journal")
+
+    monkeypatch.setattr(
+        preparing, "_resume_bootstrap_subscription_replace", stop_after_journal
+    )
+    candidate = _subscription(active_ref="refs/heads/stable")
+    with pytest.raises(RuntimeError, match="replacement journal"):
+        preparing.replace_bootstrap_subscription(
+            "gold",
+            old,
+            candidate,
+            operation_key=_UPDATE_KEY,
+            verified_commit="e" * 40,
+            ownership=installed.ownership,
+        )
+    digest = _UPDATE_KEY.rsplit(":", 1)[-1]
+    journal_path = (
+        manager.root
+        / "repository-bootstrap/subscription-mutations/default/gold"
+        / f"{digest}.json"
+    )
+    payload = json.loads(journal_path.read_text())
+    payload["quarantine"] = "subscriptions/default/.operator-owned.old"
+    journal_path.write_text(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n")
+
+    with pytest.raises(ValueError, match="journal"):
+        SubscriptionManager(
+            config_manager=manager,
+            profile_name="default",
+            catalog_verifier=lambda path: path,
+            authorizer=lambda verified: verified,
+            repository_factory=_BootstrapRepository,
+        ).replace_bootstrap_subscription(
+            "gold",
+            old,
+            candidate,
+            operation_key=_UPDATE_KEY,
+            verified_commit="e" * 40,
+            ownership=installed.ownership,
+        )
+
+    assert _BootstrapRepository.pulls == 1
 
 
 def _obsolete_operation(path: ManagedPath) -> BootstrapOperation:
@@ -787,6 +1218,35 @@ def test_remove_obsolete_paths_unlinks_only_the_exact_regular_leaf(tmp_path: Pat
     assert not target.exists()
     assert sibling.read_bytes() == b"keep"
     assert parent.is_dir()
+
+
+def test_remove_obsolete_receipt_uses_state_root_not_managed_root(
+    tmp_path: Path,
+) -> None:
+    """Catches split-root cleanup selecting a same-relative repository leaf."""
+    managed_root = tmp_path / "managed"
+    state_root = tmp_path / "state"
+    relative = "repository-bootstrap/subscription-ownership/default/gold/old.json"
+    state_target = state_root / relative
+    state_target.parent.mkdir(parents=True)
+    state_target.write_bytes(b"owned")
+    repository_sibling = managed_root / relative
+    repository_sibling.parent.mkdir(parents=True)
+    repository_sibling.write_bytes(b"operator")
+    receipt = ManagedPath(
+        path=relative,
+        sha256=hashlib.sha256(b"owned").hexdigest(),
+        role="receipt",
+    )
+
+    remove_obsolete_paths(
+        managed_root,
+        _obsolete_operation(receipt),
+        state_root=state_root,
+    )
+
+    assert not state_target.exists()
+    assert repository_sibling.read_bytes() == b"operator"
 
 
 def test_remove_obsolete_paths_rejects_modified_or_symlinked_leaf(tmp_path: Path) -> None:
@@ -841,6 +1301,67 @@ def test_subscription_sync_push_is_explicitly_disabled_before_repository_work(
         service.sync(push=True)
 
     assert _BootstrapRepository.pulls == 0
+
+
+def test_subscription_push_denial_precedes_pending_removal_recovery(
+    tmp_path: Path,
+) -> None:
+    """Catches denied push mutating a pending quarantine before returning denial."""
+    manager = _config_manager(tmp_path)
+    subscription = _subscription()
+    config = manager.load()
+    profile = config.profiles["default"].model_copy(
+        update={"subscriptions": {"gold": subscription}}
+    )
+    manager.replace(
+        config.model_copy(update={"profiles": {**config.profiles, "default": profile}})
+    )
+    transaction = "7" * 32
+    quarantine_relative = subscription.checkout.with_name(
+        f".{subscription.checkout.name}.remove-{transaction}"
+    )
+    quarantine = manager.root / quarantine_relative
+    quarantine.mkdir(parents=True)
+    marker = quarantine / "operator-marker"
+    marker.write_bytes(b"unchanged")
+    identity = quarantine.stat(follow_symlinks=False)
+    subscription_sha256 = hashlib.sha256(
+        json.dumps(
+            subscription.model_dump(mode="json"),
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    journal = RemovalJournal(
+        kind="subscription",
+        transaction_id=transaction,
+        phase=RemovalPhase.QUARANTINED,
+        profile_name="default",
+        target=subscription.checkout,
+        quarantine=quarantine_relative,
+        device=identity.st_dev,
+        inode=identity.st_ino,
+        name="gold",
+        subscription_sha256=subscription_sha256,
+    )
+    write_removal_journal(manager.root, journal)
+    journal_path = removal_journal_path(manager.root, journal)
+    journal_bytes = journal_path.read_bytes()
+    service = SubscriptionManager(
+        config_manager=manager,
+        profile_name="default",
+        catalog_verifier=lambda path: path,
+        authorizer=lambda verified: verified,
+        repository_factory=_BootstrapRepository,
+    )
+
+    with pytest.raises(ValueError, match="does not authorize repository push"):
+        service.sync(push=True)
+
+    assert quarantine.is_dir()
+    assert marker.read_bytes() == b"unchanged"
+    assert not manager.subscription_checkout(subscription).exists()
+    assert journal_path.read_bytes() == journal_bytes
 
 
 def _bootstrap_request(
@@ -1093,3 +1614,133 @@ def test_coordinator_update_and_remove_forward_exact_ownership_receipts(
     assert removed.grant_mutation.action == "remove"
     assert removed.subscription_mutation is not None
     assert removed.subscription_mutation.action == "remove"
+
+
+def test_bootstrap_manager_separates_operational_state_from_managed_repository(
+    tmp_path: Path,
+) -> None:
+    """Catches receipts polluting the repository whose managed skills are publishable."""
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    subprocess.run(("git", "init", "-q"), cwd=repository, check=True)
+    state_root = tmp_path / "state"
+    request = _bootstrap_request()
+
+    def install_skill(operation: BootstrapOperation) -> tuple[ManagedPath, ...]:
+        relative = Path(".agents/skills/gold/SKILL.md")
+        destination = repository / relative
+        destination.parent.mkdir(parents=True)
+        value = b"# Gold\n"
+        destination.write_bytes(value)
+        return (
+            ManagedPath(
+                path=relative.as_posix(),
+                sha256=hashlib.sha256(value).hexdigest(),
+                role="skill",
+            ),
+        )
+
+    receipt = RepositoryBootstrapManager(
+        managed_root=repository,
+        state_root=state_root,
+        announce=lambda message: None,
+        now=lambda: _NOW,
+        verify=_verified_request,
+        record_trust=lambda operation, grant: None,
+        subscribe=lambda operation: (),
+        hydrate_artifacts=lambda operation: (),
+        install_generic_skill=install_skill,
+        export_catalog_skills=lambda operation: (),
+        link_agents=lambda operation: (),
+    ).install(request)
+
+    assert (state_root / "repository-bootstrap/gold.json").is_file()
+    assert not (repository / "repository-bootstrap").exists()
+    assert receipt.managed_paths[0].path == ".agents/skills/gold/SKILL.md"
+    status = subprocess.run(
+        ("git", "status", "--porcelain"),
+        cwd=repository,
+        text=True,
+        capture_output=True,
+        check=True,
+        env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
+    ).stdout.splitlines()
+    assert status == ["?? .agents/"]
+
+
+@pytest.mark.parametrize("linked_root", ["managed", "state"])
+def test_bootstrap_manager_rejects_symlinked_managed_or_state_root(
+    tmp_path: Path,
+    linked_root: str,
+) -> None:
+    """Catches either authority root traversing a symlink into another tree."""
+    managed = tmp_path / "managed"
+    state = tmp_path / "state"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    if linked_root == "managed":
+        managed.symlink_to(outside, target_is_directory=True)
+        state.mkdir()
+    else:
+        managed.mkdir()
+        state.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="root.*symbolic link"):
+        RepositoryBootstrapManager(
+            managed_root=managed,
+            state_root=state,
+            announce=lambda message: None,
+        )
+
+
+@pytest.mark.parametrize(
+    ("role", "relative"),
+    [
+        ("skill", ".agents/skills/gold/SKILL.md"),
+        (
+            "receipt",
+            "repository-bootstrap/subscription-ownership/default/gold/"
+            f"{'1' * 64}.json",
+        ),
+    ],
+)
+def test_bootstrap_manager_never_resolves_owned_evidence_from_the_other_root(
+    tmp_path: Path,
+    role: str,
+    relative: str,
+) -> None:
+    """Catches repository and state evidence being adopted across authority roots."""
+    managed = tmp_path / "managed"
+    state = tmp_path / "state"
+    managed.mkdir()
+    state.mkdir()
+    wrong_root = state if role == "skill" else managed
+    wrong_path = wrong_root / relative
+    wrong_path.parent.mkdir(parents=True)
+    value = b"owned only in the wrong root\n"
+    wrong_path.write_bytes(value)
+    evidence = ManagedPath(
+        path=relative,
+        sha256=hashlib.sha256(value).hexdigest(),
+        role=role,
+    )
+    subscription_result = (evidence,) if role == "receipt" else ()
+    skill_result = (evidence,) if role == "skill" else ()
+    manager = RepositoryBootstrapManager(
+        managed_root=managed,
+        state_root=state,
+        announce=lambda message: None,
+        now=lambda: _NOW,
+        verify=_verified_request,
+        record_trust=lambda operation, grant: None,
+        subscribe=lambda operation: subscription_result,
+        hydrate_artifacts=lambda operation: (),
+        install_generic_skill=lambda operation: skill_result,
+        export_catalog_skills=lambda operation: (),
+        link_agents=lambda operation: (),
+    )
+
+    with pytest.raises(ValueError, match="missing or unsafe"):
+        manager.install(_bootstrap_request())
+
+    assert wrong_path.read_bytes() == value

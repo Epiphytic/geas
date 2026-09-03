@@ -6,6 +6,7 @@ import hashlib
 import os
 import re
 import shutil
+import subprocess
 from collections.abc import Callable, Mapping
 from contextlib import suppress
 from pathlib import Path, PurePosixPath
@@ -494,8 +495,11 @@ class SubscriptionManager:
                     raise ValueError(
                         "bootstrap checkout commit does not match verified identity"
                     )
-                verified = self.catalog_verifier(staging / subscription.catalog)
-                self.authorizer(verified)
+                self._verify_repository_identity(
+                    staging,
+                    subscription,
+                    expected_commit=journal.verified_commit,
+                )
                 identity = staging.stat(follow_symlinks=False)
                 journal = journal.model_copy(
                     update={
@@ -520,12 +524,22 @@ class SubscriptionManager:
                     inode=journal.new_checkout_inode,
                     label="swapped bootstrap subscription checkout",
                 )
+                self._verify_repository_identity(
+                    destination,
+                    subscription,
+                    expected_commit=journal.verified_commit,
+                )
             else:
                 self._assert_checkout_identity(
                     staging,
                     device=journal.new_checkout_device,
                     inode=journal.new_checkout_inode,
                     label="staged bootstrap subscription checkout",
+                )
+                self._verify_repository_identity(
+                    staging,
+                    subscription,
+                    expected_commit=journal.verified_commit,
                 )
                 os.replace(staging, destination)
                 sync_removal_parent(self.config_manager.root, journal.checkout)
@@ -537,6 +551,11 @@ class SubscriptionManager:
                 device=journal.new_checkout_device,
                 inode=journal.new_checkout_inode,
                 label="swapped bootstrap subscription checkout",
+            )
+            self._verify_repository_identity(
+                destination,
+                subscription,
+                expected_commit=journal.verified_commit,
             )
 
             def add_subscription(profile: GeasProfile) -> GeasProfile:
@@ -646,7 +665,6 @@ class SubscriptionManager:
 
         self._assert_subscription_ownership(ownership, old)
         destination = self.config_manager.subscription_checkout(old)
-        self._repository(destination, old).assert_removable()
         before, config = self.config_manager._validated_config_bytes()
 
         def replace_subscription(profile: GeasProfile) -> GeasProfile:
@@ -739,7 +757,17 @@ class SubscriptionManager:
                 inode=journal.new_checkout_inode,
                 label="replacement bootstrap subscription checkout",
             )
-            self._remove_replaced_checkout(journal, quarantine)
+            self._verify_repository_identity(
+                destination,
+                candidate,
+                expected_commit=journal.verified_commit,
+            )
+            self._remove_replaced_checkout(
+                journal,
+                quarantine,
+                old_subscription,
+                prior_ownership.verified_commit,
+            )
             mutation = self._subscription_config_receipt(
                 journal, "subscription_replace"
             )
@@ -753,7 +781,6 @@ class SubscriptionManager:
         )
         if journal.phase == "prepared":
             self._assert_subscription_ownership(prior_ownership, old_subscription)
-            self._repository(destination, old_subscription).assert_removable()
             if (
                 staging.exists()
                 or staging.is_symlink()
@@ -768,8 +795,11 @@ class SubscriptionManager:
                     raise ValueError(
                         "bootstrap checkout commit does not match verified identity"
                     )
-                verified = self.catalog_verifier(staging / candidate.catalog)
-                self.authorizer(verified)
+                self._verify_repository_identity(
+                    staging,
+                    candidate,
+                    expected_commit=journal.verified_commit,
+                )
                 identity = staging.stat(follow_symlinks=False)
                 journal = journal.model_copy(
                     update={
@@ -787,20 +817,13 @@ class SubscriptionManager:
                 journal.bootstrap_name, journal.old_subscription_sha256
             )
             if quarantine.exists() or quarantine.is_symlink():
-                self._assert_checkout_identity(
-                    quarantine,
-                    device=journal.old_checkout_device,
-                    inode=journal.old_checkout_inode,
-                    label="quarantined old bootstrap subscription checkout",
+                self._assert_subscription_ownership(
+                    prior_ownership,
+                    old_subscription,
+                    checkout_override=quarantine,
                 )
             else:
-                self._assert_checkout_identity(
-                    destination,
-                    device=journal.old_checkout_device,
-                    inode=journal.old_checkout_inode,
-                    label="old bootstrap subscription checkout",
-                )
-                self._repository(destination, old_subscription).assert_removable()
+                self._assert_subscription_ownership(prior_ownership, old_subscription)
                 os.replace(destination, quarantine)
                 sync_removal_parent(self.config_manager.root, journal.quarantine)
             if destination.exists() or destination.is_symlink():
@@ -812,12 +835,22 @@ class SubscriptionManager:
                     inode=journal.new_checkout_inode,
                     label="replacement bootstrap subscription checkout",
                 )
+                self._verify_repository_identity(
+                    destination,
+                    candidate,
+                    expected_commit=journal.verified_commit,
+                )
             else:
                 self._assert_checkout_identity(
                     staging,
                     device=journal.new_checkout_device,
                     inode=journal.new_checkout_inode,
                     label="staged replacement bootstrap subscription checkout",
+                )
+                self._verify_repository_identity(
+                    staging,
+                    candidate,
+                    expected_commit=journal.verified_commit,
                 )
                 os.replace(staging, destination)
                 sync_removal_parent(self.config_manager.root, journal.checkout)
@@ -830,11 +863,21 @@ class SubscriptionManager:
                 inode=journal.new_checkout_inode,
                 label="replacement bootstrap subscription checkout",
             )
+            self._verify_repository_identity(
+                destination,
+                candidate,
+                expected_commit=journal.verified_commit,
+            )
             self._assert_checkout_identity(
                 quarantine,
                 device=journal.old_checkout_device,
                 inode=journal.old_checkout_inode,
                 label="quarantined old bootstrap subscription checkout",
+            )
+            self._verify_repository_identity(
+                quarantine,
+                old_subscription,
+                expected_commit=prior_ownership.verified_commit,
             )
             config = self.config_manager.load()
 
@@ -877,7 +920,13 @@ class SubscriptionManager:
             except BaseException:
                 if self.config_manager.config_sha256() == journal.before_config_sha256:
                     self._rollback_subscription_replacement(
-                        journal, destination, staging, quarantine
+                        journal,
+                        destination,
+                        staging,
+                        quarantine,
+                        old_subscription,
+                        candidate,
+                        prior_ownership.verified_commit,
                     )
                     journal = journal.model_copy(update={"phase": "staged"})
                     self.config_manager._write_bootstrap_state(journal_path, journal)
@@ -888,7 +937,12 @@ class SubscriptionManager:
             mutation = self._subscription_config_receipt(
                 journal, "subscription_replace"
             )
-        self._remove_replaced_checkout(journal, quarantine)
+        self._remove_replaced_checkout(
+            journal,
+            quarantine,
+            old_subscription,
+            prior_ownership.verified_commit,
+        )
         return self._finalize_bootstrap_subscription(
             journal_path, journal, mutation, destination
         )
@@ -899,6 +953,9 @@ class SubscriptionManager:
         destination: Path,
         staging: Path,
         quarantine: Path,
+        old_subscription: OntologySubscription,
+        candidate: OntologySubscription,
+        old_verified_commit: str,
     ) -> None:
         self._assert_checkout_identity(
             destination,
@@ -906,11 +963,21 @@ class SubscriptionManager:
             inode=journal.new_checkout_inode,
             label="replacement bootstrap subscription checkout",
         )
+        self._verify_repository_identity(
+            destination,
+            candidate,
+            expected_commit=journal.verified_commit,
+        )
         self._assert_checkout_identity(
             quarantine,
             device=journal.old_checkout_device,
             inode=journal.old_checkout_inode,
             label="quarantined old bootstrap subscription checkout",
+        )
+        self._verify_repository_identity(
+            quarantine,
+            old_subscription,
+            expected_commit=old_verified_commit,
         )
         os.replace(destination, staging)
         os.replace(quarantine, destination)
@@ -920,6 +987,8 @@ class SubscriptionManager:
         self,
         journal: _BootstrapSubscriptionJournal,
         quarantine: Path,
+        old_subscription: OntologySubscription,
+        old_verified_commit: str,
     ) -> None:
         if not (quarantine.exists() or quarantine.is_symlink()):
             return
@@ -928,6 +997,11 @@ class SubscriptionManager:
             device=journal.old_checkout_device,
             inode=journal.old_checkout_inode,
             label="quarantined old bootstrap subscription checkout",
+        )
+        self._verify_repository_identity(
+            quarantine,
+            old_subscription,
+            expected_commit=old_verified_commit,
         )
         shutil.rmtree(quarantine)
         assert journal.quarantine is not None
@@ -986,7 +1060,6 @@ class SubscriptionManager:
             subscription_name=name,
             expected_checkout=destination,
         )
-        self._repository(destination, validated).assert_removable()
 
         def remove_subscription(profile: GeasProfile) -> GeasProfile:
             normalized = profile.normalized_subscriptions(
@@ -1060,7 +1133,6 @@ class SubscriptionManager:
                 subscription_name=journal.bootstrap_name,
                 expected_checkout=destination,
             )
-            self._repository(destination, subscription).assert_removable()
             self.unsubscribe(journal.bootstrap_name, remove_checkout=True)
             if self.config_manager.config_sha256() != journal.after_config_sha256:
                 raise RuntimeError("bootstrap subscription removal config identity changed")
@@ -1103,6 +1175,14 @@ class SubscriptionManager:
             device=journal.new_checkout_device,
             inode=journal.new_checkout_inode,
             label="owned bootstrap subscription checkout",
+        )
+        configured_subscription = self._assert_named_subscription(
+            journal.bootstrap_name, journal.new_subscription_sha256
+        )
+        self._verify_repository_identity(
+            destination,
+            configured_subscription,
+            expected_commit=journal.verified_commit,
         )
         identity = destination.stat(follow_symlinks=False)
         evidence_path = self._bootstrap_subscription_evidence_path(
@@ -1215,8 +1295,8 @@ class SubscriptionManager:
         except ValueError as error:
             raise ValueError("bootstrap subscription mutation journal is invalid") from error
 
-    @staticmethod
     def _validate_bootstrap_subscription_journal(
+        self,
         journal: _BootstrapSubscriptionJournal,
         *,
         operation_key: str,
@@ -1228,14 +1308,31 @@ class SubscriptionManager:
         checkout: Path,
         verified_commit: str,
     ) -> None:
+        operation_digest = operation_key.rsplit(":", 1)[-1]
+        destination = self.config_manager._confined_state_path(checkout)
+        expected_staging = destination.with_name(
+            f".{destination.name}.bootstrap-{operation_digest}.stage"
+        ).relative_to(self.config_manager.root)
+        expected_quarantine = (
+            destination.with_name(
+                f".{destination.name}.bootstrap-{operation_digest}.old"
+            ).relative_to(self.config_manager.root)
+            if action == "replace"
+            else None
+        )
+        if action == "remove":
+            expected_staging = checkout
         if (
             journal.operation_key != operation_key
+            or journal.profile_name != self.profile_name
             or journal.bootstrap_name != name
             or journal.action != action
             or journal.owner_operation_key != owner_operation_key
             or journal.old_subscription_sha256 != old_subscription_sha256
             or journal.new_subscription_sha256 != new_subscription_sha256
             or journal.checkout != checkout
+            or journal.staging != expected_staging
+            or journal.quarantine != expected_quarantine
             or journal.verified_commit != verified_commit
         ):
             raise ValueError("bootstrap subscription operation conflicts with its journal")
@@ -1244,7 +1341,7 @@ class SubscriptionManager:
         self,
         name: str,
         expected_sha256: str | None,
-    ) -> None:
+    ) -> OntologySubscription:
         if expected_sha256 is None:
             raise ValueError("owned bootstrap subscription identity is missing")
         config = self.config_manager.load()
@@ -1257,6 +1354,7 @@ class SubscriptionManager:
             raise ValueError("owned bootstrap subscription is missing") from None
         if _subscription_identity_sha256(subscription) != expected_sha256:
             raise ValueError("owned bootstrap subscription config identity changed")
+        return subscription
 
     def _assert_named_subscription_absent(self, name: str) -> None:
         config = self.config_manager.load()
@@ -1318,6 +1416,8 @@ class SubscriptionManager:
         self,
         ownership: BootstrapSubscriptionOwnershipReceipt,
         expected_subscription: OntologySubscription | None = None,
+        *,
+        checkout_override: Path | None = None,
     ) -> None:
         if (
             ownership.profile_name != self.profile_name
@@ -1331,10 +1431,16 @@ class SubscriptionManager:
             or ownership.checkout != expected_subscription.checkout.as_posix()
         ):
             raise ValueError("bootstrap subscription ownership does not match exact old state")
-        self._assert_named_subscription(
+        configured_subscription = self._assert_named_subscription(
             ownership.bootstrap_name, ownership.subscription_sha256
         )
-        checkout = self.config_manager._confined_state_path(Path(ownership.checkout))
+        config = self.config_manager.load()
+        self.config_manager.validate_subscription_layout(config)
+        checkout = (
+            checkout_override
+            if checkout_override is not None
+            else self.config_manager.subscription_checkout(configured_subscription)
+        )
         if checkout.is_symlink() or not checkout.is_dir():
             raise ValueError("owned bootstrap subscription checkout is missing or unsafe")
         identity = checkout.stat(follow_symlinks=False)
@@ -1346,10 +1452,62 @@ class SubscriptionManager:
         evidence_path = self.config_manager._confined_state_path(
             Path(ownership.evidence_path)
         )
+        expected_evidence_path = self._bootstrap_subscription_evidence_path(
+            ownership.bootstrap_name,
+            ownership.operation_key,
+        )
+        if evidence_path != expected_evidence_path:
+            raise ValueError("bootstrap subscription ownership evidence path changed")
         evidence = self.config_manager._load_bootstrap_state(evidence_path)
         expected = canonical_json(ownership.model_dump(mode="json")) + b"\n"
         if evidence != expected:
             raise ValueError("bootstrap subscription ownership evidence changed")
+        self._verify_repository_identity(
+            checkout,
+            configured_subscription,
+            expected_commit=ownership.verified_commit,
+        )
+
+    def _verify_repository_identity(
+        self,
+        checkout: Path,
+        subscription: OntologySubscription,
+        *,
+        expected_commit: str,
+    ) -> None:
+        """Recheck the exact clean synchronized repository and catalog identity."""
+        if checkout.is_symlink() or not checkout.is_dir():
+            raise ValueError("bootstrap subscription checkout is missing or unsafe")
+        git_directory = checkout / ".git"
+        if git_directory.is_symlink():
+            raise ValueError("bootstrap subscription Git metadata contains a symbolic link")
+        catalog = checkout / subscription.catalog
+        current = checkout
+        for component in subscription.catalog.parts:
+            current /= component
+            if current.is_symlink():
+                raise ValueError("bootstrap subscription catalog contains a symbolic link")
+        if catalog.is_symlink() or not catalog.is_file():
+            raise ValueError("bootstrap subscription catalog is missing or unsafe")
+        repository = self._repository(checkout, subscription)
+        repository.assert_removable()
+        assert_verified_commit = getattr(repository, "assert_verified_commit", None)
+        if callable(assert_verified_commit):
+            assert_verified_commit(expected_commit)
+        else:
+            result = subprocess.run(
+                ("git", "-C", str(checkout), "rev-parse", "--verify", "HEAD^{commit}"),
+                check=False,
+                capture_output=True,
+                text=True,
+                env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
+            )
+            if result.returncode != 0 or result.stdout.strip() != expected_commit:
+                raise ValueError(
+                    "bootstrap subscription checkout does not match the exact verified commit"
+                )
+        verified = self.catalog_verifier(catalog)
+        self.authorizer(verified)
 
     def subscribe(
         self,
@@ -1579,9 +1737,9 @@ class SubscriptionManager:
         pull: bool = True,
         push: bool = False,
     ) -> tuple[SubscriptionSyncReceipt, ...]:
-        self._recover_all_removals()
         if push:
             raise ValueError("ontology subscription sync does not authorize repository push")
+        self._recover_all_removals()
         config = self.config_manager.load()
         profile = config.profile(self.profile_name)[1]
         configured = profile.normalized_subscriptions(freshness=config.ontology_freshness)

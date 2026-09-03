@@ -64,11 +64,20 @@ class BootstrapOperation:
     subscription_ownership: BootstrapSubscriptionOwnershipReceipt | None = None
 
 
-def remove_obsolete_paths(root: Path, operation: BootstrapOperation) -> None:
+def remove_obsolete_paths(
+    root: Path,
+    operation: BootstrapOperation,
+    *,
+    state_root: Path | None = None,
+) -> None:
     """Unlink only exact confined file/link leaves named by update ownership."""
-    confined_root = Path(os.path.abspath(os.fspath(root.expanduser())))
+    confined_managed_root = _authority_root(root, label="managed")
+    confined_state_root = _authority_root(state_root or root, label="state")
     verified: list[Path] = []
     for item in operation.owned_paths:
+        confined_root = (
+            confined_state_root if item.role == "receipt" else confined_managed_root
+        )
         candidate = _confined_owned_path(confined_root, item.path)
         if item.role == "link":
             if not candidate.is_symlink():
@@ -149,7 +158,9 @@ class RepositoryBootstrapManager:
     def __init__(
         self,
         *,
-        root: Path,
+        root: Path | None = None,
+        managed_root: Path | None = None,
+        state_root: Path | None = None,
         announce: Callable[[str], None],
         now: Callable[[], datetime] = utc_now,
         verify: Callable[[RepositoryBootstrapRequest], VerifiedRepositoryBootstrap] | None = None,
@@ -190,7 +201,15 @@ class RepositoryBootstrapManager:
         remove_obsolete_paths: Callable[[BootstrapOperation], None] | None = None,
         verify_software_provenance: Callable[[], None] | None = None,
     ) -> None:
-        self.root = Path(os.path.abspath(os.fspath(root.expanduser())))
+        selected_managed_root = managed_root if managed_root is not None else root
+        selected_state_root = state_root if state_root is not None else root
+        if selected_managed_root is None or selected_state_root is None:
+            raise ValueError(
+                "repository bootstrap requires both managed_root and state_root"
+            )
+        self.managed_root = _authority_root(selected_managed_root, label="managed")
+        self.state_root = _authority_root(selected_state_root, label="state")
+        self.root = self.managed_root
         self.announce, self.now, self.verify = announce, now, verify
         self.record_trust, self.replace_trust = record_trust, replace_trust
         self.subscribe, self.replace_subscription = subscribe, replace_subscription
@@ -722,13 +741,13 @@ class RepositoryBootstrapManager:
 
     def _assert_paths_exact_or_absent(self, managed: tuple[ManagedPath, ...]) -> None:
         for item in managed:
-            candidate = _confined_owned_path(self.root, item.path)
+            candidate = self._owned_path(item)
             if candidate.exists() or candidate.is_symlink():
                 self._assert_owned_paths((item,))
 
     def _assert_paths_absent(self, managed: tuple[ManagedPath, ...]) -> None:
         for item in managed:
-            candidate = _confined_owned_path(self.root, item.path)
+            candidate = self._owned_path(item)
             if candidate.exists() or candidate.is_symlink():
                 raise ValueError(f"managed path still exists after removal: {item.path}")
 
@@ -939,6 +958,7 @@ class RepositoryBootstrapManager:
                 "updated_at": self.now(),
             }
         )
+        self._assert_owned_paths(committed.managed_paths)
         self._write(committed)
         return committed
 
@@ -1060,10 +1080,10 @@ class RepositoryBootstrapManager:
         self.announce(f"Geas will verify software provenance before updating {request.name}.")
 
     def _receipt_path(self, name: str) -> Path:
-        return self.root / "repository-bootstrap" / f"{name}.json"
+        return self.state_root / "repository-bootstrap" / f"{name}.json"
 
     def _update_path(self, name: str) -> Path:
-        return self.root / "repository-bootstrap" / f"{name}.update.json"
+        return self.state_root / "repository-bootstrap" / f"{name}.update.json"
 
     def _write_update(self, journal: RepositoryUpdateJournal) -> None:
         journal = RepositoryUpdateJournal.model_validate(journal.model_dump(mode="python"))
@@ -1149,7 +1169,7 @@ class RepositoryBootstrapManager:
 
     def _assert_owned_paths(self, managed: tuple[ManagedPath, ...]) -> None:
         for item in managed:
-            candidate = _confined_owned_path(self.root, item.path)
+            candidate = self._owned_path(item)
             if item.role == "link":
                 if not candidate.is_symlink():
                     raise ValueError(f"managed link is missing or unsafe: {item.path}")
@@ -1161,7 +1181,7 @@ class RepositoryBootstrapManager:
                 _reject_symlink_ancestry(lexical_target.parent)
                 try:
                     lexical_target.resolve(strict=False).relative_to(
-                        self.root.resolve(strict=False)
+                        self.managed_root.resolve(strict=False)
                     )
                 except ValueError as error:
                     raise ValueError(
@@ -1173,6 +1193,10 @@ class RepositoryBootstrapManager:
                 raise ValueError(f"managed path is missing or unsafe: {item.path}")
             elif hashlib.sha256(candidate.read_bytes()).hexdigest() != item.sha256:
                 raise ValueError(f"managed path was modified: {item.path}")
+
+    def _owned_path(self, item: ManagedPath) -> Path:
+        root = self.state_root if item.role == "receipt" else self.managed_root
+        return _confined_owned_path(root, item.path)
 
 
 def _verify_identity(
@@ -1221,6 +1245,16 @@ def _reject_symlink_ancestry(path: Path) -> None:
         current /= part
         if current.is_symlink():
             raise ValueError("managed path must not traverse symbolic links")
+
+
+def _authority_root(path: Path, *, label: str) -> Path:
+    absolute = Path(os.path.abspath(os.fspath(path.expanduser())))
+    current = Path(absolute.anchor)
+    for part in absolute.parts[1:]:
+        current /= part
+        if current.is_symlink():
+            raise ValueError(f"repository bootstrap {label} root cannot be a symbolic link")
+    return absolute
 
 
 def _confined_owned_path(root: Path, relative: str) -> Path:
