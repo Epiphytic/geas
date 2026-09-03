@@ -873,6 +873,9 @@ class SourceWorkCoordinator:
         )
         from research_agent.source_intent import DiscoveryKind, SourceCandidate, authorize_candidate
 
+        select_adapter = getattr(self.adapter, "select", None)
+        if select_adapter is not None:
+            select_adapter(effective_intent)
         discovery_bound = int(
             getattr(
                 self.adapter,
@@ -1443,12 +1446,12 @@ class SourceWorkCoordinator:
                             )
                             candidate_complete = False
                         else:
-                            proposal_ids.extend(self._propose(current, source_id))
+                            proposal_ids.extend(self._propose(current))
                             current = self._advance(
                                 current, SourceWorkPhase.EXTRACTION_PROPOSED, now
                             )
                 else:
-                    proposal_ids.extend(self._propose(current, source_id))
+                    proposal_ids.extend(self._propose(current))
                     current = self._advance(current, SourceWorkPhase.EXTRACTION_PROPOSED, now)
         if current.phase in {
             SourceWorkPhase.EXTRACTION_PROPOSED,
@@ -1688,9 +1691,18 @@ class SourceWorkCoordinator:
         last_fetch = getattr(provider, "last_fetch", {})
         result = last_fetch.get(candidate.id) if isinstance(last_fetch, dict) else None
         if result is not None:
+            if result.requested_url != candidate.locator:
+                raise ValueError("source fetch requested URL differs from the authorized candidate")
+            expected_final_url = (
+                result.redirect_chain[-1] if result.redirect_chain else result.requested_url
+            )
+            if result.final_url != expected_final_url:
+                raise ValueError("source fetch final URL differs from its exact redirect chain")
+            if result.media_type is None:
+                raise ValueError("fetched source result omitted its media type")
             return FetchedSourcePayload(
                 content=result.content,
-                source_uri=result.locator,
+                source_uri=result.final_url,
                 media_type=result.media_type,
                 connector_id=self.adapter.adapter_id,
                 license=None,
@@ -1932,16 +1944,41 @@ class SourceWorkCoordinator:
             self.library_database,
         )
 
-    def _propose(self, item: SourceWorkItem, source_id: str | None) -> tuple[str, ...]:
+    def _propose(self, item: SourceWorkItem) -> tuple[str, ...]:
         result = self._result(item)
         anchor_ids = tuple(str(value) for value in result.get("anchor_ids", ()))
-        if not anchor_ids or source_id is None:
+        derived_source_id = result.get("derived_source_version_id")
+        derivation_id = result.get("structural_derivation_id")
+        if (
+            not anchor_ids
+            or not isinstance(derived_source_id, str)
+            or not isinstance(derivation_id, str)
+        ):
             raise ValueError("proposal extraction requires exact immutable anchors")
+        derivations = tuple(
+            value
+            for value in self.store.iter_records("structural-derivation")
+            if value.get("id") == derivation_id
+            and value.get("source_version_id") == derived_source_id
+        )
+        if len(derivations) != 1 or not set(anchor_ids).issubset(
+            set(derivations[0].get("anchor_ids", ()))
+        ):
+            raise ValueError("proposal anchors differ from the parsed source derivation")
+        anchors = tuple(
+            value
+            for value in self.store.iter_records("structural-anchor")
+            if value.get("id") in set(anchor_ids)
+            and value.get("structural_derivation_id") == derivation_id
+            and value.get("source_version_id") == derived_source_id
+        )
+        if len(anchors) != len(anchor_ids):
+            raise ValueError("proposal anchors differ from the parsed source derivation")
         if self.extraction is None:
             raise TypeError("source extraction adapter is unavailable")
         proposal = self.extraction.propose(
-            source_version_id=source_id,
-            structural_derivation_id=str(result["structural_derivation_id"]),
+            source_version_id=derived_source_id,
+            structural_derivation_id=derivation_id,
             anchor_ids=anchor_ids,
         )
         proposal_id = getattr(proposal, "id", None)

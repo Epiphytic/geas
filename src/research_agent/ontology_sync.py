@@ -5,7 +5,7 @@ import json
 import os
 import re
 import subprocess
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -14,6 +14,7 @@ from uuid import uuid4
 
 from pydantic import Field
 
+from research_agent.capabilities import Capability, CapabilityDecision
 from research_agent.credential_scanning import contains_possible_credential
 from research_agent.models import StrictModel, utc_now
 from research_agent.ontology_subscriptions import OntologySubscription
@@ -259,7 +260,13 @@ class OntologyRepositoryManager:
         relative_paths: tuple[Path, ...] = (),
         message: str = "geas: update ontologies",
         freshness_state_path: Path | None = None,
+        capability_decisions: Sequence[CapabilityDecision] | None = None,
     ) -> dict[str, object]:
+        targets = (Path(".gitignore"), *relative_paths)
+        for target in targets:
+            if target.is_absolute() or ".." in target.parts:
+                raise OntologySyncError("ontology push path must remain checkout-relative")
+        self._authorize_legacy_push(targets, capability_decisions)
         if not self._is_branch_ref():
             raise OntologySyncError(
                 "tag and commit ontology refs are read-only; push requires a branch"
@@ -268,10 +275,6 @@ class OntologyRepositoryManager:
         self._assert_remote()
         self._set_unborn_branch()
         self.ensure_gitignore()
-        targets = (Path(".gitignore"), *relative_paths)
-        for target in targets:
-            if target.is_absolute() or ".." in target.parts:
-                raise OntologySyncError("ontology push path must remain checkout-relative")
         self._run(("git", "add", "-A", "--", *(item.as_posix() for item in targets)))
         all_staged = tuple(
             Path(line)
@@ -312,6 +315,42 @@ class OntologyRepositoryManager:
             "commit": self._head(),
             "staged_paths": tuple(path.as_posix() for path in all_staged),
         }
+
+    def _authorize_legacy_push(
+        self,
+        targets: tuple[Path, ...],
+        decisions: Sequence[CapabilityDecision] | None,
+    ) -> None:
+        """Require an already evaluated exact local decision for each staged path."""
+        if decisions is None:
+            raise OntologySyncError(
+                "legacy ontology push requires an injected exact capability decision; "
+                "use GitRepositoryPublisher"
+            )
+        by_path = {decision.request.path: decision for decision in decisions}
+        expected = {path.as_posix() for path in targets}
+        if len(by_path) != len(tuple(decisions)) or set(by_path) != expected:
+            raise OntologySyncError(
+                "legacy ontology push capability decisions do not cover exact paths"
+            )
+        active_ref = self._active_ref()
+        for path in sorted(expected):
+            decision = by_path[path]
+            request = decision.request
+            if (
+                decision.decision != "allow"
+                or request.capabilities != (Capability.GIT_DIRECT_PUSH,)
+                or decision.effective_capabilities != (Capability.GIT_DIRECT_PUSH,)
+                or request.authority_repository != self.config.url
+                or request.target_repository != self.config.url
+                or request.ref != active_ref
+                or request.path != path
+                or not request.dirty
+                or decision.delegation_chain
+            ):
+                raise OntologySyncError(
+                    "legacy ontology push lacks exact root-local direct-push authority"
+                )
 
     def assert_removable(self) -> None:
         """Validate exact identity and clean synchronized state before removal."""
@@ -633,9 +672,11 @@ class OntologyRepositoryManager:
             **os.environ,
             "GIT_TERMINAL_PROMPT": "0",
             "GIT_NO_REPLACE_OBJECTS": "1",
-            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_COUNT": "2",
             "GIT_CONFIG_KEY_0": "core.hooksPath",
             "GIT_CONFIG_VALUE_0": os.devnull,
+            "GIT_CONFIG_KEY_1": "credential.helper",
+            "GIT_CONFIG_VALUE_1": "",
         }
 
 

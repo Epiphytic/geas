@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import urllib.parse
 from datetime import UTC, datetime
 
 import pytest
@@ -53,13 +54,21 @@ class RecordingEvaluator(AllowEvaluator):
 def _capability_request(
     intent: SourceIntent, locator: str, capability: Capability
 ) -> CapabilityRequest:
+    connectors = {
+        DiscoveryKind.DIRECT_URL: "source:direct-url",
+        DiscoveryKind.RSS_ATOM: "source:feed",
+        DiscoveryKind.SITEMAP: "source:sitemap",
+        DiscoveryKind.HTTPS_HTML: "source:https-html",
+        DiscoveryKind.MOJEEK: "source:mojeek",
+    }
     return CapabilityRequest(
         authority_repository="https://github.com/example/ontology",
         target_repository="https://github.com/example/ontology",
         capabilities=(capability,),
         ref="refs/heads/main",
         path="ontology/example",
-        host="issuer.example",
+        connector=connectors[intent.discovery.kind],
+        host=urllib.parse.urlsplit(locator).hostname,
         target=locator,
         requested_at=NOW,
     )

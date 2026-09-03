@@ -8,6 +8,7 @@ import os
 import re
 import subprocess
 import tempfile
+import urllib.parse
 from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime
 from pathlib import Path, PurePosixPath
@@ -33,6 +34,8 @@ from research_agent.publishing import (
 )
 
 _GIT_OBJECT = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
+_BRANCH = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
+_GITHUB_SLUG_PART = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
 class PublicationError(PermissionError):
@@ -83,6 +86,197 @@ class GitRemoteTransport(Protocol):
         ref: str,
         expected: str | None,
     ) -> subprocess.CompletedProcess[str]: ...
+
+
+class GitHubCliForgeClient:
+    """Narrow noninteractive GitHub PR adapter over an exact ``gh`` executable."""
+
+    def __init__(
+        self,
+        *,
+        executable: str,
+        runner: Callable[[tuple[str, ...]], subprocess.CompletedProcess[str]] | None = None,
+    ) -> None:
+        path = Path(executable)
+        if not path.is_absolute():
+            raise ValueError("GitHub CLI executable must be an absolute path")
+        self.executable = str(path)
+        self.runner = runner or self._run
+
+    def assert_authenticated(self, *, repository: str) -> None:
+        """Fail closed unless ``gh`` has one active GitHub authentication context."""
+        self._slug(repository)
+        self._checked(
+            (
+                self.executable,
+                "auth",
+                "status",
+                "--hostname",
+                "github.com",
+            )
+        )
+
+    def upsert_pull_request(
+        self,
+        *,
+        repository: str,
+        head: str,
+        base: str,
+        title: str,
+        body: str,
+    ) -> str:
+        slug = self._slug(repository)
+        self._branch(head)
+        self._branch(base)
+        query = (
+            self.executable,
+            "pr",
+            "list",
+            "--repo",
+            slug,
+            "--head",
+            head,
+            "--base",
+            base,
+            "--state",
+            "open",
+            "--json",
+            "url,headRefName,baseRefName,isCrossRepository",
+            "--limit",
+            "2",
+        )
+        listed = self._checked(query)
+        try:
+            values = json.loads(listed.stdout)
+        except (json.JSONDecodeError, TypeError):
+            raise PublicationError(
+                "GitHub CLI returned an invalid pull-request inventory"
+            ) from None
+        if not isinstance(values, list) or len(values) > 1:
+            raise PublicationError("GitHub CLI returned an ambiguous pull-request inventory")
+        if values:
+            item = values[0]
+            if (
+                not isinstance(item, dict)
+                or not isinstance(item.get("url"), str)
+                or item.get("headRefName") != head
+                or item.get("baseRefName") != base
+                or item.get("isCrossRepository") is not False
+            ):
+                raise PublicationError("GitHub CLI returned an invalid pull-request identity")
+            url = self._pull_request_url(slug, item["url"])
+            self._checked(
+                (
+                    self.executable,
+                    "pr",
+                    "edit",
+                    url,
+                    "--repo",
+                    slug,
+                    "--title",
+                    title,
+                    "--body",
+                    body,
+                )
+            )
+            return url
+        created = self._checked(
+            (
+                self.executable,
+                "pr",
+                "create",
+                "--repo",
+                slug,
+                "--head",
+                head,
+                "--base",
+                base,
+                "--title",
+                title,
+                "--body",
+                body,
+            )
+        )
+        return self._pull_request_url(slug, created.stdout.strip())
+
+    def enable_auto_merge(
+        self,
+        *,
+        repository: str,
+        head: str,
+        pull_request_url: str,
+    ) -> None:
+        slug = self._slug(repository)
+        self._branch(head)
+        url = self._pull_request_url(slug, pull_request_url)
+        self._checked(
+            (
+                self.executable,
+                "pr",
+                "merge",
+                url,
+                "--repo",
+                slug,
+                "--auto",
+                "--merge",
+            )
+        )
+
+    def _checked(self, command: tuple[str, ...]) -> subprocess.CompletedProcess[str]:
+        result = self.runner(command)
+        if result.returncode != 0:
+            raise PublicationError("GitHub CLI operation failed")
+        return result
+
+    def _run(self, command: tuple[str, ...]) -> subprocess.CompletedProcess[str]:
+        environment = {
+            **os.environ,
+            "GH_PROMPT_DISABLED": "1",
+            "GIT_TERMINAL_PROMPT": "0",
+        }
+        return subprocess.run(
+            command,
+            env=environment,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+    @staticmethod
+    def _slug(repository: str) -> str:
+        normalized = _https_url(repository, label="publication repository")
+        parsed = urllib.parse.urlsplit(normalized)
+        parts = tuple(item for item in parsed.path.split("/") if item)
+        if (
+            parsed.hostname != "github.com"
+            or len(parts) != 2
+            or any(
+                item in {".", ".."} or _GITHUB_SLUG_PART.fullmatch(item) is None
+                for item in parts
+            )
+        ):
+            if parsed.hostname == "github.com" and len(parts) == 2:
+                raise PublicationError("GitHub repository slug is invalid")
+            raise PublicationError("GitHub CLI publication requires a GitHub repository")
+        return "/".join(parts)
+
+    @staticmethod
+    def _branch(value: str) -> str:
+        if (
+            _BRANCH.fullmatch(value) is None
+            or ".." in value
+            or "//" in value
+            or value.endswith(("/", ".lock"))
+        ):
+            raise PublicationError("GitHub pull-request branch is invalid")
+        return value
+
+    @staticmethod
+    def _pull_request_url(slug: str, value: str) -> str:
+        pattern = rf"^https://github\.com/{re.escape(slug)}/pull/[1-9][0-9]*$"
+        if re.fullmatch(pattern, value) is None:
+            raise PublicationError("GitHub CLI returned an unexpected pull-request URL")
+        return value
 
 
 class GitRepositoryPublisher:
@@ -401,7 +595,7 @@ class GitRepositoryPublisher:
                     extra_env=environment,
                 )
             tree = self._git("write-tree", extra_env=environment)
-        message = f"geas: publish managed changes {identity[:12]}\n"
+        message = f"{request.message or f'geas: publish managed changes {identity[:12]}'}\n"
         date = request.created_at.isoformat()
         commit = (
             self._git_bytes(

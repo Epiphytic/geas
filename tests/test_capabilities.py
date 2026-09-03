@@ -207,6 +207,74 @@ def test_source_request_requires_canonical_wire_target_and_cross_checks_host() -
         )
 
 
+def test_github_repository_request_accepts_exact_commit_pinned_readme_target() -> None:
+    target = (
+        "https://api.github.com/repos/Example/Research/readme?ref="
+        + "a" * 40
+    )
+    request = CapabilityRequest(
+        authority_repository=ROOT,
+        target_repository=ROOT,
+        capabilities=(Capability.SOURCE_FETCH,),
+        ref="refs/heads/main",
+        path="ontology/a",
+        bundle_sha256=DIGEST,
+        connector="source:github-repository",
+        host="api.github.com",
+        target=target,
+        requested_at=NOW,
+    )
+    decision = _evaluator(
+        _grant(
+            hosts=("api.github.com",),
+            path_prefixes=("/repos/Example/Research",),
+            connectors=("source:github-repository",),
+        )
+    ).evaluate(request)
+
+    assert request.target == target
+    assert decision.allowed
+    assert decision.request.target == target
+
+
+@pytest.mark.parametrize(
+    "target",
+    (
+        "https://api.github.com/repos/Example/Research/readme?ref=",
+        "https://api.github.com/repos/Example/Research/readme?ref=" + "A" * 40,
+        "https://api.github.com/repos/Example/Research/readme?ref=" + "g" * 40,
+        "https://api.github.com/repos/Example/Research/readme?ref=" + "%61" * 40,
+        "https://api.github.com/repos/Example/Research/readme?ref=" + "a" * 39,
+        "https://api.github.com/repos/Example/Research/readme?ref=" + "a" * 41,
+        "https://api.github.com/repos/Example/Research/readme?ref="
+        + "a" * 40
+        + "&other=value",
+        "https://api.github.com/repos/Example/Research/readme?ref="
+        + "a" * 40
+        + "&ref="
+        + "b" * 40,
+        "https://api.github.com/repos/Example/Research/readme?other=" + "a" * 40,
+        "https://api.github.com/repos/Example/Research/readme/?ref=" + "a" * 40,
+        "https://api.github.com/repos/Example/Research/README?ref=" + "a" * 40,
+        "https://api.github.com:443/repos/Example/Research/readme?ref=" + "a" * 40,
+        "https://user@api.github.com/repos/Example/Research/readme?ref=" + "a" * 40,
+        "https://api.github.com/repos/Example/Research/readme?ref="
+        + "a" * 40
+        + "#fragment",
+    ),
+)
+def test_github_repository_request_rejects_noncanonical_readme_target(target: str) -> None:
+    raw = _request(Capability.SOURCE_FETCH).model_dump(mode="python")
+    raw.update(
+        connector="source:github-repository",
+        host="api.github.com",
+        target=target,
+    )
+
+    with pytest.raises(ValidationError):
+        CapabilityRequest.model_validate(raw)
+
+
 @pytest.mark.parametrize(
     "target",
     (

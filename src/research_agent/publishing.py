@@ -131,12 +131,13 @@ _POLICY_PATHS = frozenset(
 
 def _producer_path_allowed(producer: PublicationProducer, value: str) -> bool:
     parts = PurePosixPath(value).parts
+    skill_root = parts[:2] in {(".agents", "skills"), (".geas", "skills")}
     if producer is PublicationProducer.GENERIC_SKILL:
-        return len(parts) > 3 and parts[:3] == (".agents", "skills", "geas")
+        return len(parts) > 3 and skill_root and parts[2] == "geas"
     if producer is PublicationProducer.EXPORTED_SKILL:
         return (
             len(parts) > 3
-            and parts[:2] == (".agents", "skills")
+            and skill_root
             and parts[2] != "geas"
             and _ONTOLOGY_NAME.fullmatch(parts[2]) is not None
         )
@@ -197,15 +198,20 @@ def classify_managed_path(
     normalized = _relative_path(path, label="managed publication path")
     parts = PurePosixPath(normalized).parts
     name = parts[-1]
+    trackable_skill_fallback = parts[:2] == (".geas", "skills") and len(parts) > 3
     if (
-        parts[0] in _RUNTIME_ROOTS
+        (parts[0] in _RUNTIME_ROOTS and not trackable_skill_fallback)
         or name in _RUNTIME_NAMES
         or name.startswith(".env.")
         or name.endswith((".sqlite", ".sqlite-shm", ".sqlite-wal"))
     ):
         return PathRole.RUNTIME_STORE
     generic_root = (".agents", "skills", "geas")
-    if parts[: len(generic_root)] == generic_root and len(parts) > len(generic_root):
+    fallback_generic_root = (".geas", "skills", "geas")
+    if (
+        parts[: len(generic_root)] == generic_root
+        or parts[: len(fallback_generic_root)] == fallback_generic_root
+    ) and len(parts) > len(generic_root):
         return PathRole.GENERIC_SKILL
     matches = {
         item.role for manifest in manifests for item in manifest.paths if item.path == normalized
@@ -252,6 +258,7 @@ class PublishRequest(StrictModel):
     mode: PublishMode = PublishMode.PULL_REQUEST
     paths: tuple[PublishPath, ...] = Field(min_length=1)
     capability_decision_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    message: str | None = Field(default=None, min_length=1, max_length=500)
     created_at: datetime
 
     @field_validator("repository", mode="before")
@@ -271,6 +278,16 @@ class PublishRequest(StrictModel):
         if len({item.path for item in result}) != len(result):
             raise ValueError("publish paths must be unique")
         return result
+
+    @field_validator("message")
+    @classmethod
+    def commit_message_is_unambiguous(cls, value: str | None) -> str | None:
+        if value is not None and (
+            value.strip() != value
+            or any(ord(character) < 32 or ord(character) == 127 for character in value)
+        ):
+            raise ValueError("publish message contains ambiguous whitespace or control characters")
+        return value
 
     @field_validator("created_at")
     @classmethod

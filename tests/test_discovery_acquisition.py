@@ -53,7 +53,8 @@ def _capability_request(
         capabilities=(capability,),
         ref="refs/heads/main",
         path="ontology/example",
-        host="github.com",
+        connector="source:github-repository",
+        host=urllib.parse.urlsplit(locator).hostname,
         target=locator,
         requested_at=NOW,
     )

@@ -2,12 +2,18 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import hashlib
 import json
 import math
 import mimetypes
 import os
 import shutil
+import subprocess
 import sys
+import tempfile
+import urllib.parse
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
@@ -30,8 +36,22 @@ from research_agent.agent_skills import (
 from research_agent.approvals import ApprovalRegistry, AuthenticatedPrincipal
 from research_agent.audit import DeterministicKnowledgeAuditor
 from research_agent.benchmark import ProjectionBenchmark
+from research_agent.bootstrap_models import (
+    BootstrapPhase,
+    RepositoryBootstrapReceipt,
+    RepositoryBootstrapRequest,
+    VerifiedRepositoryBootstrap,
+)
 from research_agent.budget import BudgetPolicy, UsageLedger
 from research_agent.bundles import KnowledgeBundleImporter
+from research_agent.capabilities import (
+    Capability,
+    CapabilityDecision,
+    CapabilityRequest,
+    DeterministicCapabilityEvaluator,
+    VerifiedDelegationManifest,
+    _ref,
+)
 from research_agent.catalog_skill_export import export_catalog_skill
 from research_agent.citations import CitationDocumentManager, IdentifierKind
 from research_agent.connectors import (
@@ -42,6 +62,7 @@ from research_agent.connectors import (
     OpenAlexDiscoveryConnector,
     UnpaywallResolver,
 )
+from research_agent.connectors.mojeek import HttpsMojeekTransport
 from research_agent.connectors.unpaywall import UnpaywallError
 from research_agent.deposits import (
     AcquisitionMethod,
@@ -60,11 +81,16 @@ from research_agent.discovery import (
     AccessConstraintReason,
     CompilerIdentity,
     ConnectorCapability,
+    DiscoveryRequest,
     OpenAccessResolution,
     SourceClass,
+    TermMatch,
     identified,
 )
-from research_agent.discovery_acquisition import GitHubDiscoveryAcquirer
+from research_agent.discovery_acquisition import (
+    GitHubDiscoveryAcquirer,
+    GitHubRepositorySourceAdapter,
+)
 from research_agent.extraction import AnchorGroundedExtractionManager
 from research_agent.geas_update import GeasUpdateError, GeasUpdater, GeasUpdateReceipt
 from research_agent.identifiers import doi_locator, normalize_doi
@@ -92,6 +118,7 @@ from research_agent.models import (
     PolicyStage,
     ThreatObservation,
     ThreatTarget,
+    utc_now,
 )
 from research_agent.onboarding import build_setup_guide, render_setup_guide_markdown
 from research_agent.ontology_artifacts import (
@@ -105,8 +132,10 @@ from research_agent.ontology_build import (
     OntologyBuildConfig,
     OntologyBuilder,
     OntologyBuildReceipt,
+    OntologyUpdateService,
 )
 from research_agent.ontology_catalog import inventory_catalog, inventory_ontologies
+from research_agent.ontology_config import OntologyBuildDefaults
 from research_agent.ontology_recovery import recover_managed_removals
 from research_agent.ontology_resolution import (
     OntologyCatalog,
@@ -150,8 +179,18 @@ from research_agent.projection import (
 )
 from research_agent.promotion import GitPromotionManager
 from research_agent.providers import ModelClient, load_provider_configs
+from research_agent.publishing import (
+    PathRole,
+    PublicationManifest,
+    PublicationManifestPath,
+    PublicationProducer,
+    PublishMode,
+    PublishPath,
+    PublishRequest,
+    capability_decision_set_sha256,
+)
 from research_agent.rdf_render import render_topic_turtle
-from research_agent.remote_acquisition import LicenseGatedAcquirer
+from research_agent.remote_acquisition import ConditionalHttpsTransport, LicenseGatedAcquirer
 from research_agent.render import (
     render_agent_instructions,
     render_ontology_skill,
@@ -162,14 +201,31 @@ from research_agent.render import (
 from research_agent.repository_catalog import (
     ResolvedRepositoryCatalog,
     VerifiedCatalogOntology,
+    normalized_repository_identity,
     refresh_catalog,
     resolve_repository_catalog,
     validate_bundle_sha256,
     validate_ontology_name,
     verify_catalog,
 )
+from research_agent.repository_publisher import GitHubCliForgeClient, GitRepositoryPublisher
 from research_agent.research import DiscoveryExecutor, OfflineResearchRunner
 from research_agent.secrets import load_env_file, load_secret_sources
+from research_agent.source_intent import (
+    DiscoveryKind,
+    SourceAdapter,
+    SourceCandidate,
+    SourceIntent,
+)
+from research_agent.source_work import (
+    AnchorGroundedSourceExtractionAdapter,
+    FetchedSourcePayload,
+    ImmutableSourceWorkStore,
+    SourceAuthorityContext,
+    SourceCheckpoint,
+    SourceExtractionConfig,
+    SourceWorkCoordinator,
+)
 from research_agent.store import ImmutableStore
 from research_agent.structure import AnchorKind, StructuralAnchor, StructuralDocumentManager
 from research_agent.truth import SQLiteProjectionGuard, TruthManager, TruthPolicy, TruthSnapshot
@@ -179,6 +235,13 @@ from research_agent.user_config import (
     OntologyGitConfig,
     UserConfigManager,
     default_config_path,
+)
+from research_agent.web_sources import (
+    DirectUrlAdapter,
+    FeedAdapter,
+    HtmlDiscoveryAdapter,
+    MojeekSourceAdapter,
+    SitemapAdapter,
 )
 from research_agent.workflow import ActorKind, WorkflowEngine, WorkflowState
 from research_agent.workload import WorkloadPolicy
@@ -308,6 +371,268 @@ def _selected_user_config(
     if profile_name != user_config.default_profile:
         user_config = user_config.model_copy(update={"default_profile": profile_name})
     return user_config, profile_name, profile
+
+
+def _selected_capability_evaluator(
+    args: argparse.Namespace,
+    *,
+    catalogs: Sequence[ResolvedRepositoryCatalog] = (),
+    clock: Callable[[], datetime] = utc_now,
+) -> DeterministicCapabilityEvaluator:
+    """Build evaluator v2 only from the selected profile and Git-bound manifests."""
+    manager = _user_config_manager(args)
+    _config, _profile_name, profile = _selected_user_config(args, manager)
+    manifests: dict[str, VerifiedDelegationManifest] = {}
+    for catalog in catalogs:
+        if catalog.delegation_manifest is None:
+            continue
+        if (
+            catalog.repository_identity is None
+            or catalog.delegation_manifest_sha256 is None
+            or catalog.commit is None
+        ):
+            raise ValueError("verified delegation catalog metadata is incomplete")
+        verified = VerifiedDelegationManifest(
+            repository=catalog.repository_identity,
+            manifest=catalog.delegation_manifest,
+            manifest_sha256=catalog.delegation_manifest_sha256,
+            catalog_commit=catalog.commit,
+        )
+        existing = manifests.get(verified.repository)
+        if existing is not None and existing != verified:
+            raise ValueError("conflicting verified delegation manifests for repository")
+        manifests[verified.repository] = verified
+    return DeterministicCapabilityEvaluator(
+        profile.effective_capability_grants(),
+        manifests,
+        clock=clock,
+        yolo=args.yolo,
+    )
+
+
+_SOURCE_CONNECTORS = {
+    DiscoveryKind.DIRECT_URL: "source:direct-url",
+    DiscoveryKind.RSS_ATOM: "source:feed",
+    DiscoveryKind.SITEMAP: "source:sitemap",
+    DiscoveryKind.HTTPS_HTML: "source:https-html",
+    DiscoveryKind.MOJEEK: "source:mojeek",
+    DiscoveryKind.GITHUB_REPOSITORY: "source:github-repository",
+}
+
+
+@dataclass(frozen=True)
+class _SourceCapabilityRequestFactory:
+    """Bind every source decision to its exact Git and wire selectors."""
+
+    authority: SourceAuthorityContext
+    ontology_bundle_sha256: str
+    model_provider: str | None = None
+    model_name: str | None = None
+    model_data_class: str | None = None
+    clock: Callable[[], datetime] = utc_now
+
+    def __post_init__(self) -> None:
+        supplied = tuple(
+            value is not None
+            for value in (self.model_provider, self.model_name, self.model_data_class)
+        )
+        if any(supplied) and not all(supplied):
+            raise ValueError("external model selectors must be supplied together")
+
+    def __call__(
+        self,
+        intent: SourceIntent,
+        candidate: SourceCandidate,
+        capabilities: tuple[Capability, ...],
+        now: datetime,
+    ) -> CapabilityRequest:
+        if candidate.intent_id != intent.id:
+            raise ValueError("source capability candidate does not match its intent")
+        return self._request(intent, candidate.locator, capabilities, now)
+
+    def for_adapter(
+        self,
+        intent: SourceIntent,
+        locator: str,
+        capability: Capability,
+    ) -> CapabilityRequest:
+        return self._request(intent, locator, (capability,), self.clock())
+
+    def _request(
+        self,
+        intent: SourceIntent,
+        locator: str,
+        capabilities: tuple[Capability, ...],
+        now: datetime,
+    ) -> CapabilityRequest:
+        parsed = urllib.parse.urlsplit(locator)
+        external_model = Capability.MODEL_EXTERNAL in capabilities
+        if external_model and self.model_provider is None:
+            raise ValueError("model.external request lacks trusted provider selectors")
+        return CapabilityRequest(
+            authority_repository=self.authority.authority_repository,
+            target_repository=self.authority.target_repository,
+            capabilities=capabilities,
+            ref=self.authority.ref,
+            path=self.authority.path,
+            bundle_sha256=self.ontology_bundle_sha256,
+            connector=_SOURCE_CONNECTORS[intent.discovery.kind],
+            host=parsed.hostname,
+            target=locator,
+            provider=self.model_provider if external_model else None,
+            model=self.model_name if external_model else None,
+            data_class=self.model_data_class if external_model else None,
+            requested_at=now,
+        )
+
+
+class _SourceAdapterRouter:
+    """Route every source work item to the adapter declared by its trusted intent."""
+
+    def __init__(self, adapters: Mapping[DiscoveryKind, SourceAdapter]) -> None:
+        if set(adapters) != set(DiscoveryKind):
+            raise ValueError("source adapter router requires every supported discovery kind")
+        self.adapters = dict(adapters)
+        self._active: SourceAdapter | None = None
+        self._candidate_adapters: dict[str, SourceAdapter] = {}
+
+    def select(self, intent: SourceIntent) -> None:
+        try:
+            self._active = self.adapters[intent.discovery.kind]
+        except KeyError:
+            raise ValueError("source intent has no configured adapter") from None
+
+    def _selected(self) -> SourceAdapter:
+        if self._active is None:
+            raise ValueError("source adapter must be selected before use")
+        return self._active
+
+    @property
+    def adapter_id(self) -> str:
+        return self._selected().adapter_id
+
+    @property
+    def version(self) -> str:
+        return self._selected().version
+
+    @property
+    def max_discovery_requests(self) -> int:
+        return int(getattr(self._selected(), "max_discovery_requests", 1))
+
+    @property
+    def max_fetch_requests(self) -> int:
+        return int(getattr(self._selected(), "max_fetch_requests", 1))
+
+    @property
+    def last_discovery_request_count(self) -> int:
+        return int(getattr(self._selected(), "last_discovery_request_count", 0))
+
+    def discover(self, intent: SourceIntent) -> tuple[SourceCandidate, ...]:
+        self.select(intent)
+        adapter = self._selected()
+        candidates = adapter.discover(intent)
+        for candidate in candidates:
+            if candidate.intent_id != intent.id:
+                raise ValueError("source adapter returned a candidate for another intent")
+            existing = self._candidate_adapters.get(candidate.id)
+            if existing is not None and existing is not adapter:
+                raise ValueError("source candidate identity maps to conflicting adapters")
+            self._candidate_adapters[candidate.id] = adapter
+        return candidates
+
+    def _candidate_adapter(self, candidate: SourceCandidate) -> SourceAdapter:
+        try:
+            adapter = self._candidate_adapters[candidate.id]
+        except KeyError:
+            raise ValueError("source candidate was not emitted by the adapter router") from None
+        self._active = adapter
+        return adapter
+
+    def fetch(
+        self,
+        candidate: SourceCandidate,
+        *,
+        prior: SourceCheckpoint | None,
+    ) -> SourceCheckpoint:
+        return self._candidate_adapter(candidate).fetch(candidate, prior=prior)
+
+    def payload(
+        self,
+        candidate: SourceCandidate,
+        checkpoint: SourceCheckpoint,
+    ) -> FetchedSourcePayload:
+        adapter = self._candidate_adapter(candidate)
+        payload = getattr(adapter, "payload", None)
+        if callable(payload):
+            return payload(candidate, checkpoint)
+        last_fetch = getattr(adapter, "last_fetch", {})
+        result = last_fetch.get(candidate.id) if isinstance(last_fetch, dict) else None
+        if result is None:
+            raise ValueError("selected source adapter did not retain fetched payload bytes")
+        if result.requested_url != candidate.locator:
+            raise ValueError("source fetch requested URL differs from the authorized candidate")
+        expected_final_url = (
+            result.redirect_chain[-1] if result.redirect_chain else result.requested_url
+        )
+        if result.final_url != expected_final_url:
+            raise ValueError("source fetch final URL differs from its exact redirect chain")
+        if result.media_type is None:
+            raise ValueError("fetched source result omitted its media type")
+        return FetchedSourcePayload(
+            content=result.content,
+            source_uri=result.final_url,
+            media_type=result.media_type,
+            connector_id=adapter.adapter_id,
+            license=None,
+            observed_at=checkpoint.recorded_at,
+        )
+
+
+class _MojeekIntentSearch:
+    """Translate one verified source intent into bounded transient web discovery."""
+
+    def __init__(
+        self,
+        connector: MojeekDiscoveryConnector,
+        *,
+        max_requests_per_run: int,
+    ) -> None:
+        self.connector = connector
+        self.max_requests_per_run = max_requests_per_run
+        self.last_request_count = 0
+
+    def __call__(self, intent: SourceIntent) -> tuple[str, ...]:
+        if intent.discovery.kind is not DiscoveryKind.MOJEEK:
+            raise ValueError("Mojeek search requires a mojeek source intent")
+        result_limit = min(intent.refresh.max_items, self.connector.manifest.max_results)
+        page_limit = min(
+            math.ceil(result_limit / 40),
+            self.max_requests_per_run,
+            self.connector.manifest.max_pages,
+        )
+        request = DiscoveryRequest(
+            query_plan_id=intent.canonical_id,
+            exact_terms=(intent.role, *intent.associations.topics),
+            match=TermMatch.ALL,
+            result_limit=result_limit,
+            page_limit=max(page_limit, 1),
+            languages=("en",),
+        )
+        locators: list[str] = []
+        self.last_request_count = 0
+        try:
+            for page in self.connector.discover(request):
+                self.last_request_count += 1
+                locators.extend(item.canonical_locator for item in page.candidates)
+        except Exception as error:
+            # A generator can fail after transport I/O but before yielding its page.
+            # Conservatively charge the complete preauthorized bound so a failed
+            # connector can never undercount the shared request ceiling.
+            self.last_request_count = page_limit
+            failure = RuntimeError("bounded Mojeek discovery failed")
+            failure.request_count = page_limit  # type: ignore[attr-defined]
+            raise failure from error
+        return tuple(locators)
 
 
 def _resolve_cli_catalog(
@@ -999,8 +1324,1031 @@ def _skill_removal_payload(receipt: SkillRemovalReceipt) -> dict[str, object]:
     }
 
 
+def _git_ref_argument(value: str) -> str:
+    try:
+        return _ref(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
+
+
+def _delegate_depth_argument(value: str) -> int:
+    try:
+        depth = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("delegation depth must be an integer") from error
+    if not 0 <= depth <= 32:
+        raise argparse.ArgumentTypeError("delegation depth must be between 0 and 32")
+    return depth
+
+
+class _GeasArgumentParser(argparse.ArgumentParser):
+    """Apply command-shape constraints after argparse has a complete namespace."""
+
+    def parse_args(
+        self,
+        args: Sequence[str] | None = None,
+        namespace: argparse.Namespace | None = None,
+    ) -> argparse.Namespace:
+        parsed = super().parse_args(args, namespace)
+        if parsed.command == "repository-install":
+            if parsed.current_repository:
+                if parsed.name is not None or parsed.url is not None:
+                    self.error("--current-repository cannot be combined with NAME or URL")
+            elif parsed.name is None or parsed.url is None:
+                self.error("repository-install requires NAME and URL or --current-repository")
+            if parsed.delegate_depth != 1 and not parsed.trust_repository:
+                self.error("--delegate-depth requires --trust-repository")
+        if parsed.command == "ontology-sync" and parsed.direct_push and not parsed.push:
+            self.error("--direct-push requires --push for ontology-sync compatibility")
+        if parsed.command == "ontology-init" and parsed.direct_push and parsed.push is not True:
+            self.error("--direct-push requires --push for ontology-init compatibility")
+        return parsed
+
+
+def _add_publication_arguments(parser: argparse.ArgumentParser) -> None:
+    publication = parser.add_mutually_exclusive_group()
+    publication.add_argument(
+        "--publish",
+        choices=("pull-request", "none"),
+        default="pull-request",
+    )
+    publication.add_argument("--direct-push", action="store_true")
+    parser.set_defaults(direct_push=False)
+    parser.add_argument("--message", default=None)
+
+
+def _source_extraction_question(config: OntologyBuildConfig) -> str:
+    criteria = (
+        "; ".join(config.scope_criteria)
+        if config.scope_criteria
+        else f"explicit relevance to {config.topic}"
+    )
+    facets = ", ".join(config.ontology_facets)
+    competency = (
+        " Competency questions: " + "; ".join(config.competency_questions) + "."
+        if config.competency_questions
+        else ""
+    )
+    return (
+        f'Assess this immutable source for the maintained ontology "{config.topic}" '
+        "without presupposing that it is in scope. The supplied source must explicitly "
+        f"satisfy at least one scope criterion: {criteria}. Source names, search ranking, "
+        "configured topic text, and this question are not evidence. If relevance is not "
+        "explicitly supported, return empty concepts, claims, controversies, and gaps. "
+        f"If supported, extract only evidenced reusable knowledge for: {facets}."
+        f"{competency}"
+    )
+
+
+def _ontology_update_service(args: argparse.Namespace) -> OntologyUpdateService:
+    """Compose one verified, policy-gated source-update service."""
+    selection = _catalog_selection(args, Path(args.name), freshen=True)
+    if selection is None or selection.trust_status != "trusted":
+        raise ValueError("ontology-update requires one trusted catalog selection")
+    required = {
+        "repository identity": selection.repository_identity,
+        "repository root": selection.repository_root,
+        "verified repository root": selection.verified_repository_root,
+        "ref": selection.active_ref,
+        "commit": selection.commit,
+        "repository path": selection.repository_path,
+        "bundle digest": selection.bundle_sha256,
+    }
+    missing = tuple(label for label, value in required.items() if value is None)
+    if missing:
+        raise ValueError(
+            "ontology-update selection lacks verified " + ", ".join(missing)
+        )
+    repository_identity = selection.repository_identity
+    repository_root = selection.repository_root
+    verified_repository_root = selection.verified_repository_root
+    active_ref = selection.active_ref
+    commit = selection.commit
+    repository_path = selection.repository_path
+    bundle_sha256 = selection.bundle_sha256
+    assert repository_identity is not None
+    assert repository_root is not None
+    assert verified_repository_root is not None
+    assert active_ref is not None
+    assert commit is not None
+    assert repository_path is not None
+    assert bundle_sha256 is not None
+    if repository_root != verified_repository_root:
+        raise ValueError("ontology-update repository identity changed after verification")
+
+    catalog = resolve_repository_catalog(repository_root, verified_commit=commit)
+    if (
+        catalog.repository_root != verified_repository_root
+        or catalog.repository_identity != repository_identity
+        or catalog.commit != commit
+    ):
+        raise ValueError("ontology-update catalog differs from the verified selection")
+
+    manager = _user_config_manager(args)
+    user_config, _profile_name, _profile = _selected_user_config(args, manager)
+    config_path = resolve_selected_ontology_config(
+        Path(args.name),
+        filename="build.yaml",
+        selection=selection,
+    )
+    config = OntologyBuildConfig.from_yaml(
+        config_path,
+        defaults=user_config.ontology_defaults,
+    )
+    if not config.source_intent:
+        return OntologyUpdateService(configs={args.name: config}, coordinators={})
+
+    library_path = selection.ontology_directory / "library.yaml"
+    library_declared = selection.files is None or any(
+        item.path == Path("library.yaml") for item in selection.files
+    )
+    library_manifest = None
+    if library_declared and library_path.is_file():
+        library_manifest = SourceLibraryManifest.from_yaml(
+            resolve_selected_ontology_config(
+                Path(args.name),
+                filename="library.yaml",
+                selection=selection,
+            )
+        )
+
+    _default_provider, providers = load_provider_configs(args.providers)
+    try:
+        provider = providers[config.provider]
+    except KeyError:
+        raise ValueError(
+            f"ontology-update provider is not configured: {config.provider}"
+        ) from None
+    research_policy = ResearchPolicy.from_yaml(args.research_policy)
+    mojeek_policy = research_policy.provider("connector:mojeek")
+    uses_mojeek = any(
+        intent.discovery.kind is DiscoveryKind.MOJEEK
+        for intent in config.source_intent
+    )
+    if uses_mojeek and not mojeek_policy.enabled:
+        raise ValueError("ontology-update declares a disabled Mojeek source intent")
+    _load_allowed_secrets(
+        args,
+        allowed_names=frozenset(
+            value
+            for value in (
+                provider.api_key_env,
+                mojeek_policy.credential_env if uses_mojeek else None,
+            )
+            if value
+        ),
+    )
+
+    runtime_root = Path(args.root).resolve() / "ontologies" / args.name
+    store = ImmutableStore(runtime_root)
+    authority = SourceAuthorityContext(
+        authority_repository=repository_identity,
+        target_repository=repository_identity,
+        ref=active_ref,
+        path=repository_path.as_posix(),
+    )
+    evaluator = _selected_capability_evaluator(args, catalogs=(catalog,), clock=utc_now)
+    request_factory = _SourceCapabilityRequestFactory(
+        authority=authority,
+        ontology_bundle_sha256=bundle_sha256,
+        model_provider=config.provider if provider.external else None,
+        model_name=provider.model if provider.external else None,
+        model_data_class=DataClass.PUBLIC.value if provider.external else None,
+        clock=utc_now,
+    )
+    gate = ModelUseGate(
+        ModelUsePolicy.from_yaml(args.model_policy),
+        ModelUseContext(
+            operation=ModelOperation.ONTOLOGY_EXTRACTION,
+            data_class=DataClass.PUBLIC,
+            input_kind=InputKind.SOURCE_CONTENT,
+            model_route=(
+                ModelRoute.EXTERNAL_ALLOWED
+                if provider.external
+                else ModelRoute.LOCAL_PREFERRED
+            ),
+            run_id=f"run:ontology-update:{args.name}:{uuid4()}",
+        ),
+        budget_policy=BudgetPolicy.from_yaml(args.budget_policy),
+        usage_ledger=UsageLedger(Path(args.root).resolve() / "usage.sqlite"),
+        approval_registry=ApprovalRegistry(Path(args.root).resolve() / "usage.sqlite"),
+    )
+    client = ModelClient(
+        config.provider,
+        provider,
+        gate=gate,
+        timeout=config.timeout_seconds,
+        parameters=config.model_parameters,
+        connection_attempts=config.connection_attempts,
+        connection_retry_seconds=config.connection_retry_seconds,
+    )
+    extraction = AnchorGroundedSourceExtractionAdapter(
+        AnchorGroundedExtractionManager(
+            store=store,
+            client=client,
+            provider=config.provider,
+            model=provider.model,
+        ),
+        SourceExtractionConfig(
+            question=_source_extraction_question(config),
+            provider=provider,
+            max_output_tokens=config.max_output_tokens,
+            model_parameters=config.model_parameters,
+            allowed_concept_ids=(config.topic_concept_id,),
+            debug_reasoning=config.debug_reasoning,
+            allow_partial_items=True,
+        ),
+        provider_registry=providers,
+    )
+    transport = ConditionalHttpsTransport(
+        capability_evaluator=evaluator,
+        clock=utc_now,
+    )
+    adapter_arguments = {
+        "transport": transport,
+        "clock": utc_now,
+        "capability_evaluator": evaluator,
+        "capability_request": request_factory.for_adapter,
+    }
+    mojeek_search = _MojeekIntentSearch(
+        MojeekDiscoveryConnector(
+            HttpsMojeekTransport(api_key_env=mojeek_policy.credential_env)
+        ),
+        max_requests_per_run=mojeek_policy.max_requests_per_run,
+    )
+    mojeek_adapter = MojeekSourceAdapter(
+        search=mojeek_search,
+        **adapter_arguments,
+    )
+    mojeek_adapter.max_discovery_requests = min(
+        mojeek_policy.max_requests_per_run,
+        mojeek_search.connector.manifest.max_pages,
+    )
+    adapters: dict[DiscoveryKind, SourceAdapter] = {
+        DiscoveryKind.DIRECT_URL: DirectUrlAdapter(**adapter_arguments),
+        DiscoveryKind.RSS_ATOM: FeedAdapter(**adapter_arguments),
+        DiscoveryKind.SITEMAP: SitemapAdapter(**adapter_arguments),
+        DiscoveryKind.HTTPS_HTML: HtmlDiscoveryAdapter(**adapter_arguments),
+        DiscoveryKind.MOJEEK: mojeek_adapter,
+        DiscoveryKind.GITHUB_REPOSITORY: GitHubRepositorySourceAdapter(
+            GitHubDiscoveryAcquirer(store=store, clock=utc_now),
+            capability_evaluator=evaluator,
+            capability_request=request_factory.for_adapter,
+        ),
+    }
+    coordinator = SourceWorkCoordinator(
+        store=store,
+        work_store=ImmutableSourceWorkStore(store),
+        adapter=_SourceAdapterRouter(adapters),
+        capability_evaluator=evaluator,
+        capability_request=request_factory,
+        authority=authority,
+        ontology_bundle_sha256=bundle_sha256,
+        library_manifest=library_manifest,
+        library_database=runtime_root / "library.sqlite",
+        extraction=extraction,
+        source_policy=PolicyEngine.from_yaml(args.policy),
+        clock=utc_now,
+        limits=config.source_work,
+    )
+    return OntologyUpdateService(
+        configs={args.name: config},
+        coordinators={args.name: coordinator},
+    )
+
+
+def _repository_bootstrap_request(
+    args: argparse.Namespace,
+    *,
+    action: Literal["install", "update", "remove"],
+) -> RepositoryBootstrapRequest:
+    """Resolve one exact bootstrap request before constructing mutation services."""
+    manager = _user_config_manager(args)
+    user_config, _profile_name, _profile = _selected_user_config(args, manager)
+    if action in {"update", "remove"}:
+        name = validate_subscription_name(args.name)
+        previous = _load_repository_bootstrap_receipt(manager, name)
+        if action == "remove":
+            return previous.request
+        active_ref = args.active_ref or previous.request.ref
+        verified = _inspect_repository_bootstrap(
+            repository=previous.request.repository,
+            active_ref=active_ref,
+            catalog=Path(previous.request.catalog),
+            current_worktree=previous.request.current_worktree,
+            defaults=user_config.ontology_defaults,
+        )
+        return _repository_request_from_verified(
+            name=name,
+            verified=verified,
+            trust=previous.request.trust,
+            delegate_depth=previous.request.delegate_depth,
+        )
+
+    if args.current_repository:
+        verified = _inspect_repository_bootstrap(
+            repository=None,
+            active_ref=args.active_ref,
+            catalog=args.catalog,
+            current_worktree=Path.cwd().resolve(),
+            defaults=user_config.ontology_defaults,
+        )
+        name = validate_subscription_name(
+            urllib.parse.urlsplit(verified.repository).path.rstrip("/").rsplit("/", 1)[-1]
+        )
+    else:
+        name = validate_subscription_name(args.name)
+        verified = _inspect_repository_bootstrap(
+            repository=normalized_repository_identity(args.url),
+            active_ref=args.active_ref,
+            catalog=args.catalog,
+            current_worktree=None,
+            defaults=user_config.ontology_defaults,
+        )
+    trust: Literal["none", "read_only", "trust_repository"] = (
+        "trust_repository"
+        if args.trust_repository
+        else "read_only"
+        if args.read_only
+        else "none"
+    )
+    return _repository_request_from_verified(
+        name=name,
+        verified=verified,
+        trust=trust,
+        delegate_depth=args.delegate_depth,
+    )
+
+
+@dataclass(frozen=True)
+class _RepositoryPublicationScope:
+    """Trusted pre-verification identity used to deny publication before I/O."""
+
+    repository: str
+    ref: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "repository",
+            normalized_repository_identity(self.repository),
+        )
+        object.__setattr__(self, "ref", _ref(self.ref))
+
+
+def _initial_repository_publication_scope(
+    args: argparse.Namespace,
+    *,
+    action: Literal["install", "update", "remove"],
+) -> _RepositoryPublicationScope | None:
+    """Resolve publication scope without DNS, network, checkout, or mutation work."""
+    mode, _capability = _repository_publication_mode(args)
+    if action == "remove" or mode is PublishMode.NONE:
+        return None
+    if action == "update":
+        manager = _user_config_manager(args)
+        previous = _load_repository_bootstrap_receipt(
+            manager,
+            validate_subscription_name(args.name),
+        )
+        return _RepositoryPublicationScope(
+            repository=previous.request.repository,
+            ref=args.active_ref or previous.request.ref,
+        )
+    if not args.current_repository:
+        validate_subscription_name(args.name)
+        return _RepositoryPublicationScope(
+            repository=args.url,
+            ref=args.active_ref,
+        )
+
+    root_result = subprocess.run(
+        ("git", "rev-parse", "--show-toplevel"),
+        cwd=Path.cwd(),
+        env=OntologyRepositoryManager._git_environment(),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if root_result.returncode != 0:
+        raise ValueError("current repository publication requires a Git worktree")
+    root = Path(root_result.stdout.strip()).resolve(strict=True)
+    remote_result = subprocess.run(
+        ("git", "config", "--get-all", "remote.origin.url"),
+        cwd=root,
+        env=OntologyRepositoryManager._git_environment(),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    endpoints = tuple(value for value in remote_result.stdout.splitlines() if value)
+    if remote_result.returncode != 0 or len(endpoints) != 1:
+        raise ValueError(
+            "current repository publication requires one exact origin endpoint"
+        )
+    return _RepositoryPublicationScope(
+        repository=endpoints[0],
+        ref=args.active_ref,
+    )
+
+
+def _repository_request_from_verified(
+    *,
+    name: str,
+    verified: VerifiedRepositoryBootstrap,
+    trust: Literal["none", "read_only", "trust_repository"],
+    delegate_depth: int,
+) -> RepositoryBootstrapRequest:
+    scoped = trust == "trust_repository"
+    return RepositoryBootstrapRequest(
+        name=name,
+        repository=verified.repository,
+        ref=verified.ref,
+        catalog=verified.catalog,
+        commit_sha256=verified.commit_sha256,
+        trust=trust,
+        delegate_depth=delegate_depth,
+        ontology_paths=verified.ontology_paths if scoped else (),
+        bundle_sha256=verified.bundle_sha256 if scoped else (),
+        source_hosts=verified.source_hosts if scoped else (),
+        source_path_prefixes=verified.source_path_prefixes if scoped else (),
+        source_connectors=verified.source_connectors if scoped else (),
+        delegated_repositories=verified.delegated_repositories if scoped else (),
+        current_worktree=verified.current_worktree,
+    )
+
+
+def _load_repository_bootstrap_receipt(
+    manager: UserConfigManager,
+    name: str,
+) -> RepositoryBootstrapReceipt:
+    path = manager.root / "repository-bootstrap" / f"{name}.json"
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"unknown active repository bootstrap: {name}")
+    receipt = RepositoryBootstrapReceipt.model_validate_json(path.read_bytes())
+    if receipt.request.name != name or receipt.removed:
+        raise ValueError(f"unknown active repository bootstrap: {name}")
+    return receipt
+
+
+def _inspect_repository_bootstrap(
+    *,
+    repository: str | None,
+    active_ref: str,
+    catalog: Path,
+    current_worktree: Path | None,
+    defaults: OntologyBuildDefaults,
+) -> VerifiedRepositoryBootstrap:
+    """Read and Git-bind one catalog snapshot without persisting bootstrap state."""
+    if (
+        catalog.is_absolute()
+        or catalog.name != "geas.yaml"
+        or ".." in catalog.parts
+        or "\\" in str(catalog)
+    ):
+        raise ValueError("repository bootstrap catalog must be a confined geas.yaml path")
+    catalog_value = catalog.as_posix()
+    if current_worktree is not None:
+        initial = resolve_repository_catalog(current_worktree.resolve(strict=True))
+        if initial.repository_root is None:
+            raise ValueError("current repository bootstrap requires a Git worktree")
+        root = initial.repository_root
+        resolved = resolve_repository_catalog(root / catalog)
+        if resolved.repository_identity is None or resolved.identity_kind != "remote":
+            raise ValueError("current repository bootstrap requires a configured remote identity")
+        repository = resolved.repository_identity
+        verified_current = resolved.repository_root
+        if verified_current is None:
+            raise ValueError("current repository bootstrap lost its verified worktree")
+    else:
+        if repository is None:
+            raise ValueError("remote repository bootstrap requires a repository identity")
+        with tempfile.TemporaryDirectory(prefix="geas-bootstrap-verify-") as temporary:
+            root = Path(temporary) / "checkout"
+            probe = OntologySubscription(
+                url=repository,
+                active_ref=active_ref,
+                checkout=Path("checkout"),
+                catalog=catalog,
+            )
+            OntologyRepositoryManager(checkout=root, config=probe).pull()
+            resolved = resolve_repository_catalog(root / catalog)
+            return _verified_repository_bootstrap_from_catalog(
+                resolved,
+                repository=repository,
+                active_ref=active_ref,
+                catalog_path=catalog_value,
+                current_worktree=None,
+                defaults=defaults,
+            )
+    return _verified_repository_bootstrap_from_catalog(
+        resolved,
+        repository=repository,
+        active_ref=active_ref,
+        catalog_path=catalog_value,
+        current_worktree=verified_current,
+        defaults=defaults,
+    )
+
+
+def _verified_repository_bootstrap_from_catalog(
+    resolved: ResolvedRepositoryCatalog,
+    *,
+    repository: str,
+    active_ref: str,
+    catalog_path: str,
+    current_worktree: Path | None,
+    defaults: OntologyBuildDefaults,
+) -> VerifiedRepositoryBootstrap:
+    root = resolved.repository_root
+    commit = resolved.commit
+    if (
+        root is None
+        or resolved.repository_identity is None
+        or resolved.identity_kind != "remote"
+        or commit is None
+    ):
+        raise ValueError("repository bootstrap requires a verified remote Git catalog")
+    if resolved.repository_identity != normalized_repository_identity(repository):
+        raise ValueError("verified repository identity differs from the requested repository")
+    requested_catalog = (root / catalog_path).resolve(strict=True)
+    if requested_catalog not in resolved.catalog_paths:
+        raise ValueError("requested repository bootstrap catalog was not Git-verified")
+    command = subprocess.run(
+        ("git", "rev-parse", "--verify", f"{active_ref}^{{commit}}"),
+        cwd=root,
+        env=OntologyRepositoryManager._git_environment(),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if command.returncode != 0 or command.stdout.strip() != commit:
+        raise ValueError("verified repository commit differs from the requested ref")
+    if active_ref.startswith("refs/heads/") and resolved.active_ref != active_ref:
+        raise ValueError("verified repository checkout is not on the requested branch")
+    if not resolved.ontologies:
+        raise ValueError("repository bootstrap catalog declares no verified ontologies")
+    if any(item.dirty for item in resolved.ontologies):
+        raise ValueError("repository bootstrap ontology inputs differ from verified Git bytes")
+
+    ontology_paths = tuple(item.workspace_path.as_posix() for item in resolved.ontologies)
+    bundle_sha256 = tuple(item.bundle_sha256 for item in resolved.ontologies)
+    intents: list[SourceIntent] = []
+    for ontology in resolved.ontologies:
+        if any(item.path == Path("build.yaml") for item in ontology.files):
+            build_path = ontology.ontology_path / "build.yaml"
+            intents.extend(
+                OntologyBuildConfig.from_yaml(build_path, defaults=defaults).source_intent
+            )
+    delegated = (
+        tuple(
+            item.subject.repository
+            for item in resolved.delegation_manifest.delegations
+        )
+        if resolved.delegation_manifest is not None
+        else ()
+    )
+    return VerifiedRepositoryBootstrap(
+        repository=resolved.repository_identity,
+        ref=active_ref,
+        catalog=catalog_path,
+        commit_sha256=commit,
+        ontology_paths=ontology_paths,
+        bundle_sha256=bundle_sha256,
+        source_hosts=tuple(
+            sorted({host for intent in intents for host in intent.allowed_hosts})
+        ),
+        source_path_prefixes=tuple(
+            sorted(
+                {
+                    prefix
+                    for intent in intents
+                    for prefix in intent.allowed_path_prefixes
+                }
+            )
+        ),
+        source_connectors=tuple(
+            sorted({_SOURCE_CONNECTORS[intent.discovery.kind] for intent in intents})
+        ),
+        delegated_repositories=tuple(sorted(set(delegated))),
+        current_worktree=current_worktree,
+    )
+
+
+def _repository_bootstrap_service(args: argparse.Namespace) -> object:
+    """Compose exact bootstrap lifecycle adapters for the selected profile."""
+    del args
+    raise ValueError("repository bootstrap composition is unavailable")
+
+
+def _preauthorize_repository_publication(
+    args: argparse.Namespace,
+    request: RepositoryBootstrapRequest | _RepositoryPublicationScope,
+) -> None:
+    """Require an effective local Git grant before bootstrap lifecycle writes."""
+    mode, capability = _repository_publication_mode(args)
+    if mode is PublishMode.NONE:
+        return
+    if not request.ref.startswith("refs/heads/"):
+        raise PermissionError("repository publication requires a writable branch ref")
+    manager = _user_config_manager(args)
+    _config, _profile_name, profile = _selected_user_config(args, manager)
+    evaluator = _selected_capability_evaluator(args, clock=utc_now)
+    fallback_paths = (
+        ".agents/skills/geas/SKILL.md",
+        ".geas/skills/geas/SKILL.md",
+    )
+    for grant in profile.effective_capability_grants():
+        if (
+            grant.decision != "allow"
+            or capability not in grant.capabilities
+            or grant.subject.repository != request.repository
+        ):
+            continue
+        paths = grant.subject.paths if grant.subject.paths != "*" else fallback_paths
+        bundles: tuple[str | None, ...] = (
+            grant.subject.bundle_sha256
+            if grant.subject.bundle_sha256 != "*"
+            else (None,)
+        )
+        for path in paths:
+            for bundle_sha256 in bundles:
+                decision = evaluator.evaluate(
+                    CapabilityRequest(
+                        authority_repository=request.repository,
+                        target_repository=request.repository,
+                        capabilities=(capability,),
+                        ref=request.ref,
+                        path=path,
+                        bundle_sha256=bundle_sha256,
+                        dirty=True,
+                        requested_at=utc_now(),
+                    )
+                )
+                if decision.allowed and not decision.delegation_chain:
+                    if mode is PublishMode.PULL_REQUEST:
+                        _github_forge_client(request.repository)
+                    return
+    raise PermissionError(
+        f"repository publication requires an exact root-local {capability.value} grant"
+    )
+
+
+def _publish_repository_receipt(
+    args: argparse.Namespace,
+    request: RepositoryBootstrapRequest,
+    receipt: RepositoryBootstrapReceipt,
+) -> object:
+    """Publish only through the role-classified repository publisher boundary."""
+    if receipt.request != request:
+        raise ValueError("bootstrap receipt does not match the exact bootstrap request")
+    if receipt.removed:
+        return receipt
+    mode, capability = _repository_publication_mode(args)
+    if mode is PublishMode.NONE:
+        return receipt
+    repository = _repository_managed_root(args, request)
+    manifests = _bootstrap_publication_manifests(repository, receipt)
+    if not manifests:
+        return receipt
+    manager = _user_config_manager(args)
+    _config, _profile_name, profile = _selected_user_config(args, manager)
+    evaluator = _selected_capability_evaluator(args, clock=utc_now)
+    decisions = tuple(
+        _repository_publication_decision(
+            evaluator=evaluator,
+            request=request,
+            path=item.path,
+            capability=capability,
+            bundle_sha256=(
+                receipt.verified.bundle_sha256 if receipt.verified is not None else ()
+            ),
+        )
+        for manifest in manifests
+        for item in manifest.paths
+    )
+    publish_request = PublishRequest(
+        repository=request.repository,
+        target_ref=request.ref,
+        mode=mode,
+        paths=tuple(
+            PublishPath(path=item.path, role=item.role)
+            for manifest in manifests
+            for item in manifest.paths
+        ),
+        capability_decision_sha256=capability_decision_set_sha256(decisions),
+        message=args.message,
+        created_at=utc_now(),
+    )
+    publisher = GitRepositoryPublisher(
+        repository=repository,
+        manifests=manifests,
+        capability_decision=decisions,
+        forge=(
+            _github_forge_client(request.repository)
+            if mode is PublishMode.PULL_REQUEST
+            else None
+        ),
+        now=utc_now,
+        direct_push=mode is PublishMode.DIRECT_PUSH,
+        grants={grant.id: grant for grant in profile.effective_capability_grants()},
+        receipt_verifier=_BootstrapPublicationReceiptVerifier(repository, receipt),
+    )
+    result = publisher.publish(publish_request)
+    payload = receipt.model_dump(mode="json")
+    payload["publication"] = result.model_dump(mode="json")
+    return payload
+
+
+def _repository_publication_mode(
+    args: argparse.Namespace,
+) -> tuple[PublishMode, Capability]:
+    if getattr(args, "direct_push", False):
+        return PublishMode.DIRECT_PUSH, Capability.GIT_DIRECT_PUSH
+    if getattr(args, "publish", "none") == "pull-request":
+        return PublishMode.PULL_REQUEST, Capability.GIT_PULL_REQUEST
+    return PublishMode.NONE, Capability.GIT_PULL_REQUEST
+
+
+def _github_forge_client(repository: str) -> GitHubCliForgeClient:
+    executable = shutil.which("gh")
+    if executable is None:
+        raise PermissionError(
+            "pull-request publication requires an authenticated GitHub CLI executable"
+        )
+    client = GitHubCliForgeClient(executable=str(Path(executable).resolve()))
+    client.assert_authenticated(repository=repository)
+    return client
+
+
+def _repository_managed_root(
+    args: argparse.Namespace,
+    request: RepositoryBootstrapRequest,
+) -> Path:
+    if request.current_worktree is not None:
+        root = request.current_worktree.resolve(strict=True)
+    else:
+        manager = _user_config_manager(args)
+        _config, profile_name, _profile = _selected_user_config(args, manager)
+        root = (manager.root / "subscriptions" / profile_name / request.name).resolve(
+            strict=True
+        )
+    command = subprocess.run(
+        ("git", "rev-parse", "--show-toplevel"),
+        cwd=root,
+        env=OntologyRepositoryManager._git_environment(),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if command.returncode != 0 or Path(command.stdout.strip()).resolve() != root:
+        raise ValueError("repository publication requires the verified Git checkout root")
+    return root
+
+
+def _repository_publication_decision(
+    *,
+    evaluator: DeterministicCapabilityEvaluator,
+    request: RepositoryBootstrapRequest,
+    path: str,
+    capability: Capability,
+    bundle_sha256: Sequence[str],
+) -> CapabilityDecision:
+    values: tuple[str | None, ...] = (*tuple(sorted(set(bundle_sha256))), None)
+    for digest in values:
+        decision = evaluator.evaluate(
+            CapabilityRequest(
+                authority_repository=request.repository,
+                target_repository=request.repository,
+                capabilities=(capability,),
+                ref=request.ref,
+                path=path,
+                bundle_sha256=digest,
+                dirty=True,
+                requested_at=utc_now(),
+            )
+        )
+        if decision.allowed and not decision.delegation_chain:
+            return decision
+    raise PermissionError(
+        f"repository publication path lacks exact {capability.value} authority: {path}"
+    )
+
+
+def _bootstrap_publication_manifests(
+    repository: Path,
+    receipt: RepositoryBootstrapReceipt,
+) -> tuple[PublicationManifest, ...]:
+    """Derive complete skill manifests only from exact bootstrap-owned leaf paths."""
+    if (
+        receipt.verified is None
+        or BootstrapPhase.COMPLETED not in receipt.completed_phases
+        or receipt.pending_phase is not None
+        or receipt.removal_pending
+        or receipt.removed
+    ):
+        raise ValueError("publication requires one completed bootstrap verification receipt")
+    repository = repository.resolve(strict=True)
+    verified = receipt.verified
+    catalog = resolve_repository_catalog(
+        repository / verified.catalog,
+        verified_commit=verified.commit_sha256,
+    )
+    requested_catalog = (repository / verified.catalog).resolve(strict=True)
+    if (
+        catalog.repository_root != repository
+        or catalog.repository_identity is None
+        or _normalized_git_url(catalog.repository_identity)
+        != _normalized_git_url(verified.repository)
+        or catalog.commit != verified.commit_sha256
+        or requested_catalog not in catalog.catalog_paths
+    ):
+        raise ValueError("bootstrap publication catalog differs from exact verification")
+    owned = {item.path: item for item in receipt.managed_paths}
+    roots: set[str] = set()
+    for path in owned:
+        parts = tuple(Path(path).parts)
+        if (
+            len(parts) > 3
+            and parts[:2] in {(".agents", "skills"), (".geas", "skills")}
+        ):
+            roots.add(Path(*parts[:3]).as_posix())
+    manifests: list[PublicationManifest] = []
+    receipt_sha256 = receipt.id.rsplit(":", 1)[-1]
+    for root_value in sorted(roots, key=lambda value: value.encode("utf-8")):
+        root = repository / root_value
+        _snapshot, skill_manifest = resolve_skill_snapshot(root)
+        skill_name = Path(root_value).name
+        if skill_manifest.skill.name != skill_name:
+            raise ValueError("bootstrap-owned skill path differs from its manifest identity")
+        expected = {
+            f"{root_value}/{item.path}": item.sha256 for item in skill_manifest.files
+        }
+        manifest_path = f"{root_value}/geas-skill.json"
+        expected[manifest_path] = hashlib.sha256(
+            (repository / manifest_path).read_bytes()
+        ).hexdigest()
+        owned_under_root = {
+            path: item.sha256
+            for path, item in owned.items()
+            if path.startswith(f"{root_value}/")
+        }
+        if owned_under_root != expected:
+            raise ValueError("bootstrap receipt does not own one complete skill snapshot")
+        role = (
+            PathRole.GENERIC_SKILL
+            if skill_name == "geas"
+            else PathRole.EXPORTED_SKILL
+        )
+        if role is PathRole.EXPORTED_SKILL:
+            ontology = skill_manifest.ontology
+            exact_catalog_entries = tuple(
+                item
+                for item in catalog.ontologies
+                if item.name == ontology.name
+                and item.workspace_path.as_posix() == ontology.ontology_path
+                and item.bundle_sha256 == ontology.bundle_sha256
+                and item.catalog_path.resolve() == requested_catalog
+            )
+            if (
+                skill_manifest.format_version != 2
+                or _normalized_git_url(ontology.repository_url)
+                != _normalized_git_url(verified.repository)
+                or ontology.active_ref != verified.ref
+                or ontology.ontology_commit != verified.commit_sha256
+                or ontology.subscription_name != receipt.request.name
+                or ontology.catalog_path != verified.catalog
+                or ontology.ontology_path not in verified.ontology_paths
+                or ontology.bundle_sha256 not in verified.bundle_sha256
+                or len(exact_catalog_entries) != 1
+            ):
+                raise ValueError(
+                    "exported skill producer differs from its bootstrap verification "
+                    "identity or exact verified catalog entry"
+                )
+        producer = (
+            PublicationProducer.GENERIC_SKILL
+            if skill_name == "geas"
+            else PublicationProducer.EXPORTED_SKILL
+        )
+        manifests.append(
+            PublicationManifest(
+                producer=producer,
+                receipt_sha256=receipt_sha256,
+                paths=tuple(
+                    PublicationManifestPath(path=path, role=role, sha256=digest)
+                    for path, digest in sorted(expected.items())
+                ),
+            )
+        )
+    return tuple(manifests)
+
+
+@dataclass(frozen=True)
+class _BootstrapPublicationReceiptVerifier:
+    repository: Path
+    receipt: RepositoryBootstrapReceipt
+
+    def verify(self, manifest: PublicationManifest) -> None:
+        expected = _bootstrap_publication_manifests(self.repository, self.receipt)
+        if manifest not in expected:
+            raise ValueError("publication manifest differs from the bootstrap ownership receipt")
+
+
+def _preauthorize_ontology_sync_publication(
+    args: argparse.Namespace,
+    *,
+    manager: UserConfigManager,
+    profile_name: str,
+    names: tuple[str, ...],
+) -> object:
+    """Refuse legacy arbitrary-tree pushes before subscription I/O.
+
+    ``ontology-sync`` has no producer receipt or exact classified path inventory,
+    so even its explicit compatibility flags cannot manufacture publication
+    authority. Repository lifecycle commands provide the receipt-owned route.
+    """
+    del args, manager, profile_name, names
+    raise PermissionError(
+        "ontology-sync direct push lacks an exact producer-owned path manifest; "
+        "use repository-update with explicit publication authority"
+    )
+
+
+def _publish_ontology_sync(
+    plan: object,
+    receipts: object,
+    *,
+    message: str,
+) -> object:
+    """Invoke an already composed safe publisher; never the legacy Git helper."""
+    del receipts
+    publisher = getattr(plan, "publisher", None)
+    request = getattr(plan, "request", None)
+    if publisher is None or request is None:
+        raise PermissionError("ontology-sync publication plan is incomplete")
+    if hasattr(request, "model_copy") and "message" in type(request).model_fields:
+        request = request.model_copy(update={"message": message})
+    return publisher.publish(request)
+
+
+def _preauthorize_ontology_init_publication(
+    args: argparse.Namespace,
+    *,
+    manager: UserConfigManager,
+    profile_name: str,
+    profile: GeasProfile,
+    ontology_name: str,
+) -> object:
+    """Reject config generation as a source of implicit Git authority."""
+    del args, manager, profile_name, profile, ontology_name
+    raise PermissionError(
+        "ontology-init has no verified producer receipt for direct publication; "
+        "publish later through repository-update"
+    )
+
+
+def _publish_ontology_init(plan: object, *, message: str) -> object:
+    publisher = getattr(plan, "publisher", None)
+    request = getattr(plan, "request", None)
+    if publisher is None or request is None:
+        raise PermissionError("ontology-init publication plan is incomplete")
+    if hasattr(request, "model_copy") and "message" in type(request).model_fields:
+        request = request.model_copy(update={"message": message})
+    return publisher.publish(request)
+
+
+def _preauthorize_artifact_publication(
+    args: argparse.Namespace,
+    selection: OntologySelection,
+) -> object:
+    """Fail before release or Git mutation when no exact publication manifest exists."""
+    if selection.active_ref is None or not selection.active_ref.startswith("refs/heads/"):
+        raise RuntimeError("read-only ontology ref cannot be published; a branch is required")
+    mode = "direct push" if args.direct_push else "pull request"
+    raise PermissionError(
+        f"artifact {mode} requires an exact producer-owned publication manifest"
+    )
+
+
+def _publish_artifact_manifest(
+    plan: object,
+    receipt: object,
+    *,
+    message: str,
+) -> object:
+    del receipt
+    publisher = getattr(plan, "publisher", None)
+    request = getattr(plan, "request", None)
+    if publisher is None or request is None:
+        raise PermissionError("artifact publication plan is incomplete")
+    if hasattr(request, "model_copy") and "message" in type(request).model_fields:
+        request = request.model_copy(update={"message": message})
+    return publisher.publish(request)
+
+
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="geas")
+    parser = _GeasArgumentParser(prog="geas")
     parser.add_argument(
         "--providers",
         type=Path,
@@ -1107,7 +2455,60 @@ def _build_parser() -> argparse.ArgumentParser:
     ontology_sync.add_argument("names", nargs="*")
     ontology_sync.add_argument("--pull", action="store_true")
     ontology_sync.add_argument("--push", action="store_true")
+    ontology_sync.add_argument("--direct-push", action="store_true")
     ontology_sync.add_argument("--message", default="geas: update ontologies")
+
+    ontology_update = subparsers.add_parser(
+        "ontology-update",
+        help="run due bounded source work for one configured ontology",
+    )
+    ontology_update.add_argument("name")
+    ontology_update.add_argument("--root", type=Path, default=Path("data"))
+
+    repository_install = subparsers.add_parser(
+        "repository-install",
+        help="verify and install one repository-backed Geas workspace",
+    )
+    repository_install.add_argument("name", nargs="?")
+    repository_install.add_argument("url", nargs="?")
+    repository_install.add_argument("--current-repository", action="store_true")
+    repository_install.add_argument(
+        "--ref",
+        dest="active_ref",
+        type=_git_ref_argument,
+        default="refs/heads/main",
+    )
+    repository_install.add_argument("--catalog", type=Path, default=Path("geas.yaml"))
+    trust = repository_install.add_mutually_exclusive_group()
+    trust.add_argument("--trust-repository", action="store_true")
+    trust.add_argument("--read-only", action="store_true")
+    repository_install.add_argument(
+        "--delegate-depth",
+        type=_delegate_depth_argument,
+        default=1,
+    )
+    repository_install.add_argument("--link", action="store_true")
+    _add_publication_arguments(repository_install)
+
+    repository_update = subparsers.add_parser(
+        "repository-update",
+        help="reverify and update one owned repository bootstrap",
+    )
+    repository_update.add_argument("name")
+    repository_update.add_argument(
+        "--ref",
+        dest="active_ref",
+        type=_git_ref_argument,
+        default=None,
+    )
+    repository_update.add_argument("--link", action="store_true")
+    _add_publication_arguments(repository_update)
+
+    repository_remove = subparsers.add_parser(
+        "repository-remove",
+        help="remove one exact owned repository bootstrap",
+    )
+    repository_remove.add_argument("name")
 
     catalog_verify = subparsers.add_parser(
         "catalog-verify",
@@ -1128,7 +2529,12 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     ontology_subscribe.add_argument("name")
     ontology_subscribe.add_argument("url")
-    ontology_subscribe.add_argument("--ref", dest="active_ref", default="refs/heads/main")
+    ontology_subscribe.add_argument(
+        "--ref",
+        dest="active_ref",
+        type=_git_ref_argument,
+        default="refs/heads/main",
+    )
     ontology_subscribe.add_argument("--catalog", type=Path, default=Path("geas.yaml"))
 
     ontology_unsubscribe = subparsers.add_parser(
@@ -1163,6 +2569,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Git commit message for the updated artifact manifest",
     )
+    artifact_publish.add_argument("--direct-push", action="store_true")
 
     artifact_sync = subparsers.add_parser(
         "ontology-artifact-sync",
@@ -1232,6 +2639,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="override profile push_on_update for this update",
     )
+    ontology_init.add_argument("--direct-push", action="store_true")
 
     source = subparsers.add_parser("source-add", help="archive a local source file")
     source.add_argument("path", type=Path)
@@ -1856,7 +3264,88 @@ def main() -> None:
     if args.command == "ontology-snapshot-remove":
         _validate_snapshot_removal_arguments(args.ontology, args.bundle_sha256)
     _resolve_cli_config_paths(args)
+    repository_action = (
+        args.command.removeprefix("repository-")
+        if args.command
+        in {"repository-install", "repository-update", "repository-remove"}
+        else None
+    )
+    initial_publication_scope = None
+    ontology_sync_publication_plan = None
+    ontology_init_publication_plan = None
+    if repository_action is not None:
+        initial_publication_scope = _initial_repository_publication_scope(
+            args,
+            action=repository_action,
+        )
+        if initial_publication_scope is not None:
+            _preauthorize_repository_publication(args, initial_publication_scope)
+    elif args.command == "ontology-sync" and args.direct_push:
+        manager = _user_config_manager(args)
+        config = manager.load() if manager.path.is_file() else GeasUserConfig.default()
+        profile_name, _profile = config.profile(args.geas_profile)
+        ontology_sync_publication_plan = _preauthorize_ontology_sync_publication(
+            args,
+            manager=manager,
+            profile_name=profile_name,
+            names=tuple(args.names),
+        )
+        if ontology_sync_publication_plan is None:
+            raise PermissionError("ontology-sync publication preauthorization is incomplete")
+    elif args.command == "ontology-init" and args.direct_push:
+        if args.directory is not None:
+            raise ValueError(
+                "--direct-push applies only to the default profile ontology location"
+            )
+        manager = _user_config_manager(args)
+        config = manager.load() if manager.path.is_file() else GeasUserConfig.default()
+        profile_name, profile = config.profile(args.geas_profile)
+        ontology_name = shared_ontology_directory(
+            args.concept_id,
+            config_home=manager.root,
+        ).name
+        ontology_init_publication_plan = _preauthorize_ontology_init_publication(
+            args,
+            manager=manager,
+            profile_name=profile_name,
+            profile=profile,
+            ontology_name=ontology_name,
+        )
+        if ontology_init_publication_plan is None:
+            raise PermissionError("ontology-init publication preauthorization is incomplete")
     recover_managed_removals(_user_config_manager(args))
+
+    if args.command == "ontology-update":
+        print(f"Updating ontology {args.name!r} from due source intents.", file=sys.stderr)
+        receipt = _ontology_update_service(args).update(args.name, now=utc_now())
+        _json(receipt)
+        if not receipt.complete:
+            print(
+                receipt.recovery_command
+                or "Ontology source update is incomplete; rerun the same command.",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
+        return
+
+    if args.command in {"repository-install", "repository-update", "repository-remove"}:
+        assert repository_action is not None
+        request = _repository_bootstrap_request(args, action=repository_action)
+        if initial_publication_scope is not None and (
+            request.repository != initial_publication_scope.repository
+            or request.ref != initial_publication_scope.ref
+        ):
+            raise ValueError(
+                "verified repository identity differs from the preauthorized scope"
+            )
+        print(
+            f"Running repository {repository_action} for {request.name!r}.",
+            file=sys.stderr,
+        )
+        service = _repository_bootstrap_service(args)
+        receipt = getattr(service, repository_action)(request)
+        _json(_publish_repository_receipt(args, request, receipt))
+        return
 
     if args.command == "skill-export":
         manager = _user_config_manager(args)
@@ -2093,13 +3582,13 @@ def main() -> None:
                 first_config_bytes = manager.path.read_bytes()
         user_config = manager.load() if first_config else manager.load_or_create()
         profile_name, _profile = user_config.profile(args.geas_profile)
-        subscriptions = _subscription_service(
-            args,
-            manager=manager,
-            profile_name=profile_name,
-        )
         if args.command == "ontology-subscribe":
             assert subscription is not None
+            subscriptions = _subscription_service(
+                args,
+                manager=manager,
+                profile_name=profile_name,
+            )
             print(f"Subscribing and verifying {args.name!r}.", file=sys.stderr)
             try:
                 receipt = subscriptions.subscribe(args.name, subscription)
@@ -2117,6 +3606,11 @@ def main() -> None:
             _json(receipt)
             return
         if args.command == "ontology-unsubscribe":
+            subscriptions = _subscription_service(
+                args,
+                manager=manager,
+                profile_name=profile_name,
+            )
             print(f"Unsubscribing {args.name!r}.", file=sys.stderr)
             _json(
                 subscriptions.unsubscribe(
@@ -2125,16 +3619,40 @@ def main() -> None:
                 )
             )
             return
+        publication_plan = ontology_sync_publication_plan
+        if args.direct_push:
+            assert publication_plan is not None
+        elif args.push:
+            print(
+                "Legacy --push does not authorize a remote write; synchronizing read-only.",
+                file=sys.stderr,
+            )
+        subscriptions = _subscription_service(
+            args,
+            manager=manager,
+            profile_name=profile_name,
+        )
         print("Synchronizing ontology subscriptions.", file=sys.stderr)
-        pull_requested = args.pull or not args.push
+        pull_requested = args.pull or not args.direct_push
+        sync_receipts = subscriptions.sync(
+            tuple(args.names),
+            pull=pull_requested,
+            push=False,
+        )
+        publication = (
+            _publish_ontology_sync(
+                publication_plan,
+                sync_receipts,
+                message=args.message,
+            )
+            if publication_plan is not None
+            else None
+        )
         _json(
             {
                 "profile": profile_name,
-                "subscriptions": subscriptions.sync(
-                    tuple(args.names),
-                    pull=pull_requested,
-                    push=args.push,
-                ),
+                "subscriptions": sync_receipts,
+                "publication": publication,
             }
         )
         return
@@ -2192,15 +3710,11 @@ def main() -> None:
             filename="artifacts.yaml",
             selection=selection,
         )
-        repository = None
+        publication_plan = ontology_init_publication_plan
         if args.command == "ontology-artifact-publish":
             if repository_root is None:
                 raise ValueError("ontology artifact publication has no repository checkout")
-            repository = OntologyRepositoryManager(
-                checkout=repository_root,
-                config=repository_config,
-            )
-            repository.assert_pushable()
+            publication_plan = _preauthorize_artifact_publication(args, selection)
         artifact_manager = OntologyArtifactManager(ontology_directory)
         artifact_store = GitHubReleaseArtifactStore(
             repository_config.url,
@@ -2229,14 +3743,11 @@ def main() -> None:
             knowledge_projection=args.knowledge_projection,
             generated_content=args.generated_content,
         )
-        assert repository is not None
-        relative = selection.repository_path or Path(ontology_value.name)
-        push = repository.push(
-            relative_paths=(relative,),
+        assert publication_plan is not None
+        push = _publish_artifact_manifest(
+            publication_plan,
+            publication,
             message=(args.message or f"geas: publish artifacts for {ontology_value.name}"),
-            freshness_state_path=(
-                manager.root / "state" / "ontology-sync" / f"{profile_name}.json"
-            ),
         )
         _json(
             {
@@ -2407,6 +3918,7 @@ def main() -> None:
         repository = None
         pull_receipt = None
         push_receipt = None
+        publication_plan = None
         if shared_default:
             profile_name, profile = user_config.profile(args.geas_profile)
             ontology_root = manager.ontology_root(profile)
@@ -2422,12 +3934,15 @@ def main() -> None:
                     or profile.ontology_git.pull_before_update
                     or not (ontology_root / ".git").is_dir()
                 )
-            push_requested = (
-                profile.ontology_git.push_on_update
-                if args.push is None and profile.ontology_git is not None
-                else bool(args.push)
-            )
-            if (pull_requested or push_requested) and profile.ontology_git is None:
+            if args.push and not args.direct_push:
+                print(
+                    "Legacy --push does not authorize ontology-init publication; "
+                    "configuration will remain local.",
+                    file=sys.stderr,
+                )
+            if args.direct_push:
+                assert publication_plan is not None
+            if pull_requested and profile.ontology_git is None:
                 raise ValueError(f"Geas profile {profile_name!r} has no ontology_git config")
             if profile.ontology_git is not None:
                 repository = OntologyRepositoryManager(
@@ -2443,7 +3958,6 @@ def main() -> None:
         else:
             directory = args.directory
             ontology_name = directory.name
-            push_requested = False
             if args.pull is not None or args.push is not None:
                 raise ValueError(
                     "--pull and --push apply only to the default profile ontology location"
@@ -2490,13 +4004,10 @@ def main() -> None:
         directory.mkdir(parents=True, exist_ok=True)
         build_path.write_text(config.explicit_yaml())
         library_path.write_text(library.explicit_yaml())
-        if push_requested and repository is not None:
-            push_receipt = repository.push(
-                relative_paths=(Path(ontology_name),),
+        if publication_plan is not None:
+            push_receipt = _publish_ontology_init(
+                publication_plan,
                 message=f"geas: update ontology {ontology_name}",
-                freshness_state_path=(
-                    manager.root / "state" / "ontology-sync" / f"{profile_name}.json"
-                ),
             )
         _json(
             {
@@ -2664,7 +4175,9 @@ def main() -> None:
             args,
             allowed_names=frozenset({provider_policy.credential_env}),
         )
-        connector = MojeekDiscoveryConnector()
+        connector = MojeekDiscoveryConnector(
+            HttpsMojeekTransport(api_key_env=provider_policy.credential_env)
+        )
         vocabulary = ConceptVocabulary.from_yaml(args.vocabulary)
         base = deterministic_proposal(
             args.question,

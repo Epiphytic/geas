@@ -140,6 +140,7 @@ def _source_request() -> SourceFetchRequest:
         capabilities=(Capability.SOURCE_FETCH,),
         ref="refs/heads/main",
         path="ontology/example",
+        connector="source:direct-url",
         host="issuer.example",
         target="https://issuer.example/report.pdf",
         requested_at=INSTANT,

@@ -28,6 +28,7 @@ from research_agent.models import (
     content_id,
 )
 from research_agent.providers import ModelClient
+from research_agent.remote_acquisition import SourceFetchResult
 from research_agent.source_intent import (
     DiscoveryKind,
     SourceAssociations,
@@ -46,6 +47,7 @@ from research_agent.source_work import (
     SourceAuthorityContext,
     SourceCheckpoint,
     SourceExtractionConfig,
+    SourceRetentionDecision,
     SourceWorkCoordinator,
     SourceWorkInterruption,
     SourceWorkItem,
@@ -54,6 +56,7 @@ from research_agent.source_work import (
     SourceWorkPhase,
 )
 from research_agent.store import ImmutableStore
+from research_agent.web_sources import DirectUrlAdapter
 
 NOW = datetime(2026, 9, 3, 12, tzinfo=UTC)
 REPOSITORY = "https://github.com/example/ontology"
@@ -470,6 +473,139 @@ def test_crash_after_fetched_resumes_from_durable_payload_without_adapter_state(
     assert receipt.complete
 
 
+def test_real_web_adapter_result_preserves_requested_and_final_url_identity(
+    tmp_path: Path,
+) -> None:
+    intent = _intent()
+    final_url = "https://issuer.example/news/canonical.txt"
+    content = b"canonical source\n"
+
+    class Transport:
+        def fetch(self, request, *, prior=None):
+            del prior
+            return SourceFetchResult(
+                requested_url=request.locator,
+                final_url=final_url,
+                redirect_chain=(final_url,),
+                status=200,
+                media_type="text/plain",
+                content=content,
+            )
+
+    evaluator = _AllowEvaluator()
+
+    def adapter_request(source_intent, locator, capability):
+        candidate = SourceCandidate(
+            intent_id=source_intent.id,
+            locator=locator,
+            discovered_at=NOW,
+        )
+        return _request(source_intent, candidate, (capability,), NOW).model_copy(
+            update={"connector": "source:direct-url"}
+        )
+
+    def coordinator_request(source_intent, candidate, capabilities, now):
+        return _request(source_intent, candidate, capabilities, now).model_copy(
+            update={"connector": "source:direct-url"}
+        )
+
+    class Retention:
+        def __init__(self) -> None:
+            self.requests = []
+
+        def evaluate(self, request):
+            self.requests.append(request)
+            return SourceRetentionDecision(
+                request_id=request.id,
+                decision="deny",
+                reason="fixture stops before parsing",
+                policy_version="fixture/1",
+            )
+
+    retention = Retention()
+    adapter = DirectUrlAdapter(
+        transport=Transport(),
+        clock=lambda: NOW,
+        capability_evaluator=evaluator,
+        capability_request=adapter_request,
+    )
+    store = ImmutableStore(tmp_path)
+    receipt = SourceWorkCoordinator(
+        store=store,
+        work_store=ImmutableSourceWorkStore(store),
+        adapter=adapter,
+        capability_evaluator=evaluator,
+        capability_request=coordinator_request,
+        authority=AUTHORITY,
+        ontology_bundle_sha256=BUNDLE,
+        retention_policy=retention,
+        clock=lambda: NOW,
+        monotonic=lambda: 0.0,
+    ).run_due((intent,), now=NOW)
+
+    assert receipt.complete is False
+    assert len(retention.requests) == 1
+    assert retention.requests[0].locator == intent.discovery.locator
+    assert retention.requests[0].source_uri == final_url
+
+
+def test_real_web_adapter_result_rejects_a_different_requested_url(tmp_path: Path) -> None:
+    intent = _intent()
+    content = b"wrong request identity\n"
+
+    class Transport:
+        def fetch(self, request, *, prior=None):
+            del request, prior
+            return SourceFetchResult(
+                requested_url="https://issuer.example/news/different.txt",
+                final_url="https://issuer.example/news/different.txt",
+                status=200,
+                media_type="text/plain",
+                content=content,
+            )
+
+    evaluator = _AllowEvaluator()
+
+    def adapter_request(source_intent, locator, capability):
+        candidate = SourceCandidate(
+            intent_id=source_intent.id,
+            locator=locator,
+            discovered_at=NOW,
+        )
+        return _request(source_intent, candidate, (capability,), NOW).model_copy(
+            update={"connector": "source:direct-url"}
+        )
+
+    def coordinator_request(source_intent, candidate, capabilities, now):
+        return _request(source_intent, candidate, capabilities, now).model_copy(
+            update={"connector": "source:direct-url"}
+        )
+
+    adapter = DirectUrlAdapter(
+        transport=Transport(),
+        clock=lambda: NOW,
+        capability_evaluator=evaluator,
+        capability_request=adapter_request,
+    )
+    store = ImmutableStore(tmp_path)
+    coordinator = SourceWorkCoordinator(
+        store=store,
+        work_store=ImmutableSourceWorkStore(store),
+        adapter=adapter,
+        capability_evaluator=evaluator,
+        capability_request=coordinator_request,
+        authority=AUTHORITY,
+        ontology_bundle_sha256=BUNDLE,
+        clock=lambda: NOW,
+        monotonic=lambda: 0.0,
+    )
+
+    with pytest.raises(ValueError, match="requested URL differs"):
+        coordinator.run_due((intent,), now=NOW)
+
+    assert tuple((tmp_path / "blobs" / "sha256").glob("*/*")) == ()
+
+
 def test_capability_factory_cannot_substitute_fetch_for_archive_extract_or_model(
     tmp_path: Path,
 ) -> None:
@@ -583,7 +719,9 @@ def test_real_extraction_manager_adapter_produces_proposal_only_output(tmp_path:
     receipt = SourceWorkCoordinator(
         store=store,
         work_store=ImmutableSourceWorkStore(store),
-        adapter=_Adapter(),
+        # No final newline forces parsing to create a distinct, immutable text
+        # derivation instead of accidentally sharing the original identity.
+        adapter=_Adapter(content=b"Production increased."),
         capability_evaluator=_AllowEvaluator(),
         capability_request=_request,
         authority=AUTHORITY,
@@ -593,7 +731,13 @@ def test_real_extraction_manager_adapter_produces_proposal_only_output(tmp_path:
         monotonic=lambda: 0.0,
     ).run_due((_intent(),), now=NOW)
 
+    parsed = next(iter(store.iter_records("parsed-ingest-receipt")))
+    request = next(iter(store.iter_records("extraction-request")))
     proposal = next(iter(store.iter_records("extraction-proposal")))
+    assert parsed["original_source_version_id"] != parsed["derived_source_version_id"]
+    assert receipt.source_version_ids == (parsed["original_source_version_id"],)
+    assert request["source_version_id"] == parsed["derived_source_version_id"]
+    assert proposal["source_version_id"] == parsed["derived_source_version_id"]
     assert receipt.proposal_ids == (proposal["id"],)
     assert proposal["review_state"] == "proposed"
     assert proposal["commit_authority"] == "none_proposal_only"
@@ -1410,6 +1554,41 @@ def test_due_intents_run_by_descending_priority_then_utf8_id(tmp_path: Path) -> 
     )
     _coordinator(tmp_path, adapter=adapter).run_due(intents, now=NOW)
     assert adapter.discovery_calls == ["alpha", "beta", "zeta"]
+
+
+def test_coordinator_selects_routed_adapter_before_discovery_authorization(
+    tmp_path: Path,
+) -> None:
+    """The discovery decision must use the connector selected for this intent."""
+
+    class RoutedAdapter(_Adapter):
+        def __init__(self) -> None:
+            super().__init__()
+            self.selected: list[str] = []
+
+        @property
+        def adapter_id(self) -> str:
+            if not self.selected:
+                raise AssertionError("adapter was inspected before routing")
+            return "source:test"
+
+        def select(self, intent: SourceIntent) -> None:
+            self.selected.append(intent.id)
+
+    adapter = RoutedAdapter()
+    intent = _intent().model_copy(
+        update={
+            "discovery": SourceDiscovery(
+                kind=DiscoveryKind.RSS_ATOM,
+                locator="https://issuer.example/news/feed.xml",
+            )
+        }
+    )
+
+    receipt = _coordinator(tmp_path, adapter=adapter).run_due((intent,), now=NOW)
+
+    assert receipt.complete
+    assert adapter.selected == [intent.id]
 
 
 def test_refresh_is_due_at_the_exact_fake_clock_boundary(tmp_path: Path) -> None:

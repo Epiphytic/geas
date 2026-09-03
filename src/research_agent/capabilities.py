@@ -33,6 +33,10 @@ class Capability(StrEnum):
 
 _REF = re.compile(r"^refs/(?:heads|tags)/[A-Za-z0-9][A-Za-z0-9._/-]*$")
 _HEX = re.compile(r"^[0-9a-f]{64}$")
+_GITHUB_README_PATH = re.compile(
+    r"^/repos/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/readme$"
+)
+_GITHUB_COMMIT_REF_QUERY = re.compile(r"^ref=[0-9a-f]{40}$")
 _HOST = re.compile(r"^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$")
 _RESOURCE_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]*$")
 _GIT_OBJECT_ID = re.compile(r"^[0-9a-f]{40,64}$")
@@ -109,7 +113,7 @@ def _repository_identity(value: object, *, label: str) -> str:
     return f"{parsed.scheme.lower()}://{username}{rendered_host}{port}{path}"
 
 
-def _source_target(value: object) -> tuple[str, str]:
+def _source_target(value: object, *, connector: str) -> tuple[str, str]:
     """Validate a byte-stable source wire URL and derive its host."""
     raw = str(value)
     parsed = urlsplit(raw)
@@ -123,15 +127,22 @@ def _source_target(value: object) -> tuple[str, str]:
         or parsed.username is not None
         or parsed.password is not None
         or port is not None
-        or parsed.query
         or parsed.fragment
         or any(ord(character) < 32 or ord(character) == 127 for character in raw)
     ):
         raise ValueError("source target must be a canonical credential-free HTTPS URL")
     host = _host(parsed.hostname)
     path = parsed.path
+    query = parsed.query
+    if query and not (
+        connector == "source:github-repository"
+        and host == "api.github.com"
+        and _GITHUB_README_PATH.fullmatch(path)
+        and _GITHUB_COMMIT_REF_QUERY.fullmatch(query)
+    ):
+        raise ValueError("source target must be a canonical credential-free HTTPS URL")
     canonical_path = quote_from_bytes(unquote_to_bytes(path), safe="/-._~")
-    canonical_target = urlunsplit(("https", host, path, "", ""))
+    canonical_target = urlunsplit(("https", host, path, query, ""))
     if (
         not path.startswith("/")
         or "\\" in path
@@ -396,7 +407,9 @@ class CapabilityRequest(StrictModel):
                     raise ValueError(
                         "source capability resource selectors must be supplied together"
                     )
-                canonical_target, derived_host = _source_target(normalized["target"])
+                canonical_target, derived_host = _source_target(
+                    normalized["target"], connector=str(normalized["connector"])
+                )
                 claimed_host = _host(normalized["host"])
                 if claimed_host != derived_host:
                     raise ValueError("source request host must match the host derived from target")
@@ -778,7 +791,9 @@ def _resources_match(
         if request.connector is None or request.host is None or request.target is None:
             return False
         try:
-            canonical_target, derived_host = _source_target(request.target)
+            canonical_target, derived_host = _source_target(
+                request.target, connector=request.connector
+            )
         except ValueError:
             return False
         if canonical_target != request.target or derived_host != request.host:

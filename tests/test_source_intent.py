@@ -50,7 +50,9 @@ def _host_decision(host: str) -> CapabilityDecision:
         capabilities=(Capability.SOURCE_FETCH,),
         ref="refs/heads/main",
         path="ontology/example",
+        connector="source:direct-url",
         host=host,
+        target=f"https://{host}/a",
         requested_at=NOW,
     )
     return CapabilityDecision(

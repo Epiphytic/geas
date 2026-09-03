@@ -131,6 +131,7 @@ def _request(
     *,
     mode: PublishMode = PublishMode.PULL_REQUEST,
     target_ref: str = "refs/heads/main",
+    message: str | None = None,
 ) -> PublishRequest:
     return PublishRequest(
         repository=REPOSITORY,
@@ -138,6 +139,7 @@ def _request(
         mode=mode,
         paths=(PublishPath(path=path, role=role),),
         capability_decision_sha256=decision.sha256,
+        message=message,
         created_at=NOW,
     )
 
@@ -172,6 +174,177 @@ class _ReceiptVerifier:
         self.calls.append(manifest)
         if manifest not in self.manifests:
             raise ValueError("receipt does not bind manifest")
+
+
+def test_github_cli_forge_creates_or_updates_one_exact_pull_request() -> None:
+    module = __import__(
+        "research_agent.repository_publisher",
+        fromlist=["GitHubCliForgeClient"],
+    )
+    calls: list[tuple[str, ...]] = []
+    results = iter(
+        (
+            subprocess.CompletedProcess((), 0, "[]\n", ""),
+            subprocess.CompletedProcess(
+                (), 0, "https://github.com/example/gold/pull/7\n", ""
+            ),
+            subprocess.CompletedProcess(
+                (),
+                0,
+                (
+                    '[{"baseRefName":"main","headRefName":"geas/publish/abc",'
+                    '"isCrossRepository":false,'
+                    '"url":"https://github.com/example/gold/pull/7"}]\n'
+                ),
+                "",
+            ),
+            subprocess.CompletedProcess((), 0, "", ""),
+        )
+    )
+
+    def run(command: tuple[str, ...]) -> subprocess.CompletedProcess[str]:
+        calls.append(command)
+        return next(results)
+
+    forge = module.GitHubCliForgeClient(executable="/usr/bin/gh", runner=run)
+
+    created = forge.upsert_pull_request(
+        repository=REPOSITORY,
+        head="geas/publish/abc",
+        base="main",
+        title="geas: deterministic update",
+        body="Exact receipt.",
+    )
+    updated = forge.upsert_pull_request(
+        repository=REPOSITORY,
+        head="geas/publish/abc",
+        base="main",
+        title="geas: deterministic update",
+        body="Exact receipt.",
+    )
+
+    assert created == updated == "https://github.com/example/gold/pull/7"
+    assert calls[0][0] == "/usr/bin/gh"
+    assert calls[0][1:4] == ("pr", "list", "--repo")
+    assert calls[1][1:3] == ("pr", "create")
+    assert calls[2] == calls[0]
+    assert calls[3][1:3] == ("pr", "edit")
+    assert "Exact receipt." in calls[1]
+    assert "Exact receipt." in calls[3]
+
+
+def test_github_cli_forge_rejects_ambiguous_or_malformed_cli_results() -> None:
+    module = __import__(
+        "research_agent.repository_publisher",
+        fromlist=["GitHubCliForgeClient", "PublicationError"],
+    )
+    ambiguous = module.GitHubCliForgeClient(
+        executable="/usr/bin/gh",
+        runner=lambda _command: subprocess.CompletedProcess(
+            (),
+            0,
+            (
+                '[{"url":"https://github.com/example/gold/pull/7"},'
+                '{"url":"https://github.com/example/gold/pull/8"}]'
+            ),
+            "",
+        ),
+    )
+    malformed = module.GitHubCliForgeClient(
+        executable="/usr/bin/gh",
+        runner=lambda _command: subprocess.CompletedProcess((), 0, "not-json", ""),
+    )
+    fork = module.GitHubCliForgeClient(
+        executable="/usr/bin/gh",
+        runner=lambda _command: subprocess.CompletedProcess(
+            (),
+            0,
+            (
+                '[{"baseRefName":"main","headRefName":"geas/publish/abc",'
+                '"isCrossRepository":true,'
+                '"url":"https://github.com/example/gold/pull/7"}]'
+            ),
+            "",
+        ),
+    )
+
+    for forge in (ambiguous, malformed, fork):
+        with pytest.raises(module.PublicationError):
+            forge.upsert_pull_request(
+                repository=REPOSITORY,
+                head="geas/publish/abc",
+                base="main",
+                title="geas: deterministic update",
+                body="Exact receipt.",
+            )
+
+
+def test_github_cli_forge_authentication_preflight_fails_closed() -> None:
+    module = __import__(
+        "research_agent.repository_publisher",
+        fromlist=["GitHubCliForgeClient", "PublicationError"],
+    )
+    calls: list[tuple[str, ...]] = []
+
+    def authenticated(command: tuple[str, ...]) -> subprocess.CompletedProcess[str]:
+        calls.append(command)
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    forge = module.GitHubCliForgeClient(executable="/usr/bin/gh", runner=authenticated)
+    forge.assert_authenticated(repository=REPOSITORY)
+
+    assert calls == [
+        (
+            "/usr/bin/gh",
+            "auth",
+            "status",
+            "--hostname",
+            "github.com",
+        )
+    ]
+
+    denied = module.GitHubCliForgeClient(
+        executable="/usr/bin/gh",
+        runner=lambda command: subprocess.CompletedProcess(command, 1, "", "not logged in"),
+    )
+    with pytest.raises(module.PublicationError, match="GitHub CLI operation failed"):
+        denied.assert_authenticated(repository=REPOSITORY)
+
+    before = tuple(calls)
+    with pytest.raises(module.PublicationError, match="GitHub repository slug"):
+        forge.assert_authenticated(
+            repository="https://github.com/example/%67old",
+        )
+    assert tuple(calls) == before
+
+
+@pytest.mark.parametrize(
+    ("producer", "path", "role"),
+    (
+        (
+            publishing.PublicationProducer.GENERIC_SKILL,
+            ".geas/skills/geas/SKILL.md",
+            PathRole.GENERIC_SKILL,
+        ),
+        (
+            publishing.PublicationProducer.EXPORTED_SKILL,
+            ".geas/skills/gold/SKILL.md",
+            PathRole.EXPORTED_SKILL,
+        ),
+    ),
+)
+def test_trackable_geas_skill_fallback_is_manifest_classified(
+    producer: publishing.PublicationProducer,
+    path: str,
+    role: PathRole,
+) -> None:
+    manifest = PublicationManifest(
+        producer=producer,
+        receipt_sha256="a" * 64,
+        paths=({"path": path, "role": role, "sha256": "b" * 64},),
+    )
+
+    assert publishing.classify_managed_path(path, manifests=(manifest,)) is role
 
 
 class _LocalRemoteTransport:
@@ -474,6 +647,48 @@ def test_pull_request_retries_converge_and_stage_only_manifest_owned_paths(
     assert forge.upserts[0] == forge.upserts[1]
     assert forge.upserts[0]["head"] == first.branch
     assert request.id in forge.upserts[0]["body"]
+
+
+def test_requested_commit_message_is_forwarded_only_through_publisher(
+    tmp_path: Path,
+) -> None:
+    remote, worktree = _repository(tmp_path)
+    path = ".agents/skills/gold/SKILL.md"
+    (worktree / path).parent.mkdir(parents=True)
+    (worktree / path).write_text("generated\n")
+    decision = _decision(path=path, capabilities=(Capability.GIT_PULL_REQUEST,))
+    request = _request(
+        path,
+        PathRole.EXPORTED_SKILL,
+        decision,
+        message="refresh gold",
+    )
+
+    result = _publisher(
+        worktree,
+        _manifest(worktree, path, PathRole.EXPORTED_SKILL),
+        decision,
+        forge=_Forge(),
+    ).publish(request)
+
+    assert result.commit_sha256 is not None
+    assert _git(remote, "show", "-s", "--format=%B", result.commit_sha256) == "refresh gold"
+
+
+@pytest.mark.parametrize("message", ("", " leading", "trailing ", "line\nbreak", "x" * 501))
+def test_publish_request_rejects_ambiguous_commit_messages(message: str) -> None:
+    decision = _decision(
+        path=".agents/skills/gold/SKILL.md",
+        capabilities=(Capability.GIT_PULL_REQUEST,),
+    )
+
+    with pytest.raises(ValueError, match="message|string|characters"):
+        _request(
+            ".agents/skills/gold/SKILL.md",
+            PathRole.EXPORTED_SKILL,
+            decision,
+            message=message,
+        )
 
 
 def test_pull_request_identity_is_bound_to_the_producing_receipt_hash(
