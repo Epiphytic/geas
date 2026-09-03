@@ -12,6 +12,7 @@ from typing import Protocol
 
 from pydantic import Field
 
+from research_agent.capabilities import Capability, CapabilityEvaluator, CapabilityRequest
 from research_agent.discovery import (
     AccessConstraint,
     AccessConstraintReason,
@@ -23,6 +24,13 @@ from research_agent.discovery import (
 from research_agent.models import StrictModel, utc_now
 from research_agent.parsing import ParsedDocumentManager, ParsedIngestReceipt
 from research_agent.remote_acquisition import PinnedHttpsFetcher, RemoteFetchError
+from research_agent.source_intent import (
+    DiscoveryKind,
+    SourceCandidate,
+    SourceIntent,
+    authorize_candidate,
+)
+from research_agent.source_work import SourceCheckpoint, SourceWorkPhase
 from research_agent.store import ImmutableStore
 
 
@@ -248,8 +256,7 @@ class GitHubDiscoveryAcquirer:
         license_value = metadata.get("license")
         spdx = (
             license_value.get("spdx_id")
-            if isinstance(license_value, dict)
-            and isinstance(license_value.get("spdx_id"), str)
+            if isinstance(license_value, dict) and isinstance(license_value.get("spdx_id"), str)
             else None
         )
         if spdx in {"NOASSERTION", "OTHER"}:
@@ -371,3 +378,90 @@ class GitHubDiscoveryAcquirer:
         if not isinstance(item, str) or not item.strip():
             raise DiscoveryAcquisitionError(f"official API omitted {key}")
         return item.strip()
+
+
+class GitHubRepositorySourceAdapter:
+    """Expose the legacy immutable GitHub README acquisition through source intent."""
+
+    adapter_id = "source:github-repository"
+    version = "1"
+
+    def __init__(
+        self,
+        acquirer: GitHubDiscoveryAcquirer,
+        *,
+        capability_evaluator: CapabilityEvaluator | None = None,
+        capability_request: Callable[[SourceIntent, str, Capability], CapabilityRequest]
+        | None = None,
+    ) -> None:
+        self.acquirer = acquirer
+        self.capability_evaluator = capability_evaluator
+        self.capability_request = capability_request
+        self._intents: dict[str, SourceIntent] = {}
+        self.last_acquired: dict[str, AcquiredRepository] = {}
+
+    def _require(self, intent: SourceIntent, locator: str, capability: Capability) -> None:
+        if self.capability_evaluator is None or self.capability_request is None:
+            raise PermissionError("GitHub source adapter requires a capability evaluator")
+        decision = self.capability_evaluator.evaluate(
+            self.capability_request(intent, locator, capability)
+        )
+        if decision.decision != "allow" or capability not in decision.effective_capabilities:
+            raise PermissionError(f"GitHub source adapter lacks {capability.value} authority")
+
+    def discover(self, intent: SourceIntent) -> tuple[SourceCandidate, ...]:
+        if intent.discovery.kind is not DiscoveryKind.GITHUB_REPOSITORY:
+            raise DiscoveryAcquisitionError(
+                "GitHub source adapter requires github_repository discovery"
+            )
+        candidate = SourceCandidate(
+            intent_id=intent.id,
+            locator=intent.discovery.locator,
+            discovered_at=intent.created_at,
+        )
+        self._require(intent, candidate.locator, Capability.SOURCE_DISCOVER)
+        self._intents[intent.id] = intent
+        return (authorize_candidate(candidate, intent),)
+
+    def acquire(self, candidate: SourceCandidate) -> AcquiredRepository:
+        try:
+            intent = self._intents[candidate.intent_id]
+        except KeyError:
+            raise DiscoveryAcquisitionError("candidate was not emitted by this adapter") from None
+        authorize_candidate(candidate, intent)
+        self._require(intent, candidate.locator, Capability.SOURCE_FETCH)
+        self._require(intent, candidate.locator, Capability.SOURCE_ARCHIVE)
+        self._require(intent, candidate.locator, Capability.SOURCE_EXTRACT)
+        hit = DiscoveryHit(
+            id=candidate.id,
+            upstream_id=candidate.upstream_id or candidate.locator,
+            canonical_locator=candidate.locator,
+            title=candidate.locator,
+            upstream_rank=1,
+            discovery_run_id=f"source-intent:{intent.canonical_id}",
+            acquisition_eligible=True,
+        )
+        receipt = self.acquirer.acquire_hits(
+            (hit,), discovery_label=f"source-intent:{intent.id}", limit=1
+        )
+        if not receipt.acquired:
+            raise DiscoveryAcquisitionError("GitHub repository acquisition was constrained")
+        return receipt.acquired[0]
+
+    def fetch(
+        self, candidate: SourceCandidate, *, prior: SourceCheckpoint | None = None
+    ) -> SourceCheckpoint:
+        """Acquire the same immutable README representation as the legacy acquirer.
+
+        GitHub's commit-pinned API path is already its conditional identity; a
+        generic HTTP validator cannot safely broaden that protocol.
+        """
+        del prior
+        acquired = self.acquire(candidate)
+        self.last_acquired[candidate.id] = acquired
+        return SourceCheckpoint(
+            work_item_id=candidate.id,
+            phase=SourceWorkPhase.FETCHED,
+            result_sha256=acquired.snapshot.source_content_sha256,
+            recorded_at=acquired.snapshot.observed_at,
+        )

@@ -8,15 +8,52 @@ from pathlib import Path
 
 import pytest
 
+from research_agent.capabilities import Capability, CapabilityDecision, CapabilityRequest
 from research_agent.discovery import DiscoveryHit
 from research_agent.discovery_acquisition import (
     DiscoveryAcquisitionError,
     GitHubDiscoveryAcquirer,
+    GitHubRepositorySourceAdapter,
 )
 from research_agent.remote_acquisition import RemoteFetchError
+from research_agent.source_intent import (
+    DiscoveryKind,
+    SourceAssociations,
+    SourceDiscovery,
+    SourceIntent,
+    SourceRefreshPolicy,
+    SourceTemporalPolicy,
+)
 from research_agent.store import ImmutableStore
 
 NOW = datetime(2026, 8, 3, 12, 0, tzinfo=UTC)
+
+
+class AllowEvaluator:
+    def evaluate(self, request: CapabilityRequest) -> CapabilityDecision:
+        return CapabilityDecision(
+            request=request,
+            decision="allow",
+            effective_capabilities=request.capabilities,
+            reason="fixture",
+            evaluator_version="fixture/1",
+            decided_at=NOW,
+        )
+
+
+def _capability_request(
+    intent: SourceIntent, locator: str, capability: Capability
+) -> CapabilityRequest:
+    return CapabilityRequest(
+        authority_repository="https://github.com/example/ontology",
+        target_repository="https://github.com/example/ontology",
+        capabilities=(capability,),
+        ref="refs/heads/main",
+        path="ontology/example",
+        host="github.com",
+        target=locator,
+        requested_at=NOW,
+    )
 
 
 class FakeTransport:
@@ -75,9 +112,7 @@ def _responses(content: bytes) -> dict[str, dict[str, object]]:
 def test_acquire_discovery_uses_official_immutable_repository_source(
     tmp_path: Path,
 ) -> None:
-    content = (
-        b"# Research\n\nThe system searches official sources and produces cited findings.\n"
-    )
+    content = b"# Research\n\nThe system searches official sources and produces cited findings.\n"
     transport = FakeTransport(_responses(content))
     discovery = _discovery(
         tmp_path / "discovery.json",
@@ -104,8 +139,7 @@ def test_acquire_discovery_uses_official_immutable_repository_source(
     assert acquired.snapshot.license == "Apache-2.0"
     assert acquired.acquisition_attempt.discovery_hit_id == "discovery-hit:test:2"
     assert acquired.acquisition_attempt.resolved_locator == (
-        "https://raw.githubusercontent.com/Example/Research/"
-        f"{'a' * 40}/README.md"
+        f"https://raw.githubusercontent.com/Example/Research/{'a' * 40}/README.md"
     )
     assert len(transport.requested) == 3
     assert tuple(store.iter_records("repository-snapshot"))
@@ -157,3 +191,42 @@ def test_acquire_discovery_rejects_malformed_input_and_records_api_failure(
     assert not receipt.acquired
     assert len(receipt.access_constraints) == 1
     assert receipt.access_constraints[0].target_id == "discovery-hit:test:1"
+
+
+def test_github_source_adapter_preserves_legacy_immutable_readme_result(tmp_path: Path) -> None:
+    """Replacing the official API path would lose the commit-pinned README contract."""
+    content = b"# Research\n"
+    adapter = GitHubRepositorySourceAdapter(
+        GitHubDiscoveryAcquirer(
+            store=ImmutableStore(tmp_path / "data"),
+            transport=FakeTransport(_responses(content)),
+            clock=lambda: NOW,
+        ),
+        capability_evaluator=AllowEvaluator(),
+        capability_request=_capability_request,
+    )
+    intent = SourceIntent(
+        id="github-research",
+        role="repository",
+        discovery=SourceDiscovery(
+            kind=DiscoveryKind.GITHUB_REPOSITORY,
+            locator="https://github.com/Example/Research",
+        ),
+        allowed_hosts=("github.com",),
+        allowed_path_prefixes=("/Example/",),
+        accepted_media_types=("text/markdown",),
+        refresh=SourceRefreshPolicy(interval_seconds=60, max_items=1, max_depth=0),
+        required=True,
+        priority=1,
+        associations=SourceAssociations(),
+        temporal=SourceTemporalPolicy(field="observed_at", retention="latest"),
+        created_at=NOW,
+    )
+
+    candidate = adapter.discover(intent)[0]
+    checkpoint = adapter.fetch(candidate)
+    acquired = adapter.last_acquired[candidate.id]
+
+    assert acquired.snapshot.commit_sha == "a" * 40
+    assert acquired.parsed_ingest.derived_source_version_id == acquired.snapshot.source_version_id
+    assert checkpoint.result_sha256 == acquired.snapshot.source_content_sha256

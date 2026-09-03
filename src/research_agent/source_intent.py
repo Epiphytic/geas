@@ -6,11 +6,13 @@ import ipaddress
 import re
 from datetime import datetime
 from enum import StrEnum
+from fnmatch import fnmatchcase
 from typing import Literal, Protocol
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
 from pydantic import Field, field_validator, model_validator
 
+from research_agent.capabilities import Capability, CapabilityDecision
 from research_agent.models import StrictModel, content_id
 from research_agent.source_work import SourceCheckpoint
 
@@ -26,6 +28,12 @@ class DiscoveryKind(StrEnum):
 
 def _source_url(value: object) -> str:
     raw = str(value)
+    if (
+        "\\" in raw
+        or re.search(r"%(?![0-9A-Fa-f]{2})", raw)
+        or re.search(r"%(?:2f|5c)", raw, flags=re.IGNORECASE)
+    ):
+        raise ValueError("locator path is unsafe")
     parsed = urlsplit(raw)
     if (
         parsed.scheme != "https"
@@ -43,13 +51,37 @@ def _source_url(value: object) -> str:
         pass
     else:
         raise ValueError("locator must name a hostname, not an IP address")
-    if not parsed.path.startswith("/") or "/../" in f"/{parsed.path}/" or "//" in parsed.path:
+    decoded_path = parsed.path
+    for _ in range(4):
+        if re.search(r"%(?:2f|5c)", decoded_path, flags=re.IGNORECASE):
+            raise ValueError("locator path is unsafe")
+        next_path = unquote(decoded_path)
+        if next_path == decoded_path:
+            break
+        decoded_path = next_path
+    else:
+        raise ValueError("locator path has excessive percent encoding")
+    if (
+        not parsed.path.startswith("/")
+        or "//" in decoded_path
+        or "\\" in decoded_path
+        or any(ord(character) < 32 or ord(character) == 127 for character in decoded_path)
+        or any(segment in {".", ".."} for segment in decoded_path.split("/"))
+    ):
         raise ValueError("locator path is unsafe")
-    return urlunsplit(("https", parsed.hostname.lower(), parsed.path, parsed.query, ""))
+    canonical_path = quote(decoded_path, safe="/%:@!$&'()*+,;=-._~")
+    if unquote(canonical_path) != decoded_path:
+        raise ValueError("locator path is not canonically encodable")
+    return urlunsplit(("https", parsed.hostname.lower(), canonical_path, parsed.query, ""))
 
 
 def _ordered(values: tuple[str, ...], *, label: str) -> tuple[str, ...]:
-    if any(not value or value.strip() != value for value in values):
+    if any(
+        not value
+        or value.strip() != value
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+        for value in values
+    ):
         raise ValueError(f"{label} must contain normalized non-empty strings")
     return tuple(sorted(set(values)))
 
@@ -67,9 +99,52 @@ def _host(value: object) -> str:
 
 def _prefix(value: object) -> str:
     raw = str(value)
-    if not raw.startswith("/") or "//" in raw or "\\" in raw or "/../" in f"/{raw}/":
+    if (
+        not raw.startswith("/")
+        or "//" in raw
+        or "\\" in raw
+        or "/../" in f"/{raw}/"
+        or any(ord(character) < 32 or ord(character) == 127 for character in raw)
+    ):
         raise ValueError("allowed path prefix must be normalized and absolute")
     return raw
+
+
+def _media_type(value: object) -> str:
+    raw = str(value).casefold()
+    if not re.fullmatch(r"[a-z0-9!#$&^_.+-]+/[a-z0-9!#$&^_.+-]+", raw):
+        raise ValueError("media type must be a normalized type/subtype")
+    return raw
+
+
+def _document_pattern(value: object) -> str:
+    raw = str(value)
+    if (
+        not raw.startswith("/")
+        or "\\" in raw
+        or "//" in raw
+        or "/../" in f"/{raw}/"
+        or any(ord(character) < 32 or ord(character) == 127 for character in raw)
+    ):
+        raise ValueError("document pattern must be a normalized absolute glob")
+    return raw
+
+
+def _path_is_within(path: str, prefix: str) -> bool:
+    if prefix == "/":
+        return True
+    root = prefix.rstrip("/")
+    return path == root or path.startswith(f"{root}/")
+
+
+def _matches_document_pattern(path: str, pattern: str) -> bool:
+    """Glob each URL segment independently; `*` may not cross a slash."""
+    path_parts = path.split("/")
+    pattern_parts = pattern.split("/")
+    return len(path_parts) == len(pattern_parts) and all(
+        fnmatchcase(value, selector)
+        for value, selector in zip(path_parts, pattern_parts, strict=True)
+    )
 
 
 class SourceDiscovery(StrictModel):
@@ -133,10 +208,15 @@ class SourceIntent(StrictModel):
     def normalize_prefixes(cls, value: object) -> tuple[str, ...]:
         return tuple(sorted({_prefix(item) for item in value}))  # type: ignore[arg-type]
 
-    @field_validator("accepted_media_types", "document_patterns")
+    @field_validator("accepted_media_types", mode="before")
     @classmethod
-    def normalize_strings(cls, value: tuple[str, ...]) -> tuple[str, ...]:
-        return _ordered(value, label="source intent selectors")
+    def normalize_media_types(cls, value: object) -> tuple[str, ...]:
+        return tuple(sorted({_media_type(item) for item in value}))  # type: ignore[arg-type]
+
+    @field_validator("document_patterns", mode="before")
+    @classmethod
+    def normalize_document_patterns(cls, value: object) -> tuple[str, ...]:
+        return tuple(sorted({_document_pattern(item) for item in value}))  # type: ignore[arg-type]
 
     @field_validator("created_at")
     @classmethod
@@ -150,7 +230,7 @@ class SourceIntent(StrictModel):
         parsed = urlsplit(self.discovery.locator)
         if parsed.hostname not in self.allowed_hosts:
             raise ValueError("discovery locator host must be in allowed_hosts")
-        if not any(parsed.path.startswith(prefix) for prefix in self.allowed_path_prefixes):
+        if not any(_path_is_within(parsed.path, prefix) for prefix in self.allowed_path_prefixes):
             raise ValueError("discovery locator path must be in allowed_path_prefixes")
         return self
 
@@ -163,7 +243,7 @@ class SourceIntent(StrictModel):
         normalized = _source_url(locator)
         parsed = urlsplit(normalized)
         return parsed.hostname in self.allowed_hosts and any(
-            parsed.path.startswith(prefix) for prefix in self.allowed_path_prefixes
+            _path_is_within(parsed.path, prefix) for prefix in self.allowed_path_prefixes
         )
 
 
@@ -180,6 +260,11 @@ class SourceCandidate(StrictModel):
     def normalize_locator(cls, value: object) -> str:
         return _source_url(value)
 
+    @field_validator("media_type", mode="before")
+    @classmethod
+    def normalize_media_type(cls, value: object) -> str | None:
+        return None if value is None else _media_type(value)
+
     @field_validator("discovered_at")
     @classmethod
     def timezone_aware(cls, value: datetime) -> datetime:
@@ -190,6 +275,49 @@ class SourceCandidate(StrictModel):
     @property
     def id(self) -> str:
         return content_id("source-candidate", self.model_dump(mode="json"))
+
+
+class SourceAuthorizationError(ValueError):
+    """A source declaration did not authorize a discovered child URL."""
+
+
+def authorize_candidate(
+    candidate: SourceCandidate, authority: SourceIntent | CapabilityDecision
+) -> SourceCandidate:
+    """Fail closed when an enumerated child escapes its checked-in source intent."""
+    if isinstance(authority, CapabilityDecision):
+        request = authority.request
+        if authority.decision != "allow" or not {
+            Capability.SOURCE_DISCOVER,
+            Capability.SOURCE_FETCH,
+        }.intersection(authority.effective_capabilities):
+            raise SourceAuthorizationError(
+                "candidate capability decision does not authorize source access"
+            )
+        if request.host is None or urlsplit(candidate.locator).hostname != request.host:
+            raise SourceAuthorizationError("candidate host is outside the capability decision")
+        return candidate
+    if candidate.intent_id != authority.id:
+        raise SourceAuthorizationError("candidate intent does not match its authority")
+    parsed = urlsplit(candidate.locator)
+    if parsed.hostname not in authority.allowed_hosts:
+        raise SourceAuthorizationError("candidate host is outside the authorized source intent")
+    if not any(_path_is_within(parsed.path, prefix) for prefix in authority.allowed_path_prefixes):
+        raise SourceAuthorizationError("candidate path is outside the authorized source intent")
+    if authority.document_patterns and not any(
+        _matches_document_pattern(parsed.path, pattern) for pattern in authority.document_patterns
+    ):
+        raise SourceAuthorizationError(
+            "candidate path does not match an authorized document pattern"
+        )
+    if (
+        candidate.media_type is not None
+        and candidate.media_type.casefold() not in authority.accepted_media_types
+    ):
+        raise SourceAuthorizationError(
+            "candidate media type is outside the authorized source intent"
+        )
+    return candidate
 
 
 class SourceAdapter(Protocol):
