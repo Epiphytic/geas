@@ -610,6 +610,7 @@ class RepositoryBootstrapManager:
             self._assert_complete_install(receipt)
             return None
         if self._receipt_is_completed_candidate(receipt, journal):
+            self._assert_complete_install(receipt)
             if journal.phase is not RepositoryUpdatePhase.FINALIZING:
                 raise ValueError(
                     "completed candidate receipt requires a FINALIZING update journal"
@@ -626,10 +627,7 @@ class RepositoryBootstrapManager:
             and receipt.verified == journal.candidate_verified
             and receipt.trust_grant == journal.candidate_grant
             and receipt.managed_paths == journal.candidate_managed_paths
-            and receipt.completed_phases == _PHASES
-            and receipt.pending_phase is None
             and not receipt.removed
-            and not receipt.removal_pending
         )
 
     def _assert_complete_install(self, receipt: RepositoryBootstrapReceipt) -> None:

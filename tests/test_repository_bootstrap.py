@@ -1278,3 +1278,41 @@ def test_final_receipt_cleanup_rejects_non_final_journal_phase(
         )
 
     assert journal.exists()
+
+
+def test_final_receipt_cleanup_rejects_stale_update_candidate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches journal cleanup accepting an install receipt with pending update state."""
+    root = tmp_path / "state"
+    candidate_request = _request(commit_sha256="c" * 40)
+
+    def verify(request: RepositoryBootstrapRequest) -> VerifiedRepositoryBootstrap:
+        return _verified(commit_sha256=request.commit_sha256)
+
+    manager = _manager(tmp_path, root=root, verify=verify)
+    manager.install(_request())
+    monkeypatch.setattr(
+        manager,
+        "_remove_update_journal",
+        lambda _name: (_ for _ in ()).throw(RuntimeError("after receipt")),
+    )
+    with pytest.raises(RuntimeError, match="after receipt"):
+        manager.update(candidate_request)
+
+    receipt_path = root / "repository-bootstrap" / "example.json"
+    journal_path = receipt_path.with_name("example.update.json")
+    receipt = RepositoryBootstrapReceipt.model_validate_json(receipt_path.read_bytes())
+    receipt_path.write_bytes(
+        receipt.model_copy(update={"update_candidate": receipt.verified})
+        .model_dump_json()
+        .encode()
+    )
+    stale_receipt = receipt_path.read_bytes()
+    active_journal = journal_path.read_bytes()
+
+    with pytest.raises(ValueError, match="complete before update"):
+        _manager(tmp_path, root=root, verify=verify).update(candidate_request)
+
+    assert receipt_path.read_bytes() == stale_receipt
+    assert journal_path.read_bytes() == active_journal
