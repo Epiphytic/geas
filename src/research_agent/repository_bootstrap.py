@@ -211,7 +211,9 @@ class RepositoryBootstrapManager:
             )
         self.managed_root = _authority_root(selected_managed_root, label="managed")
         self.state_root = _authority_root(selected_state_root, label="state")
-        self._requires_managed_worktree_binding = managed_root is not None
+        self._requires_managed_worktree_binding = (
+            managed_root is not None or self.state_root != self.managed_root
+        )
         if self._requires_managed_worktree_binding and (
             self.state_root == self.managed_root
             or self.state_root.is_relative_to(self.managed_root)
@@ -1006,7 +1008,9 @@ class RepositoryBootstrapManager:
             raise ValueError("managed root differs from the verified Git worktree")
         if not managed.is_dir():
             raise ValueError("verified managed root is not a safe Git worktree")
-        declared_git_directory = _local_git_directory(managed)
+        declared_git_directory, declared_common_directory = _local_git_directories(
+            managed
+        )
 
         top = self._managed_git(("rev-parse", "--show-toplevel"))
         try:
@@ -1024,6 +1028,16 @@ class RepositoryBootstrapManager:
             raise ValueError("verified managed root has unsafe local Git metadata") from error
         if actual_git_directory != declared_git_directory:
             raise ValueError("verified managed root local Git metadata identity changed")
+        actual_common_value = self._managed_git(("rev-parse", "--git-common-dir"))
+        actual_common_candidate = Path(actual_common_value)
+        if not actual_common_candidate.is_absolute():
+            actual_common_candidate = managed / actual_common_candidate
+        try:
+            actual_common_directory = actual_common_candidate.resolve(strict=True)
+        except (FileNotFoundError, OSError) as error:
+            raise ValueError("verified managed root has unsafe Git common metadata") from error
+        if actual_common_directory != declared_common_directory:
+            raise ValueError("verified managed root Git common metadata identity changed")
         head = self._managed_git(("rev-parse", "--verify", "HEAD^{commit}"))
         if head != verified.commit_sha256:
             raise ValueError("managed Git worktree HEAD differs from verified commit")
@@ -1385,13 +1399,14 @@ def _authority_root(path: Path, *, label: str) -> Path:
     return absolute
 
 
-def _local_git_directory(worktree: Path) -> Path:
+def _local_git_directories(worktree: Path) -> tuple[Path, Path]:
     """Resolve only Git metadata declared by this exact worktree root."""
     metadata = worktree / ".git"
     if metadata.is_symlink():
         raise ValueError("verified managed root local Git metadata cannot be a symlink")
     if metadata.is_dir():
-        return metadata.resolve(strict=True)
+        resolved = metadata.resolve(strict=True)
+        return resolved, resolved
     if not metadata.is_file():
         raise ValueError("verified managed Git worktree has no local metadata")
     try:
@@ -1417,7 +1432,68 @@ def _local_git_directory(worktree: Path) -> Path:
         raise ValueError("verified managed root linked Git metadata is missing") from error
     if not resolved.is_dir():
         raise ValueError("verified managed root linked Git metadata is unsafe")
-    return resolved
+    if (
+        resolved.name in {"", ".", ".."}
+        or resolved.parent.name != "worktrees"
+        or resolved.parent.parent == resolved.parent
+    ):
+        raise ValueError(
+            "verified managed root linked Git metadata is not a worktree administrative directory"
+        )
+    common = resolved.parent.parent
+    _reject_symlink_ancestry(common)
+    if common.is_symlink() or not common.is_dir():
+        raise ValueError("verified managed root linked Git common metadata is unsafe")
+    commondir = resolved / "commondir"
+    backlink = resolved / "gitdir"
+    for pointer in (commondir, backlink):
+        if pointer.is_symlink() or not pointer.is_file():
+            raise ValueError(
+                "verified managed root linked Git metadata is missing an administrative pointer"
+            )
+    try:
+        common_value = commondir.read_text(encoding="utf-8").strip()
+        backlink_value = backlink.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError) as error:
+        raise ValueError(
+            "verified managed root linked Git administrative metadata cannot be read"
+        ) from error
+    if common_value != "../..":
+        raise ValueError(
+            "verified managed root linked Git common-directory pointer is invalid"
+        )
+    if (
+        not backlink_value
+        or "\n" in backlink_value
+        or "\r" in backlink_value
+        or not Path(backlink_value).is_absolute()
+    ):
+        raise ValueError("verified managed root linked Git backlink is invalid")
+    declared_backlink = Path(os.path.abspath(backlink_value))
+    _reject_symlink_ancestry(declared_backlink)
+    if declared_backlink != metadata:
+        raise ValueError(
+            "verified managed root linked Git metadata does not point back to this worktree"
+        )
+    try:
+        resolved_backlink = declared_backlink.resolve(strict=True)
+        resolved_common = (resolved / common_value).resolve(strict=True)
+    except (FileNotFoundError, OSError) as error:
+        raise ValueError(
+            "verified managed root linked Git administrative metadata is unsafe"
+        ) from error
+    if resolved_backlink != metadata.resolve(strict=True) or resolved_common != common:
+        raise ValueError(
+            "verified managed root linked Git administrative metadata is inconsistent"
+        )
+    required_common_entries = (common / "config", common / "objects", common / "refs")
+    if (
+        required_common_entries[0].is_symlink()
+        or not required_common_entries[0].is_file()
+        or any(path.is_symlink() or not path.is_dir() for path in required_common_entries[1:])
+    ):
+        raise ValueError("verified managed root linked Git common metadata is incomplete")
+    return resolved, common
 
 
 def _confined_owned_path(root: Path, relative: str) -> Path:

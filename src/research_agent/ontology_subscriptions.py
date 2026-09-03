@@ -1781,7 +1781,6 @@ class SubscriptionManager:
         )
         self.config_manager.validate_subscription_layout(prospective)
         destination = self.config_manager.subscription_checkout(validated)
-        before = self.config_manager.path.read_bytes()
         created = not destination.exists()
         staging = (
             destination.with_name(f".{destination.name}.tmp-{uuid4().hex}")
@@ -1830,11 +1829,6 @@ class SubscriptionManager:
                 pull=pull_receipt,
             )
         except BaseException:
-            if (
-                not self.config_manager.path.exists()
-                or self.config_manager.path.read_bytes() != before
-            ):
-                self.config_manager.restore_bytes(before)
             if created:
                 self._remove_exact_checkout(destination if installed else staging)
             raise

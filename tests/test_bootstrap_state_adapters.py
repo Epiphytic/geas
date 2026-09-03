@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import threading
 from datetime import UTC, datetime
@@ -432,6 +433,82 @@ def test_profile_config_mutation_rejects_a_stale_compare_and_swap(
         )
 
     assert manager.path.read_bytes() == before
+
+
+def test_public_config_replace_rejects_a_stale_loaded_snapshot(tmp_path: Path) -> None:
+    """Catches an ordinary writer resurrecting bytes replaced by another manager."""
+    manager = _config_manager(tmp_path)
+    stale = manager.load()
+    contender = UserConfigManager(manager.path)
+    concurrent = contender.load().model_copy(update={"default_profile": "other"})
+    contender.replace(concurrent)
+    concurrent_bytes = manager.path.read_bytes()
+
+    with pytest.raises(RuntimeError, match="changed.*replacement"):
+        manager.replace(stale)
+
+    assert manager.path.read_bytes() == concurrent_bytes
+
+
+def test_public_config_restore_rejects_a_stale_expected_identity(tmp_path: Path) -> None:
+    """A rollback helper cannot overwrite a later operator-owned config state."""
+    manager = _config_manager(tmp_path)
+    original = manager.path.read_bytes()
+    original_sha256 = manager.config_sha256()
+    concurrent = manager.load().model_copy(update={"default_profile": "other"})
+    manager.replace(concurrent)
+    concurrent_bytes = manager.path.read_bytes()
+
+    with pytest.raises(RuntimeError, match="changed.*restoration"):
+        manager.restore_bytes(
+            original,
+            expected_config_sha256=original_sha256,
+        )
+
+    assert manager.path.read_bytes() == concurrent_bytes
+
+
+def test_normal_subscribe_cannot_stale_write_after_checkout_is_removed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The race may fail, but it may never leave config true and checkout false."""
+    manager = _config_manager(tmp_path)
+    subscription = _subscription()
+    destination = manager.subscription_checkout(subscription)
+    service = SubscriptionManager(
+        config_manager=manager,
+        profile_name="default",
+        catalog_verifier=lambda path: path,
+        authorizer=lambda verified: verified,
+        repository_factory=_BootstrapRepository,
+    )
+    import research_agent.ontology_subscriptions as subscriptions
+
+    original_replace = subscriptions.os.replace
+    raced = False
+
+    def remove_after_checkout_install(source: object, target: object) -> None:
+        nonlocal raced
+        original_replace(source, target)
+        if Path(target) != destination or raced:
+            return
+        raced = True
+        contender = UserConfigManager(manager.path)
+        concurrent = contender.load().model_copy(update={"default_profile": "other"})
+        contender.replace(concurrent)
+        shutil.rmtree(destination)
+
+    monkeypatch.setattr(subscriptions.os, "replace", remove_after_checkout_install)
+
+    with pytest.raises(RuntimeError, match="changed.*replacement"):
+        service.subscribe("gold", subscription)
+
+    current = manager.load()
+    assert raced
+    assert current.default_profile == "other"
+    assert "gold" not in current.profiles["default"].subscriptions
+    assert not destination.exists()
 
 
 def test_record_bootstrap_grant_migrates_only_intended_v1_state(
@@ -2006,6 +2083,42 @@ def test_explicit_managed_root_rejects_repository_environment_spoof(
     assert not (tmp_path / "state" / "repository-bootstrap").exists()
 
 
+def test_explicit_managed_root_rejects_gitfile_pointing_at_a_sibling_repository(
+    tmp_path: Path,
+) -> None:
+    """A local gitfile is not proof that its administrative directory owns this root."""
+    sibling = tmp_path / "sibling"
+    commit = _initialize_managed_repository(sibling)
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    shutil.copyfile(sibling / "geas.yaml", managed / "geas.yaml")
+    (managed / ".git").write_text(f"gitdir: {(sibling / '.git').resolve()}\n")
+    request = _bootstrap_request(commit=commit)
+    verified = _verified_request(request).model_copy(
+        update={"current_worktree": managed.resolve()}
+    )
+    effects: list[str] = []
+    manager = RepositoryBootstrapManager(
+        managed_root=managed,
+        state_root=tmp_path / "state",
+        announce=lambda message: None,
+        now=lambda: _NOW,
+        verify=lambda candidate: verified,
+        record_trust=lambda operation, grant: effects.append("trust"),
+        subscribe=lambda operation: effects.append("subscription") or (),
+        hydrate_artifacts=lambda operation: (),
+        install_generic_skill=lambda operation: (),
+        export_catalog_skills=lambda operation: (),
+        link_agents=lambda operation: (),
+    )
+
+    with pytest.raises(ValueError, match="linked Git metadata|administrative"):
+        manager.install(request)
+
+    assert effects == []
+    assert not (tmp_path / "state" / "repository-bootstrap").exists()
+
+
 def test_explicit_managed_root_accepts_bound_linked_worktree(tmp_path: Path) -> None:
     repository = tmp_path / "repository"
     commit = _initialize_managed_repository(repository)
@@ -2037,6 +2150,46 @@ def test_explicit_managed_root_accepts_bound_linked_worktree(tmp_path: Path) -> 
 
     assert receipt.completed_phases[-1] is BootstrapPhase.COMPLETED
     assert (managed / ".git").is_file()
+
+
+def test_explicit_worktree_receipt_round_trips_for_fresh_resume_and_removal(
+    tmp_path: Path,
+) -> None:
+    """Durable receipt JSON must preserve its strict absolute worktree identity."""
+    managed = tmp_path / "managed"
+    commit = _initialize_managed_repository(managed)
+    state = tmp_path / "state"
+    request = _bootstrap_request(commit=commit)
+    verified = _verified_request(request).model_copy(
+        update={"current_worktree": managed.resolve()}
+    )
+
+    def coordinator() -> RepositoryBootstrapManager:
+        return RepositoryBootstrapManager(
+            managed_root=managed,
+            state_root=state,
+            announce=lambda message: None,
+            now=lambda: _NOW,
+            verify=lambda candidate: verified,
+            record_trust=lambda operation, grant: None,
+            subscribe=lambda operation: (),
+            hydrate_artifacts=lambda operation: (),
+            install_generic_skill=lambda operation: (),
+            export_catalog_skills=lambda operation: (),
+            link_agents=lambda operation: (),
+            remove_trust=lambda operation, grant: None,
+            unsubscribe=lambda operation: None,
+            remove_skills=lambda operation: None,
+        )
+
+    installed = coordinator().install(request)
+    reloaded = coordinator().install(request)
+    removed = coordinator().remove(request)
+
+    assert reloaded == installed
+    assert reloaded.verified is not None
+    assert reloaded.verified.current_worktree == managed.resolve()
+    assert removed.removed is True
 
 
 @pytest.mark.parametrize("drift", ("head", "ref", "remote"))
@@ -2103,6 +2256,23 @@ def test_explicit_state_root_cannot_live_inside_managed_repository(
         )
 
     assert not (managed / "repository-bootstrap").exists()
+    assert not (managed / ".geas-state").exists()
+
+
+def test_legacy_root_with_explicit_nested_state_root_uses_split_root_guards(
+    tmp_path: Path,
+) -> None:
+    """Legacy spelling cannot bypass explicit state-root separation and Git binding."""
+    managed = tmp_path / "managed"
+    managed.mkdir()
+
+    with pytest.raises(ValueError, match="state root.*managed root"):
+        RepositoryBootstrapManager(
+            root=managed,
+            state_root=managed / ".geas-state",
+            announce=lambda message: None,
+        )
+
     assert not (managed / ".geas-state").exists()
 
 
