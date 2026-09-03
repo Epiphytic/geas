@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import shutil
 import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from types import SimpleNamespace
 from urllib.parse import urlsplit
 
 import pytest
@@ -43,8 +43,20 @@ from research_agent.capabilities import (
     DeterministicCapabilityEvaluator,
     VerifiedDelegationManifest,
 )
-from research_agent.library import SourceLibraryBuilder, SourceLibraryManifest
+from research_agent.extraction import (
+    AnchorGroundedExtractionManager,
+    ValidatedExtractionProposal,
+)
+from research_agent.library import (
+    SourceLibraryBuilder,
+    SourceLibraryManifest,
+    SourceLibraryQueryEngine,
+)
+from research_agent.models import ModelParameters, ProviderConfig
 from research_agent.ontology_build import OntologyBuildConfig
+from research_agent.ontology_subscriptions import OntologySubscription, SubscriptionManager
+from research_agent.parsing import ParsedDocumentManager
+from research_agent.providers import ModelClient
 from research_agent.publishing import (
     PathRole,
     PublicationManifest,
@@ -57,31 +69,32 @@ from research_agent.publishing import (
 from research_agent.remote_acquisition import (
     ConditionalHttpResponse,
     ConditionalHttpsTransport,
-    SourceFetchRequest,
 )
 from research_agent.repository_bootstrap import BootstrapOperation, RepositoryBootstrapManager
 from research_agent.repository_catalog import resolve_repository_catalog, verify_catalog
 from research_agent.repository_publisher import GitRepositoryPublisher
 from research_agent.source_intent import SourceCandidate, SourceIntent
 from research_agent.source_work import (
-    FetchedSourcePayload,
+    AnchorGroundedSourceExtractionAdapter,
     ImmutableSourceWorkStore,
     SourceAuthorityContext,
     SourceCheckpoint,
+    SourceExtractionConfig,
     SourceRetentionDecision,
     SourceRetentionRequest,
     SourceWorkCoordinator,
-    SourceWorkInterruption,
     SourceWorkOutcome,
     SourceWorkPhase,
 )
 from research_agent.store import ImmutableStore
+from research_agent.user_config import GeasProfile, GeasUserConfig, UserConfigManager
+from research_agent.web_sources import DirectUrlAdapter, FeedAdapter
 
 FIXTURE = Path(__file__).parent / "fixtures" / "automatic_acquisition" / "gold"
 NOW = datetime(2026, 9, 3, 12, tzinfo=UTC)
 ROOT_REPOSITORY = "https://github.com/example/aurora-gold-ontology"
 SOURCE_REPOSITORY = "https://github.com/example/aurora-gold-sources"
-BUNDLE_SHA256 = "ec438e2de8e178cc997b5ab69308bcc8547a51a5f2cce84f18282a56fe206eab"
+BUNDLE_SHA256 = "7e778112e6b36b284c3de267a02e71908cc1c50fb0d2f287493cfd789f1385f7"
 FEED_URL = "https://aurora-gold.example.test/news/feed.xml"
 NEWS_URL = "https://aurora-gold.example.test/news/production-update.html"
 REGULATORY_URL = "https://sedar-plus.example.test/filings/ni-43-101.html"
@@ -90,17 +103,32 @@ CONSTRAINED_URL = "https://sedar-plus.example.test/filings/pending.html"
 
 
 def _git(cwd: Path, *arguments: str) -> str:
+    environment = {
+        "GIT_AUTHOR_DATE": "2000-01-01T00:00:00+00:00",
+        "GIT_AUTHOR_EMAIL": "gold-fixture@example.invalid",
+        "GIT_AUTHOR_NAME": "Geas Gold Fixture",
+        "GIT_COMMITTER_DATE": "2000-01-01T00:00:00+00:00",
+        "GIT_COMMITTER_EMAIL": "gold-fixture@example.invalid",
+        "GIT_COMMITTER_NAME": "Geas Gold Fixture",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_DEFAULT_HASH": "sha1",
+        "GIT_TERMINAL_PROMPT": "0",
+        "HOME": str(cwd),
+        "LC_ALL": "C",
+        "PATH": os.environ.get("PATH", ""),
+    }
     completed = subprocess.run(
-        ("git", *arguments),
+        (
+            "git",
+            "-c",
+            "commit.gpgSign=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+            *arguments,
+        ),
         cwd=cwd,
-        env={
-            **os.environ,
-            "GIT_AUTHOR_NAME": "Geas Gold Fixture",
-            "GIT_AUTHOR_EMAIL": "gold-fixture@example.invalid",
-            "GIT_COMMITTER_NAME": "Geas Gold Fixture",
-            "GIT_COMMITTER_EMAIL": "gold-fixture@example.invalid",
-            "GIT_TERMINAL_PROMPT": "0",
-        },
+        env=environment,
         check=True,
         capture_output=True,
         text=True,
@@ -110,9 +138,26 @@ def _git(cwd: Path, *arguments: str) -> str:
 
 def _local_bare_repository(tmp_path: Path) -> tuple[Path, Path, str]:
     remote = tmp_path / "remote.git"
-    _git(tmp_path, "init", "--bare", "--initial-branch=main", str(remote))
+    template = tmp_path / "empty-git-template"
+    template.mkdir()
+    _git(
+        tmp_path,
+        "init",
+        "--bare",
+        "--object-format=sha1",
+        "--initial-branch=main",
+        f"--template={template}",
+        str(remote),
+    )
     upstream = tmp_path / "upstream"
-    _git(tmp_path, "init", "--initial-branch=main", str(upstream))
+    _git(
+        tmp_path,
+        "init",
+        "--object-format=sha1",
+        "--initial-branch=main",
+        f"--template={template}",
+        str(upstream),
+    )
     shutil.copytree(FIXTURE, upstream, dirs_exist_ok=True)
     _git(upstream, "remote", "add", "origin", str(remote))
     _git(upstream, "add", ".")
@@ -122,20 +167,29 @@ def _local_bare_repository(tmp_path: Path) -> tuple[Path, Path, str]:
     return remote, upstream, _git(upstream, "rev-parse", "HEAD")
 
 
-class _AllowEvaluator:
-    def __init__(self) -> None:
-        self.requests: list[CapabilityRequest] = []
+def test_local_gold_seed_is_reproducible_and_ignores_host_git_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selector = tmp_path / "host-selected.git"
+    selector.mkdir()
+    monkeypatch.setenv("GIT_DIR", str(selector))
+    monkeypatch.setenv("GIT_WORK_TREE", str(tmp_path / "host-worktree"))
+    monkeypatch.setenv("GIT_AUTHOR_DATE", "2040-01-01T00:00:00Z")
+    monkeypatch.setenv("GIT_COMMITTER_DATE", "2040-01-01T00:00:00Z")
 
-    def evaluate(self, request: CapabilityRequest) -> CapabilityDecision:
-        self.requests.append(request)
-        return CapabilityDecision(
-            request=request,
-            decision="allow",
-            effective_capabilities=request.capabilities,
-            reason="offline fixture grant",
-            evaluator_version="gold-fixture/1",
-            decided_at=request.requested_at,
-        )
+    first_root = tmp_path / "first"
+    second_root = tmp_path / "second"
+    first_root.mkdir()
+    second_root.mkdir()
+    first = _local_bare_repository(first_root)
+    second = _local_bare_repository(second_root)
+
+    assert first[2] == second[2]
+    assert _git(first[1], "show", "-s", "--format=%aI%n%cI", "HEAD").splitlines() == [
+        "2000-01-01T00:00:00Z",
+        "2000-01-01T00:00:00Z",
+    ]
 
 
 class _RecordingHttpClient:
@@ -166,121 +220,81 @@ class _FixtureRetentionPolicy:
         )
 
 
-class _FixtureModel:
-    validator_version = "gold-fixture-extraction/1"
-    external = False
+class _FixtureModelClient(ModelClient):
+    """A local typed model client whose only external effect is deterministic JSON."""
 
-    def __init__(self, store: ImmutableStore) -> None:
-        self.store = store
-        self.calls: list[tuple[str, str, tuple[str, ...]]] = []
+    def __init__(
+        self,
+        config: ProviderConfig,
+        parameters: ModelParameters,
+    ) -> None:
+        super().__init__("fixture-local", config, parameters=parameters)
+        self.calls: list[dict[str, object]] = []
 
-    def propose(
+    def complete_json(
         self,
         *,
-        source_version_id: str,
-        structural_derivation_id: str,
-        anchor_ids: tuple[str, ...],
-    ) -> object:
-        self.calls.append((source_version_id, structural_derivation_id, anchor_ids))
-        values = {
+        system: str,
+        user: str,
+        max_output_tokens: int | None = None,
+    ) -> dict[str, object]:
+        del system, max_output_tokens
+        payload = json.loads(user)
+        anchors = payload["untrusted_source_anchors"]
+        self.calls.append(payload)
+        joined = "\n".join(str(item["untrusted_text"]) for item in anchors)
+        if "Management maintained full-year production guidance" in joined:
+            key = "management_guidance"
+            predicate = "mining:production_guidance"
+            value: str | float = "195,000 to 205,000 ounces"
+            exact = (
+                "Management maintained full-year production guidance of "
+                "195,000 to 205,000 ounces."
+            )
+        elif '"revenue_millions": 148.2' in joined:
+            key = "financial_health"
+            predicate = "finance:quarterly_revenue_millions"
+            value = 148.2
+            exact = '"revenue_millions": 148.2'
+        else:
+            key = "resource_estimate"
+            predicate = "mining:measured_indicated_resources"
+            value = "1.8 million ounces"
+            exact = (
+                "The technical report estimates 1.8 million ounces of measured and "
+                "indicated gold resources."
+            )
+        anchor = next(item for item in anchors if exact in str(item["untrusted_text"]))
+        return {
             "version": 1,
-            "source_version_id": source_version_id,
-            "structural_derivation_id": structural_derivation_id,
-            "anchor_ids": anchor_ids,
-            "review_state": "proposed",
-            "commit_authority": "none_proposal_only",
-            "model": "fixture-local",
+            "concepts": [],
+            "claims": [
+                {
+                    "key": key,
+                    "subject": "concept:aurora-gold",
+                    "predicate": predicate,
+                    "object": value,
+                    "qualifiers": {},
+                    "stance": "reports",
+                    "epistemic_status": "observed",
+                    "evidence": [{"anchor_id": anchor["anchor_id"], "exact": exact}],
+                }
+            ],
+            "controversies": [],
+            "gaps": [],
         }
-        digest = self.store.put_record("extraction-proposal", values)
-        return SimpleNamespace(id=f"extraction-proposal:sha256:{digest}")
 
 
-class _ScenarioAdapter:
-    adapter_id = "source:gold-fixture"
-    version = "1"
-    max_discovery_requests = 0
-    max_fetch_requests = 1
+class _FailingParser:
+    """Interrupt at the real parser boundary after the source archive is durable."""
 
-    def __init__(self, calls: list[tuple[str, SourceCheckpoint | None]]) -> None:
-        self.calls = calls
-        self.news_fetches = sum(locator == NEWS_URL for locator, _prior in calls)
+    def __init__(self, delegate: ParsedDocumentManager) -> None:
+        self.registry = delegate.registry
+        self.calls = 0
 
-    def discover(self, intent: SourceIntent) -> tuple[SourceCandidate, ...]:
-        locators = {
-            "aurora-constrained": CONSTRAINED_URL,
-            "aurora-financials": FINANCIAL_URL,
-            "aurora-news": NEWS_URL,
-            "aurora-regulatory": REGULATORY_URL,
-        }
-        return (
-            SourceCandidate(
-                intent_id=intent.id,
-                locator=locators[intent.id],
-                discovered_at=NOW,
-            ),
-        )
-
-    def fetch(
-        self,
-        candidate: SourceCandidate,
-        *,
-        prior: SourceCheckpoint | None,
-    ) -> SourceCheckpoint:
-        self.calls.append((candidate.locator, prior))
-        if candidate.locator == CONSTRAINED_URL:
-            return SourceCheckpoint(
-                work_item_id=candidate.id,
-                phase=SourceWorkPhase.ACCESS_CONSTRAINED,
-                constraint="rate_limited",
-                retry_after=60,
-                request_count=1,
-                recorded_at=NOW,
-            )
-        if candidate.locator == NEWS_URL and self.news_fetches:
-            assert prior is not None
-            assert prior.etag == '"news-v1"'
-            assert prior.prior_source_version_id is not None
-            return SourceCheckpoint(
-                work_item_id=candidate.id,
-                phase=SourceWorkPhase.NOT_MODIFIED,
-                etag='"news-v1"',
-                last_modified="Sat, 15 Aug 2026 12:00:00 GMT",
-                request_count=1,
-                recorded_at=NOW + timedelta(seconds=901),
-            )
-        if candidate.locator == NEWS_URL:
-            self.news_fetches += 1
-        content = _source_bytes(candidate.locator)
-        return SourceCheckpoint(
-            work_item_id=candidate.id,
-            phase=SourceWorkPhase.FETCHED,
-            result_sha256=hashlib.sha256(content).hexdigest(),
-            etag='"news-v1"' if candidate.locator == NEWS_URL else None,
-            last_modified=(
-                "Sat, 15 Aug 2026 12:00:00 GMT"
-                if candidate.locator == NEWS_URL
-                else None
-            ),
-            request_count=1,
-            recorded_at=NOW,
-        )
-
-    def payload(
-        self,
-        candidate: SourceCandidate,
-        _checkpoint: SourceCheckpoint,
-    ) -> FetchedSourcePayload:
-        media_type = "application/json" if candidate.locator == FINANCIAL_URL else "text/html"
-        return FetchedSourcePayload(
-            content=_source_bytes(candidate.locator),
-            source_uri=candidate.locator,
-            media_type=media_type,
-            connector_id=self.adapter_id,
-            license=None,
-            observed_at=NOW,
-            published_at=NOW - timedelta(days=1),
-            valid_at=NOW - timedelta(days=1),
-        )
+    def parse_source(self, *_args: object, **_kwargs: object) -> object:
+        self.calls += 1
+        raise RuntimeError("fixture parser boundary interruption")
 
 
 def _source_bytes(locator: str) -> bytes:
@@ -292,41 +306,72 @@ def _source_bytes(locator: str) -> bytes:
     return (FIXTURE / "http" / names[locator]).read_bytes()
 
 
-def _source_request(
-    intent: SourceIntent,
-    candidate: SourceCandidate,
-    capabilities: tuple[Capability, ...],
-    now: datetime,
-) -> CapabilityRequest:
-    return CapabilityRequest(
-        authority_repository=ROOT_REPOSITORY,
-        target_repository=SOURCE_REPOSITORY,
-        capabilities=capabilities,
-        ref="refs/heads/main",
-        path="sources/aurora-gold",
-        bundle_sha256=BUNDLE_SHA256,
-        connector="source:gold-fixture",
-        host=urlsplit(candidate.locator).hostname,
-        target=candidate.locator,
-        requested_at=now,
-    )
+class _SourceRequests:
+    def __init__(self, connector: str, now: datetime) -> None:
+        self.connector = connector
+        self.now = now
+
+    def _request(
+        self,
+        locator: str,
+        capabilities: tuple[Capability, ...],
+        now: datetime,
+    ) -> CapabilityRequest:
+        return CapabilityRequest(
+            authority_repository=ROOT_REPOSITORY,
+            target_repository=SOURCE_REPOSITORY,
+            capabilities=capabilities,
+            ref="refs/heads/main",
+            path="sources/aurora-gold",
+            bundle_sha256=BUNDLE_SHA256,
+            connector=self.connector,
+            host=urlsplit(locator).hostname,
+            target=locator,
+            requested_at=now,
+        )
+
+    def adapter(
+        self,
+        _intent: SourceIntent,
+        locator: str,
+        capability: Capability,
+    ) -> CapabilityRequest:
+        return self._request(locator, (capability,), self.now)
+
+    def coordinator(
+        self,
+        _intent: SourceIntent,
+        candidate: SourceCandidate,
+        capabilities: tuple[Capability, ...],
+        now: datetime,
+    ) -> CapabilityRequest:
+        return self._request(candidate.locator, capabilities, now)
 
 
 def _coordinator(
     root: Path,
     *,
-    adapter: _ScenarioAdapter,
-    evaluator: _AllowEvaluator,
-    model: _FixtureModel,
-    after_phase: object = None,
-) -> SourceWorkCoordinator:
-    store = model.store
-    return SourceWorkCoordinator(
+    store: ImmutableStore,
+    adapter_type: type[DirectUrlAdapter] | type[FeedAdapter],
+    transport: ConditionalHttpsTransport,
+    evaluator: DeterministicCapabilityEvaluator,
+    extraction: AnchorGroundedSourceExtractionAdapter,
+    now: datetime = NOW,
+    parser: object | None = None,
+) -> tuple[SourceWorkCoordinator, DirectUrlAdapter | FeedAdapter]:
+    requests = _SourceRequests(adapter_type.adapter_id, now)
+    adapter = adapter_type(
+        transport=transport,
+        clock=lambda: now,
+        capability_evaluator=evaluator,
+        capability_request=requests.adapter,
+    )
+    coordinator = SourceWorkCoordinator(
         store=store,
         work_store=ImmutableSourceWorkStore(store),
         adapter=adapter,
         capability_evaluator=evaluator,
-        capability_request=_source_request,
+        capability_request=requests.coordinator,
         authority=SourceAuthorityContext(
             authority_repository=ROOT_REPOSITORY,
             target_repository=SOURCE_REPOSITORY,
@@ -336,15 +381,19 @@ def _coordinator(
         ontology_bundle_sha256=BUNDLE_SHA256,
         library_manifest=SourceLibraryManifest.from_yaml(FIXTURE / "ontology/library.yaml"),
         library_database=root / "library.sqlite",
-        extraction=model,
+        extraction=extraction,
         retention_policy=_FixtureRetentionPolicy(),
-        clock=lambda: NOW,
+        clock=lambda: now,
         monotonic=lambda: 0.0,
-        after_phase=after_phase,  # type: ignore[arg-type]
+        parser=parser,  # type: ignore[arg-type]
     )
+    return coordinator, adapter
 
 
-def _delegated_decision(repository: Path, commit: str) -> CapabilityDecision:
+def _capability_evaluator(
+    repository: Path,
+    commit: str,
+) -> DeterministicCapabilityEvaluator:
     catalog = resolve_repository_catalog(repository)
     assert catalog.delegation_manifest is not None
     assert catalog.delegation_manifest_sha256 is not None
@@ -374,14 +423,14 @@ def _delegated_decision(repository: Path, commit: str) -> CapabilityDecision:
             delegated_repositories=(SOURCE_REPOSITORY,),
             hosts=("aurora-gold.example.test", "sedar-plus.example.test"),
             path_prefixes=("/filings/", "/financials/", "/news/"),
-            connectors=("direct-https", "rss-atom"),
+            connectors=("source:direct-url", "source:feed"),
         ),
         max_delegation_depth=1,
         expires_at=None,
         created_at=NOW,
         created_via="manual",
     )
-    evaluator = DeterministicCapabilityEvaluator(
+    return DeterministicCapabilityEvaluator(
         (grant,),
         {
             ROOT_REPOSITORY: VerifiedDelegationManifest(
@@ -393,19 +442,41 @@ def _delegated_decision(repository: Path, commit: str) -> CapabilityDecision:
         },
         clock=lambda: NOW,
     )
-    return evaluator.evaluate(
-        CapabilityRequest(
-            authority_repository=ROOT_REPOSITORY,
-            target_repository=SOURCE_REPOSITORY,
-            capabilities=(Capability.SOURCE_FETCH,),
-            ref="refs/heads/main",
-            path="sources/aurora-gold",
-            connector="direct-https",
-            host="sedar-plus.example.test",
-            target=REGULATORY_URL,
-            requested_at=NOW,
-        )
+
+
+def _extraction(
+    store: ImmutableStore,
+) -> tuple[AnchorGroundedSourceExtractionAdapter, _FixtureModelClient]:
+    provider = ProviderConfig(
+        kind="openai_compatible",
+        base_url="http://127.0.0.1:8000/v1",
+        model="fixture-local",
+        external=False,
+        max_output_tokens=4096,
+        context_window_tokens=8192,
     )
+    parameters = ModelParameters(thinking=False, reasoning_effort="none")
+    client = _FixtureModelClient(provider, parameters)
+    manager = AnchorGroundedExtractionManager(
+        store=store,
+        client=client,
+        provider="fixture-local",
+        model="fixture-local",
+        clock=lambda: NOW,
+    )
+    adapter = AnchorGroundedSourceExtractionAdapter(
+        manager,
+        SourceExtractionConfig(
+            question="Extract exact management, financial, and resource facts.",
+            provider=provider,
+            max_output_tokens=4096,
+            model_parameters=parameters,
+            allowed_concept_ids=("concept:aurora-gold",),
+            debug_reasoning=False,
+        ),
+        provider_registry={"fixture-local": provider},
+    )
+    return adapter, client
 
 
 def _skill_files(commit: str) -> dict[Path, bytes]:
@@ -546,15 +617,27 @@ def test_canadian_gold_miner_automatic_acquisition_is_offline_resumable_and_owne
     assert (upstream / "geas-delegations.yaml").read_bytes() == (
         upstream / "ontology/geas-delegations.yaml"
     ).read_bytes()
+    catalog = resolve_repository_catalog(upstream)
+    assert catalog.delegation_manifest is not None
+    assert catalog.delegation_manifest.delegations[0].resources.connectors == (
+        "source:direct-url",
+        "source:feed",
+    )
 
-    delegated = _delegated_decision(upstream, commit)
+    evaluator = _capability_evaluator(upstream, commit)
+    delegated = evaluator.evaluate(
+        _SourceRequests(DirectUrlAdapter.adapter_id, NOW)._request(
+            REGULATORY_URL,
+            (Capability.SOURCE_FETCH,),
+            NOW,
+        )
+    )
     assert delegated.allowed
     assert delegated.delegation_chain == (ROOT_REPOSITORY, SOURCE_REPOSITORY)
     assert delegated.effective_remaining_depth == 0
 
-    # The real bounded transport runs over an injected DNS resolver and response
-    # queue. No socket, credential, wall clock, live model, or live forge is used.
-    transport_evaluator = _AllowEvaluator()
+    # Only DNS and HTTP are fake. The real adapters enumerate the feed, the real
+    # delegated evaluator authorizes every hop, and the real coordinator owns work.
     client = _RecordingHttpClient(
         {
             FEED_URL: [
@@ -562,14 +645,24 @@ def test_canadian_gold_miner_automatic_acquisition_is_offline_resumable_and_owne
                     status=200,
                     headers={"Content-Type": "application/rss+xml"},
                     body=(FIXTURE / "http/issuer-feed.xml").read_bytes(),
-                )
+                ),
+                ConditionalHttpResponse(
+                    status=200,
+                    headers={"Content-Type": "application/rss+xml"},
+                    body=(FIXTURE / "http/issuer-feed.xml").read_bytes(),
+                ),
             ],
             NEWS_URL: [
                 ConditionalHttpResponse(
                     status=200,
-                    headers={"Content-Type": "text/html"},
+                    headers={
+                        "Content-Type": "text/html",
+                        "ETag": '"news-v1"',
+                        "Last-Modified": "Sat, 15 Aug 2026 12:00:00 GMT",
+                    },
                     body=_source_bytes(NEWS_URL),
-                )
+                ),
+                ConditionalHttpResponse(status=304, headers={"ETag": '"news-v1"'}),
             ],
             FINANCIAL_URL: [
                 ConditionalHttpResponse(
@@ -583,8 +676,7 @@ def test_canadian_gold_miner_automatic_acquisition_is_offline_resumable_and_owne
                     status=200,
                     headers={"Content-Type": "text/html", "ETag": '"filing-v1"'},
                     body=_source_bytes(REGULATORY_URL),
-                ),
-                ConditionalHttpResponse(status=304, headers={"ETag": '"filing-v1"'}),
+                )
             ],
             CONSTRAINED_URL: [
                 ConditionalHttpResponse(status=429, headers={"Retry-After": "60"})
@@ -594,119 +686,144 @@ def test_canadian_gold_miner_automatic_acquisition_is_offline_resumable_and_owne
     transport = ConditionalHttpsTransport(
         dns_resolver=lambda _host: ("8.8.8.8", "2001:4860:4860::8888"),
         http_client=client,
-        capability_evaluator=transport_evaluator,
+        capability_evaluator=evaluator,
         clock=lambda: NOW,
     )
-    public_documents = (
-        (
-            FEED_URL,
-            ("aurora-gold.example.test",),
-            ("/news/",),
-            ("application/rss+xml",),
-        ),
-        (
-            NEWS_URL,
-            ("aurora-gold.example.test",),
-            ("/news/",),
-            ("text/html",),
-        ),
-        (
-            FINANCIAL_URL,
-            ("aurora-gold.example.test",),
-            ("/financials/",),
-            ("application/json",),
-        ),
-    )
-    transported = tuple(
-        transport.fetch(
-            SourceFetchRequest(
-                locator=locator,
-                allowed_hosts=hosts,
-                allowed_path_prefixes=prefixes,
-                accepted_media_types=media_types,
-                capability_request=delegated.request,
-            )
-        )
-        for locator, hosts, prefixes, media_types in public_documents
-    )
-    assert tuple(item.status for item in transported) == (200, 200, 200)
-    assert tuple(item.media_type for item in transported) == (
-        "application/rss+xml",
-        "text/html",
-        "application/json",
-    )
-    transport_request = SourceFetchRequest(
-        locator=REGULATORY_URL,
-        allowed_hosts=("sedar-plus.example.test",),
-        allowed_path_prefixes=("/filings/",),
-        accepted_media_types=("text/html",),
-        capability_request=delegated.request,
-    )
-    fetched = transport.fetch(transport_request)
-    unchanged = transport.fetch(transport_request, prior=fetched.validator)
-    constrained = transport.fetch(
-        transport_request.model_copy(update={"locator": CONSTRAINED_URL})
-    )
-    assert unchanged.status == 304
-    assert client.calls[4]["headers"] == {
-        "accept-encoding": "gzip, deflate",
-        "if-none-match": '"filing-v1"',
-    }
-    assert constrained.constraint is not None
-    assert constrained.constraint.value == "rate_limited"
 
     state = tmp_path / "source-state"
     store = ImmutableStore(state)
-    model = _FixtureModel(store)
-    source_calls: list[tuple[str, SourceCheckpoint | None]] = []
-    evaluator = _AllowEvaluator()
-    interrupted = False
-
-    def stop_after_first_archive(phase: SourceWorkPhase) -> None:
-        nonlocal interrupted
-        if phase is SourceWorkPhase.ARCHIVED and not interrupted:
-            interrupted = True
-            raise SourceWorkInterruption("fixture interruption after durable archive")
-
-    with pytest.raises(SourceWorkInterruption, match="durable archive"):
-        _coordinator(
-            state,
-            adapter=_ScenarioAdapter(source_calls),
-            evaluator=evaluator,
-            model=model,
-            after_phase=stop_after_first_archive,
-        ).run_due(config.source_intent, now=NOW)
-
-    calls_before_resume = tuple(locator for locator, _prior in source_calls)
-    receipt = _coordinator(
+    extraction, model_client = _extraction(store)
+    financial = next(item for item in config.source_intent if item.id == "aurora-financials")
+    direct_intents = tuple(
+        item
+        for item in config.source_intent
+        if item.discovery.kind.value == "direct_url"
+    )
+    failing_parser = _FailingParser(ParsedDocumentManager(store=store, clock=lambda: NOW))
+    interrupted, _adapter = _coordinator(
         state,
-        adapter=_ScenarioAdapter(source_calls),
+        store=store,
+        adapter_type=DirectUrlAdapter,
+        transport=transport,
         evaluator=evaluator,
-        model=model,
-    ).run_due(config.source_intent, now=NOW)
-    assert receipt.complete, receipt.model_dump(mode="json")
-    assert len(receipt.source_version_ids) == 3
-    assert calls_before_resume.count(FINANCIAL_URL) == 1
-    assert tuple(locator for locator, _prior in source_calls).count(FINANCIAL_URL) == 1
-    assert SourceWorkOutcome.CONSTRAINED_OPTIONAL in receipt.semantic_outcomes
-    assert len(tuple(store.iter_records("extraction-proposal"))) >= 2
+        extraction=extraction,
+        parser=failing_parser,
+    )
+    with pytest.raises(RuntimeError, match="parser boundary interruption"):
+        interrupted.run_due((financial,), now=NOW)
+    assert failing_parser.calls == 1
+    assert [call["url"] for call in client.calls].count(FINANCIAL_URL) == 1
+
+    resumed, _adapter = _coordinator(
+        state,
+        store=store,
+        adapter_type=DirectUrlAdapter,
+        transport=transport,
+        evaluator=evaluator,
+        extraction=extraction,
+    )
+    direct_receipt = resumed.run_due(direct_intents, now=NOW)
+    feed_worker, _adapter = _coordinator(
+        state,
+        store=store,
+        adapter_type=FeedAdapter,
+        transport=transport,
+        evaluator=evaluator,
+        extraction=extraction,
+    )
+    news = next(item for item in config.source_intent if item.id == "aurora-news")
+    feed_receipt = feed_worker.run_due((news,), now=NOW)
+
+    assert direct_receipt.complete, direct_receipt.model_dump(mode="json")
+    assert feed_receipt.complete, feed_receipt.model_dump(mode="json")
+    assert len({*direct_receipt.source_version_ids, *feed_receipt.source_version_ids}) == 3
+    news_work = tuple(
+        value
+        for value in store.iter_records("source-work")
+        if value["source_intent_id"] == "aurora-news"
+    )
+    assert news_work
+    assert {value["locator"] for value in news_work} == {NEWS_URL}
+    assert [call["url"] for call in client.calls].count(FEED_URL) == 1
+    assert [call["url"] for call in client.calls].count(FINANCIAL_URL) == 1
+    assert SourceWorkOutcome.CONSTRAINED_OPTIONAL in direct_receipt.semantic_outcomes
+    proposals = tuple(
+        ValidatedExtractionProposal.model_validate(value)
+        for value in store.iter_records("extraction-proposal")
+    )
+    assert {claim.key for proposal in proposals for claim in proposal.claims} >= {
+        "financial_health",
+        "management_guidance",
+    }
+    assert all(proposal.review_state == "proposed" for proposal in proposals)
+    assert all(proposal.commit_authority == "none_proposal_only" for proposal in proposals)
+    claims = {
+        claim.key: (proposal, claim)
+        for proposal in proposals
+        for claim in proposal.claims
+    }
+    expected_evidence = {
+        "financial_health": '"revenue_millions": 148.2',
+        "management_guidance": (
+            "Management maintained full-year production guidance of "
+            "195,000 to 205,000 ounces."
+        ),
+        "resource_estimate": (
+            "The technical report estimates 1.8 million ounces of measured and "
+            "indicated gold resources."
+        ),
+    }
+    for key, exact in expected_evidence.items():
+        proposal, claim = claims[key]
+        assert len(claim.evidence) == 1
+        evidence = claim.evidence[0]
+        source_text = store.read_blob(proposal.source_content_sha256).decode()
+        assert source_text[evidence.start : evidence.end] == exact
+        assert evidence.exact == exact
+        assert evidence.exact_sha256 == hashlib.sha256(exact.encode()).hexdigest()
+    decisions = tuple(
+        CapabilityDecision.model_validate(value)
+        for value in store.iter_records("capability-decision")
+    )
+    assert decisions
+    assert all(decision.grant_ids for decision in decisions)
+    assert {decision.request.connector for decision in decisions} <= {
+        "source:direct-url",
+        "source:feed",
+    }
     assert tuple(store.iter_records("claim")) == ()
 
+    constraint_checkpoints = tuple(
+        SourceCheckpoint.model_validate(value)
+        for value in store.iter_records("source-checkpoint")
+        if value.get("constraint") == "rate_limited"
+    )
+    assert len(constraint_checkpoints) == 1
+    assert constraint_checkpoints[0].retry_after == 60
+
     first_source_count = len(tuple(store.iter_records("source-version")))
-    first_model_count = len(model.calls)
-    refresh = _coordinator(
+    first_model_count = len(model_client.calls)
+    refreshed_worker, _adapter = _coordinator(
         state,
-        adapter=_ScenarioAdapter(source_calls),
+        store=store,
+        adapter_type=FeedAdapter,
+        transport=transport,
         evaluator=evaluator,
-        model=model,
-    ).run_due(
-        tuple(item for item in config.source_intent if item.id == "aurora-news"),
+        extraction=extraction,
         now=NOW + timedelta(seconds=901),
     )
+    refresh = refreshed_worker.run_due((news,), now=NOW + timedelta(seconds=901))
     assert refresh.complete
     assert SourceWorkPhase.NOT_MODIFIED in refresh.completed_phases
     assert len(tuple(store.iter_records("source-version"))) == first_source_count
-    assert len(model.calls) == first_model_count
+    assert len(model_client.calls) == first_model_count
+    news_calls = tuple(call for call in client.calls if call["url"] == NEWS_URL)
+    assert len(news_calls) == 2
+    assert news_calls[-1]["headers"] == {
+        "accept-encoding": "gzip, deflate",
+        "if-modified-since": "Sat, 15 Aug 2026 12:00:00 GMT",
+        "if-none-match": '"news-v1"',
+    }
 
     rebuilt = SourceLibraryBuilder(store=store, clock=lambda: NOW).build(
         library, state / "library-rebuilt.sqlite"
@@ -721,6 +838,22 @@ def test_canadian_gold_miner_automatic_acquisition_is_offline_resumable_and_owne
     assert any(b"51,200 ounces" in value for value in exact_text)
     assert any(b"1.8 million ounces" in value for value in exact_text)
     assert any(b"sustaining_cost_per_ounce" in value for value in exact_text)
+    query = SourceLibraryQueryEngine(state / "library-rebuilt.sqlite").query(
+        "sustaining cost per ounce"
+    )
+    assert query.hits
+    assert query.hits[0].source_uri == FINANCIAL_URL
+    financial_anchor = next(
+        value
+        for value in anchors
+        if b"sustaining_cost_per_ounce"
+        in store.read_blob(value["source_content_sha256"])[value["start"] : value["end"]]
+    )
+    assert query.hits[0].anchor_id == financial_anchor["id"]
+    assert (query.hits[0].start, query.hits[0].end) == (
+        financial_anchor["start"],
+        financial_anchor["end"],
+    )
 
     # Task 7 is intentionally absent from this branch. This is the first
     # cross-stream fan-in boundary after the existing services above prove green.
@@ -738,16 +871,110 @@ def test_canadian_gold_miner_automatic_acquisition_is_offline_resumable_and_owne
     assert install.publish == "pull-request"
     assert install.direct_push is False
 
-    sentinel = upstream / "operator-notes.txt"
-    sentinel.write_text("unrelated operator state must survive\n")
-    trust_events: list[str] = []
-    subscription_path = ".geas/subscriptions/aurora-gold.json"
+    # These methods land with Task 7's bootstrap-state fan-in. Keeping the calls
+    # after the parser gate makes the pre-fan-in failure precise without fake state.
+    from research_agent.repository_bootstrap import remove_obsolete_paths
 
-    def subscribe(_operation: BootstrapOperation) -> tuple[ManagedPath, ...]:
-        target = upstream / subscription_path
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text('{"name":"aurora-gold"}\n')
-        return (_managed_file(upstream, subscription_path, role="manifest"),)
+    state_root = tmp_path / "geas-state"
+    config_manager = UserConfigManager(state_root / "config.yaml")
+    config_manager.root.mkdir(parents=True)
+    unrelated_subscription = OntologySubscription(
+        url="https://github.com/example/unrelated-ontology.git",
+        active_ref="refs/heads/main",
+        checkout=Path("subscriptions/default/unrelated"),
+    )
+    unrelated_grant = CapabilityGrant(
+        decision="allow",
+        subject=CapabilitySubject(
+            repository="https://github.com/example/unrelated-ontology",
+            refs=("refs/heads/main",),
+            paths="*",
+            bundle_sha256="*",
+        ),
+        capabilities=(Capability.REPOSITORY_READ,),
+        delegable_capabilities=(),
+        resources=CapabilityResources(),
+        max_delegation_depth=0,
+        expires_at=None,
+        created_at=NOW,
+        created_via="manual",
+    )
+    config_manager.replace(
+        GeasUserConfig(
+            version=2,
+            profiles={
+                "default": GeasProfile(
+                    ontology_git=None,
+                    subscriptions={"unrelated": unrelated_subscription},
+                    capability_grants=(unrelated_grant,),
+                ),
+                "preserved": GeasProfile(
+                    ontology_git=None,
+                    ontology_directory=Path("preserved-ontologies"),
+                ),
+            }
+        ),
+        upgrade_version=True,
+    )
+    sentinel = state_root / "operator-notes.txt"
+    sentinel.write_text("unrelated operator state must survive\n")
+
+    class LocalSubscriptionRepository:
+        def __init__(self, checkout: Path, subscription: OntologySubscription) -> None:
+            self.checkout = checkout
+            self.subscription = subscription
+
+        def pull(self) -> dict[str, object]:
+            self.checkout.parent.mkdir(parents=True, exist_ok=True)
+            _git(
+                self.checkout.parent,
+                "clone",
+                "--no-checkout",
+                str(remote),
+                str(self.checkout),
+            )
+            _git(self.checkout, "checkout", "--detach", commit)
+            _git(self.checkout, "remote", "set-url", "origin", self.subscription.url)
+            return {"commit": commit}
+
+        def assert_removable(self) -> None:
+            assert _git(self.checkout, "status", "--porcelain") == ""
+            assert _git(self.checkout, "remote", "get-url", "origin") == ROOT_REPOSITORY
+
+        def assert_verified_commit(self, expected_commit: str) -> None:
+            assert _git(self.checkout, "rev-parse", "HEAD") == expected_commit
+
+    subscriptions = SubscriptionManager(
+        config_manager=config_manager,
+        profile_name="default",
+        catalog_verifier=verify_catalog,
+        authorizer=lambda verified_catalog: verified_catalog,
+        repository_factory=LocalSubscriptionRepository,
+    )
+
+    def operation_subscription(operation: BootstrapOperation) -> OntologySubscription:
+        return OntologySubscription(
+            url=operation.verified.repository,
+            active_ref=operation.verified.ref,
+            checkout=Path("subscriptions/default") / operation.request.name,
+            catalog=Path(operation.verified.catalog),
+        )
+
+    def record_trust(operation: BootstrapOperation, grant: CapabilityGrant) -> object:
+        return config_manager.record_bootstrap_grant(
+            operation_key=operation.idempotency_key,
+            profile_name="default",
+            bootstrap_name=operation.request.name,
+            grant=grant,
+        )
+
+    def subscribe(operation: BootstrapOperation) -> object:
+        return subscriptions.ensure_bootstrap_subscription(
+            operation.request.name,
+            operation_subscription(operation),
+            operation_key=operation.idempotency_key,
+            verified_commit=operation.verified.commit_sha256,
+        )
 
     def export_catalog(_operation: BootstrapOperation) -> tuple[ManagedPath, ...]:
         exported = export_skill(
@@ -769,18 +996,38 @@ def test_canadian_gold_miner_automatic_acquisition_is_offline_resumable_and_owne
             if path.is_file()
         )
 
-    def remove_paths(operation: BootstrapOperation) -> None:
-        for owned in operation.owned_paths:
-            target = upstream / owned.path
-            if target.exists() and target.is_file():
-                target.unlink()
-        for relative in (
-            ".agents/skills/aurora-gold/references",
-            ".agents/skills/aurora-gold",
-        ):
-            directory = upstream / relative
-            if directory.is_dir() and not any(directory.iterdir()):
-                directory.rmdir()
+    def remove_trust(operation: BootstrapOperation, grant: CapabilityGrant) -> object:
+        assert operation.grant_ownership is not None
+        return config_manager.remove_bootstrap_grant(
+            operation_key=operation.idempotency_key,
+            profile_name="default",
+            bootstrap_name=operation.request.name,
+            ownership=operation.grant_ownership,
+            grant=grant,
+        )
+
+    def unsubscribe(operation: BootstrapOperation) -> object:
+        assert operation.subscription_ownership is not None
+        return subscriptions.remove_bootstrap_subscription(
+            operation.request.name,
+            operation_subscription(operation),
+            operation_key=operation.idempotency_key,
+            ownership=operation.subscription_ownership,
+        )
+
+    def remove_skill_paths(operation: BootstrapOperation) -> None:
+        skill_operation = BootstrapOperation(
+            request=operation.request,
+            verified=operation.verified,
+            phase=operation.phase,
+            idempotency_key=operation.idempotency_key,
+            owned_paths=tuple(
+                path for path in operation.owned_paths if path.role != "receipt"
+            ),
+            grant_ownership=operation.grant_ownership,
+            subscription_ownership=operation.subscription_ownership,
+        )
+        remove_obsolete_paths(upstream, skill_operation, state_root=state_root)
 
     bootstrap_request = RepositoryBootstrapRequest(
         name="aurora-gold",
@@ -794,7 +1041,7 @@ def test_canadian_gold_miner_automatic_acquisition_is_offline_resumable_and_owne
         bundle_sha256=(BUNDLE_SHA256,),
         source_hosts=("aurora-gold.example.test", "sedar-plus.example.test"),
         source_path_prefixes=("/filings/", "/financials/", "/news/"),
-        source_connectors=("direct-https", "rss-atom"),
+        source_connectors=("source:direct-url", "source:feed"),
         delegated_repositories=(SOURCE_REPOSITORY,),
     )
     verified_bootstrap = VerifiedRepositoryBootstrap(
@@ -806,27 +1053,40 @@ def test_canadian_gold_miner_automatic_acquisition_is_offline_resumable_and_owne
         bundle_sha256=(BUNDLE_SHA256,),
         source_hosts=("aurora-gold.example.test", "sedar-plus.example.test"),
         source_path_prefixes=("/filings/", "/financials/", "/news/"),
-        source_connectors=("direct-https", "rss-atom"),
+        source_connectors=("source:direct-url", "source:feed"),
         delegated_repositories=(SOURCE_REPOSITORY,),
+        current_worktree=upstream.resolve(),
     )
     bootstrap = RepositoryBootstrapManager(
-        root=upstream,
+        managed_root=upstream,
+        state_root=state_root,
         announce=lambda _message: None,
         now=lambda: NOW,
         verify=lambda _request: verified_bootstrap,
-        record_trust=lambda _operation, grant: trust_events.append(grant.id),
+        record_trust=record_trust,
         subscribe=subscribe,
         hydrate_artifacts=lambda _operation: (),
         install_generic_skill=lambda _operation: (),
         export_catalog_skills=export_catalog,
         link_agents=lambda _operation: (),
-        remove_trust=lambda _operation, grant: trust_events.remove(grant.id),
-        unsubscribe=remove_paths,
-        remove_skills=remove_paths,
+        remove_trust=remove_trust,
+        unsubscribe=unsubscribe,
+        remove_skills=remove_skill_paths,
+        verify_software_provenance=lambda: None,
     )
     installed = bootstrap.install(bootstrap_request)
     assert installed.completed_phases[-1] is BootstrapPhase.COMPLETED
-    assert len(trust_events) == 1
+    assert installed.grant_ownership is not None
+    assert installed.subscription_ownership is not None
+    assert installed.grant_mutation is not None
+    assert installed.subscription_mutation is not None
+    installed_profile = config_manager.load().profiles["default"]
+    assert len(installed_profile.capability_grants) == 2
+    assert tuple(sorted(installed_profile.subscriptions)) == ("aurora-gold", "unrelated")
+    checkout = config_manager.root / "subscriptions/default/aurora-gold"
+    assert _git(checkout, "rev-parse", "HEAD") == commit
+    assert (state_root / "repository-bootstrap/aurora-gold.json").is_file()
+    assert not (upstream / "repository-bootstrap").exists()
     skill_path = ".agents/skills/aurora-gold/SKILL.md"
     assert (upstream / skill_path).is_file()
 
@@ -845,6 +1105,12 @@ def test_canadian_gold_miner_automatic_acquisition_is_offline_resumable_and_owne
         evaluator_version="gold-fixture/1",
         decided_at=NOW,
     )
+    publication = tmp_path / "publication"
+    _git(tmp_path, "clone", str(remote), str(publication))
+    _git(publication, "remote", "set-url", "origin", ROOT_REPOSITORY)
+    publication_skill = publication / skill_path
+    publication_skill.parent.mkdir(parents=True)
+    shutil.copy2(upstream / skill_path, publication_skill)
     publication_manifest = PublicationManifest(
         producer=PublicationProducer.EXPORTED_SKILL,
         receipt_sha256=installed.id.rsplit(":", 1)[-1],
@@ -852,7 +1118,7 @@ def test_canadian_gold_miner_automatic_acquisition_is_offline_resumable_and_owne
             PublicationManifestPath(
                 path=skill_path,
                 role=PathRole.EXPORTED_SKILL,
-                sha256=hashlib.sha256((upstream / skill_path).read_bytes()).hexdigest(),
+                sha256=hashlib.sha256(publication_skill.read_bytes()).hexdigest(),
             ),
         ),
     )
@@ -866,13 +1132,13 @@ def test_canadian_gold_miner_automatic_acquisition_is_offline_resumable_and_owne
     )
     forge = _Forge()
     publisher = GitRepositoryPublisher(
-        repository=upstream,
+        repository=publication,
         manifests=(publication_manifest,),
         capability_decision=publication_decision,
         forge=forge,
         now=lambda: NOW,
         receipt_verifier=_ReceiptVerifier(publication_manifest),
-        remote_transport=_LocalRemoteTransport(upstream, remote),
+        remote_transport=_LocalRemoteTransport(publication, remote),
     )
     first_publication = publisher.publish(publication_request)
     second_publication = publisher.publish(publication_request)
@@ -884,7 +1150,14 @@ def test_canadian_gold_miner_automatic_acquisition_is_offline_resumable_and_owne
 
     removed = bootstrap.remove(bootstrap_request)
     assert removed.removed is True
-    assert trust_events == []
-    assert not (upstream / ".agents/skills/aurora-gold").exists()
-    assert not (upstream / subscription_path).exists()
+    assert removed.grant_mutation is not None
+    assert removed.grant_mutation.action == "remove"
+    assert removed.subscription_mutation is not None
+    assert removed.subscription_mutation.action == "remove"
+    final_config = config_manager.load()
+    assert tuple(final_config.profiles) == ("default", "preserved")
+    assert final_config.profiles["default"].capability_grants == (unrelated_grant,)
+    assert tuple(final_config.profiles["default"].subscriptions) == ("unrelated",)
+    assert not (upstream / skill_path).exists()
+    assert not checkout.exists()
     assert sentinel.read_text() == "unrelated operator state must survive\n"

@@ -23,8 +23,8 @@ delegations:
         - /financials/
         - /news/
       connectors:
-        - rss-atom
-        - direct-https
+        - source:direct-url
+        - source:feed
       providers: []
       models: []
       data_classes: []
