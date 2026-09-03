@@ -1,14 +1,16 @@
-"""Strict publication boundary contracts, with no forge implementation."""
+"""Strict publication boundary contracts and deterministic path roles."""
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import datetime
 from enum import StrEnum
+from pathlib import PurePosixPath
 from typing import Literal, Protocol
 
 from pydantic import Field, field_validator, model_validator
 
-from research_agent.capabilities import _https_url, _ref, _relative_path
+from research_agent.capabilities import Capability, _https_url, _ref, _relative_path
 from research_agent.models import StrictModel, content_id
 
 
@@ -38,6 +40,91 @@ class PublishPath(StrictModel):
     @classmethod
     def normalized_relative_path(cls, value: object) -> str:
         return _relative_path(value, label="publish path")
+
+
+class PublicationManifestPath(PublishPath):
+    """One content-addressed file in a producer-owned publication manifest."""
+
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class PublicationManifest(StrictModel):
+    """Closed, canonical inventory used for role classification, not authority."""
+
+    version: Literal[1] = 1
+    receipt_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    paths: tuple[PublicationManifestPath, ...] = Field(min_length=1)
+
+    @field_validator("paths")
+    @classmethod
+    def sorted_unique_paths(
+        cls, value: tuple[PublicationManifestPath, ...]
+    ) -> tuple[PublicationManifestPath, ...]:
+        result = tuple(sorted(value, key=lambda item: item.path.encode("utf-8")))
+        if len({item.path for item in result}) != len(result):
+            raise ValueError("publication manifest paths must be unique")
+        return result
+
+
+_RUNTIME_ROOTS = frozenset({".geas", "data", "logs"})
+_RUNTIME_NAMES = frozenset({".env", "credentials", "credentials.json"})
+
+
+def classify_managed_path(
+    path: str,
+    *,
+    manifests: Sequence[PublicationManifest] = (),
+) -> PathRole:
+    """Classify one normalized repository path from fixed rules and exact manifests."""
+    normalized = _relative_path(path, label="managed publication path")
+    parts = PurePosixPath(normalized).parts
+    name = parts[-1]
+    if (
+        parts[0] in _RUNTIME_ROOTS
+        or name in _RUNTIME_NAMES
+        or name.startswith(".env.")
+        or name.endswith((".sqlite", ".sqlite-shm", ".sqlite-wal"))
+    ):
+        return PathRole.RUNTIME_STORE
+    generic_root = (".agents", "skills", "geas")
+    if parts[: len(generic_root)] == generic_root and len(parts) > len(generic_root):
+        return PathRole.GENERIC_SKILL
+    matches = {
+        item.role for manifest in manifests for item in manifest.paths if item.path == normalized
+    }
+    if len(matches) > 1:
+        raise ValueError("publication manifests assign conflicting roles to a path")
+    return next(iter(matches), PathRole.UNCLASSIFIED)
+
+
+def required_capabilities(
+    role: PathRole,
+    mode: PublishMode,
+    *,
+    canonical_target: bool,
+) -> frozenset[Capability] | None:
+    """Return the literal path-role publication matrix; ``None`` means forbidden."""
+    if mode is PublishMode.NONE:
+        return frozenset()
+    if role in {PathRole.RUNTIME_STORE, PathRole.UNCLASSIFIED}:
+        return None
+    if role is PathRole.EXTRACTION_PROPOSAL and (
+        canonical_target or mode is PublishMode.AUTO_MERGE
+    ):
+        return None
+    if mode is PublishMode.PULL_REQUEST:
+        capabilities = {Capability.GIT_PULL_REQUEST}
+    elif mode is PublishMode.DIRECT_PUSH:
+        capabilities = {Capability.GIT_DIRECT_PUSH}
+    elif mode is PublishMode.AUTO_MERGE:
+        capabilities = {Capability.GIT_AUTO_MERGE}
+    else:  # pragma: no cover - strict enum closes this branch
+        raise ValueError("unsupported publication mode")
+    if role is PathRole.CANONICAL_KNOWLEDGE and (
+        canonical_target or mode is PublishMode.AUTO_MERGE
+    ):
+        capabilities.add(Capability.KNOWLEDGE_AUTO_PROMOTE)
+    return frozenset(capabilities)
 
 
 class PublishRequest(StrictModel):

@@ -72,6 +72,17 @@ jobs:
           set -euo pipefail
           gh api "repos/Epiphytic/geas/pulls/${GEAS_PULL_REQUEST}" > trusted/pull-request.json
 
+      - name: Query the complete pull-request file inventory
+        if: steps.event.outputs.writeback == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GEAS_PULL_REQUEST: ${{ steps.event.outputs.pull_request }}
+        run: |
+          set -euo pipefail
+          gh api --paginate --slurp \
+            "repos/Epiphytic/geas/pulls/${GEAS_PULL_REQUEST}/files?per_page=100" \
+            > trusted/pull-request-files.json
+
       - name: Check out the untrusted head as inert comparison bytes
         if: steps.event.outputs.writeback == 'true'
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -90,27 +101,11 @@ jobs:
             --artifact ../pr-skill-artifact \
             --context event-context.json \
             --pull-request pull-request.json \
+            --pull-request-files pull-request-files.json \
             --repository ../pr-source \
             --github-output "$GITHUB_OUTPUT"
 
-      - name: Exchange OIDC for a short-lived path-scoped write token
-        if: steps.verify.outputs.changed == 'true'
-        id: sts
-        uses: octo-sts/action@f603d3be9d8dd9871a265776e625a27b00effe05
-        with:
-          domain: sts.epiphytic.org
-          scope: Epiphytic/.github
-          identity: geas-pr-skill-sync
-
-      - name: Check out the still-expected head with the short-lived token
-        if: steps.verify.outputs.changed == 'true'
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
-        with:
-          ref: ${{ steps.event.outputs.head_sha }}
-          path: writeback
-          token: ${{ steps.sts.outputs.token }}
-
-      - name: Re-query the pull request immediately before mutation
+      - name: Re-query the pull request before token exchange
         if: steps.verify.outputs.changed == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
@@ -119,8 +114,40 @@ jobs:
           set -euo pipefail
           gh api "repos/Epiphytic/geas/pulls/${GEAS_PULL_REQUEST}" > trusted/pull-request-current.json
 
-      - name: Copy exact bytes, stage exact roots, and push with an exact lease
+      - name: Re-verify the exact head before token exchange
         if: steps.verify.outputs.changed == 'true'
+        id: reverify
+        working-directory: trusted
+        run: |
+          set -euo pipefail
+          uv run python -m research_agent.pr_skill_sync verify \
+            --artifact ../pr-skill-artifact \
+            --context event-context.json \
+            --pull-request pull-request-current.json \
+            --pull-request-files pull-request-files.json \
+            --repository ../pr-source \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Exchange OIDC for a short-lived path-scoped write token
+        if: steps.reverify.outputs.changed == 'true'
+        id: sts
+        uses: octo-sts/action@f603d3be9d8dd9871a265776e625a27b00effe05
+        with:
+          domain: sts.epiphytic.org
+          scope: Epiphytic/.github
+          identity: geas-pr-skill-sync
+
+      - name: Check out the still-expected head with the short-lived token
+        if: steps.reverify.outputs.changed == 'true'
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ steps.event.outputs.head_sha }}
+          path: writeback
+          token: ${{ steps.sts.outputs.token }}
+
+      - name: Copy exact bytes, stage exact roots, and push with an exact lease
+        if: steps.reverify.outputs.changed == 'true'
+        id: writeback
         working-directory: trusted
         run: |
           set -euo pipefail
@@ -128,4 +155,62 @@ jobs:
             --artifact ../pr-skill-artifact \
             --context event-context.json \
             --pull-request pull-request-current.json \
-            --repository ../writeback
+            --repository ../writeback \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Re-query and verify the App-authored head before approval
+        if: steps.writeback.outputs.pushed == 'true'
+        working-directory: trusted
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GEAS_PULL_REQUEST: ${{ steps.event.outputs.pull_request }}
+          GEAS_EXPECTED_HEAD: ${{ steps.writeback.outputs.commit }}
+        run: |
+          set -euo pipefail
+          gh api "repos/Epiphytic/geas/pulls/${GEAS_PULL_REQUEST}" > pull-request-after-writeback.json
+          uv run python -m research_agent.pr_skill_sync verify-head \
+            --context event-context.json \
+            --pull-request pull-request-after-writeback.json \
+            --expected-head "$GEAS_EXPECTED_HEAD"
+
+      - name: Approve with the distinct App identity
+        if: steps.writeback.outputs.pushed == 'true'
+        working-directory: trusted
+        env:
+          GH_TOKEN: ${{ steps.sts.outputs.token }}
+          GEAS_PULL_REQUEST: ${{ steps.event.outputs.pull_request }}
+        run: |
+          set -euo pipefail
+          gh api --method POST \
+            "repos/Epiphytic/geas/pulls/${GEAS_PULL_REQUEST}/reviews" \
+            -f event=APPROVE
+
+      - name: Re-query and verify the exact head before auto-merge
+        if: steps.writeback.outputs.pushed == 'true'
+        working-directory: trusted
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GEAS_PULL_REQUEST: ${{ steps.event.outputs.pull_request }}
+          GEAS_EXPECTED_HEAD: ${{ steps.writeback.outputs.commit }}
+        run: |
+          set -euo pipefail
+          gh api "repos/Epiphytic/geas/pulls/${GEAS_PULL_REQUEST}" > pull-request-before-merge.json
+          uv run python -m research_agent.pr_skill_sync verify-head \
+            --context event-context.json \
+            --pull-request pull-request-before-merge.json \
+            --expected-head "$GEAS_EXPECTED_HEAD"
+
+      - name: Enable ruleset-gated squash auto-merge
+        if: steps.writeback.outputs.pushed == 'true'
+        working-directory: trusted
+        env:
+          GH_TOKEN: ${{ steps.sts.outputs.token }}
+          GEAS_PULL_REQUEST: ${{ steps.event.outputs.pull_request }}
+          GEAS_EXPECTED_HEAD: ${{ steps.writeback.outputs.commit }}
+        run: |
+          set -euo pipefail
+          gh pr merge "$GEAS_PULL_REQUEST" \
+            --repo Epiphytic/geas \
+            --squash \
+            --auto \
+            --match-head-commit "$GEAS_EXPECTED_HEAD"

@@ -14,7 +14,7 @@ import tempfile
 from collections.abc import Callable, Mapping, Sequence
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path, PurePosixPath
-from typing import Literal
+from typing import Literal, Protocol
 
 import yaml
 from pydantic import Field, field_validator, model_validator
@@ -48,6 +48,7 @@ REGENERATION_WORKFLOW_PATH = ".github/workflows/pr-skill-regeneration.yml"
 WRITEBACK_WORKFLOW_REF = (
     r"Epiphytic/geas/\.github/workflows/pr-skill-writeback\.yml@refs/heads/main"
 )
+APP_IDENTITY = "Epiphytic/.github:.github/chainguard/geas-pr-skill-sync.sts.yaml"
 ALLOWED_SKILL_ROOTS = (
     ".agents/skills/geas",
     ".agents/skills/open-source-research-agents",
@@ -67,9 +68,9 @@ class ArtifactSource(StrictModel):
     repository: Literal["Epiphytic/geas"] = REPOSITORY
     repository_id: Literal["1320458746"] = REPOSITORY_ID
     workflow: Literal["PR Skill Regeneration"] = REGENERATION_WORKFLOW
-    workflow_path: Literal[
-        ".github/workflows/pr-skill-regeneration.yml"
-    ] = REGENERATION_WORKFLOW_PATH
+    workflow_path: Literal[".github/workflows/pr-skill-regeneration.yml"] = (
+        REGENERATION_WORKFLOW_PATH
+    )
     run_id: int = Field(gt=0)
     pull_request: int = Field(gt=0)
     head_repository: str
@@ -165,12 +166,23 @@ class WritebackReceipt(StrictModel):
     commit: str | None = None
 
 
+class ProtectedWorkflowDecision(StrictModel):
+    """Pre-mutation result that never contains the exchanged App credential."""
+
+    source: ArtifactSource
+    eligible: bool
+    changed: bool
+    token_exchanged: bool
+
+
+class TokenExchange(Protocol):
+    def __call__(self) -> str: ...
+
+
 class OrgStsPolicy(StrictModel):
     issuer: Literal["https://token.actions.githubusercontent.com"]
-    subject: Literal[
-        "repo:Epiphytic@228616596/geas@1320458746:ref:refs/heads/main"
-    ]
-    claim_patterns: dict[str, str]
+    subject: Literal["repo:Epiphytic@228616596/geas@1320458746:ref:refs/heads/main"]
+    claim_pattern: dict[str, str]
     permissions: dict[str, str]
     repositories: tuple[str, ...]
 
@@ -181,9 +193,9 @@ class OrgStsPolicy(StrictModel):
             "event_name": "workflow_run",
             "workflow_ref": WRITEBACK_WORKFLOW_REF,
         }
-        if self.claim_patterns != expected_claims:
+        if self.claim_pattern != expected_claims:
             raise ValueError("Octo STS policy claim patterns are not exact")
-        if self.permissions != {"contents": "write"}:
+        if self.permissions != {"contents": "write", "pull_requests": "write"}:
             raise ValueError("Octo STS policy permissions are not exact")
         if self.repositories != ("geas",):
             raise ValueError("Octo STS policy repository scope is not exact")
@@ -335,15 +347,11 @@ class _PreseededProjectionStore:
                 reader.source_identity.sha256 != artifact.content_sha256
                 or _sha256_file(stable) != artifact.content_sha256
             ):
-                raise ValueError(
-                    "preseeded knowledge projection has the wrong content address"
-                )
+                raise ValueError("preseeded knowledge projection has the wrong content address")
             if _sqlite_input_revision(stable, artifact.role) != artifact.input_revision:
                 raise ValueError("preseeded knowledge projection has the wrong input revision")
             if not reader.source_is_unchanged():
-                raise ValueError(
-                    "preseeded knowledge projection changed while it was copied"
-                )
+                raise ValueError("preseeded knowledge projection changed while it was copied")
             reader.install_copy_no_replace(destination)
         finally:
             reader.close()
@@ -544,6 +552,8 @@ def verify_pull_request(
         raise ValueError("pull request number changed")
     if base_repo.get("full_name") != REPOSITORY:
         raise ValueError("pull request base repository changed")
+    if base.get("ref") != "main":
+        raise ValueError("pull request base branch changed")
     if head_repo.get("full_name") != source.head_repository:
         raise ValueError("pull request head repository changed")
     if bool(head_repo.get("fork")) or source.head_repository != REPOSITORY:
@@ -558,6 +568,52 @@ def verify_pull_request(
         head_ref=source.head_ref,
         head_sha=source.head_sha,
     )
+
+
+def verify_pull_request_head(
+    value: Mapping[str, object],
+    *,
+    source: ArtifactSource,
+    expected_head: str,
+) -> PullRequestVerification:
+    """Re-bind the same PR and branch to a verified post-writeback head."""
+    if not _GIT_ID.fullmatch(expected_head):
+        raise ValueError("expected pull-request head is not a full Git object ID")
+    return verify_pull_request(
+        value,
+        source=source.model_copy(update={"head_sha": expected_head}),
+    )
+
+
+def verify_pull_request_files(value: object) -> tuple[str, ...]:
+    """Accept only a bounded GitHub file inventory under the managed roots."""
+    if not isinstance(value, (list, tuple)):
+        raise ValueError("pull-request file inventory is invalid")
+    flattened: list[object] = []
+    for page in value:
+        if isinstance(page, (list, tuple)):
+            flattened.extend(page)
+        else:
+            flattened.append(page)
+    if not flattened or len(flattened) > _MAX_FILES:
+        raise ValueError("pull-request file inventory is empty or too large")
+    paths: list[str] = []
+    for raw in flattened:
+        item = _mapping(raw, "pull-request file")
+        filename = item.get("filename")
+        if not isinstance(filename, str):
+            raise ValueError("pull-request file path is invalid")
+        _validate_payload_path(filename)
+        paths.append(filename)
+        previous = item.get("previous_filename")
+        if previous is not None:
+            if not isinstance(previous, str):
+                raise ValueError("pull-request previous file path is invalid")
+            _validate_payload_path(previous)
+            paths.append(previous)
+    if len(paths) != len(set(paths)):
+        raise ValueError("pull-request file inventory contains duplicate paths")
+    return tuple(sorted(paths, key=lambda path: path.encode("utf-8")))
 
 
 def effective_source_commit(repository: Path, head_sha: str) -> str:
@@ -703,6 +759,52 @@ def validate_org_sts_policy(path: Path) -> OrgStsPolicy:
         return OrgStsPolicy.model_validate(yaml.safe_load(path.read_text()))
     except Exception as error:
         raise ValueError(f"Octo STS policy is invalid: {error}") from error
+
+
+def evaluate_protected_workflow(
+    *,
+    event: Mapping[str, object],
+    pull_request: Mapping[str, object],
+    current_pull_request: Mapping[str, object],
+    pull_request_files: object,
+    artifact: Path,
+    comparison_repository: Path,
+    sts_policy: Path,
+    app_identity: str,
+    exchange_token: TokenExchange,
+) -> ProtectedWorkflowDecision:
+    """Complete every inert read gate before exchanging an Octo STS token."""
+    workflow = evaluate_workflow_run(event)
+    if not workflow.writeback:
+        raise ValueError("workflow run is not eligible for protected write-back")
+    verify_pull_request(pull_request, source=workflow.source)
+    verify_pull_request(current_pull_request, source=workflow.source)
+    verify_pull_request_files(pull_request_files)
+    validate_org_sts_policy(sts_policy)
+    if app_identity != APP_IDENTITY:
+        raise ValueError("protected workflow App identity is invalid")
+    changed = artifact_changed_against_commit(
+        artifact,
+        repository=comparison_repository,
+        source=workflow.source,
+    )
+    if not changed:
+        return ProtectedWorkflowDecision(
+            source=workflow.source,
+            eligible=False,
+            changed=False,
+            token_exchanged=False,
+        )
+    token = exchange_token()
+    if not isinstance(token, str) or not token:
+        raise ValueError("Octo STS returned an invalid token")
+    del token
+    return ProtectedWorkflowDecision(
+        source=workflow.source,
+        eligible=True,
+        changed=True,
+        token_exchanged=True,
+    )
 
 
 def _snapshot_identity(snapshot: Path) -> SnapshotIdentity:
@@ -1005,8 +1107,10 @@ def _assert_no_symlink_path(root: Path, relative: Path) -> None:
 
 
 def _validate_payload_path(value: str) -> None:
-    if not value or "\\" in value or any(
-        ord(character) < 32 or ord(character) == 127 for character in value
+    if (
+        not value
+        or "\\" in value
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
     ):
         raise ValueError("artifact path is not normalized")
     path = PurePosixPath(value)
@@ -1020,9 +1124,7 @@ def _validate_payload_path(value: str) -> None:
 
 
 def _root_for_path(value: str) -> str:
-    matches = tuple(
-        root for root in ALLOWED_SKILL_ROOTS if value.startswith(f"{root}/")
-    )
+    matches = tuple(root for root in ALLOWED_SKILL_ROOTS if value.startswith(f"{root}/"))
     if len(matches) != 1:
         raise ValueError("artifact path is outside the two allowed skill roots")
     return matches[0]
@@ -1081,13 +1183,16 @@ def _git(
 
 
 def _load_json(path: Path, *, label: str) -> Mapping[str, object]:
+    return _mapping(_load_json_value(path, label=label), label)
+
+
+def _load_json_value(path: Path, *, label: str) -> object:
     if path.is_symlink() or not path.is_file() or path.stat().st_size > _MAX_MANIFEST_BYTES:
         raise ValueError(f"{label} JSON is missing, unsafe, or too large")
     try:
-        value = json.loads(path.read_bytes())
+        return json.loads(path.read_bytes())
     except (json.JSONDecodeError, UnicodeDecodeError) as error:
         raise ValueError(f"{label} JSON is invalid") from error
-    return _mapping(value, label)
 
 
 def _write_outputs(path: Path, values: Mapping[str, str | int | bool]) -> None:
@@ -1115,6 +1220,7 @@ def _build_parser() -> argparse.ArgumentParser:
     verify.add_argument("--artifact", type=Path, required=True)
     verify.add_argument("--context", type=Path, required=True)
     verify.add_argument("--pull-request", type=Path, required=True)
+    verify.add_argument("--pull-request-files", type=Path, required=True)
     verify.add_argument("--github-output", type=Path, required=True)
     verify.add_argument("--repository", type=Path, required=True)
     writeback = subparsers.add_parser("writeback")
@@ -1122,6 +1228,11 @@ def _build_parser() -> argparse.ArgumentParser:
     writeback.add_argument("--context", type=Path, required=True)
     writeback.add_argument("--pull-request", type=Path, required=True)
     writeback.add_argument("--repository", type=Path, required=True)
+    writeback.add_argument("--github-output", type=Path)
+    verify_head = subparsers.add_parser("verify-head")
+    verify_head.add_argument("--context", type=Path, required=True)
+    verify_head.add_argument("--pull-request", type=Path, required=True)
+    verify_head.add_argument("--expected-head", required=True)
     policy = subparsers.add_parser("validate-policy")
     policy.add_argument("path", type=Path)
     return parser
@@ -1170,6 +1281,9 @@ def main() -> None:
             _load_json(args.pull_request, label="pull request"),
             source=decision.source,
         )
+        verify_pull_request_files(
+            _load_json_value(args.pull_request_files, label="pull-request files")
+        )
         changed = artifact_changed_against_commit(
             args.artifact,
             repository=args.repository,
@@ -1187,7 +1301,23 @@ def main() -> None:
             source=decision.source,
             pull_request=_load_json(args.pull_request, label="pull request"),
         )
+        if args.github_output is not None:
+            outputs: dict[str, str | bool] = {"pushed": receipt.pushed}
+            if receipt.commit is not None:
+                outputs["commit"] = receipt.commit
+            _write_outputs(args.github_output, outputs)
         print(_canonical_json(receipt).decode("utf-8"), end="")
+        return
+    if args.command == "verify-head":
+        decision = WorkflowRunDecision.model_validate_json(args.context.read_bytes())
+        if not decision.writeback:
+            raise ValueError("workflow run is not eligible for write-back")
+        verification = verify_pull_request_head(
+            _load_json(args.pull_request, label="pull request"),
+            source=decision.source,
+            expected_head=args.expected_head,
+        )
+        print(_canonical_json(verification).decode("utf-8"), end="")
         return
     if args.command == "validate-policy":
         print(_canonical_json(validate_org_sts_policy(args.path)).decode("utf-8"), end="")

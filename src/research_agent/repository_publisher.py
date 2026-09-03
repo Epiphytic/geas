@@ -1,0 +1,485 @@
+"""Role-classified, capability-gated Git repository publication."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import subprocess
+import tempfile
+from collections.abc import Callable, Mapping, Sequence
+from datetime import datetime
+from pathlib import Path, PurePosixPath
+from typing import Protocol
+
+from research_agent.capabilities import Capability, CapabilityDecision, CapabilityGrant
+from research_agent.publishing import (
+    PathRole,
+    PublicationManifest,
+    PublicationManifestPath,
+    PublishMode,
+    PublishRequest,
+    PublishResult,
+    classify_managed_path,
+    required_capabilities,
+)
+
+_GIT_OBJECT = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
+
+
+class PublicationError(PermissionError):
+    """A publication boundary rejected the requested mutation."""
+
+
+class ForgeClient(Protocol):
+    def upsert_pull_request(
+        self,
+        *,
+        repository: str,
+        head: str,
+        base: str,
+        title: str,
+        body: str,
+    ) -> str: ...
+
+    def enable_auto_merge(
+        self,
+        *,
+        repository: str,
+        head: str,
+        pull_request_url: str,
+    ) -> None: ...
+
+
+class PromotionVerifier(Protocol):
+    def verify(
+        self,
+        *,
+        repository: Path,
+        commit: str,
+        canonical_ref: str,
+        paths: tuple[str, ...],
+    ) -> None: ...
+
+
+class GitRepositoryPublisher:
+    """Publish exact manifest-owned paths without using the operator's Git index."""
+
+    def __init__(
+        self,
+        *,
+        repository: Path,
+        manifests: Sequence[PublicationManifest],
+        capability_decision: CapabilityDecision,
+        forge: ForgeClient | None,
+        now: Callable[[], datetime],
+        direct_push: bool = False,
+        canonical_ref: str = "refs/heads/main",
+        remote: str = "origin",
+        grants: Mapping[str, CapabilityGrant] | None = None,
+        promotion_verifier: PromotionVerifier | None = None,
+    ) -> None:
+        self.repository = repository.resolve()
+        self.manifests = tuple(manifests)
+        self.capability_decision = capability_decision
+        self.forge = forge
+        self.now = now
+        self.direct_push = direct_push
+        self.canonical_ref = canonical_ref
+        self.remote = remote
+        self.grants = dict(grants or {})
+        self.promotion_verifier = promotion_verifier
+
+    def publish(self, request: PublishRequest) -> PublishResult:
+        if request.mode is PublishMode.NONE:
+            return PublishResult(
+                request_id=request.id,
+                published=False,
+                reason="publication-disabled",
+                completed_at=self.now(),
+            )
+        items = self._verified_manifest_items(request)
+        canonical = request.target_ref == self.canonical_ref
+        required = self._authorize(request, items, canonical=canonical)
+        if request.mode is PublishMode.DIRECT_PUSH:
+            return self._publish_direct(request, items, required=required, canonical=canonical)
+        return self._publish_pull_request(
+            request,
+            items,
+            required=required,
+            auto_merge=request.mode is PublishMode.AUTO_MERGE,
+            canonical=canonical,
+        )
+
+    def _verified_manifest_items(
+        self, request: PublishRequest
+    ) -> tuple[PublicationManifestPath, ...]:
+        manifest_items = {item.path: item for manifest in self.manifests for item in manifest.paths}
+        if sum(len(manifest.paths) for manifest in self.manifests) != len(manifest_items):
+            raise PublicationError("publication manifests contain duplicate paths")
+        result: list[PublicationManifestPath] = []
+        for requested in request.paths:
+            classified = classify_managed_path(requested.path, manifests=self.manifests)
+            if classified in {PathRole.RUNTIME_STORE, PathRole.UNCLASSIFIED}:
+                raise PublicationError("publish path is not classified as a managed artifact")
+            if requested.role is not classified:
+                raise PublicationError("publish path role does not match manifest classification")
+            item = manifest_items.get(requested.path)
+            if item is None:
+                raise PublicationError("publish path is not owned by an exact artifact manifest")
+            if item.role is not classified:
+                raise PublicationError("manifest role does not match path classification")
+            result.append(item)
+        return tuple(result)
+
+    def _authorize(
+        self,
+        request: PublishRequest,
+        items: Sequence[PublicationManifestPath],
+        *,
+        canonical: bool,
+    ) -> frozenset[Capability]:
+        required: set[Capability] = set()
+        for item in items:
+            item_required = required_capabilities(
+                item.role,
+                request.mode,
+                canonical_target=canonical,
+            )
+            if item_required is None:
+                raise PublicationError("path role is forbidden for this publication mode")
+            required.update(item_required)
+        decision = self.capability_decision
+        if request.capability_decision_sha256 != decision.sha256:
+            raise PublicationError("publish request does not match its capability decision")
+        decided = decision.request
+        if (
+            decision.decision != "allow"
+            or decided.target_repository != request.repository
+            or decided.ref != request.target_ref
+            or {item.path for item in items} != {decided.path}
+            or not required.issubset(decision.effective_capabilities)
+        ):
+            raise PublicationError("capability decision does not authorize exact publication")
+        if Capability.GIT_DIRECT_PUSH in required and decision.delegation_chain:
+            self._verify_delegated_direct_push(decision)
+        return frozenset(required)
+
+    def _verify_delegated_direct_push(self, decision: CapabilityDecision) -> None:
+        if not decision.grant_ids:
+            raise PublicationError("delegated direct push has no verified grant chain")
+        for grant_id in decision.grant_ids:
+            grant = self.grants.get(grant_id)
+            if grant is None or Capability.GIT_DIRECT_PUSH not in grant.capabilities:
+                raise PublicationError("delegated direct push is absent from a capability grant")
+            if Capability.GIT_DIRECT_PUSH not in grant.delegable_capabilities:
+                raise PublicationError(
+                    "delegated direct push is absent from delegable capabilities"
+                )
+
+    def _publish_pull_request(
+        self,
+        request: PublishRequest,
+        items: Sequence[PublicationManifestPath],
+        *,
+        required: frozenset[Capability],
+        auto_merge: bool,
+        canonical: bool,
+    ) -> PublishResult:
+        if self.forge is None:
+            raise PublicationError("pull-request publication requires an injected forge client")
+        base = self._verified_local_commit(request.target_ref)
+        identity = self._publication_identity(request, items)
+        commit = self._build_commit(request, items, parent=base, identity=identity)
+        if Capability.KNOWLEDGE_AUTO_PROMOTE in required:
+            self._verify_promotion(commit, request, items, canonical=canonical)
+        branch = f"geas/publish/{identity[:20]}"
+        branch_ref = f"refs/heads/{branch}"
+        expected = self._remote_object(branch_ref)
+        if expected != commit:
+            self._push(commit, branch_ref, expected)
+        title = f"geas: publish managed changes {identity[:12]}"
+        body = (
+            f"Deterministic Geas publication `{request.id}`.\n\n"
+            f"Publication identity: `{identity}`.\n\n"
+            f"Capability decision: `{request.capability_decision_sha256}`."
+        )
+        url = self.forge.upsert_pull_request(
+            repository=request.repository,
+            head=branch,
+            base=request.target_ref.removeprefix("refs/heads/"),
+            title=title,
+            body=body,
+        )
+        if auto_merge:
+            self.forge.enable_auto_merge(
+                repository=request.repository,
+                head=branch,
+                pull_request_url=url,
+            )
+        return PublishResult(
+            request_id=request.id,
+            published=True,
+            branch=branch,
+            commit_sha256=commit,
+            pull_request_url=url,
+            reason="auto-merge-requested" if auto_merge else "pull-request-upserted",
+            completed_at=self.now(),
+        )
+
+    def _publish_direct(
+        self,
+        request: PublishRequest,
+        items: Sequence[PublicationManifestPath],
+        *,
+        required: frozenset[Capability],
+        canonical: bool,
+    ) -> PublishResult:
+        if not self.direct_push:
+            raise PublicationError("direct push requires the explicit direct-push flag")
+        if not request.target_ref.startswith("refs/heads/"):
+            raise PublicationError("direct push requires a writable branch ref")
+        active = self._git_result("symbolic-ref", "-q", "HEAD", check=False)
+        if active.returncode != 0 or active.stdout.strip() != request.target_ref:
+            raise PublicationError("direct push requires HEAD on the exact target branch")
+        self._require_only_owned_changes(items)
+        expected = self._remote_object(request.target_ref)
+        local = self._verified_local_commit(request.target_ref)
+        head = self._verified_local_commit("HEAD")
+        if expected is None or local != expected or head != local:
+            raise PublicationError("direct-push target moved or is not freshly verified")
+        identity = self._publication_identity(request, items)
+        commit = self._build_commit(request, items, parent=local, identity=identity)
+        if Capability.KNOWLEDGE_AUTO_PROMOTE in required:
+            self._verify_promotion(commit, request, items, canonical=canonical)
+        self._push(commit, request.target_ref, expected)
+        self._git("update-ref", request.target_ref, commit, local)
+        return PublishResult(
+            request_id=request.id,
+            published=True,
+            branch=request.target_ref.removeprefix("refs/heads/"),
+            commit_sha256=commit,
+            reason="direct-push-completed",
+            completed_at=self.now(),
+        )
+
+    def _verify_promotion(
+        self,
+        commit: str,
+        request: PublishRequest,
+        items: Sequence[PublicationManifestPath],
+        *,
+        canonical: bool,
+    ) -> None:
+        if not canonical or self.promotion_verifier is None:
+            raise PublicationError(
+                "canonical semantic publication requires existing promotion verification"
+            )
+        self.promotion_verifier.verify(
+            repository=self.repository,
+            commit=commit,
+            canonical_ref=request.target_ref,
+            paths=tuple(item.path for item in items),
+        )
+
+    def _require_only_owned_changes(self, items: Sequence[PublicationManifestPath]) -> None:
+        allowed = {item.path for item in items}
+        status = self._git("status", "--porcelain=v1", "-z", "--untracked-files=all")
+        entries = tuple(entry for entry in status.split("\x00") if entry)
+        changed: set[str] = set()
+        for entry in entries:
+            if len(entry) < 4:
+                raise PublicationError("Git status returned an invalid path")
+            changed.add(entry[3:])
+        if not changed or not changed.issubset(allowed):
+            raise PublicationError("direct push requires only manifest-owned local changes")
+
+    def _build_commit(
+        self,
+        request: PublishRequest,
+        items: Sequence[PublicationManifestPath],
+        *,
+        parent: str,
+        identity: str,
+    ) -> str:
+        root = self._verified_root()
+        with tempfile.TemporaryDirectory(prefix="geas-publish-") as temporary:
+            index = Path(temporary) / "index"
+            environment = {"GIT_INDEX_FILE": str(index)}
+            self._git("read-tree", parent, extra_env=environment)
+            for item in items:
+                self._assert_safe_regular_path(root, item.path)
+                data = (root / item.path).read_bytes()
+                if hashlib.sha256(data).hexdigest() != item.sha256:
+                    raise PublicationError("managed path bytes do not match the exact manifest")
+                blob = (
+                    self._git_bytes(
+                        "hash-object",
+                        "-w",
+                        "--no-filters",
+                        "--stdin",
+                        input_bytes=data,
+                    )
+                    .decode("ascii")
+                    .strip()
+                )
+                self._git(
+                    "update-index",
+                    "--add",
+                    "--cacheinfo",
+                    f"100644,{blob},{item.path}",
+                    extra_env=environment,
+                )
+            tree = self._git("write-tree", extra_env=environment)
+        message = f"geas: publish managed changes {identity[:12]}\n"
+        date = request.created_at.isoformat()
+        commit = (
+            self._git_bytes(
+                "commit-tree",
+                tree,
+                "-p",
+                parent,
+                input_bytes=message.encode("utf-8"),
+                extra_env={
+                    "GIT_AUTHOR_NAME": "Geas Publisher",
+                    "GIT_AUTHOR_EMAIL": "geas-publisher@users.noreply.github.com",
+                    "GIT_COMMITTER_NAME": "Geas Publisher",
+                    "GIT_COMMITTER_EMAIL": "geas-publisher@users.noreply.github.com",
+                    "GIT_AUTHOR_DATE": date,
+                    "GIT_COMMITTER_DATE": date,
+                },
+            )
+            .decode("ascii")
+            .strip()
+        )
+        return self._object_id(commit, label="publication commit")
+
+    def _publication_identity(
+        self,
+        request: PublishRequest,
+        items: Sequence[PublicationManifestPath],
+    ) -> str:
+        selected = {item.path for item in items}
+        receipts = sorted(
+            {
+                manifest.receipt_sha256
+                for manifest in self.manifests
+                if any(item.path in selected for item in manifest.paths)
+            }
+        )
+        payload = {
+            "request_id": request.id,
+            "receipt_sha256": receipts,
+            "paths": [
+                {"path": item.path, "role": item.role.value, "sha256": item.sha256}
+                for item in items
+            ],
+        }
+        encoded = json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def _verified_root(self) -> Path:
+        root = Path(self._git("rev-parse", "--show-toplevel")).resolve()
+        if root != self.repository:
+            raise PublicationError("publication repository is not its Git worktree root")
+        return root
+
+    def _verified_local_commit(self, ref: str) -> str:
+        value = self._git("rev-parse", "--verify", f"{ref}^{{commit}}")
+        return self._object_id(value, label="local target")
+
+    def _remote_object(self, ref: str) -> str | None:
+        lines = self._git("ls-remote", "--refs", self.remote, ref).splitlines()
+        if not lines:
+            return None
+        if len(lines) != 1:
+            raise PublicationError("remote ref did not resolve exactly once")
+        object_id, resolved_ref = lines[0].split("\t", 1)
+        if resolved_ref != ref:
+            raise PublicationError("remote ref resolution changed")
+        return self._object_id(object_id, label="remote target")
+
+    def _push(self, commit: str, ref: str, expected: str | None) -> None:
+        lease_expected = expected if expected is not None else ""
+        result = self._git_result(
+            "-c",
+            "core.hooksPath=/dev/null",
+            "push",
+            f"--force-with-lease={ref}:{lease_expected}",
+            self.remote,
+            f"{commit}:{ref}",
+            check=False,
+        )
+        if result.returncode != 0:
+            recovery = (
+                f"git push --force-with-lease={ref}:{expected or ''} "
+                f"{self.remote} {commit}:{ref}"
+            )
+            raise PublicationError(
+                f"publication push failed under the exact lease; local commit {commit}; "
+                f"recovery: {recovery}"
+            )
+
+    def _assert_safe_regular_path(self, root: Path, relative: str) -> None:
+        current = root
+        for part in PurePosixPath(relative).parts:
+            current = current / part
+            if current.is_symlink():
+                raise PublicationError("managed publication path contains a symbolic link")
+        if not current.is_file():
+            raise PublicationError("managed publication path is not a regular file")
+        if not current.resolve().is_relative_to(root):
+            raise PublicationError("managed publication path escaped the repository")
+
+    @staticmethod
+    def _object_id(value: str, *, label: str) -> str:
+        if not _GIT_OBJECT.fullmatch(value):
+            raise PublicationError(f"{label} is not a full Git object ID")
+        return value
+
+    def _git(
+        self,
+        *arguments: str,
+        extra_env: Mapping[str, str] | None = None,
+    ) -> str:
+        return self._git_result(*arguments, extra_env=extra_env).stdout.strip()
+
+    def _git_bytes(
+        self,
+        *arguments: str,
+        input_bytes: bytes,
+        extra_env: Mapping[str, str] | None = None,
+    ) -> bytes:
+        result = subprocess.run(
+            ("git", *arguments),
+            cwd=self.repository,
+            env={**os.environ, "GIT_TERMINAL_PROMPT": "0", **(extra_env or {})},
+            input=input_bytes,
+            capture_output=True,
+            check=True,
+        )
+        return result.stdout
+
+    def _git_result(
+        self,
+        *arguments: str,
+        check: bool = True,
+        extra_env: Mapping[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        try:
+            return subprocess.run(
+                ("git", *arguments),
+                cwd=self.repository,
+                env={**os.environ, "GIT_TERMINAL_PROMPT": "0", **(extra_env or {})},
+                text=True,
+                capture_output=True,
+                check=check,
+            )
+        except subprocess.CalledProcessError as error:
+            raise PublicationError("bounded Git publication operation failed") from error

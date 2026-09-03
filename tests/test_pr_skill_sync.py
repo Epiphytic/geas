@@ -23,6 +23,7 @@ from research_agent.agent_skills import (
     canonical_manifest_bytes,
     snapshot_digest,
 )
+from research_agent.ontology_artifacts import ArtifactRole, _sqlite_input_revision
 from research_agent.pr_skill_sync import (
     ALLOWED_SKILL_ROOTS,
     ArtifactFile,
@@ -42,9 +43,7 @@ from research_agent.repository_catalog import load_catalog, refresh_catalog
 
 REPOSITORY = "Epiphytic/geas"
 REPOSITORY_ID = "1320458746"
-IMMUTABLE_SUBJECT = (
-    "repo:Epiphytic@228616596/geas@1320458746:ref:refs/heads/main"
-)
+IMMUTABLE_SUBJECT = "repo:Epiphytic@228616596/geas@1320458746:ref:refs/heads/main"
 HEAD_SHA = "1" * 40
 RUN_ID = 731
 PR_NUMBER = 42
@@ -130,7 +129,7 @@ def _pull_request(
     return {
         "number": PR_NUMBER,
         "state": "open",
-        "base": {"repo": {"full_name": REPOSITORY}},
+        "base": {"ref": "main", "repo": {"full_name": REPOSITORY}},
         "head": {
             "ref": "feature/skill-sync",
             "sha": head_sha,
@@ -220,9 +219,7 @@ def test_artifact_generation_is_canonical_and_independently_repeatable(tmp_path:
 def test_workflow_run_decision_separates_success_same_repo_fork_and_failure() -> None:
     """Catches granting write authority to forks or failed untrusted runs."""
     same = evaluate_workflow_run(_workflow_event())
-    fork = evaluate_workflow_run(
-        _workflow_event(head_repository="contributor/geas")
-    )
+    fork = evaluate_workflow_run(_workflow_event(head_repository="contributor/geas"))
     failed = evaluate_workflow_run(_workflow_event(conclusion="failure"))
 
     assert same.writeback is True
@@ -246,6 +243,11 @@ def test_pull_request_must_remain_open_and_match_the_exact_head() -> None:
     closed["state"] = "closed"
     with pytest.raises(ValueError, match="open"):
         verify_pull_request(closed, source=source)
+
+    retargeted = _pull_request()
+    retargeted["base"]["ref"] = "release"
+    with pytest.raises(ValueError, match="base branch"):
+        verify_pull_request(retargeted, source=source)
 
 
 @pytest.mark.parametrize(
@@ -292,9 +294,7 @@ def test_artifact_verification_fails_closed_for_manifest_and_inventory_tampering
         path = artifact / "payload" / manifest.files[0].path
         path.chmod(0o600)
     if mutation not in {"extra-file", "mode"}:
-        manifest_path.write_text(
-            json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
-        )
+        manifest_path.write_text(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n")
 
     with pytest.raises(ValueError, match=message):
         verify_skill_artifact(artifact, expected=_source())
@@ -375,9 +375,7 @@ def test_untrusted_artifact_values_are_not_reflected_in_errors(tmp_path: Path) -
     payload = json.loads(manifest_path.read_text())
     secret = "ghp_untrusted_artifact_secret_value"
     payload["unexpected_token"] = secret
-    manifest_path.write_text(
-        json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
-    )
+    manifest_path.write_text(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n")
 
     with pytest.raises(ValueError) as failure:
         verify_skill_artifact(artifact, expected=_source())
@@ -443,9 +441,7 @@ def test_writeback_stages_and_pushes_only_the_two_exact_skill_roots(tmp_path: Pa
     assert receipt.pushed is True
     assert receipt.staged_roots == ALLOWED_SKILL_ROOTS
     assert (worktree / "README.md").read_bytes() == before
-    changed = tuple(
-        _git(worktree, "diff", "--name-only", f"{head}..HEAD").stdout.splitlines()
-    )
+    changed = tuple(_git(worktree, "diff", "--name-only", f"{head}..HEAD").stdout.splitlines())
     assert changed
     assert all(
         any(path == root or path.startswith(f"{root}/") for root in ALLOWED_SKILL_ROOTS)
@@ -585,11 +581,14 @@ def test_pre_token_comparison_treats_executable_git_mode_as_changed(
     source = _source(head_sha=head)
     build_skill_artifact(repository, artifact, source=source)
 
-    assert artifact_changed_against_commit(
-        artifact,
-        repository=repository,
-        source=source,
-    ) is True
+    assert (
+        artifact_changed_against_commit(
+            artifact,
+            repository=repository,
+            source=source,
+        )
+        is True
+    )
 
 
 def test_writeback_corrects_executable_mode_drift(tmp_path: Path) -> None:
@@ -654,12 +653,11 @@ def test_writeback_commits_manifest_bytes_despite_pr_git_attributes(
 
     assert receipt.pushed is True
     for item in manifest.files:
-        assert _git_blob(worktree, f"HEAD:{item.path}") == (
-            artifact / "payload" / item.path
-        ).read_bytes()
-        assert _git(worktree, "ls-tree", "HEAD", item.path).stdout.startswith(
-            "100644 blob "
+        assert (
+            _git_blob(worktree, f"HEAD:{item.path}")
+            == (artifact / "payload" / item.path).read_bytes()
         )
+        assert _git(worktree, "ls-tree", "HEAD", item.path).stdout.startswith("100644 blob ")
 
 
 def test_writeback_rejects_staged_blob_mismatch_before_push(
@@ -680,13 +678,17 @@ def test_writeback_rejects_staged_blob_mismatch_before_push(
     ) -> None:
         original(repository, payload, manifest)
         item = manifest.files[0]
-        blob = subprocess.run(
-            ("git", "hash-object", "-w", "--stdin"),
-            cwd=repository,
-            input=b"corrupt staged bytes\n",
-            capture_output=True,
-            check=True,
-        ).stdout.decode().strip()
+        blob = (
+            subprocess.run(
+                ("git", "hash-object", "-w", "--stdin"),
+                cwd=repository,
+                input=b"corrupt staged bytes\n",
+                capture_output=True,
+                check=True,
+            )
+            .stdout.decode()
+            .strip()
+        )
         _git(repository, "update-index", "--add", "--cacheinfo", f"100644,{blob},{item.path}")
 
     monkeypatch.setattr(pr_skill_sync, "_write_manifest_index", corrupt_index)
@@ -712,6 +714,8 @@ def test_workflows_pin_actions_and_keep_token_exchange_after_all_gates() -> None
     regeneration = yaml.load(regeneration_path.read_text(), Loader=yaml.BaseLoader)
     writeback = yaml.load(writeback_path.read_text(), Loader=yaml.BaseLoader)
 
+    assert "pull_request_target" not in regeneration_path.read_text()
+    assert "pull_request_target" not in writeback_path.read_text()
     assert regeneration["permissions"] == {"contents": "read"}
     assert set(writeback["permissions"]) == {
         "actions",
@@ -727,12 +731,7 @@ def test_workflows_pin_actions_and_keep_token_exchange_after_all_gates() -> None
     def uses(document: dict[str, object]) -> list[str]:
         jobs = document["jobs"]
         assert isinstance(jobs, dict)
-        return [
-            step["uses"]
-            for job in jobs.values()
-            for step in job["steps"]
-            if "uses" in step
-        ]
+        return [step["uses"] for job in jobs.values() for step in job["steps"] if "uses" in step]
 
     all_uses = uses(regeneration) + uses(writeback)
     for value in all_uses:
@@ -743,9 +742,7 @@ def test_workflows_pin_actions_and_keep_token_exchange_after_all_gates() -> None
 
     regeneration_steps = regeneration["jobs"]["generate"]["steps"]
     checkout = next(
-        step
-        for step in regeneration_steps
-        if step.get("uses", "").startswith("actions/checkout@")
+        step for step in regeneration_steps if step.get("uses", "").startswith("actions/checkout@")
     )
     assert checkout["with"]["persist-credentials"] == "false"
     assert "id-token" not in regeneration["permissions"]
@@ -772,8 +769,12 @@ def test_workflows_pin_actions_and_keep_token_exchange_after_all_gates() -> None
     verification_index = next(
         index for index, step in enumerate(steps) if step.get("id") == "verify"
     )
+    revalidation_index = next(
+        index for index, step in enumerate(steps) if step.get("id") == "reverify"
+    )
     assert token_index > verification_index
-    assert steps[token_index]["if"] == "steps.verify.outputs.changed == 'true'"
+    assert token_index > revalidation_index
+    assert steps[token_index]["if"] == "steps.reverify.outputs.changed == 'true'"
     assert steps[token_index]["with"] == {
         "domain": "sts.epiphytic.org",
         "scope": "Epiphytic/.github",
@@ -783,6 +784,20 @@ def test_workflows_pin_actions_and_keep_token_exchange_after_all_gates() -> None
         for job in document["jobs"].values():
             for step in job["steps"]:
                 assert "${{ github.event" not in step.get("run", "")
+    assert all(
+        step.get("working-directory") == "trusted"
+        for step in steps[token_index:]
+        if "run" in step
+    )
+    mutation_names = [
+        step["name"]
+        for step in steps[token_index + 1 :]
+        if step["name"].startswith(("Approve", "Enable"))
+    ]
+    assert mutation_names == [
+        "Approve with the distinct App identity",
+        "Enable ruleset-gated squash auto-merge",
+    ]
 
 
 def test_org_policy_contract_is_exact_and_rejects_broader_permissions(tmp_path: Path) -> None:
@@ -791,20 +806,21 @@ def test_org_policy_contract_is_exact_and_rejects_broader_permissions(tmp_path: 
     policy.write_text(
         "issuer: https://token.actions.githubusercontent.com\n"
         f"subject: {IMMUTABLE_SUBJECT}\n"
-        "claim_patterns:\n"
+        "claim_pattern:\n"
         "  repository_id: '1320458746'\n"
         "  event_name: workflow_run\n"
         "  workflow_ref: 'Epiphytic/geas/\\.github/workflows/"
         "pr-skill-writeback\\.yml@refs/heads/main'\n"
         "permissions:\n"
         "  contents: write\n"
+        "  pull_requests: write\n"
         "repositories:\n"
         "  - geas\n"
     )
 
     parsed = validate_org_sts_policy(policy)
     assert parsed.subject == IMMUTABLE_SUBJECT
-    assert parsed.permissions == {"contents": "write"}
+    assert parsed.permissions == {"contents": "write", "pull_requests": "write"}
     assert parsed.repositories == ("geas",)
 
     raw = yaml.safe_load(policy.read_text())
@@ -812,6 +828,139 @@ def test_org_policy_contract_is_exact_and_rejects_broader_permissions(tmp_path: 
     policy.write_text(yaml.safe_dump(raw, sort_keys=False))
     with pytest.raises(ValueError, match="policy"):
         validate_org_sts_policy(policy)
+
+
+def test_protected_evaluation_exchanges_token_only_after_all_read_only_checks(
+    tmp_path: Path,
+) -> None:
+    """Catches an App token request before event, PR, artifact, tree, and policy checks."""
+    _remote, worktree, head = _bare_remote(tmp_path)
+    source = _source(head_sha=head)
+    artifact = tmp_path / "artifact"
+    build_skill_artifact(_snapshots(tmp_path / "snapshots"), artifact, source=source)
+    policy = tmp_path / "geas-pr-skill-sync.sts.yaml"
+    policy.write_text(
+        "issuer: https://token.actions.githubusercontent.com\n"
+        f"subject: {IMMUTABLE_SUBJECT}\n"
+        "claim_pattern:\n"
+        "  repository_id: '1320458746'\n"
+        "  event_name: workflow_run\n"
+        "  workflow_ref: 'Epiphytic/geas/\\.github/workflows/"
+        "pr-skill-writeback\\.yml@refs/heads/main'\n"
+        "permissions:\n"
+        "  contents: write\n"
+        "  pull_requests: write\n"
+        "repositories:\n"
+        "  - geas\n"
+    )
+    event = _workflow_event(head_sha=head)
+    pull_request = _pull_request(head_sha=head)
+    exchanged: list[str] = []
+    evaluate = pr_skill_sync.evaluate_protected_workflow
+
+    decision = evaluate(
+        event=event,
+        pull_request=pull_request,
+        current_pull_request=pull_request,
+        pull_request_files=({"filename": ".agents/skills/geas/SKILL.md"},),
+        artifact=artifact,
+        comparison_repository=worktree,
+        sts_policy=policy,
+        app_identity="Epiphytic/.github:.github/chainguard/geas-pr-skill-sync.sts.yaml",
+        exchange_token=lambda: exchanged.append("token") or "short-lived-secret",
+    )
+
+    assert decision.eligible is True
+    assert decision.changed is True
+    assert decision.token_exchanged is True
+    assert "short-lived-secret" not in decision.model_dump_json()
+    assert exchanged == ["token"]
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "repository",
+        "workflow",
+        "fork",
+        "head",
+        "artifact",
+        "path",
+        "policy-ref",
+        "app-identity",
+    ],
+)
+def test_protected_evaluation_denials_have_no_token_or_write_side_effect(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    remote, worktree, head = _bare_remote(tmp_path)
+    source = _source(head_sha=head)
+    artifact = tmp_path / "artifact"
+    build_skill_artifact(_snapshots(tmp_path / "snapshots"), artifact, source=source)
+    event = _workflow_event(head_sha=head)
+    pull_request = _pull_request(head_sha=head)
+    current = _pull_request(head_sha=head)
+    policy = tmp_path / "geas-pr-skill-sync.sts.yaml"
+    workflow_ref = (
+        "Epiphytic/geas/\\.github/workflows/wrong.yml@refs/heads/main"
+        if mutation == "policy-ref"
+        else "Epiphytic/geas/\\.github/workflows/pr-skill-writeback\\.yml@refs/heads/main"
+    )
+    policy.write_text(
+        "issuer: https://token.actions.githubusercontent.com\n"
+        f"subject: {IMMUTABLE_SUBJECT}\n"
+        "claim_pattern:\n"
+        "  repository_id: '1320458746'\n"
+        "  event_name: workflow_run\n"
+        f"  workflow_ref: '{workflow_ref}'\n"
+        "permissions:\n"
+        "  contents: write\n"
+        "  pull_requests: write\n"
+        "repositories:\n"
+        "  - geas\n"
+    )
+    if mutation == "repository":
+        event["repository"]["id"] = 7
+    elif mutation == "workflow":
+        event["workflow_run"]["path"] = ".github/workflows/untrusted.yml"
+    elif mutation == "fork":
+        event["workflow_run"]["head_repository"]["full_name"] = "fork/geas"
+    elif mutation == "head":
+        current["head"]["sha"] = "f" * 40
+    elif mutation == "artifact":
+        (artifact / "payload" / "unexpected.txt").write_text("unexpected\n")
+    exchanged: list[str] = []
+    before = _git(remote, "for-each-ref", "--format=%(refname):%(objectname)").stdout
+    evaluate = pr_skill_sync.evaluate_protected_workflow
+
+    with pytest.raises(ValueError):
+        evaluate(
+            event=event,
+            pull_request=pull_request,
+            current_pull_request=current,
+            pull_request_files=(
+                {
+                    "filename": (
+                        "src/research_agent/unsafe.py"
+                        if mutation == "path"
+                        else ".agents/skills/geas/SKILL.md"
+                    )
+                },
+            ),
+            artifact=artifact,
+            comparison_repository=worktree,
+            sts_policy=policy,
+            app_identity=(
+                "wrong/app"
+                if mutation == "app-identity"
+                else "Epiphytic/.github:.github/chainguard/geas-pr-skill-sync.sts.yaml"
+            ),
+            exchange_token=lambda: exchanged.append("token") or "secret",
+        )
+
+    assert exchanged == []
+    assert _git(remote, "for-each-ref", "--format=%(refname):%(objectname)").stdout == before
 
 
 def test_generated_artifact_files_are_regular_and_normalized_to_git_mode(tmp_path: Path) -> None:
@@ -858,8 +1007,26 @@ def test_production_generation_uses_catalog_and_preseeded_verified_projection(
     build = yaml.safe_load(build_path.read_text())
     build["topic_concept_id"] = "concept:ontology"
     build_path.write_text(yaml.safe_dump(build, sort_keys=False))
+    artifacts_path = checkout / "ontology" / "open-source-research-agents" / "artifacts.yaml"
+    artifacts = yaml.safe_load(artifacts_path.read_text())
+    projection = demo / "query.sqlite"
+    artifacts["artifacts"][0]["content_sha256"] = hashlib.sha256(
+        projection.read_bytes()
+    ).hexdigest()
+    artifacts["artifacts"][0]["size_bytes"] = projection.stat().st_size
+    artifacts["artifacts"][0]["input_revision"] = _sqlite_input_revision(
+        projection,
+        ArtifactRole.KNOWLEDGE_PROJECTION,
+    )
+    artifacts_path.write_text(yaml.safe_dump(artifacts, sort_keys=False))
     refresh_catalog(checkout / "geas.yaml", names=("open-source-research-agents",))
-    _git(checkout, "add", "geas.yaml", build_path.relative_to(checkout).as_posix())
+    _git(
+        checkout,
+        "add",
+        "geas.yaml",
+        build_path.relative_to(checkout).as_posix(),
+        artifacts_path.relative_to(checkout).as_posix(),
+    )
     _git(checkout, "commit", "-m", "mutate catalog-declared export topic")
     head = _git(checkout, "rev-parse", "HEAD").stdout.strip()
     source = _source(head_sha=head)
@@ -893,11 +1060,7 @@ def test_production_generation_uses_catalog_and_preseeded_verified_projection(
     assert first_files == second_files
     ontology = SkillManifest.model_validate_json(
         (
-            first
-            / ".agents"
-            / "skills"
-            / "open-source-research-agents"
-            / "geas-skill.json"
+            first / ".agents" / "skills" / "open-source-research-agents" / "geas-skill.json"
         ).read_bytes()
     )
     assert ontology.ontology.catalog_path == "geas.yaml"
@@ -909,6 +1072,7 @@ def test_production_generation_uses_catalog_and_preseeded_verified_projection(
     )
     assert ontology.projection.topic_concept_id == "concept:ontology"
     assert ontology.artifact is not None
-    assert ontology.artifact.content_sha256 == hashlib.sha256(
-        (demo / "query.sqlite").read_bytes()
-    ).hexdigest()
+    assert (
+        ontology.artifact.content_sha256
+        == hashlib.sha256((demo / "query.sqlite").read_bytes()).hexdigest()
+    )
