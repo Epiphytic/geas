@@ -2262,6 +2262,7 @@ def _bootstrap_request(
     *,
     ref: str = "refs/heads/main",
     commit: str = "d" * 40,
+    current_worktree: Path | None = None,
 ) -> RepositoryBootstrapRequest:
     return RepositoryBootstrapRequest(
         name="gold",
@@ -2269,6 +2270,7 @@ def _bootstrap_request(
         ref=ref,
         commit_sha256=commit,
         trust="read_only",
+        current_worktree=current_worktree,
     )
 
 
@@ -2317,6 +2319,350 @@ def _initialize_managed_repository(
         capture_output=True,
         check=True,
     ).stdout.strip()
+
+
+class _CopiedGitBootstrapRepository:
+    """Exercise subscription ownership with real local Git metadata and commands."""
+
+    source: Path
+    rewrite_origin: str | None = None
+
+    def __init__(self, checkout: Path, subscription: OntologySubscription) -> None:
+        self.checkout = checkout
+        self.subscription = subscription
+
+    def pull(self) -> dict[str, object]:
+        shutil.copytree(type(self).source, self.checkout)
+        if type(self).rewrite_origin is not None:
+            subprocess.run(
+                (
+                    "git",
+                    "remote",
+                    "set-url",
+                    "origin",
+                    type(self).rewrite_origin,
+                ),
+                cwd=self.checkout,
+                check=True,
+            )
+        return {"commit": self._head()}
+
+    def push(self) -> dict[str, object]:
+        raise AssertionError("bootstrap subscription must not push")
+
+    def assert_removable(self) -> None:
+        status = subprocess.run(
+            ("git", "status", "--porcelain=v1", "-z", "--untracked-files=all"),
+            cwd=self.checkout,
+            text=True,
+            capture_output=True,
+            check=True,
+        ).stdout
+        if status:
+            raise ValueError("checkout has local changes")
+
+    def assert_verified_commit(self, expected_commit: str) -> None:
+        if self._head() != expected_commit:
+            raise ValueError("checkout does not match the exact verified commit")
+
+    def _head(self) -> str:
+        return subprocess.run(
+            ("git", "rev-parse", "--verify", "HEAD^{commit}"),
+            cwd=self.checkout,
+            text=True,
+            capture_output=True,
+            check=True,
+        ).stdout.strip()
+
+
+def _remote_bootstrap_components(
+    tmp_path: Path,
+    *,
+    repository_type: type[_CopiedGitBootstrapRepository] = _CopiedGitBootstrapRepository,
+) -> tuple[
+    UserConfigManager,
+    SubscriptionManager,
+    Path,
+    RepositoryBootstrapRequest,
+    VerifiedRepositoryBootstrap,
+]:
+    config = _config_manager(tmp_path)
+    source = tmp_path / "source"
+    commit = _initialize_managed_repository(source)
+    repository_type.source = source
+    repository_type.rewrite_origin = None
+    managed = config.root / "subscriptions/default/gold"
+    request = _bootstrap_request(commit=commit).model_copy(update={"trust": "none"})
+    verified = _verified_request(request).model_copy(
+        update={"current_worktree": managed.resolve(strict=False)}
+    )
+    service = SubscriptionManager(
+        config_manager=config,
+        profile_name="default",
+        catalog_verifier=lambda path: path,
+        authorizer=lambda candidate: candidate,
+        repository_factory=repository_type,
+    )
+    return config, service, managed, request, verified
+
+
+def test_remote_install_defers_managed_git_binding_until_typed_subscription(
+    tmp_path: Path,
+) -> None:
+    """The fixed checkout is absent until the exact subscription adapter owns it."""
+    config, service, managed, request, verified = _remote_bootstrap_components(tmp_path)
+    events: list[str] = []
+
+    def subscribe(operation: BootstrapOperation) -> BootstrapSubscriptionMutationReceipt:
+        events.append("subscription")
+        assert not managed.exists()
+        return service.ensure_bootstrap_subscription(
+            operation.request.name,
+            _operation_subscription(operation),
+            operation_key=operation.idempotency_key,
+            verified_commit=operation.verified.commit_sha256,
+        )
+
+    def hydrate(operation: BootstrapOperation) -> tuple[ManagedPath, ...]:
+        events.append("artifacts")
+        assert operation.verified == verified
+        assert managed.is_dir()
+        return ()
+
+    receipt = RepositoryBootstrapManager(
+        managed_root=managed,
+        state_root=config.root,
+        announce=lambda message: None,
+        now=lambda: _NOW,
+        verify=lambda candidate: verified,
+        record_trust=lambda operation, grant: None,
+        subscribe=subscribe,
+        hydrate_artifacts=hydrate,
+        install_generic_skill=lambda operation: events.append("generic-skill") or (),
+        export_catalog_skills=lambda operation: events.append("catalog-skills") or (),
+        link_agents=lambda operation: events.append("links") or (),
+    ).install(request)
+
+    assert events == ["subscription", "artifacts", "generic-skill", "catalog-skills", "links"]
+    assert receipt.subscription_mutation is not None
+    assert receipt.subscription_ownership is not None
+    assert Path(receipt.subscription_ownership.checkout) == Path(
+        "subscriptions/default/gold"
+    )
+    assert managed.resolve(strict=True) == verified.current_worktree
+
+
+def test_remote_install_rechecks_candidate_origin_before_artifact_or_skill_write(
+    tmp_path: Path,
+) -> None:
+    class WrongOriginRepository(_CopiedGitBootstrapRepository):
+        pass
+
+    config, service, managed, request, verified = _remote_bootstrap_components(
+        tmp_path,
+        repository_type=WrongOriginRepository,
+    )
+    WrongOriginRepository.rewrite_origin = "https://example.test/other.git"
+    later_effects: list[str] = []
+
+    def subscribe(operation: BootstrapOperation) -> BootstrapSubscriptionMutationReceipt:
+        return service.ensure_bootstrap_subscription(
+            operation.request.name,
+            _operation_subscription(operation),
+            operation_key=operation.idempotency_key,
+            verified_commit=operation.verified.commit_sha256,
+        )
+
+    manager = RepositoryBootstrapManager(
+        managed_root=managed,
+        state_root=config.root,
+        announce=lambda message: None,
+        now=lambda: _NOW,
+        verify=lambda candidate: verified,
+        record_trust=lambda operation, grant: None,
+        subscribe=subscribe,
+        hydrate_artifacts=lambda operation: later_effects.append("artifacts") or (),
+        install_generic_skill=lambda operation: later_effects.append("generic-skill") or (),
+        export_catalog_skills=lambda operation: later_effects.append("catalog-skills") or (),
+        link_agents=lambda operation: later_effects.append("links") or (),
+    )
+
+    with pytest.raises(ValueError, match="remote differs"):
+        manager.install(request)
+
+    assert later_effects == []
+    assert config.load().profiles["default"].subscriptions["gold"].checkout == Path(
+        "subscriptions/default/gold"
+    )
+
+
+def test_remote_install_rejects_precreated_matching_checkout_without_ownership(
+    tmp_path: Path,
+) -> None:
+    config, _service, managed, request, verified = _remote_bootstrap_components(tmp_path)
+    shutil.copytree(_CopiedGitBootstrapRepository.source, managed)
+    effects: list[str] = []
+    manager = RepositoryBootstrapManager(
+        managed_root=managed,
+        state_root=config.root,
+        announce=lambda message: None,
+        now=lambda: _NOW,
+        verify=lambda candidate: verified,
+        record_trust=lambda operation, grant: effects.append("trust"),
+        subscribe=lambda operation: effects.append("subscription") or (),
+        hydrate_artifacts=lambda operation: effects.append("artifacts") or (),
+        install_generic_skill=lambda operation: effects.append("generic-skill") or (),
+        export_catalog_skills=lambda operation: effects.append("catalog-skills") or (),
+        link_agents=lambda operation: effects.append("links") or (),
+    )
+
+    with pytest.raises(ValueError, match="already exists without ownership"):
+        manager.install(request)
+
+    assert effects == []
+    assert config.load().profiles["default"].subscriptions == {}
+    assert not (config.root / "repository-bootstrap/gold.json").exists()
+
+
+def test_remote_install_cannot_adopt_checkout_from_untyped_subscription_callback(
+    tmp_path: Path,
+) -> None:
+    config, _service, managed, request, verified = _remote_bootstrap_components(tmp_path)
+    later_effects: list[str] = []
+
+    def untyped_subscribe(operation: BootstrapOperation) -> tuple[ManagedPath, ...]:
+        shutil.copytree(_CopiedGitBootstrapRepository.source, managed)
+        return ()
+
+    manager = RepositoryBootstrapManager(
+        managed_root=managed,
+        state_root=config.root,
+        announce=lambda message: None,
+        now=lambda: _NOW,
+        verify=lambda candidate: verified,
+        record_trust=lambda operation, grant: None,
+        subscribe=untyped_subscribe,
+        hydrate_artifacts=lambda operation: later_effects.append("artifacts") or (),
+        install_generic_skill=lambda operation: later_effects.append("generic-skill") or (),
+        export_catalog_skills=lambda operation: later_effects.append("catalog-skills") or (),
+        link_agents=lambda operation: later_effects.append("links") or (),
+    )
+
+    with pytest.raises(ValueError, match="typed subscription ownership receipt"):
+        manager.install(request)
+
+    assert later_effects == []
+    assert config.load().profiles["default"].subscriptions == {}
+
+
+def test_remote_update_validates_old_then_typed_swap_then_candidate(
+    tmp_path: Path,
+) -> None:
+    config, service, managed, request, verified = _remote_bootstrap_components(tmp_path)
+    source = _CopiedGitBootstrapRepository.source
+    verified_by_commit = {request.commit_sha256: verified}
+    events: list[str] = []
+    interrupt_after_swap = True
+
+    def subscribe(operation: BootstrapOperation) -> BootstrapSubscriptionMutationReceipt:
+        return service.ensure_bootstrap_subscription(
+            operation.request.name,
+            _operation_subscription(operation),
+            operation_key=operation.idempotency_key,
+            verified_commit=operation.verified.commit_sha256,
+        )
+
+    def replace_subscription(
+        old_operation: BootstrapOperation,
+        candidate_operation: BootstrapOperation,
+    ) -> BootstrapSubscriptionMutationReceipt:
+        nonlocal interrupt_after_swap
+        events.append("subscription")
+        assert old_operation.subscription_ownership is not None
+        old_head = subprocess.run(
+            ("git", "rev-parse", "HEAD"),
+            cwd=managed,
+            text=True,
+            capture_output=True,
+            check=True,
+        ).stdout.strip()
+        expected_head = (
+            old_operation.verified.commit_sha256
+            if interrupt_after_swap
+            else candidate_operation.verified.commit_sha256
+        )
+        assert old_head == expected_head
+        result = service.replace_bootstrap_subscription(
+            candidate_operation.request.name,
+            _operation_subscription(old_operation),
+            _operation_subscription(candidate_operation),
+            operation_key=candidate_operation.idempotency_key,
+            verified_commit=candidate_operation.verified.commit_sha256,
+            ownership=old_operation.subscription_ownership,
+        )
+        if interrupt_after_swap:
+            interrupt_after_swap = False
+            raise RuntimeError("crash after typed subscription swap")
+        return result
+
+    def coordinator() -> RepositoryBootstrapManager:
+        return RepositoryBootstrapManager(
+            managed_root=managed,
+            state_root=config.root,
+            announce=lambda message: None,
+            now=lambda: _NOW,
+            verify=lambda candidate: verified_by_commit[candidate.commit_sha256],
+            record_trust=lambda operation, grant: None,
+            subscribe=subscribe,
+            replace_subscription=replace_subscription,
+            hydrate_artifacts=lambda operation: events.append("artifacts") or (),
+            install_generic_skill=lambda operation: events.append("generic-skill") or (),
+            export_catalog_skills=lambda operation: events.append("catalog-skills") or (),
+            link_agents=lambda operation: events.append("links") or (),
+            remove_obsolete_paths=lambda operation: remove_obsolete_paths(
+                managed, operation, state_root=config.root
+            ),
+            verify_software_provenance=lambda: None,
+        )
+
+    coordinator().install(request)
+    events.clear()
+    (source / "candidate.txt").write_text("candidate\n")
+    subprocess.run(("git", "add", "candidate.txt"), cwd=source, check=True)
+    subprocess.run(("git", "commit", "-q", "-m", "candidate"), cwd=source, check=True)
+    candidate_commit = subprocess.run(
+        ("git", "rev-parse", "HEAD"),
+        cwd=source,
+        text=True,
+        capture_output=True,
+        check=True,
+    ).stdout.strip()
+    candidate_request = _bootstrap_request(commit=candidate_commit).model_copy(
+        update={"trust": "none"}
+    )
+    candidate_verified = _verified_request(candidate_request).model_copy(
+        update={"current_worktree": managed.resolve(strict=True)}
+    )
+    verified_by_commit[candidate_commit] = candidate_verified
+
+    with pytest.raises(RuntimeError, match="crash after typed subscription swap"):
+        coordinator().update(candidate_request)
+
+    assert events == ["subscription"]
+    events.clear()
+    updated = coordinator().update(candidate_request)
+
+    assert events == ["subscription", "artifacts", "generic-skill", "catalog-skills", "links"]
+    assert updated.verified == candidate_verified
+    assert updated.subscription_ownership is not None
+    assert updated.subscription_ownership.verified_commit == candidate_commit
+    assert subprocess.run(
+        ("git", "rev-parse", "HEAD"),
+        cwd=managed,
+        text=True,
+        capture_output=True,
+        check=True,
+    ).stdout.strip() == candidate_commit
 
 
 def _operation_subscription(operation: BootstrapOperation) -> OntologySubscription:
@@ -2553,7 +2899,7 @@ def test_bootstrap_manager_separates_operational_state_from_managed_repository(
     repository = tmp_path / "repository"
     commit = _initialize_managed_repository(repository)
     state_root = tmp_path / "state"
-    request = _bootstrap_request(commit=commit)
+    request = _bootstrap_request(commit=commit, current_worktree=repository.resolve())
     verified = _verified_request(request).model_copy(
         update={"current_worktree": repository.resolve()}
     )
@@ -2612,7 +2958,7 @@ def test_explicit_managed_root_requires_exact_clean_verified_git_worktree_before
     if repository_state == "dirty":
         commit = _initialize_managed_repository(repository)
         (repository / "operator-dirty.txt").write_text("preserve\n")
-    request = _bootstrap_request(commit=commit)
+    request = _bootstrap_request(commit=commit, current_worktree=repository.resolve())
     verified = _verified_request(request).model_copy(
         update={"current_worktree": repository.resolve()}
     )
@@ -2644,7 +2990,7 @@ def test_explicit_managed_root_must_equal_verified_worktree(tmp_path: Path) -> N
     verified_root = tmp_path / "verified"
     managed.mkdir()
     verified_root.mkdir()
-    request = _bootstrap_request()
+    request = _bootstrap_request(current_worktree=verified_root.resolve())
     verified = _verified_request(request).model_copy(
         update={"current_worktree": verified_root.resolve()}
     )
@@ -2678,7 +3024,7 @@ def test_explicit_managed_root_rejects_repository_environment_spoof(
     managed = tmp_path / "managed"
     managed.mkdir()
     (managed / "geas.yaml").write_text("version: 1\nontologies: []\n")
-    request = _bootstrap_request(commit=commit)
+    request = _bootstrap_request(commit=commit, current_worktree=managed.resolve())
     verified = _verified_request(request).model_copy(
         update={"current_worktree": managed.resolve()}
     )
@@ -2716,7 +3062,7 @@ def test_explicit_managed_root_rejects_gitfile_pointing_at_a_sibling_repository(
     managed.mkdir()
     shutil.copyfile(sibling / "geas.yaml", managed / "geas.yaml")
     (managed / ".git").write_text(f"gitdir: {(sibling / '.git').resolve()}\n")
-    request = _bootstrap_request(commit=commit)
+    request = _bootstrap_request(commit=commit, current_worktree=managed.resolve())
     verified = _verified_request(request).model_copy(
         update={"current_worktree": managed.resolve()}
     )
@@ -2751,7 +3097,11 @@ def test_explicit_managed_root_accepts_bound_linked_worktree(tmp_path: Path) -> 
         cwd=repository,
         check=True,
     )
-    request = _bootstrap_request(ref="refs/heads/fixture-linked", commit=commit)
+    request = _bootstrap_request(
+        ref="refs/heads/fixture-linked",
+        commit=commit,
+        current_worktree=managed.resolve(),
+    )
     verified = _verified_request(request).model_copy(
         update={"current_worktree": managed.resolve()}
     )
@@ -2782,7 +3132,7 @@ def test_explicit_worktree_receipt_round_trips_for_fresh_resume_and_removal(
     managed = tmp_path / "managed"
     commit = _initialize_managed_repository(managed)
     state = tmp_path / "state"
-    request = _bootstrap_request(commit=commit)
+    request = _bootstrap_request(commit=commit, current_worktree=managed.resolve())
     verified = _verified_request(request).model_copy(
         update={"current_worktree": managed.resolve()}
     )
@@ -2823,7 +3173,7 @@ def test_explicit_managed_root_rechecks_exact_git_identity_before_mutation(
     """Catches a stale verification result authorizing a changed clean worktree."""
     managed = tmp_path / "managed"
     commit = _initialize_managed_repository(managed)
-    request = _bootstrap_request(commit=commit)
+    request = _bootstrap_request(commit=commit, current_worktree=managed.resolve())
     verified = _verified_request(request).model_copy(
         update={"current_worktree": managed.resolve()}
     )
@@ -2920,7 +3270,7 @@ def test_explicit_managed_root_may_live_below_state_root(tmp_path: Path) -> None
     state = tmp_path / "state"
     managed = state / "subscriptions/default/gold"
     commit = _initialize_managed_repository(managed)
-    request = _bootstrap_request(commit=commit)
+    request = _bootstrap_request(commit=commit, current_worktree=managed.resolve())
     verified = _verified_request(request).model_copy(
         update={"current_worktree": managed.resolve()}
     )
@@ -3000,7 +3350,7 @@ def test_bootstrap_manager_never_resolves_owned_evidence_from_the_other_root(
         wrong_path.write_bytes(value)
     commit = _initialize_managed_repository(managed, tracked=tracked)
     wrong_path = wrong_root / relative
-    request = _bootstrap_request(commit=commit)
+    request = _bootstrap_request(commit=commit, current_worktree=managed.resolve())
     verified = _verified_request(request).model_copy(
         update={"current_worktree": managed.resolve()}
     )
