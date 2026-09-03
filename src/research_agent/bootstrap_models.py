@@ -58,6 +58,18 @@ class RepositoryRemovalPhase(StrEnum):
     TRUST_REMOVED = "trust_removed"
 
 
+class RepositoryUpdateEffect(StrEnum):
+    """Semantic mutations whose receipts make an update phase meaningful."""
+
+    TRUST = "trust"
+    SUBSCRIPTION = "subscription"
+    ARTIFACTS = "artifacts"
+    GENERIC_SKILL = "generic-skill"
+    CATALOG_SKILLS = "catalog-skills"
+    AGENT_LINKS = "agent-links"
+    OBSOLETE_PATHS = "obsolete-paths"
+
+
 class ManagedPath(StrictModel):
     version: Literal[1] = 1
     path: str
@@ -68,6 +80,46 @@ class ManagedPath(StrictModel):
     @classmethod
     def normalized_relative_path(cls, value: object) -> str:
         return _relative_path(value, label="managed path")
+
+
+class RepositoryUpdateEffectReceipt(StrictModel):
+    """Durable result of one stable-keyed update effect."""
+
+    version: Literal[1] = 1
+    effect: RepositoryUpdateEffect
+    idempotency_key: str = Field(
+        pattern=r"^repository-bootstrap-update-operation:sha256:[0-9a-f]{64}$"
+    )
+    mutation_performed: bool
+    affected_paths: tuple[ManagedPath, ...] = ()
+
+    @field_validator("affected_paths")
+    @classmethod
+    def unique_affected_paths(cls, value: tuple[ManagedPath, ...]) -> tuple[ManagedPath, ...]:
+        ordered = tuple(sorted(value, key=lambda item: item.path))
+        if len({item.path for item in ordered}) != len(ordered):
+            raise ValueError("update effect paths must be unique")
+        return ordered
+
+
+_UPDATE_PHASE_EFFECT_COUNT = {
+    RepositoryUpdatePhase.VERIFIED: 0,
+    RepositoryUpdatePhase.TRUST_PENDING: 0,
+    RepositoryUpdatePhase.TRUST_REPLACED: 1,
+    RepositoryUpdatePhase.SUBSCRIPTION_PENDING: 1,
+    RepositoryUpdatePhase.SUBSCRIPTION_REPLACED: 2,
+    RepositoryUpdatePhase.ARTIFACTS_PENDING: 2,
+    RepositoryUpdatePhase.ARTIFACTS_HYDRATED: 3,
+    RepositoryUpdatePhase.GENERIC_SKILL_PENDING: 3,
+    RepositoryUpdatePhase.GENERIC_SKILL_INSTALLED: 4,
+    RepositoryUpdatePhase.CATALOG_SKILLS_PENDING: 4,
+    RepositoryUpdatePhase.CATALOG_SKILLS_EXPORTED: 5,
+    RepositoryUpdatePhase.AGENT_LINKS_PENDING: 5,
+    RepositoryUpdatePhase.AGENT_LINKS_INSTALLED: 6,
+    RepositoryUpdatePhase.OBSOLETE_PATHS_PENDING: 6,
+    RepositoryUpdatePhase.OBSOLETE_PATHS_REMOVED: 7,
+    RepositoryUpdatePhase.FINALIZING: 7,
+}
 
 
 class RepositoryInstallReceipt(StrictModel):
@@ -418,6 +470,7 @@ class RepositoryUpdateJournal(StrictModel):
     candidate_verified: VerifiedRepositoryBootstrap
     candidate_grant: CapabilityGrant | None = None
     candidate_managed_paths: tuple[ManagedPath, ...] = ()
+    effect_receipts: tuple[RepositoryUpdateEffectReceipt, ...] = ()
     phase: RepositoryUpdatePhase
     created_at: datetime
     updated_at: datetime
@@ -447,7 +500,73 @@ class RepositoryUpdateJournal(StrictModel):
             raise ValueError("candidate verified identity does not match candidate request")
         if self.old_request.name != self.candidate_request.name:
             raise ValueError("update journal bootstrap names must match")
+        expected_effects = tuple(RepositoryUpdateEffect)[
+            : _UPDATE_PHASE_EFFECT_COUNT[self.phase]
+        ]
+        if tuple(receipt.effect for receipt in self.effect_receipts) != expected_effects:
+            raise ValueError("update journal effects do not match its phase")
+        produced: dict[str, ManagedPath] = {}
+        for receipt in self.effect_receipts:
+            expected_key = repository_update_operation_id(
+                old_receipt_sha256=self.old_receipt_sha256,
+                candidate_request=self.candidate_request,
+                candidate_verified=self.candidate_verified,
+                effect=receipt.effect,
+            )
+            if receipt.idempotency_key != expected_key:
+                raise ValueError("update effect idempotency key does not match its transaction")
+            if receipt.effect is RepositoryUpdateEffect.TRUST:
+                if receipt.affected_paths:
+                    raise ValueError("trust effect cannot own managed paths")
+                if receipt.mutation_performed != (self.old_grant != self.candidate_grant):
+                    raise ValueError("trust effect does not match the grant replacement")
+            elif receipt.effect is RepositoryUpdateEffect.OBSOLETE_PATHS:
+                continue
+            elif not receipt.mutation_performed:
+                raise ValueError("completed update adapter must record its mutation")
+            else:
+                for item in receipt.affected_paths:
+                    previous = produced.get(item.path)
+                    if previous is not None and previous != item:
+                        raise ValueError("update effects disagree about a managed path")
+                    produced[item.path] = item
+        expected_paths = tuple(produced[path] for path in sorted(produced))
+        if self.candidate_managed_paths != expected_paths:
+            raise ValueError("candidate managed paths are not produced by update effects")
+        obsolete_receipts = tuple(
+            receipt
+            for receipt in self.effect_receipts
+            if receipt.effect is RepositoryUpdateEffect.OBSOLETE_PATHS
+        )
+        if obsolete_receipts:
+            obsolete = tuple(
+                item for item in self.old_managed_paths if item.path not in produced
+            )
+            receipt = obsolete_receipts[0]
+            if receipt.affected_paths != obsolete:
+                raise ValueError("obsolete-path effect does not match old ownership")
+            if receipt.mutation_performed != bool(obsolete):
+                raise ValueError("obsolete-path effect has an invalid mutation result")
         return self
+
+
+def repository_update_operation_id(
+    *,
+    old_receipt_sha256: str,
+    candidate_request: RepositoryBootstrapRequest,
+    candidate_verified: VerifiedRepositoryBootstrap,
+    effect: RepositoryUpdateEffect,
+) -> str:
+    """Return the stable semantic idempotency key for one update effect."""
+    return content_id(
+        "repository-bootstrap-update-operation",
+        {
+            "old_receipt_sha256": old_receipt_sha256,
+            "candidate_request": candidate_request.model_dump(mode="json"),
+            "candidate_verified": candidate_verified.id,
+            "step": effect.value,
+        },
+    )
 
 
 class RepositoryBootstrapService(Protocol):

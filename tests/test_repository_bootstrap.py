@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -772,3 +773,324 @@ def test_repeated_remove_returns_completed_receipt_without_replaying_mutations(
 
     assert second == first
     assert mutations == ["skills", "subscription", "trust"]
+
+
+def test_update_rejects_modified_old_skill_before_any_candidate_mutation(
+    tmp_path: Path,
+) -> None:
+    """Catches candidate adapters running after receipt-owned bytes were modified."""
+    root = tmp_path / "state"
+    calls: list[str] = []
+    skill_relative = ".agents/skills/example/SKILL.md"
+
+    def verify(request: RepositoryBootstrapRequest) -> VerifiedRepositoryBootstrap:
+        return _verified(commit_sha256=request.commit_sha256)
+
+    def install_skill(operation: BootstrapOperation) -> tuple[ManagedPath, ...]:
+        if operation.request.commit_sha256 != "a" * 40:
+            calls.append("generic")
+        return (_written_path(root, skill_relative, "installed\n", "skill"),)
+
+    _manager(
+        tmp_path,
+        root=root,
+        verify=verify,
+        install_generic_skill=install_skill,
+    ).install(_request())
+    skill = root / skill_relative
+    skill.write_text("operator modification\n")
+
+    with pytest.raises(ValueError, match="managed path was modified"):
+        _manager(
+            tmp_path,
+            root=root,
+            verify=verify,
+            replace_subscription=lambda _old, _candidate: calls.append("subscription") or (),
+            hydrate_artifacts=lambda _operation: calls.append("hydrate") or (),
+            install_generic_skill=install_skill,
+            export_catalog_skills=lambda _operation: calls.append("export") or (),
+            link_agents=lambda _operation: calls.append("link") or (),
+            remove_obsolete_paths=lambda _operation: calls.append("obsolete"),
+        ).update(_request(commit_sha256="c" * 40))
+
+    assert calls == []
+    assert skill.read_bytes() == b"operator modification\n"
+    assert not (root / "repository-bootstrap" / "example.update.json").exists()
+
+
+@pytest.mark.parametrize(
+    ("phase", "candidate_paths"),
+    (
+        ("finalizing", False),
+        ("subscription_pending", True),
+        ("artifacts_hydrated", False),
+    ),
+)
+def test_update_rejects_impossible_journal_phase_payload_on_actual_resume(
+    tmp_path: Path, phase: str, candidate_paths: bool
+) -> None:
+    """Catches a tampered journal phase skipping or inventing adapter effects."""
+    root = tmp_path / "state"
+    old_request = _request()
+    candidate_request = _request(commit_sha256="c" * 40)
+
+    def verify(request: RepositoryBootstrapRequest) -> VerifiedRepositoryBootstrap:
+        return _verified(commit_sha256=request.commit_sha256)
+
+    manager = _manager(tmp_path, root=root, verify=verify)
+    manager.install(old_request)
+    with pytest.raises(RuntimeError, match="interrupt"):
+        _manager(
+            tmp_path,
+            root=root,
+            verify=verify,
+            hydrate_artifacts=lambda _operation: (_ for _ in ()).throw(
+                RuntimeError("interrupt")
+            ),
+        ).update(candidate_request)
+
+    journal_path = root / "repository-bootstrap" / "example.update.json"
+    payload = json.loads(journal_path.read_text())
+    payload["phase"] = phase
+    if candidate_paths:
+        invented = _written_path(root, "invented/path", "not produced\n", "skill")
+        payload["candidate_managed_paths"] = [invented.model_dump(mode="json")]
+    journal_path.write_text(json.dumps(payload))
+
+    with pytest.raises(ValueError, match="update journal is invalid"):
+        _manager(tmp_path, root=root, verify=verify).update(candidate_request)
+
+
+def test_update_rejects_finalizing_journal_with_nonexistent_produced_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches a structurally valid final journal owning bytes an adapter never installed."""
+    root = tmp_path / "state"
+    old_request = _request()
+    candidate_request = _request(commit_sha256="c" * 40)
+
+    def verify(request: RepositoryBootstrapRequest) -> VerifiedRepositoryBootstrap:
+        return _verified(commit_sha256=request.commit_sha256)
+
+    manager = _manager(tmp_path, root=root, verify=verify)
+    manager.install(old_request)
+    monkeypatch.setattr(
+        manager,
+        "_write",
+        lambda _receipt: (_ for _ in ()).throw(RuntimeError("before final receipt")),
+    )
+    with pytest.raises(RuntimeError, match="before final receipt"):
+        manager.update(candidate_request)
+
+    journal_path = root / "repository-bootstrap" / "example.update.json"
+    payload = json.loads(journal_path.read_text())
+    missing = ManagedPath(
+        path="candidate/missing",
+        sha256=hashlib.sha256(b"missing").hexdigest(),
+        role="skill",
+    ).model_dump(mode="json")
+    payload["candidate_managed_paths"] = [missing]
+    payload["effect_receipts"][1]["affected_paths"] = [missing]
+    journal_path.write_text(json.dumps(payload))
+
+    with pytest.raises(ValueError, match="managed path is missing"):
+        _manager(tmp_path, root=root, verify=verify).update(candidate_request)
+
+
+def test_update_accepts_verified_bundle_digest_rotation_without_scope_widening(
+    tmp_path: Path,
+) -> None:
+    """Catches immutable version digests being treated as permanent trust resources."""
+    replacements: list[tuple[tuple[str, ...], tuple[str, ...]]] = []
+    old_request = _request()
+    candidate_request = _request(commit_sha256="c" * 40)
+
+    def verify(request: RepositoryBootstrapRequest) -> VerifiedRepositoryBootstrap:
+        digest = "b" * 64 if request.commit_sha256 == "a" * 40 else "c" * 64
+        return _verified(commit_sha256=request.commit_sha256, bundle_sha256=(digest,))
+
+    manager = _manager(
+        tmp_path,
+        verify=verify,
+        replace_trust=lambda _operation, old, new: replacements.append(
+            (old.subject.bundle_sha256, new.subject.bundle_sha256)  # type: ignore[union-attr]
+        ),
+    )
+    manager.install(old_request)
+    updated = manager.update(candidate_request)
+
+    assert updated.verified is not None
+    assert updated.verified.bundle_sha256 == ("c" * 64,)
+    assert replacements == [(("b" * 64,), ("c" * 64,))]
+
+
+@pytest.mark.parametrize(
+    ("extra_hosts", "extra_repositories"),
+    (
+        (("evil.example.test",), ()),
+        ((), ("https://example.test/unrelated.git",)),
+    ),
+)
+def test_update_digest_rotation_still_rejects_added_source_or_repository_scope(
+    tmp_path: Path,
+    extra_hosts: tuple[str, ...],
+    extra_repositories: tuple[str, ...],
+) -> None:
+    """Catches version rotation becoming a route to widen resource authority."""
+    old_request = _request(
+        trust="trust_repository",
+        ontology_paths=("ontology/example",),
+        bundle_sha256=("b" * 64,),
+        source_hosts=("news.example.test",),
+        source_path_prefixes=("/disclosures/",),
+        source_connectors=("connector:fixture",),
+        delegated_repositories=("https://example.test/child.git",),
+    )
+    candidate_request = _request(
+        commit_sha256="c" * 40,
+        trust="trust_repository",
+        ontology_paths=("ontology/example",),
+        bundle_sha256=("c" * 64,),
+        source_hosts=("news.example.test", *extra_hosts),
+        source_path_prefixes=("/disclosures/",),
+        source_connectors=("connector:fixture",),
+        delegated_repositories=("https://example.test/child.git", *extra_repositories),
+    )
+
+    def verified(request: RepositoryBootstrapRequest) -> VerifiedRepositoryBootstrap:
+        if request.commit_sha256 == "a" * 40:
+            return _verified()
+        return _verified(
+            commit_sha256=request.commit_sha256,
+            bundle_sha256=("c" * 64,),
+            source_hosts=("news.example.test", *extra_hosts),
+            delegated_repositories=("https://example.test/child.git", *extra_repositories),
+        )
+
+    manager = _manager(tmp_path, verify=verified)
+    manager.install(old_request)
+
+    with pytest.raises(ValueError, match="expands"):
+        manager.update(candidate_request)
+
+
+@pytest.mark.parametrize("widening", ("capabilities", "delegation-depth"))
+def test_update_digest_rotation_cannot_widen_capabilities_or_delegation_depth(
+    tmp_path: Path, widening: str
+) -> None:
+    """Catches digest replacement bypassing capability or depth intersection."""
+    trusted_scope: dict[str, object] = {
+        "trust": "trust_repository",
+        "ontology_paths": ("ontology/example",),
+        "bundle_sha256": ("b" * 64,),
+        "source_hosts": ("news.example.test",),
+        "source_path_prefixes": ("/disclosures/",),
+        "source_connectors": ("connector:fixture",),
+        "delegated_repositories": ("https://example.test/child.git",),
+    }
+    old_request = (
+        _request()
+        if widening == "capabilities"
+        else _request(**trusted_scope, delegate_depth=1)
+    )
+    candidate_scope = dict(trusted_scope)
+    candidate_scope["bundle_sha256"] = ("c" * 64,)
+    candidate_request = _request(
+        commit_sha256="c" * 40,
+        **candidate_scope,
+        **({"delegate_depth": 2} if widening == "delegation-depth" else {}),
+    )
+
+    def verify(request: RepositoryBootstrapRequest) -> VerifiedRepositoryBootstrap:
+        digest = "b" * 64 if request.commit_sha256 == "a" * 40 else "c" * 64
+        return _verified(commit_sha256=request.commit_sha256, bundle_sha256=(digest,))
+
+    manager = _manager(tmp_path, verify=verify)
+    manager.install(old_request)
+
+    with pytest.raises(ValueError, match="expands"):
+        manager.update(candidate_request)
+
+
+@pytest.mark.parametrize(
+    ("relative", "role"),
+    (
+        (".agents/skills/example/SKILL.md", "skill"),
+        ("subscriptions/example.json", "manifest"),
+    ),
+)
+def test_remove_noop_adapter_cannot_clear_ownership_of_existing_files(
+    tmp_path: Path, relative: str, role: str
+) -> None:
+    """Catches a no-op remover claiming success while a managed file remains."""
+    root = tmp_path / "state"
+    managed = _written_path(root, relative, "owned\n", role)
+    manager = _manager(tmp_path, root=root)
+    installed = manager.install(_request())
+    receipt_path = root / "repository-bootstrap" / "example.json"
+    receipt_path.write_bytes(
+        installed.model_copy(update={"managed_paths": (managed,)}).model_dump_json().encode()
+    )
+
+    with pytest.raises(ValueError, match="still exists"):
+        manager.remove(_request())
+
+    persisted = RepositoryBootstrapReceipt.model_validate_json(receipt_path.read_bytes())
+    assert persisted.removal_pending is True
+    assert persisted.removed is False
+    assert persisted.managed_paths == (managed,)
+    assert (root / managed.path).read_bytes() == b"owned\n"
+
+
+@pytest.mark.parametrize("interrupted_step", ("skills", "subscription", "trust"))
+def test_remove_resumes_each_subphase_only_after_owned_paths_are_absent(
+    tmp_path: Path, interrupted_step: str
+) -> None:
+    """Catches removal resumption either replaying with a new key or orphaning files."""
+    root = tmp_path / "state"
+    skill = _written_path(root, ".agents/skills/example/SKILL.md", "owned\n", "skill")
+    manifest = _written_path(root, "subscriptions/example.json", "owned\n", "manifest")
+    calls: dict[str, list[str]] = {}
+    interrupted = {interrupted_step: True}
+
+    def apply(operation: BootstrapOperation, step: str) -> None:
+        calls.setdefault(step, []).append(operation.idempotency_key)
+        for item in operation.owned_paths:
+            path = root / item.path
+            if path.exists() or path.is_symlink():
+                path.unlink()
+        if interrupted.pop(step, False):
+            raise RuntimeError(f"interrupt {step}")
+
+    def remove_trust(operation: BootstrapOperation, _grant: object) -> None:
+        apply(operation, "trust")
+
+    manager = _manager(
+        tmp_path,
+        root=root,
+        remove_skills=lambda operation: apply(operation, "skills"),
+        unsubscribe=lambda operation: apply(operation, "subscription"),
+        remove_trust=remove_trust,
+    )
+    installed = manager.install(_request())
+    receipt_path = root / "repository-bootstrap" / "example.json"
+    receipt_path.write_bytes(
+        installed.model_copy(update={"managed_paths": (skill, manifest)}).model_dump_json().encode()
+    )
+    with pytest.raises(RuntimeError, match=f"interrupt {interrupted_step}"):
+        manager.remove(_request())
+
+    removed = _manager(
+        tmp_path,
+        root=root,
+        remove_skills=lambda operation: apply(operation, "skills"),
+        unsubscribe=lambda operation: apply(operation, "subscription"),
+        remove_trust=remove_trust,
+    ).remove(_request())
+
+    assert removed.removed is True
+    assert removed.managed_paths == ()
+    assert not (root / skill.path).exists()
+    assert not (root / manifest.path).exists()
+    assert len(calls[interrupted_step]) == 2
+    assert len(set(calls[interrupted_step])) == 1

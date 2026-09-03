@@ -15,9 +15,12 @@ from research_agent.bootstrap_models import (
     RepositoryBootstrapReceipt,
     RepositoryBootstrapRequest,
     RepositoryRemovalPhase,
+    RepositoryUpdateEffect,
+    RepositoryUpdateEffectReceipt,
     RepositoryUpdateJournal,
     RepositoryUpdatePhase,
     VerifiedRepositoryBootstrap,
+    repository_update_operation_id,
 )
 from research_agent.capabilities import (
     Capability,
@@ -188,6 +191,7 @@ class RepositoryBootstrapManager:
         journal = self._load_update(request.name)
         if journal is None:
             self._assert_complete_install(existing)
+            self._assert_owned_paths(existing.managed_paths)
             if existing.request == request and existing.verified == candidate:
                 return existing
             candidate_grant = repository_trust_grant(
@@ -218,6 +222,7 @@ class RepositoryBootstrapManager:
             if completed is not None:
                 self._remove_update_journal(request.name)
                 return completed
+            self._assert_update_journal_files(journal)
             if (
                 self._update_before(journal, RepositoryUpdatePhase.TRUST_REPLACED)
                 and journal.old_grant != journal.candidate_grant
@@ -263,32 +268,39 @@ class RepositoryBootstrapManager:
             raise ValueError("repository bootstrap removal journal is invalid")
         assert self.remove_skills is not None and self.unsubscribe is not None
         if receipt.removal_phase is RepositoryRemovalPhase.PENDING:
-            self._assert_owned_paths(receipt.managed_paths)
-            self.remove_skills(self._removal_operation(receipt, "skills"))
+            skill_paths = _skill_paths(receipt.managed_paths)
+            other_paths = _non_skill_paths(receipt.managed_paths)
+            self._assert_paths_exact_or_absent(skill_paths)
+            self._assert_owned_paths(other_paths)
+            self.remove_skills(
+                self._removal_operation(receipt, "skills", owned_paths=skill_paths)
+            )
+            self._assert_paths_absent(skill_paths)
+            self._assert_owned_paths(other_paths)
             receipt = receipt.model_copy(
                 update={
                     "removal_phase": RepositoryRemovalPhase.SKILLS_REMOVED,
                     "updated_at": self.now(),
                 }
             )
-            self._assert_owned_paths(_non_skill_paths(receipt.managed_paths))
             self._write(receipt)
         if receipt.removal_phase is RepositoryRemovalPhase.SKILLS_REMOVED:
             remaining = _non_skill_paths(receipt.managed_paths)
-            self._assert_owned_paths(remaining)
+            self._assert_paths_absent(_skill_paths(receipt.managed_paths))
+            self._assert_paths_exact_or_absent(remaining)
             self.unsubscribe(
                 self._removal_operation(receipt, "subscription", owned_paths=remaining)
             )
+            self._assert_paths_absent(receipt.managed_paths)
             receipt = receipt.model_copy(
                 update={
                     "removal_phase": RepositoryRemovalPhase.SUBSCRIPTION_REMOVED,
                     "updated_at": self.now(),
                 }
             )
-            self._assert_owned_paths(())
             self._write(receipt)
         if receipt.removal_phase is RepositoryRemovalPhase.SUBSCRIPTION_REMOVED:
-            self._assert_owned_paths(())
+            self._assert_paths_absent(receipt.managed_paths)
             if receipt.trust_grant is not None:
                 assert self.remove_trust is not None
                 self.remove_trust(
@@ -301,11 +313,11 @@ class RepositoryBootstrapManager:
                     "updated_at": self.now(),
                 }
             )
-            self._assert_owned_paths(())
+            self._assert_paths_absent(receipt.managed_paths)
             self._write(receipt)
         if receipt.removal_phase is not RepositoryRemovalPhase.TRUST_REMOVED:
             raise ValueError("repository bootstrap removal journal has an invalid phase")
-        self._assert_owned_paths(())
+        self._assert_paths_absent(receipt.managed_paths)
         removed = receipt.model_copy(
             update={
                 "removal_pending": False,
@@ -342,8 +354,10 @@ class RepositoryBootstrapManager:
         )
 
         if self._update_before(journal, RepositoryUpdatePhase.TRUST_REPLACED):
-            if journal.old_grant != journal.candidate_grant:
+            trust_changed = journal.old_grant != journal.candidate_grant
+            if trust_changed:
                 journal = self._prepare_update(journal, RepositoryUpdatePhase.TRUST_PENDING)
+                self._assert_update_journal_files(journal)
                 assert self.replace_trust is not None
                 self.replace_trust(
                     self._update_operation(
@@ -356,14 +370,25 @@ class RepositoryBootstrapManager:
                     journal.old_grant,
                     journal.candidate_grant,
                 )
-            journal = self._prepare_update(journal, RepositoryUpdatePhase.TRUST_REPLACED)
+            journal = self._commit_update_effect(
+                journal,
+                phase=RepositoryUpdatePhase.TRUST_REPLACED,
+                effect=RepositoryUpdateEffect.TRUST,
+                affected_paths=(),
+                mutation_performed=trust_changed,
+            )
 
         if self._update_before(journal, RepositoryUpdatePhase.SUBSCRIPTION_REPLACED):
             journal = self._prepare_update(journal, RepositoryUpdatePhase.SUBSCRIPTION_PENDING)
+            self._assert_update_journal_files(journal)
             assert self.replace_subscription is not None
             produced = self.replace_subscription(old_operation, candidate_operation)
-            journal = self._update_with_paths(
-                journal, RepositoryUpdatePhase.SUBSCRIPTION_REPLACED, produced
+            journal = self._commit_update_effect(
+                journal,
+                phase=RepositoryUpdatePhase.SUBSCRIPTION_REPLACED,
+                effect=RepositoryUpdateEffect.SUBSCRIPTION,
+                affected_paths=produced,
+                mutation_performed=True,
             )
 
         journal = self._run_update_path_step(
@@ -406,7 +431,7 @@ class RepositoryBootstrapManager:
                 item for item in journal.old_managed_paths if item.path not in current
             )
             if obsolete:
-                self._assert_owned_paths(obsolete)
+                self._assert_update_journal_files(journal)
                 assert self.remove_obsolete_paths is not None
                 self.remove_obsolete_paths(
                     self._update_operation(
@@ -418,11 +443,17 @@ class RepositoryBootstrapManager:
                         owned_paths=obsolete,
                     )
                 )
-            journal = self._prepare_update(
-                journal, RepositoryUpdatePhase.OBSOLETE_PATHS_REMOVED
+                self._assert_paths_absent(obsolete)
+            journal = self._commit_update_effect(
+                journal,
+                phase=RepositoryUpdatePhase.OBSOLETE_PATHS_REMOVED,
+                effect=RepositoryUpdateEffect.OBSOLETE_PATHS,
+                affected_paths=obsolete,
+                mutation_performed=bool(obsolete),
             )
 
         journal = self._prepare_update(journal, RepositoryUpdatePhase.FINALIZING)
+        self._assert_update_journal_files(journal)
         replacement = RepositoryBootstrapReceipt(
             request=journal.candidate_request,
             verified=journal.candidate_verified,
@@ -449,6 +480,7 @@ class RepositoryBootstrapManager:
         if not self._update_before(journal, completed):
             return journal
         journal = self._prepare_update(journal, pending)
+        self._assert_update_journal_files(journal)
         assert callback is not None
         produced = callback(
             self._update_operation(
@@ -460,27 +492,50 @@ class RepositoryBootstrapManager:
                 owned_paths=journal.candidate_managed_paths,
             )
         )
-        return self._update_with_paths(journal, completed, produced)
+        return self._commit_update_effect(
+            journal,
+            phase=completed,
+            effect=RepositoryUpdateEffect(step),
+            affected_paths=produced,
+            mutation_performed=True,
+        )
 
-    def _update_with_paths(
+    def _commit_update_effect(
         self,
         journal: RepositoryUpdateJournal,
+        *,
         phase: RepositoryUpdatePhase,
-        produced: tuple[ManagedPath, ...],
+        effect: RepositoryUpdateEffect,
+        affected_paths: tuple[ManagedPath, ...],
+        mutation_performed: bool,
     ) -> RepositoryUpdateJournal:
         paths = {item.path: item for item in journal.candidate_managed_paths}
-        for item in produced:
-            previous = paths.get(item.path)
-            if previous is not None and previous != item:
-                raise ValueError(f"update adapters disagree about managed path: {item.path}")
-            paths[item.path] = item
+        if effect is not RepositoryUpdateEffect.OBSOLETE_PATHS:
+            for item in affected_paths:
+                previous = paths.get(item.path)
+                if previous is not None and previous != item:
+                    raise ValueError(f"update adapters disagree about managed path: {item.path}")
+                paths[item.path] = item
+        effect_receipt = RepositoryUpdateEffectReceipt(
+            effect=effect,
+            idempotency_key=repository_update_operation_id(
+                old_receipt_sha256=journal.old_receipt_sha256,
+                candidate_request=journal.candidate_request,
+                candidate_verified=journal.candidate_verified,
+                effect=effect,
+            ),
+            mutation_performed=mutation_performed,
+            affected_paths=affected_paths,
+        )
         updated = journal.model_copy(
             update={
                 "candidate_managed_paths": tuple(paths[path] for path in sorted(paths)),
+                "effect_receipts": (*journal.effect_receipts, effect_receipt),
                 "phase": phase,
                 "updated_at": self.now(),
             }
         )
+        self._assert_update_journal_files(updated)
         self._write_update(updated)
         return updated
 
@@ -501,6 +556,32 @@ class RepositoryBootstrapManager:
         self, journal: RepositoryUpdateJournal, phase: RepositoryUpdatePhase
     ) -> bool:
         return _UPDATE_PHASE_INDEX[journal.phase] < _UPDATE_PHASE_INDEX[phase]
+
+    def _assert_update_journal_files(self, journal: RepositoryUpdateJournal) -> None:
+        self._assert_owned_paths(journal.candidate_managed_paths)
+        obsolete = tuple(
+            item
+            for item in journal.old_managed_paths
+            if item.path not in {candidate.path for candidate in journal.candidate_managed_paths}
+        )
+        if self._update_before(journal, RepositoryUpdatePhase.OBSOLETE_PATHS_PENDING):
+            self._assert_owned_paths(journal.old_managed_paths)
+        elif journal.phase is RepositoryUpdatePhase.OBSOLETE_PATHS_PENDING:
+            self._assert_paths_exact_or_absent(obsolete)
+        else:
+            self._assert_paths_absent(obsolete)
+
+    def _assert_paths_exact_or_absent(self, managed: tuple[ManagedPath, ...]) -> None:
+        for item in managed:
+            candidate = _confined_owned_path(self.root, item.path)
+            if candidate.exists() or candidate.is_symlink():
+                self._assert_owned_paths((item,))
+
+    def _assert_paths_absent(self, managed: tuple[ManagedPath, ...]) -> None:
+        for item in managed:
+            candidate = _confined_owned_path(self.root, item.path)
+            if candidate.exists() or candidate.is_symlink():
+                raise ValueError(f"managed path still exists after removal: {item.path}")
 
     def _validate_loaded_update(
         self,
@@ -567,14 +648,11 @@ class RepositoryBootstrapManager:
     ) -> BootstrapOperation:
         if verified is None:
             raise ValueError("repository update is missing verified old ownership")
-        key = content_id(
-            "repository-bootstrap-update-operation",
-            {
-                "old_receipt_sha256": journal.old_receipt_sha256,
-                "candidate_request": journal.candidate_request.model_dump(mode="json"),
-                "candidate_verified": journal.candidate_verified.id,
-                "step": step,
-            },
+        key = repository_update_operation_id(
+            old_receipt_sha256=journal.old_receipt_sha256,
+            candidate_request=journal.candidate_request,
+            candidate_verified=journal.candidate_verified,
+            effect=RepositoryUpdateEffect(step),
         )
         return BootstrapOperation(
             request=request,
@@ -746,6 +824,7 @@ class RepositoryBootstrapManager:
         return self.root / "repository-bootstrap" / f"{name}.update.json"
 
     def _write_update(self, journal: RepositoryUpdateJournal) -> None:
+        journal = RepositoryUpdateJournal.model_validate(journal.model_dump(mode="python"))
         path = self._update_path(journal.candidate_request.name)
         _reject_symlink_ancestry(path.parent)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -879,7 +958,6 @@ def _grant_narrows(old: CapabilityGrant | None, new: CapabilityGrant | None) -> 
     for before, after in (
         (old.subject.refs, new.subject.refs),
         (old.subject.paths, new.subject.paths),
-        (old.subject.bundle_sha256, new.subject.bundle_sha256),
         (old.resources.delegated_repositories, new.resources.delegated_repositories),
         (old.resources.hosts, new.resources.hosts),
         (old.resources.path_prefixes, new.resources.path_prefixes),
@@ -915,6 +993,10 @@ def _confined_owned_path(root: Path, relative: str) -> Path:
 
 def _non_skill_paths(managed: tuple[ManagedPath, ...]) -> tuple[ManagedPath, ...]:
     return tuple(item for item in managed if item.role not in {"skill", "link"})
+
+
+def _skill_paths(managed: tuple[ManagedPath, ...]) -> tuple[ManagedPath, ...]:
+    return tuple(item for item in managed if item.role in {"skill", "link"})
 
 
 def _fsync_directory(path: Path) -> None:
