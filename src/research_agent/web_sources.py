@@ -25,7 +25,7 @@ from research_agent.source_intent import (
     SourceIntent,
     authorize_candidate,
 )
-from research_agent.source_work import SourceCheckpoint, SourceWorkPhase
+from research_agent.source_work import SourceCheckpoint, SourceOperationError, SourceWorkPhase
 
 
 class SourceEnumerationError(ValueError):
@@ -141,7 +141,7 @@ class _BaseAdapter:
             raise SourceAuthorizationError("candidate was not emitted by this adapter") from None
         authorize_candidate(candidate, intent)
         self._require_capability(intent, candidate.locator, Capability.SOURCE_FETCH)
-        result = self.transport.fetch(
+        result = self._transport_fetch(
             SourceFetchRequest(
                 locator=candidate.locator,
                 allowed_hosts=intent.allowed_hosts,
@@ -180,6 +180,20 @@ class _BaseAdapter:
             recorded_at=self.clock(),
         )
 
+    def _transport_fetch(
+        self,
+        request: SourceFetchRequest,
+        *,
+        prior: SourceValidator | None = None,
+    ) -> SourceFetchResult:
+        try:
+            return self.transport.fetch(request, prior=prior)
+        except Exception as error:
+            attempted = int(getattr(error, "request_count", 1))
+            raise SourceOperationError(
+                "source transport failed", request_count=attempted
+            ) from error
+
 
 class DirectUrlAdapter(_BaseAdapter):
     adapter_id = "source:direct-url"
@@ -207,7 +221,7 @@ class FeedAdapter(_BaseAdapter):
         self._check_kind(intent)
         discovered_at = self.clock()
         self._require_capability(intent, intent.discovery.locator, Capability.SOURCE_DISCOVER)
-        result = self.transport.fetch(self._request(intent))
+        result = self._transport_fetch(self._request(intent))
         self.last_discovery_request_count = 1 + len(result.redirect_chain)
         if result.status != 200 or result.constraint is not None:
             return ()
@@ -228,7 +242,7 @@ class SitemapAdapter(_BaseAdapter):
         self._check_kind(intent)
         discovered_at = self.clock()
         self._require_capability(intent, intent.discovery.locator, Capability.SOURCE_DISCOVER)
-        result = self.transport.fetch(self._request(intent))
+        result = self._transport_fetch(self._request(intent))
         self.last_discovery_request_count = 1 + len(result.redirect_chain)
         if result.status != 200 or result.constraint is not None:
             return ()
@@ -249,7 +263,7 @@ class HtmlDiscoveryAdapter(_BaseAdapter):
         self._check_kind(intent)
         discovered_at = self.clock()
         self._require_capability(intent, intent.discovery.locator, Capability.SOURCE_DISCOVER)
-        result = self.transport.fetch(self._request(intent))
+        result = self._transport_fetch(self._request(intent))
         self.last_discovery_request_count = 1 + len(result.redirect_chain)
         if result.status != 200 or result.constraint is not None:
             return ()
@@ -292,9 +306,17 @@ class MojeekSourceAdapter(_BaseAdapter):
         discovered_at = self.clock()
         self._require_capability(intent, intent.discovery.locator, Capability.SOURCE_DISCOVER)
         self._intents[intent.id] = intent
+        try:
+            links = self.search(intent)
+        except Exception as error:
+            raise SourceOperationError(
+                "source discovery failed",
+                request_count=int(getattr(error, "request_count", 1)),
+            ) from error
+        self.last_discovery_request_count = int(getattr(self.search, "last_request_count", 1))
         return self._materialize(
             intent,
-            self.search(intent),
+            links,
             discovered_at=discovered_at,
             edge_depth=1,
         )

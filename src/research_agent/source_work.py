@@ -7,7 +7,7 @@ import hashlib
 import json
 import os
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
@@ -25,12 +25,18 @@ from research_agent.capabilities import (
 )
 from research_agent.models import (
     ModelParameters,
+    PolicyAction,
+    PolicyStage,
     ProviderConfig,
     StrictModel,
+    ThreatObservation,
+    ThreatStatus,
+    ThreatTarget,
     canonical_json,
     content_id,
     utc_now,
 )
+from research_agent.policy import PolicyEngine
 from research_agent.store import ImmutableStore
 
 if TYPE_CHECKING:
@@ -57,6 +63,13 @@ class SourceWorkPhase(StrEnum):
     FINALIZED = "finalized"
 
 
+class SourceWorkOutcome(StrEnum):
+    SUCCESSFUL = "successful"
+    CONSTRAINED_REQUIRED = "constrained_required"
+    CONSTRAINED_OPTIONAL = "constrained_optional"
+    INCOMPLETE = "incomplete"
+
+
 _PREDECESSORS: dict[SourceWorkPhase, frozenset[SourceWorkPhase]] = {
     SourceWorkPhase.CANDIDATE: frozenset({SourceWorkPhase.FINALIZED}),
     SourceWorkPhase.AUTHORIZED: frozenset({SourceWorkPhase.CANDIDATE}),
@@ -72,7 +85,14 @@ _PREDECESSORS: dict[SourceWorkPhase, frozenset[SourceWorkPhase]] = {
     SourceWorkPhase.INDEXED: frozenset({SourceWorkPhase.STRUCTURED}),
     SourceWorkPhase.ANCHORS_SELECTED: frozenset({SourceWorkPhase.INDEXED}),
     SourceWorkPhase.EXTRACTION_PROPOSED: frozenset({SourceWorkPhase.ANCHORS_SELECTED}),
-    SourceWorkPhase.EXTRACTION_CONSTRAINED: frozenset({SourceWorkPhase.ANCHORS_SELECTED}),
+    SourceWorkPhase.EXTRACTION_CONSTRAINED: frozenset(
+        {
+            SourceWorkPhase.PARSED,
+            SourceWorkPhase.STRUCTURED,
+            SourceWorkPhase.INDEXED,
+            SourceWorkPhase.ANCHORS_SELECTED,
+        }
+    ),
     SourceWorkPhase.FINALIZED: frozenset(
         {
             SourceWorkPhase.NOT_MODIFIED,
@@ -161,6 +181,7 @@ class SourceCheckpoint(StrictModel):
     request_count: int = Field(default=1, ge=0)
     prior_source_version_id: str | None = None
     prior_source_record_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    semantic_outcome: SourceWorkOutcome | None = None
     recorded_at: datetime
 
     @field_validator("etag", "last_modified")
@@ -189,6 +210,8 @@ class SourceCheckpoint(StrictModel):
             raise ValueError("retry_after requires a typed source constraint")
         if (self.prior_source_version_id is None) != (self.prior_source_record_sha256 is None):
             raise ValueError("checkpoint source identity must be exact")
+        if self.semantic_outcome is not None and self.phase is not SourceWorkPhase.FINALIZED:
+            raise ValueError("semantic outcome requires a finalized checkpoint")
         return self
 
     @field_validator("recorded_at")
@@ -216,6 +239,7 @@ class SourceUpdateReceipt(StrictModel):
     checkpoint_ids: tuple[str, ...] = ()
     constraint_ids: tuple[str, ...] = ()
     proposal_ids: tuple[str, ...] = ()
+    semantic_outcomes: tuple[SourceWorkOutcome, ...] = ()
 
     @field_validator(
         "work_item_ids",
@@ -228,6 +252,13 @@ class SourceUpdateReceipt(StrictModel):
     @classmethod
     def normalize_work_ids(cls, value: tuple[str, ...]) -> tuple[str, ...]:
         return tuple(sorted(set(value)))
+
+    @field_validator("semantic_outcomes")
+    @classmethod
+    def normalize_outcomes(
+        cls, value: tuple[SourceWorkOutcome, ...]
+    ) -> tuple[SourceWorkOutcome, ...]:
+        return tuple(sorted(set(value), key=lambda item: item.value))
 
     @field_validator("finalized_at")
     @classmethod
@@ -294,16 +325,28 @@ class SourceRetentionPolicy(Protocol):
 
 
 class LicensedSourceRetentionPolicy:
-    """Conservative trusted default: only explicit license metadata is retainable."""
+    """Conservative trusted mapping; response strings never create rights."""
+
+    def __init__(self, allowed: dict[str, str] | None = None) -> None:
+        self.allowed = dict(
+            allowed
+            or {
+                "CC-BY-4.0": "trusted-license:cc-by-4.0",
+                "CC0-1.0": "trusted-license:cc0-1.0",
+                "MIT": "trusted-license:mit",
+                "Apache-2.0": "trusted-license:apache-2.0",
+            }
+        )
 
     def evaluate(self, request: SourceRetentionRequest) -> SourceRetentionDecision:
-        allowed = bool(request.license and request.license.strip())
+        storage_rights = self.allowed.get(request.license or "")
+        allowed = storage_rights is not None
         return SourceRetentionDecision(
             request_id=request.id,
             decision="allow" if allowed else "deny",
-            storage_rights=request.license if allowed else None,
-            reason="explicit license" if allowed else "missing retention rights",
-            policy_version="licensed-source-retention/1",
+            storage_rights=storage_rights,
+            reason="trusted retention mapping" if allowed else "missing retention rights",
+            policy_version="licensed-source-retention/2",
         )
 
 
@@ -343,20 +386,28 @@ class AnchorGroundedSourceExtractionAdapter:
         self,
         manager: AnchorGroundedExtractionManager,
         config: SourceExtractionConfig,
+        *,
+        provider_registry: Mapping[str, ProviderConfig],
     ) -> None:
-        if manager.model != config.provider.model:
+        trusted_provider = provider_registry.get(manager.provider)
+        if trusted_provider is None:
+            raise ValueError("extraction provider is absent from trusted registry")
+        if config.provider != trusted_provider:
+            raise ValueError("extraction config differs from trusted provider registry")
+        if manager.model != trusted_provider.model:
             raise ValueError("extraction manager model differs from trusted provider config")
         client_config = getattr(manager.client, "config", None)
-        if config.provider.external and client_config != config.provider:
-            raise ValueError("external extraction client differs from trusted provider config")
-        if config.provider.external and getattr(manager.client, "name", None) != manager.provider:
-            raise ValueError("external extraction provider differs from trusted client")
-        if config.provider.external and getattr(manager.client, "gate", None) is None:
+        if client_config != trusted_provider:
+            raise ValueError("extraction client differs from trusted provider configuration")
+        if getattr(manager.client, "name", None) != manager.provider:
+            raise ValueError("extraction manager differs from trusted provider name")
+        if client_config.external and getattr(manager.client, "gate", None) is None:
             raise ValueError("external extraction requires model-policy and budget gate")
         self.manager = manager
         self.config = config
+        self.provider = trusted_provider
         self.validator_version = manager.version
-        self.external = config.provider.external
+        self.external = client_config.external
 
     def propose(
         self,
@@ -451,6 +502,16 @@ class SourceSupersession(StrictModel):
 
 class SourceWorkInterruption(RuntimeError):
     """A caller-injected interruption used to verify durable resumption."""
+
+
+class SourceOperationError(RuntimeError):
+    """A failed adapter operation with the number of actual requests attempted."""
+
+    def __init__(self, message: str, *, request_count: int) -> None:
+        super().__init__(message)
+        if request_count < 0:
+            raise ValueError("failed operation request count cannot be negative")
+        self.request_count = request_count
 
 
 def _digest_from_id(value: str, *, label: str) -> str:
@@ -675,6 +736,7 @@ class SourceWorkCoordinator:
         library_database: Path | None = None,
         extraction: SourceExtractionAdapter | None = None,
         retention_policy: SourceRetentionPolicy | None = None,
+        source_policy: PolicyEngine | None = None,
         clock: Callable[[], datetime] = utc_now,
         monotonic: Callable[[], float] | None = None,
         limits: SourceWorkLimits | None = None,
@@ -696,6 +758,7 @@ class SourceWorkCoordinator:
         self.library_database = library_database
         self.extraction = extraction
         self.retention_policy = retention_policy or LicensedSourceRetentionPolicy()
+        self.source_policy = source_policy or PolicyEngine()
         self.clock = clock
         self.monotonic = monotonic or time.monotonic
         self.limits = limits or SourceWorkLimits()
@@ -743,6 +806,14 @@ class SourceWorkCoordinator:
             proposal_ids.extend(result[4])
             complete = complete and (result[5] or not intent.required)
         phases = tuple(item.phase for item in all_items)
+        semantic_outcomes = tuple(
+            SourceWorkOutcome(str(outcome))
+            for item in all_items
+            if item.phase is SourceWorkPhase.FINALIZED
+            and (outcome := self._result(item).get("semantic_outcome")) is not None
+        )
+        if not complete:
+            semantic_outcomes = (*semantic_outcomes, SourceWorkOutcome.INCOMPLETE)
         receipt = SourceUpdateReceipt(
             source_intent_id=(
                 processed_ids[0] if len(processed_ids) == 1 else "source-update-batch"
@@ -754,6 +825,7 @@ class SourceWorkCoordinator:
             checkpoint_ids=tuple(checkpoint_ids),
             constraint_ids=tuple(constraint_ids),
             proposal_ids=tuple(proposal_ids),
+            semantic_outcomes=semantic_outcomes,
             complete=complete,
             finalized_at=instant,
             recovery_command=None if complete else "Run the same ontology-update command again",
@@ -798,7 +870,14 @@ class SourceWorkCoordinator:
             if discovery.decision != "allow":
                 raise PermissionError("source discovery capability denied")
 
-        discovered = self.adapter.discover(effective_intent)
+        try:
+            discovered = self.adapter.discover(effective_intent)
+        except Exception as error:
+            attempted = int(getattr(error, "request_count", 0))
+            if attempted < 0 or attempted > discovery_bound:
+                raise ValueError("invalid failed discovery request receipt") from error
+            self._request_count += attempted
+            raise
         discovery_count = int(getattr(self.adapter, "last_discovery_request_count", 0))
         if discovery_count > discovery_bound:
             raise ValueError("source adapter exceeded its discovery request bound")
@@ -882,7 +961,15 @@ class SourceWorkCoordinator:
         current = self.work_store.current(base.lineage_id)
         if current is not None and current.phase is SourceWorkPhase.FINALIZED:
             if current.created_at >= now:
-                return self.work_store.chain(current), None, (), (), (), True
+                outcome = self._result(current).get("semantic_outcome")
+                return (
+                    self.work_store.chain(current),
+                    None,
+                    (),
+                    (),
+                    (),
+                    outcome == SourceWorkOutcome.SUCCESSFUL,
+                )
             base = base.model_copy(
                 update={
                     "predecessor_id": current.id,
@@ -900,7 +987,11 @@ class SourceWorkCoordinator:
         source_id = self._result(current).get("source_version_id")
         if current.phase is SourceWorkPhase.CANDIDATE:
             current = self._advance(current, SourceWorkPhase.AUTHORIZED, now)
-        if fetch_decision.decision != "allow":
+        if fetch_decision.decision != "allow" and current.phase in {
+            SourceWorkPhase.CANDIDATE,
+            SourceWorkPhase.AUTHORIZED,
+            SourceWorkPhase.FETCHED,
+        }:
             constraint_ids.append(self._constraint(intent, candidate, "source.fetch denied", now))
             current = self._advance(current, SourceWorkPhase.ACCESS_CONSTRAINED, now)
         if current.phase is SourceWorkPhase.AUTHORIZED:
@@ -918,7 +1009,14 @@ class SourceWorkCoordinator:
             fetch_bound = int(getattr(self.adapter, "max_fetch_requests", 1))
             if self._request_count + fetch_bound > self.limits.max_requests_per_run:
                 return self.work_store.chain(current), None, (), (), (), False
-            fetched = self.adapter.fetch(candidate, prior=prior)
+            try:
+                fetched = self.adapter.fetch(candidate, prior=prior)
+            except Exception as error:
+                attempted = int(getattr(error, "request_count", 0))
+                if attempted < 0 or attempted > fetch_bound:
+                    raise ValueError("invalid failed fetch request receipt") from error
+                self._request_count += attempted
+                raise
             if fetched.request_count > fetch_bound:
                 raise ValueError("source adapter exceeded its fetch request bound")
             self._request_count += fetched.request_count
@@ -937,7 +1035,22 @@ class SourceWorkCoordinator:
                     prior.prior_source_record_sha256,
                 )
             ):
-                raise ValueError("304 response has no exact prior archived source version")
+                constraint_ids.append(
+                    self._constraint(
+                        intent,
+                        candidate,
+                        "304 prior source is unavailable",
+                        now,
+                        constraint_type="invalid_prior_source",
+                    )
+                )
+                fetched = SourceCheckpoint(
+                    work_item_id=candidate.id,
+                    phase=SourceWorkPhase.ACCESS_CONSTRAINED,
+                    constraint="invalid_prior_source",
+                    request_count=fetched.request_count,
+                    recorded_at=fetched.recorded_at,
+                )
             fetched_values: dict[str, object] = {}
             fetched_record_sha256: str | None = None
             if fetched.phase is SourceWorkPhase.FETCHED:
@@ -1068,7 +1181,15 @@ class SourceWorkCoordinator:
         if current.phase in {SourceWorkPhase.NOT_MODIFIED, SourceWorkPhase.ACCESS_CONSTRAINED}:
             constrained = current.phase is SourceWorkPhase.ACCESS_CONSTRAINED
             terminal_source_id = self._result(current).get("source_version_id")
-            current = self._advance(current, SourceWorkPhase.FINALIZED, now)
+            outcome = (
+                SourceWorkOutcome.CONSTRAINED_REQUIRED
+                if constrained and intent.required
+                else SourceWorkOutcome.CONSTRAINED_OPTIONAL
+                if constrained
+                else SourceWorkOutcome.SUCCESSFUL
+            )
+            current, final_checkpoint = self._finalize(current, outcome, now)
+            checkpoint_ids.append(final_checkpoint)
             return (
                 self.work_store.chain(current),
                 str(terminal_source_id) if terminal_source_id is not None else None,
@@ -1078,6 +1199,27 @@ class SourceWorkCoordinator:
                 not constrained,
             )
         if current.phase is SourceWorkPhase.FETCHED:
+            archive = self._decision(intent, candidate, (Capability.SOURCE_ARCHIVE,), now)
+            if archive.decision != "allow":
+                constraint_ids.append(
+                    self._constraint(intent, candidate, "source.archive revoked", now)
+                )
+                current = self._advance(current, SourceWorkPhase.ACCESS_CONSTRAINED, now)
+                outcome = (
+                    SourceWorkOutcome.CONSTRAINED_REQUIRED
+                    if intent.required
+                    else SourceWorkOutcome.CONSTRAINED_OPTIONAL
+                )
+                current, final_checkpoint = self._finalize(current, outcome, now)
+                checkpoint_ids.append(final_checkpoint)
+                return (
+                    self.work_store.chain(current),
+                    None,
+                    tuple(checkpoint_ids),
+                    tuple(constraint_ids),
+                    (),
+                    False,
+                )
             payload = self._payload(candidate, current)
             expected = self._checkpoint_result(current)
             actual = hashlib.sha256(payload.content).hexdigest()
@@ -1121,8 +1263,7 @@ class SourceWorkCoordinator:
         result = self._result(current)
         source_id = str(result.get("source_version_id") or source_id or "") or None
         if current.phase is SourceWorkPhase.ARCHIVED:
-            extract = self._decision(intent, candidate, (Capability.SOURCE_EXTRACT,), now)
-            if extract.decision != "allow":
+            if not self._extract_allowed(intent, candidate, now):
                 constraint_ids.append(
                     self._constraint(intent, candidate, "source.extract denied", now)
                 )
@@ -1143,7 +1284,13 @@ class SourceWorkCoordinator:
                     result_values=self._parsed_result_values(parsed),
                 )
         if current.phase is SourceWorkPhase.PARSER_CONSTRAINED:
-            current = self._advance(current, SourceWorkPhase.FINALIZED, now)
+            outcome = (
+                SourceWorkOutcome.CONSTRAINED_REQUIRED
+                if intent.required
+                else SourceWorkOutcome.CONSTRAINED_OPTIONAL
+            )
+            current, final_checkpoint = self._finalize(current, outcome, now)
+            checkpoint_ids.append(final_checkpoint)
             return (
                 self.work_store.chain(current),
                 source_id,
@@ -1153,29 +1300,82 @@ class SourceWorkCoordinator:
                 False,
             )
         if current.phase is SourceWorkPhase.PARSED:
-            current = self._advance(
-                current,
-                SourceWorkPhase.STRUCTURED,
-                now,
-                result_values=self._result_values(current),
-            )
+            if not self._extract_allowed(intent, candidate, now):
+                constraint_ids.append(
+                    self._constraint(intent, candidate, "source.extract revoked", now)
+                )
+                current = self._advance(current, SourceWorkPhase.EXTRACTION_CONSTRAINED, now)
+                candidate_complete = False
+            else:
+                current = self._advance(
+                    current,
+                    SourceWorkPhase.STRUCTURED,
+                    now,
+                    result_values=self._result_values(current),
+                )
         if current.phase is SourceWorkPhase.STRUCTURED:
-            self._rebuild_library(now)
-            current = self._advance(
-                current,
-                SourceWorkPhase.INDEXED,
-                now,
-                result_values=self._result_values(current),
-            )
+            if not self._extract_allowed(intent, candidate, now):
+                constraint_ids.append(
+                    self._constraint(intent, candidate, "source.extract revoked", now)
+                )
+                current = self._advance(current, SourceWorkPhase.EXTRACTION_CONSTRAINED, now)
+                candidate_complete = False
+            else:
+                self._rebuild_library(now)
+                current = self._advance(
+                    current,
+                    SourceWorkPhase.INDEXED,
+                    now,
+                    result_values=self._result_values(current),
+                )
         if current.phase is SourceWorkPhase.INDEXED:
-            current = self._advance(
-                current,
-                SourceWorkPhase.ANCHORS_SELECTED,
-                now,
-                result_values=self._result_values(current),
-            )
+            if not self._extract_allowed(intent, candidate, now):
+                constraint_ids.append(
+                    self._constraint(intent, candidate, "source.extract revoked", now)
+                )
+                current = self._advance(current, SourceWorkPhase.EXTRACTION_CONSTRAINED, now)
+                candidate_complete = False
+            elif self._threat_blocks_extraction(current, source_id):
+                constraint_ids.append(
+                    self._constraint(
+                        intent,
+                        candidate,
+                        "source policy blocks threatened evidence",
+                        now,
+                        constraint_type="threat_blocked",
+                    )
+                )
+                current = self._advance(current, SourceWorkPhase.EXTRACTION_CONSTRAINED, now)
+                candidate_complete = False
+            else:
+                anchor_values = self._result_values(current)
+                anchor_values["anchor_ids"] = self._select_anchor_ids(current)
+                current = self._advance(
+                    current,
+                    SourceWorkPhase.ANCHORS_SELECTED,
+                    now,
+                    result_values=anchor_values,
+                )
         if current.phase is SourceWorkPhase.ANCHORS_SELECTED:
-            if self.extraction is None:
+            if not self._extract_allowed(intent, candidate, now):
+                constraint_ids.append(
+                    self._constraint(intent, candidate, "source.extract revoked", now)
+                )
+                current = self._advance(current, SourceWorkPhase.EXTRACTION_CONSTRAINED, now)
+                candidate_complete = False
+            elif self._threat_blocks_extraction(current, source_id):
+                constraint_ids.append(
+                    self._constraint(
+                        intent,
+                        candidate,
+                        "source policy blocks threatened evidence",
+                        now,
+                        constraint_type="threat_blocked",
+                    )
+                )
+                current = self._advance(current, SourceWorkPhase.EXTRACTION_CONSTRAINED, now)
+                candidate_complete = False
+            elif self.extraction is None:
                 current = self._advance(current, SourceWorkPhase.EXTRACTION_CONSTRAINED, now)
             else:
                 if self.extraction.external:
@@ -1216,7 +1416,15 @@ class SourceWorkCoordinator:
             SourceWorkPhase.EXTRACTION_PROPOSED,
             SourceWorkPhase.EXTRACTION_CONSTRAINED,
         }:
-            current = self._advance(current, SourceWorkPhase.FINALIZED, now)
+            outcome = (
+                SourceWorkOutcome.SUCCESSFUL
+                if current.phase is SourceWorkPhase.EXTRACTION_PROPOSED or candidate_complete
+                else SourceWorkOutcome.CONSTRAINED_REQUIRED
+                if intent.required
+                else SourceWorkOutcome.CONSTRAINED_OPTIONAL
+            )
+            current, final_checkpoint = self._finalize(current, outcome, now)
+            checkpoint_ids.append(final_checkpoint)
         return (
             self.work_store.chain(current),
             source_id,
@@ -1254,6 +1462,53 @@ class SourceWorkCoordinator:
         if decision.request.id != request.id:
             raise ValueError("capability evaluator returned a decision for another request")
         return decision
+
+    def _extract_allowed(
+        self,
+        intent: SourceIntent,
+        candidate: SourceCandidate,
+        now: datetime,
+    ) -> bool:
+        decision = self._decision(intent, candidate, (Capability.SOURCE_EXTRACT,), now)
+        return decision.decision == "allow"
+
+    def _threat_blocks_extraction(
+        self,
+        item: SourceWorkItem,
+        source_id: str | None,
+    ) -> bool:
+        result = self._result(item)
+        ids = tuple(str(value) for value in result.get("threat_observation_ids", ()))
+        if not ids:
+            return False
+        requested = set(ids)
+        observations = tuple(
+            ThreatObservation.model_validate(value)
+            for value in self.store.iter_records("threat-observation")
+            if value.get("id") in requested
+        )
+        if {observation.id for observation in observations} != requested:
+            raise ValueError("source work references missing threat observations")
+        target_id = str(result.get("derived_source_version_id") or source_id or "")
+        if not target_id:
+            raise ValueError("threat policy requires an immutable source identity")
+        decision = self.source_policy.evaluate(
+            target=ThreatTarget(source_version=target_id),
+            workflow_id=item.lineage_id,
+            stage=PolicyStage.EXTRACTION,
+            observations=observations,
+        )
+        self.store.put_record("policy-decision", decision)
+        blocked_status = any(
+            observation.status in {ThreatStatus.SUSPECTED, ThreatStatus.CONFIRMED}
+            for observation in observations
+        )
+        blocked_action = decision.action in {
+            PolicyAction.DENY,
+            PolicyAction.QUARANTINE,
+            PolicyAction.ALLOW_METADATA_ONLY,
+        }
+        return blocked_status or blocked_action
 
     @staticmethod
     def _authorization_fingerprint(decision: CapabilityDecision) -> str:
@@ -1310,6 +1565,27 @@ class SourceWorkCoordinator:
     def _after(self, phase: SourceWorkPhase) -> None:
         if self.after_phase is not None:
             self.after_phase(phase)
+
+    def _finalize(
+        self,
+        predecessor: SourceWorkItem,
+        outcome: SourceWorkOutcome,
+        now: datetime,
+    ) -> tuple[SourceWorkItem, str]:
+        finalized = self._advance(
+            predecessor,
+            SourceWorkPhase.FINALIZED,
+            now,
+            result_values={"semantic_outcome": outcome.value},
+        )
+        checkpoint = SourceCheckpoint(
+            work_item_id=finalized.id,
+            phase=SourceWorkPhase.FINALIZED,
+            request_count=0,
+            semantic_outcome=outcome,
+            recorded_at=now,
+        )
+        return finalized, self.work_store.checkpoint(checkpoint).id
 
     def _adapter_payload(
         self,
@@ -1410,28 +1686,26 @@ class SourceWorkCoordinator:
         self,
         parsed: ParsedIngestReceipt,
     ) -> dict[str, object]:
-        eligible = {
-            "heading",
-            "paragraph",
-            "list_item",
-            "footnote",
-            "caption",
-        }
-        exact_anchor_ids = tuple(
-            sorted(
-                value["id"]
-                for value in self.store.iter_records("structural-anchor")
-                if value.get("structural_derivation_id") == parsed.structural_derivation_id
-                and value.get("kind") in eligible
-            )
-        )
         return {
             "source_version_id": parsed.original_source_version_id,
             "derived_source_version_id": parsed.derived_source_version_id,
             "structural_derivation_id": parsed.structural_derivation_id,
-            "anchor_ids": exact_anchor_ids,
             "threat_observation_ids": parsed.threat_observation_ids,
         }
+
+    def _select_anchor_ids(self, item: SourceWorkItem) -> tuple[str, ...]:
+        derivation_id = self._result(item).get("structural_derivation_id")
+        if not isinstance(derivation_id, str):
+            raise ValueError("anchor selection requires an exact structural derivation")
+        eligible = {"heading", "paragraph", "list_item", "footnote", "caption"}
+        return tuple(
+            sorted(
+                value["id"]
+                for value in self.store.iter_records("structural-anchor")
+                if value.get("structural_derivation_id") == derivation_id
+                and value.get("kind") in eligible
+            )
+        )
 
     def _checkpoint_result(self, item: SourceWorkItem) -> str | None:
         value = self._result(item).get("checkpoint_result_sha256")
@@ -1534,10 +1808,27 @@ class SourceWorkCoordinator:
         return max(values, key=lambda item: (item.observed_at, item.id), default=None)
 
     def _source_record_exists(self, source_id: str, record_sha256: str) -> bool:
-        return any(
-            value.get("id") == source_id
-            and hashlib.sha256(canonical_json(value)).hexdigest() == record_sha256
+        records = tuple(
+            value
             for value in self.store.iter_records("source-version")
+            if value.get("id") == source_id
+            and hashlib.sha256(canonical_json(value)).hexdigest() == record_sha256
+        )
+        if len(records) != 1:
+            return False
+        digest = records[0].get("content_sha256")
+        if not isinstance(digest, str):
+            return False
+        try:
+            content = self.store.read_blob(digest)
+        except (FileNotFoundError, ValueError, RuntimeError):
+            return False
+        if hashlib.sha256(content).hexdigest() != digest:
+            return False
+        return any(
+            value.get("original_source_version_id") == source_id
+            and value.get("original_source_record_sha256") == record_sha256
+            for value in self.store.iter_records("parsed-ingest-receipt")
         )
 
     def _rebuild_library(self, now: datetime) -> None:
