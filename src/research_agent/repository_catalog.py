@@ -325,7 +325,16 @@ def ontology_bundle_sha256(entry: CatalogOntology) -> str:
 def load_catalog(path: Path) -> RepositoryCatalog:
     """Load one strict catalog without resolving or trusting any ontology input."""
     catalog_path = _catalog_path(path)
-    value = _load_bounded_yaml(catalog_path, label=f"catalog: {catalog_path}")
+    return _parse_catalog_value(
+        _load_bounded_yaml(catalog_path, label=f"catalog: {catalog_path}")
+    )
+
+
+def _parse_catalog_bytes(encoded: bytes, *, label: str) -> RepositoryCatalog:
+    return _parse_catalog_value(_load_bounded_yaml_bytes(encoded, label=label))
+
+
+def _parse_catalog_value(value: object) -> RepositoryCatalog:
     try:
         return RepositoryCatalog.model_validate(value)
     except ValidationError as error:
@@ -353,10 +362,17 @@ def load_delegation_manifest(
         raise ValueError("delegation manifest size mismatch")
     if hashlib.sha256(encoded).hexdigest() != declaration.sha256:
         raise ValueError("delegation manifest sha256 mismatch")
-    value = _load_bounded_yaml_bytes(
+    return _parse_delegation_manifest_bytes(
         encoded,
         label=f"delegation manifest: {manifest_path}",
     )
+
+
+def _parse_delegation_manifest_bytes(encoded: bytes, *, label: str) -> DelegationManifest:
+    return _parse_delegation_manifest_value(_load_bounded_yaml_bytes(encoded, label=label))
+
+
+def _parse_delegation_manifest_value(value: object) -> DelegationManifest:
     try:
         return DelegationManifest.model_validate(value)
     except ValidationError as error:
@@ -456,27 +472,61 @@ def discover_catalogs(start: Path) -> tuple[Path, ...]:
     )
 
 
-def resolve_repository_catalog(start: Path) -> ResolvedRepositoryCatalog:
-    """Merge complete catalog entries from Git root to the requested directory."""
+def resolve_repository_catalog(
+    start: Path,
+    *,
+    verified_commit: str | None = None,
+) -> ResolvedRepositoryCatalog:
+    """Merge catalogs whose worktree and index bytes match one named commit."""
     worktree = _git_worktree(start)
     if worktree is None:
         return ResolvedRepositoryCatalog()
     discovery_start = _start_directory(start)
-    catalog_paths = discover_catalogs(discovery_start)
+    requested_commit = verified_commit or "HEAD"
+    commit = _git(worktree, "rev-parse", "--verify", f"{requested_commit}^{{commit}}")
+    if not _GIT_OBJECT_ID.fullmatch(commit):
+        raise ValueError("verified catalog commit is not a full Git object ID")
+    bound_catalogs: list[tuple[Path, bytes]] = []
+    for path in _catalog_candidates(discovery_start, worktree=worktree):
+        encoded = _git_bound_authority_bytes(
+            worktree,
+            commit=commit,
+            path=path,
+            label="repository catalog",
+        )
+        if encoded is not None:
+            bound_catalogs.append((path.resolve(strict=True), encoded))
+    catalog_paths = tuple(path for path, _ in bound_catalogs)
     entries: dict[str, tuple[Path, CatalogOntology]] = {}
     delegation_path: Path | None = None
     delegation_declaration: CatalogFile | None = None
     delegation_manifest: DelegationManifest | None = None
-    for catalog_path in catalog_paths:
-        loaded = load_catalog(catalog_path)
+    for catalog_path, catalog_bytes in bound_catalogs:
+        loaded = _parse_catalog_bytes(
+            catalog_bytes,
+            label=f"catalog at verified commit: {catalog_path}",
+        )
         for entry in loaded.ontologies:
             entries[entry.name] = (catalog_path, entry)
         if loaded.delegations is not None:
-            delegation_manifest = load_delegation_manifest(
-                catalog_path,
-                loaded.delegations,
+            manifest_path = catalog_path.parent / loaded.delegations.path
+            manifest_bytes = _git_bound_authority_bytes(
+                worktree,
+                commit=commit,
+                path=manifest_path,
+                label="delegation manifest",
             )
-            delegation_path = catalog_path.parent / loaded.delegations.path
+            if manifest_bytes is None:
+                raise ValueError("delegation manifest is missing from the verified commit")
+            if len(manifest_bytes) != loaded.delegations.size_bytes:
+                raise ValueError("delegation manifest size mismatch")
+            if hashlib.sha256(manifest_bytes).hexdigest() != loaded.delegations.sha256:
+                raise ValueError("delegation manifest sha256 mismatch")
+            delegation_manifest = _parse_delegation_manifest_bytes(
+                manifest_bytes,
+                label=f"delegation manifest at verified commit: {manifest_path}",
+            )
+            delegation_path = manifest_path
             delegation_declaration = loaded.delegations
     verified = tuple(
         _verified_with_dirtiness(_verify_entry(catalog_path, entry, workspace=worktree), worktree)
@@ -489,10 +539,11 @@ def resolve_repository_catalog(start: Path) -> ResolvedRepositoryCatalog:
     else:
         identity = str(worktree)
         identity_kind = "machine_local"
-    commit = _git(worktree, "rev-parse", "--verify", "HEAD")
-    if not _GIT_OBJECT_ID.fullmatch(commit):
-        raise ValueError("Git HEAD is not a full object ID")
-    active_ref = _git(worktree, "symbolic-ref", "-q", "HEAD", required=False) or commit
+    active_ref = (
+        commit
+        if verified_commit is not None
+        else _git(worktree, "symbolic-ref", "-q", "HEAD", required=False) or commit
+    )
     return ResolvedRepositoryCatalog(
         repository_root=worktree,
         discovery_start=discovery_start,
@@ -513,6 +564,102 @@ def resolve_repository_catalog(start: Path) -> ResolvedRepositoryCatalog:
         ),
         delegation_manifest=delegation_manifest,
     )
+
+
+def _catalog_candidates(start: Path, *, worktree: Path) -> tuple[Path, ...]:
+    try:
+        relative = start.relative_to(worktree)
+    except ValueError as error:
+        raise ValueError("catalog start escapes Git worktree") from error
+    directories = (
+        worktree,
+        *(
+            worktree.joinpath(*relative.parts[:index])
+            for index in range(1, len(relative.parts) + 1)
+        ),
+    )
+    return tuple(directory / _CATALOG_NAME for directory in directories)
+
+
+def _git_bound_authority_bytes(
+    worktree: Path,
+    *,
+    commit: str,
+    path: Path,
+    label: str,
+) -> bytes | None:
+    """Return exact commit bytes after matching the index and regular worktree file."""
+    try:
+        relative = path.relative_to(worktree).as_posix()
+    except ValueError as error:
+        raise ValueError(f"{label} escapes Git worktree") from error
+    committed = _git_file_state(worktree, commit=commit, relative=relative)
+    indexed = _git_file_state(worktree, commit=None, relative=relative)
+    exists = path.exists() or path.is_symlink()
+    if committed is None and indexed is None and not exists:
+        return None
+    if committed is None:
+        raise ValueError(f"{label} is untracked at the verified commit")
+    if indexed is None:
+        raise ValueError(f"{label} is missing from the Git index")
+    _reject_symlink_ancestry(path)
+    if not path.is_file():
+        raise ValueError(f"{label} tracked at the verified commit is missing")
+    committed_mode, committed_bytes = committed
+    indexed_mode, indexed_bytes = indexed
+    worktree_bytes = path.read_bytes()
+    worktree_mode = "100755" if path.stat().st_mode & 0o111 else "100644"
+    if committed_mode != indexed_mode or committed_mode != worktree_mode:
+        raise ValueError(f"{label} mode differs from the verified commit or index")
+    if indexed_bytes != committed_bytes:
+        raise ValueError(f"{label} index bytes differ from the verified commit")
+    if worktree_bytes != committed_bytes:
+        raise ValueError(f"{label} worktree bytes differ from the verified commit")
+    return committed_bytes
+
+
+def _git_file_state(
+    worktree: Path,
+    *,
+    commit: str | None,
+    relative: str,
+) -> tuple[str, bytes] | None:
+    if commit is None:
+        listing = subprocess.run(
+            ("git", "-C", str(worktree), "ls-files", "--stage", "-z", "--", relative),
+            check=False,
+            capture_output=True,
+        )
+        spec = f":{relative}"
+    else:
+        listing = subprocess.run(
+            ("git", "-C", str(worktree), "ls-tree", "-z", commit, "--", relative),
+            check=False,
+            capture_output=True,
+        )
+        spec = f"{commit}:{relative}"
+    if listing.returncode:
+        raise ValueError("Git failed while verifying an authority file")
+    entries = tuple(item for item in listing.stdout.split(b"\0") if item)
+    if not entries:
+        return None
+    if len(entries) != 1:
+        raise ValueError("Git returned an ambiguous authority file identity")
+    metadata, separator, listed_path = entries[0].partition(b"\t")
+    fields = metadata.split()
+    if not separator or listed_path.decode("utf-8", errors="strict") != relative:
+        raise ValueError("Git returned a mismatched authority file path")
+    mode = fields[0].decode("ascii")
+    if mode not in {"100644", "100755"}:
+        raise ValueError("authority file must be a tracked regular Git blob")
+    content = subprocess.run(
+        ("git", "-C", str(worktree), "cat-file", "blob", spec),
+        check=False,
+        capture_output=True,
+    )
+    if content.returncode:
+        raise ValueError("Git failed to read a verified authority file blob")
+    return mode, content.stdout
 
 
 def _catalog_path(path: Path) -> Path:

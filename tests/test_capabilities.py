@@ -169,7 +169,7 @@ def test_source_requests_require_every_normalized_resource_selector(
     assert not _evaluator(_grant()).evaluate(request).allowed
 
 
-def test_source_request_derives_host_from_canonical_credential_free_target() -> None:
+def test_source_request_requires_canonical_wire_target_and_cross_checks_host() -> None:
     normalized = CapabilityRequest(
         authority_repository=ROOT,
         target_repository=ROOT,
@@ -178,13 +178,25 @@ def test_source_request_derives_host_from_canonical_credential_free_target() -> 
         path="ontology/a",
         bundle_sha256=DIGEST,
         connector="crossref",
-        host="API.EXAMPLE.INVALID.",
-        target="https://API.EXAMPLE.INVALID:443/records/1",
+        host="api.example.invalid",
+        target="https://api.example.invalid/records/1",
         requested_at=NOW,
     )
 
-    assert normalized.host == "api.example.invalid"
     assert normalized.target == "https://api.example.invalid/records/1"
+
+    for target in (
+        "https://API.EXAMPLE.INVALID/records/1",
+        "https://api.example.invalid:443/records/1",
+        "https://api.example.invalid./records/1",
+    ):
+        with pytest.raises(ValidationError, match="canonical"):
+            CapabilityRequest(
+                **{
+                    **normalized.model_dump(mode="python"),
+                    "target": target,
+                }
+            )
 
     with pytest.raises(ValidationError, match="host.*target|target.*host"):
         CapabilityRequest(
@@ -203,6 +215,14 @@ def test_source_request_derives_host_from_canonical_credential_free_target() -> 
         "ssh://git@api.example.invalid/records/1",
         "https://api.example.invalid/%41",
         "https://api.example.invalid/records\\1",
+        "https://api.example.invalid/a/./b",
+        "https://api.example.invalid/a/../b",
+        "https://api.example.invalid/a/%ZZ",
+        "https://api.example.invalid/a b",
+        "https://api.example.invalid/ümlaut",
+        "https://api.example.invalid/a;b",
+        "https://api.example.invalid/a@b",
+        "https://api.example.invalid/a%2fb",
     ),
 )
 def test_source_request_rejects_unsafe_targets(target: str) -> None:
@@ -211,6 +231,30 @@ def test_source_request_rejects_unsafe_targets(target: str) -> None:
 
     with pytest.raises(ValidationError):
         CapabilityRequest.model_validate(raw)
+
+
+@pytest.mark.parametrize(
+    "target",
+    (
+        "https://api.example.invalid/a%20b",
+        "https://api.example.invalid/%C3%BCmlaut",
+        "https://api.example.invalid/a%3Bb",
+        "https://api.example.invalid/a~b-_.",
+    ),
+)
+def test_source_target_canonical_percent_encoding_is_idempotent_and_transport_exact(
+    target: str,
+) -> None:
+    raw = _request(Capability.SOURCE_FETCH).model_dump(mode="python")
+    raw["target"] = target
+    first = CapabilityRequest.model_validate(raw)
+    second = CapabilityRequest.model_validate(first.model_dump(mode="python"))
+    decision = _evaluator(_grant()).evaluate(first)
+
+    assert first.target == target
+    assert second.target == target
+    assert decision.allowed
+    assert decision.request.target == target
 
 
 def test_explicit_empty_source_resource_grants_no_authority() -> None:

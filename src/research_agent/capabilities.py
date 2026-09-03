@@ -10,7 +10,7 @@ from datetime import datetime
 from enum import StrEnum
 from pathlib import PurePosixPath
 from typing import Literal, Protocol
-from urllib.parse import unquote, urlsplit, urlunsplit
+from urllib.parse import quote_from_bytes, unquote, unquote_to_bytes, urlsplit, urlunsplit
 
 from pydantic import Field, field_validator, model_validator
 
@@ -110,7 +110,7 @@ def _repository_identity(value: object, *, label: str) -> str:
 
 
 def _source_target(value: object) -> tuple[str, str]:
-    """Return a canonical source URL and its independently derived host."""
+    """Validate a byte-stable source wire URL and derive its host."""
     raw = str(value)
     parsed = urlsplit(raw)
     try:
@@ -118,29 +118,30 @@ def _source_target(value: object) -> tuple[str, str]:
     except ValueError as error:
         raise ValueError("source target must be a safe credential-free HTTPS URL") from error
     if (
-        parsed.scheme.lower() != "https"
+        parsed.scheme != "https"
         or not parsed.hostname
         or parsed.username is not None
         or parsed.password is not None
-        or port not in (None, 443)
+        or port is not None
         or parsed.query
         or parsed.fragment
         or any(ord(character) < 32 or ord(character) == 127 for character in raw)
     ):
-        raise ValueError("source target must be a safe credential-free HTTPS URL")
+        raise ValueError("source target must be a canonical credential-free HTTPS URL")
     host = _host(parsed.hostname)
-    path = parsed.path or "/"
-    decoded = unquote(path)
+    path = parsed.path
+    canonical_path = quote_from_bytes(unquote_to_bytes(path), safe="/-._~")
+    canonical_target = urlunsplit(("https", host, path, "", ""))
     if (
         not path.startswith("/")
-        or decoded != path
         or "\\" in path
         or "//" in path
-        or any(part in {".", ".."} for part in PurePosixPath(decoded).parts)
-        or any(ord(character) < 32 or ord(character) == 127 for character in decoded)
+        or any(part in {".", ".."} for part in path.split("/"))
+        or canonical_path != path
+        or canonical_target != raw
     ):
-        raise ValueError("source target path is unsafe")
-    return urlunsplit(("https", host, path, "", "")), host
+        raise ValueError("source target must use a canonical wire URL path")
+    return raw, host
 
 
 def _resource_identifier(value: object, *, label: str) -> str:

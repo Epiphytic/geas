@@ -716,6 +716,8 @@ def test_snapshot_install_is_inventory_only_idempotent_and_versioned(
     assert not (manager.root / first.path / "ignored.txt").exists()
     alpha.ontology_path.joinpath("build.yaml").write_text("topic: alpha two\n")
     refresh_catalog(alpha.catalog_path, names=("alpha",))
+    _git(resolved_catalog.repository_root, "add", "geas.yaml")
+    _git(resolved_catalog.repository_root, "commit", "-m", "update catalog inventory")
     updated_catalog = resolve_repository_catalog(resolved_catalog.repository_root)
     second = install_snapshot(
         updated_catalog.by_name("alpha"), manager=manager, profile_name="default"
@@ -874,6 +876,8 @@ def test_choice_four_replaces_conflicting_allows_with_effective_source_denial(
     alpha_path.write_text("topic: dirty alpha\n")
     refresh_catalog(resolved_catalog.catalog_paths[0], names=("alpha",))
     assert resolved_catalog.repository_root is not None
+    _git(resolved_catalog.repository_root, "add", "geas.yaml")
+    _git(resolved_catalog.repository_root, "commit", "-m", "record dirty alpha inventory")
     catalog = resolve_repository_catalog(resolved_catalog.repository_root)
     alpha = catalog.by_name("alpha")
     if selector_kind == "ref":
@@ -912,6 +916,8 @@ def test_choice_three_excludes_previously_allowed_source_and_denies_dirty_contex
     alpha_path.write_text("topic: dirty alpha\n")
     refresh_catalog(resolved_catalog.catalog_paths[0], names=("alpha",))
     assert resolved_catalog.repository_root is not None
+    _git(resolved_catalog.repository_root, "add", "geas.yaml")
+    _git(resolved_catalog.repository_root, "commit", "-m", "record dirty alpha inventory")
     catalog = resolve_repository_catalog(resolved_catalog.repository_root)
     manager = _manager(tmp_path)
     allow = _rule(True, paths=("ontology/alpha",))
@@ -1136,7 +1142,7 @@ def test_authorization_rejects_new_catalog_below_previous_deepest_catalog(
     )
     manager = _manager(tmp_path)
 
-    with pytest.raises(ValueError, match="changed after integrity verification"):
+    with pytest.raises(ValueError, match="untracked at the verified commit"):
         authorize_repository_catalog(
             catalog,
             manager=manager,
@@ -1156,6 +1162,8 @@ def test_source_denial_overrides_future_path_and_old_digest_allows_on_denied_ref
     old_digest = old_alpha.bundle_sha256
     old_alpha.ontology_path.joinpath("build.yaml").write_text("topic: changed alpha\n")
     refresh_catalog(resolved_catalog.catalog_paths[0], names=("alpha",))
+    _git(repository, "add", "geas.yaml")
+    _git(repository, "commit", "-m", "record changed alpha inventory")
     current = resolve_repository_catalog(repository)
     future_allow = _rule(True, paths=("ontology/future",))
     old_digest_allow = _rule(True, digests=(old_digest,))
@@ -1208,6 +1216,8 @@ def test_source_denial_overrides_future_path_and_old_digest_allows_on_denied_ref
     catalog_value = yaml.safe_load(resolved_catalog.catalog_paths[0].read_text())
     catalog_value["ontologies"].append(_catalog_entry(repository, "future", b"topic: future\n"))
     resolved_catalog.catalog_paths[0].write_text(yaml.safe_dump(catalog_value, sort_keys=False))
+    _git(repository, "add", "geas.yaml")
+    _git(repository, "commit", "-m", "record future inventory")
     later = resolve_repository_catalog(repository)
 
     assert (
