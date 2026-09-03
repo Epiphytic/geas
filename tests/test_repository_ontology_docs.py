@@ -14,6 +14,8 @@ GUIDE = REPOSITORY_ROOT / "docs" / "REPOSITORY_ONTOLOGIES.md"
 README = REPOSITORY_ROOT / "README.md"
 QUICKSTART = REPOSITORY_ROOT / "docs" / "QUICKSTART_ONTOLOGY.md"
 AGENT_SKILLS = REPOSITORY_ROOT / "docs" / "AGENT_SKILLS.md"
+GETTING_STARTED = REPOSITORY_ROOT / "docs" / "GETTING_STARTED.md"
+USER_CONFIG = REPOSITORY_ROOT / "docs" / "USER_CONFIG.md"
 PROMOTIONS = REPOSITORY_ROOT / "docs" / "PROMOTIONS.md"
 SOURCE_OF_TRUTH = REPOSITORY_ROOT / "docs" / "SOURCE_OF_TRUTH.md"
 NEXT_PHASE = REPOSITORY_ROOT / "docs" / "NEXT_PHASE.md"
@@ -32,6 +34,38 @@ def _commands_between(text: str, start_marker: str, end_marker: str) -> tuple[st
 
 def _normalized_text(*documents: str) -> str:
     return " ".join("\n".join(documents).split())
+
+
+def _concrete_geas_commands(document: Path) -> tuple[str, ...]:
+    """Return complete executable Geas invocations from shell/console fences."""
+    commands: list[str] = []
+    active = False
+    continued = ""
+    for raw_line in document.read_text().splitlines():
+        stripped = raw_line.strip()
+        if stripped.startswith("```"):
+            if active:
+                assert not continued, f"unfinished Geas command in {document}"
+                active = False
+            else:
+                active = stripped in {"```bash", "```console", "```shell"}
+            continue
+        if not active:
+            continue
+        line = stripped.removeprefix("$ ")
+        if continued:
+            line = f"{continued} {line}"
+        if line.endswith("\\"):
+            continued = line[:-1].rstrip()
+            continue
+        continued = ""
+        if line.startswith("uv run geas "):
+            line = line.removeprefix("uv run ")
+        if (line == "geas" or line.startswith("geas ")) and "[--" not in line:
+            # Bracketed synopsis lines describe optional grammar; every other
+            # invocation is a concrete example consumed by the real parser.
+            commands.append(line)
+    return tuple(commands)
 
 
 def test_repository_ontology_command_reference_matches_the_cli() -> None:
@@ -155,7 +189,76 @@ def test_legacy_subscription_push_is_not_documented_as_a_publication_path() -> N
 
     assert "$ geas ontology-sync geas-samples --push" not in GUIDE.read_text()
     assert "Push is available only for writable branch refs" not in repository
-    assert "`ontology-sync --push` does not authorize repository publication" in repository
+    assert "legacy `--push` is ignored" in repository
+    assert "compatibility input to this read-only synchronization path" in repository
+
+
+def test_legacy_git_settings_are_read_only_not_publication_authority() -> None:
+    getting_started = _normalized_text(GETTING_STARTED.read_text())
+    user_config = _normalized_text(USER_CONFIG.read_text())
+    repository = _normalized_text(GUIDE.read_text())
+
+    assert "uv run geas ontology-sync --push" not in getting_started
+    assert "uv run geas ontology-sync --pull --push" not in user_config
+    assert "legacy `--push` is ignored" in getting_started
+    assert "legacy `push_on_update` is ignored" in getting_started
+    assert "legacy `--push` is ignored" in user_config
+    assert "legacy `push_on_update` is ignored" in user_config
+    assert "root-local `git.direct_push`" in repository
+    assert "Delegation cannot authorize direct push" in repository
+    assert "generated branches" not in repository
+
+
+def test_every_concrete_documented_geas_command_matches_the_real_parser() -> None:
+    documents = (
+        README,
+        QUICKSTART,
+        AGENT_SKILLS,
+        GETTING_STARTED,
+        USER_CONFIG,
+        GUIDE,
+    )
+    parser = _build_parser()
+    choices = next(
+        action.choices
+        for action in parser._actions  # noqa: SLF001 - executable CLI documentation
+        if getattr(action, "choices", None)
+    )
+    pending_task7 = {
+        "ontology-update",
+        "repository-install",
+        "repository-remove",
+        "repository-update",
+    }
+    command_count = 0
+    skipped: set[str] = set()
+    for document in documents:
+        commands = _concrete_geas_commands(document)
+        assert commands, f"no concrete Geas commands found in {document}"
+        command_count += len(commands)
+        for command in commands:
+            arguments = shlex.split(command)[1:]
+            command_name = next(
+                (
+                    token
+                    for token in arguments
+                    if token in choices or token in pending_task7
+                ),
+                None,
+            )
+            if command_name is None:
+                with pytest.raises(SystemExit) as help_exit:
+                    parser.parse_args(arguments)
+                assert help_exit.value.code == 0
+                continue
+            if command_name not in choices:
+                assert command_name in pending_task7
+                skipped.add(command_name)
+                continue
+            parser.parse_args(arguments)
+
+    assert command_count >= 90
+    assert skipped <= pending_task7
 
 
 def test_bootstrap_recovery_uses_persisted_state_not_a_nonexistent_receipt_field() -> None:

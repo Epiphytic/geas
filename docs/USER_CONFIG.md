@@ -317,20 +317,12 @@ Pull the selected profile repository, cloning it on first use:
 uv run geas ontology-sync --pull
 ```
 
-Commit and push ontology-directory changes:
-
-```bash
-uv run geas ontology-sync --pull --push
-```
-
-Use both flags to fast-forward before pushing. Pull refuses a dirty checkout,
-uses a fixed configured remote and branch, and permits only fast-forward
-integration. Push stages only the selected scope, rejects unrelated previously
-staged paths, scans file names and contents for common credential forms, then
-commits and pushes without placing credentials in the repository URL.
-Subscription pushes currently use the fixed `geas: update ontologies` commit
-message; although the parser exposes `--message`, the subscription service does
-not yet forward it.
+Pull refuses a dirty checkout, uses a fixed configured remote and branch, and
+permits only fast-forward integration. The legacy `--push` is ignored: this
+command is a read-only synchronization path and never publishes repository
+changes. Use `geas repository-update NAME` for the pull-request default, or its
+explicit `--direct-push` mode when a matching root-local capability authorizes
+the exact repository and writable branch.
 
 The checkout receives a conservative `.gitignore` that excludes `.env` files,
 private-key formats, credential- and secret-named paths, SQLite databases,
@@ -339,15 +331,17 @@ checkpoints. These controls
 reduce accidental disclosure; they are not a substitute for repository access
 controls, forge secret scanning, or credential rotation after an exposure.
 
-Set `pull_before_update` or `push_on_update` per profile to make
-profile-backed `ontology-init` pull before and/or push its configuration update.
+Set `pull_before_update` per profile to make profile-backed `ontology-init`
+pull before its configuration update. The legacy `push_on_update` is ignored
+and cannot publish or authorize publication.
 When a configured checkout does not exist yet, `ontology-init` performs the
 initial pull before writing unless `--no-pull` is explicit. Named ontology and
 library builds also honor `pull_before_update` before reading configuration.
-The command-line `--pull`/`--no-pull` and `--push`/`--no-push` flags override
-those settings for one invocation. Model proposals never acquire automatic
-promotion authority: use the normal review and promotion workflow before
-treating generated knowledge as canonical.
+The command-line `--pull`/`--no-pull` flags override that setting for one
+invocation. Legacy `--push`/`--no-push` inputs do not change the read-only
+boundary. Model proposals never acquire automatic promotion authority: use the
+normal review and promotion workflow before treating generated knowledge as
+canonical.
 
 By default, named ontology use also performs a freshness-throttled Git check.
 The successful check time is cached outside Git, so repeated uses within one

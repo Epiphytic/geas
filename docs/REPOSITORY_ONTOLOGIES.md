@@ -260,8 +260,8 @@ geas ontology-sync geas-samples --pull
 
 With no names, `ontology-sync` processes every selected-profile subscription
 in sorted order. A sync with neither `--pull` nor `--push` pulls by default.
-The legacy `ontology-sync --push` does not authorize repository publication;
-an unqualified legacy push fails closed. Use the integrated
+The legacy `--push` is ignored and performs no publication; it remains only a
+compatibility input to this read-only synchronization path. Use the integrated
 `repository-update` workflow below for pull requests or explicit direct push.
 Named operations also use the configured freshness window, which defaults to a
 remote check at most once per hour.
@@ -289,12 +289,13 @@ Direct push is never a default or a trust side effect:
 geas repository-update gold --direct-push
 ```
 
-It requires the explicit flag, a fresh effective `git.direct_push` grant for
-the exact repository and writable branch ref, a verified clean base, only
-receipt-owned paths, a fresh remote head, and an exact force-with-lease. A
-delegated push must appear in both `capabilities` and
-`delegable_capabilities` at every edge. Semantic paths additionally require
-`knowledge.auto_promote` and existing promotion verification.
+It requires the explicit flag, a fresh effective root-local `git.direct_push`
+grant for the exact repository and writable branch ref, a verified clean base,
+only receipt-owned paths, a fresh remote head, and an exact force-with-lease.
+Delegation cannot authorize direct push, and neither repository content nor
+`--trust-repository` can create this local authority. Semantic paths
+additionally require `knowledge.auto_promote` and existing promotion
+verification.
 
 ## Remove subscriptions, snapshots, and skills
 
@@ -330,7 +331,8 @@ geas repository-remove gold
 ```
 
 It removes only receipt-owned checkout state, subscriptions, trust entries,
-skills, links, and generated branches. Modified or ambiguous paths fail closed.
+skills, and links. It does not claim ownership of or delete publication
+branches. Modified or ambiguous paths fail closed.
 A pre-commit failure removes staging; a post-commit interruption keeps the
 durable receipt and operation journal. After checking the same software,
 repository identity, arguments, and owned paths, rerun the same repository
