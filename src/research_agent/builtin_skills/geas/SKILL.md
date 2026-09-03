@@ -19,8 +19,9 @@ model output.
    bundle digest; those values are provenance, not installation authority.
 5. Read only the linked reference page needed for the present question.
 
-- Read [CLI workflows](references/cli.md) for profiles, sync, exact retrieval,
-  build, projection, and query routes.
+- Read [CLI workflows](references/cli.md) for repository lifecycle and
+  publication, profiles, sync, exact retrieval, build, projection, and query
+  routes.
 - Read [security boundaries](references/security.md) before handling source or
   model text, credentials, policies, approvals, or canonical writes.
 - Read [skill lifecycle](references/skills.md) to export, update, link, unlink,

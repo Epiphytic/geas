@@ -662,3 +662,44 @@ def test_render_ontology_skill_uses_explicit_snapshot_path_commands() -> None:
     assert "/absolute/path/to/directory-containing-this-SKILL" in entrypoint
     for command in ("skill-update", "skill-unlink", "skill-remove"):
         assert f"geas {command} ." not in entrypoint
+
+
+def test_rendered_ontology_skill_has_exact_repository_lifecycle_and_publication_boundary() -> None:
+    """Catches a portable skill being unusable without Geas or granting itself publication."""
+    from research_agent.render import render_ontology_skill
+
+    files = render_ontology_skill(
+        _topic(),
+        skill_name="test-skill",
+        ontology_name="test-ontology",
+        repository_url="https://example.test/ontology.git",
+        branch="main",
+        ontology_commit=COMMIT,
+        geas_version="1.2.3",
+        geas_commit=None,
+    )
+    entrypoint = files[Path("SKILL.md")].decode()
+    lifecycle = files[Path("references/repository.md")].decode()
+
+    for expected in (
+        "usable as static files without Geas",
+        "https://example.test/ontology.git",
+        "test-ontology",
+        "https://github.com/Epiphytic/geas",
+        "references/repository.md",
+        "generic Geas skill's `references/cli.md`",
+    ):
+        assert expected in entrypoint
+    for expected in (
+        (
+            "`geas repository-install test-ontology https://example.test/ontology.git "
+            "--ref refs/heads/main --read-only --publish none`"
+        ),
+        "`geas repository-update test-ontology --publish none`",
+        "`geas repository-remove test-ontology`",
+        "root-local `git.pull_request`",
+        'paths: `"*"`',
+        'bundle_sha256: `"*"`',
+        "only that Git capability",
+    ):
+        assert expected in lifecycle

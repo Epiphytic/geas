@@ -29,6 +29,23 @@ trusted software provenance before ontology writes, and `repository-remove`
 removes only receipt-owned state. Neither command installs or uninstalls Geas;
 the latter is separate operator guidance: `uv tool uninstall geas`.
 
+Before a first remote or current-repository install may publish, the selected
+profile needs an exact-repository, exact-ref, root-local `git.pull_request`
+grant, or a root-local `git.direct_push` grant plus explicit `--direct-push`.
+Because the first generated manifest is not known yet, its subject uses
+paths: `"*"` and bundle_sha256: `"*"`. Those selectors authorize only the named
+Git capability; they do not grant repository read, source, model, promotion,
+or another Git capability. Repository trust never supplies Git write authority.
+
+For path-specific authority, run the install with `--publish none`, inspect its
+verified JSON receipt and all complete generated skill manifests, then add
+exact local grants for each receipt-owned leaf and producer bundle. Generic
+skill leaves have no producer bundle, so bind their exact paths with the bundle
+wildcard. Request publication only afterward with
+`geas repository-update NAME`; pull request remains the default and direct push
+still requires both its root-local capability and `--direct-push`. An incomplete
+receipt or ambiguous path, skill, or bundle cannot establish the exact grant.
+
 ## Exact retrieval and research
 
 For an ontology-independent corpus, build and inspect a source library with
