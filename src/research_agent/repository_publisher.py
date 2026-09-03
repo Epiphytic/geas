@@ -473,11 +473,17 @@ class GitRepositoryPublisher:
     def _reject_url_rewrites(self) -> None:
         rewrites = self._git_result(
             "config",
+            "--name-only",
             "--get-regexp",
-            r"^url\..*\.insteadof$",
+            ".*",
             check=False,
         )
-        if rewrites.returncode not in {0, 1} or rewrites.stdout:
+        names = tuple(name.casefold() for name in rewrites.stdout.splitlines())
+        if rewrites.returncode not in {0, 1} or any(
+            name.startswith("url.")
+            and name.endswith((".insteadof", ".pushinsteadof"))
+            for name in names
+        ):
             raise PublicationError("publication repository URL rewrites are forbidden")
 
     def _configured_remote_url(self) -> str:

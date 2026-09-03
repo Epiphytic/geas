@@ -220,6 +220,7 @@ def _publisher(
     grants: dict[str, CapabilityGrant] | None = None,
     promotion_verifier: _PromotionVerifier | None = None,
     receipt_verifier: _ReceiptVerifier | None | object = ...,
+    remote_transport: object = ...,
 ):
     publisher_type = (
         __import__(
@@ -239,7 +240,9 @@ def _publisher(
         receipt_verifier=(
             _ReceiptVerifier((manifest,)) if receipt_verifier is ... else receipt_verifier
         ),
-        remote_transport=_LocalRemoteTransport(worktree),
+        remote_transport=(
+            _LocalRemoteTransport(worktree) if remote_transport is ... else remote_transport
+        ),
     )
 
 
@@ -619,6 +622,67 @@ def test_url_rewrite_race_is_rejected_before_direct_push(
 
     assert _git(remote_a, "rev-parse", "refs/heads/main") == initial_a
     assert _git(remote_b, "rev-parse", "refs/heads/main") == initial_b
+
+
+@pytest.mark.parametrize(
+    ("rewrite_name", "scope"),
+    [
+        ("insteadOf", "local"),
+        ("pushInsteadOf", "local"),
+        ("PUSHINSTEADOF", "global"),
+        ("PushInsteadOf", "system"),
+        ("pushinsteadof", "environment"),
+    ],
+)
+def test_any_git_url_rewrite_scope_is_rejected_before_pr_push(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    rewrite_name: str,
+    scope: str,
+) -> None:
+    fixture_root = tmp_path / "a"
+    fixture_root.mkdir()
+    remote_a, worktree = _repository(fixture_root)
+    remote_b = tmp_path / "remote-b.git"
+    _git(tmp_path, "clone", "--bare", str(remote_a), str(remote_b))
+    path = ".agents/skills/gold/SKILL.md"
+    (worktree / path).parent.mkdir(parents=True)
+    (worktree / path).write_text("generated\n")
+    manifest = _manifest(worktree, path, PathRole.EXPORTED_SKILL)
+    decision = _decision(path=path, capabilities=(Capability.GIT_PULL_REQUEST,))
+    request = _request(path, PathRole.EXPORTED_SKILL, decision)
+    forge = _Forge()
+    publisher = _publisher(
+        worktree,
+        manifest,
+        decision,
+        forge=forge,
+        remote_transport=None,
+    )
+    section_name = "URL" if rewrite_name == "PUSHINSTEADOF" else "url"
+    rewrite_key = f"{section_name}.{remote_b.resolve().as_uri()}.{rewrite_name}"
+    if scope == "local":
+        _git(worktree, "config", rewrite_key, REPOSITORY)
+    elif scope in {"global", "system"}:
+        config = tmp_path / f"{scope}.gitconfig"
+        _git(worktree, "config", "--file", str(config), rewrite_key, REPOSITORY)
+        monkeypatch.setenv(f"GIT_CONFIG_{scope.upper()}", str(config))
+    else:
+        monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+        monkeypatch.setenv("GIT_CONFIG_KEY_0", rewrite_key)
+        monkeypatch.setenv("GIT_CONFIG_VALUE_0", REPOSITORY)
+    before_b = _git(remote_b, "for-each-ref", "--format=%(refname):%(objectname)")
+
+    def exact_probe(_endpoint: str, _ref: str) -> None:
+        return None
+
+    monkeypatch.setattr(publisher, "_remote_object", exact_probe)
+
+    with pytest.raises(PermissionError, match="URL rewrites"):
+        publisher.publish(request)
+
+    assert _git(remote_b, "for-each-ref", "--format=%(refname):%(objectname)") == before_b
+    assert forge.upserts == []
 
 
 def test_manifest_role_requires_a_supported_producer_specific_path_schema() -> None:
