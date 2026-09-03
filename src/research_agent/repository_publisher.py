@@ -22,6 +22,7 @@ from research_agent.capabilities import (
 from research_agent.git_environment import (
     confined_git_environment,
     confined_github_environment,
+    github_cli_config_directory,
 )
 from research_agent.publishing import (
     PathRole,
@@ -107,11 +108,7 @@ class GitHubCliForgeClient:
             raise ValueError("GitHub CLI executable must be an absolute path")
         self.executable = str(path)
         self.runner = runner
-        self.config_directory = (
-            Path.home() / ".config" / "gh"
-            if config_directory is None
-            else config_directory
-        )
+        self.config_directory = github_cli_config_directory(config_directory)
         self.auth_environment = dict(auth_environment or {})
 
     def assert_authenticated(self, *, repository: str) -> None:

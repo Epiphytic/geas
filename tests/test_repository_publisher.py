@@ -337,6 +337,7 @@ def test_github_cli_forge_scrubs_ambient_selectors_and_binds_exact_repository(
     }
     for name, value in hostile.items():
         monkeypatch.setenv(name, value)
+    monkeypatch.setenv("XDG_CONFIG_HOME", "relative-ambient-selector")
     calls: list[tuple[tuple[str, ...], dict[str, str]]] = []
     results = iter(
         (
@@ -374,6 +375,8 @@ def test_github_cli_forge_scrubs_ambient_selectors_and_binds_exact_repository(
         assert environment["GH_REPO"] == "github.com/example/gold"
         assert environment["GH_CONFIG_DIR"] == str(trusted_config.resolve())
         assert environment["GH_PROMPT_DISABLED"] == "1"
+        assert environment["GH_NO_UPDATE_NOTIFIER"] == "1"
+        assert environment["GH_NO_EXTENSION_UPDATE_NOTIFIER"] == "1"
         assert "GITHUB_TOKEN" not in environment
         assert "gh_repo" not in environment
         assert "Gh_Config_Dir" not in environment
@@ -384,6 +387,99 @@ def test_github_cli_forge_scrubs_ambient_selectors_and_binds_exact_repository(
     create_command = calls[2][0]
     assert list_command[list_command.index("--repo") + 1] == "github.com/example/gold"
     assert create_command[create_command.index("--repo") + 1] == "github.com/example/gold"
+
+
+def test_github_cli_forge_uses_os_standard_xdg_config_for_auth_preflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = __import__(
+        "research_agent.repository_publisher",
+        fromlist=["GitHubCliForgeClient"],
+    )
+    xdg_config = tmp_path / "xdg"
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg_config))
+    monkeypatch.setenv("GH_CONFIG_DIR", str(tmp_path / "attacker"))
+    calls: list[dict[str, str]] = []
+
+    def run(command: tuple[str, ...], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(dict(kwargs["env"]))
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(module.subprocess, "run", run)
+    forge = module.GitHubCliForgeClient(executable="/usr/bin/gh")
+
+    forge.assert_authenticated(repository=REPOSITORY)
+
+    assert len(calls) == 1
+    assert calls[0]["GH_CONFIG_DIR"] == str((xdg_config / "gh").resolve())
+    assert calls[0]["GH_NO_UPDATE_NOTIFIER"] == "1"
+    assert calls[0]["GH_NO_EXTENSION_UPDATE_NOTIFIER"] == "1"
+
+
+def test_github_cli_config_directory_resolution_is_exact_and_platform_specific(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = __import__(
+        "research_agent.git_environment",
+        fromlist=["github_cli_config_directory"],
+    )
+    home = tmp_path / "home"
+    appdata = tmp_path / "appdata"
+
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.setattr(module.Path, "home", classmethod(lambda _cls: home))
+    assert module.github_cli_config_directory() == (home / ".config" / "gh").resolve()
+
+    monkeypatch.setattr(module, "_WINDOWS", True)
+    monkeypatch.setenv("APPDATA", str(appdata))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "ignored-xdg"))
+    assert module.github_cli_config_directory() == (appdata / "GitHub CLI").resolve()
+
+
+@pytest.mark.parametrize("selector", ("relative", "", "bad\npath"))
+def test_github_cli_config_directory_rejects_invalid_xdg_selector(
+    selector: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = __import__(
+        "research_agent.git_environment",
+        fromlist=["github_cli_config_directory"],
+    )
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", selector)
+    with pytest.raises(ValueError, match="XDG_CONFIG_HOME.*absolute safe path"):
+        module.github_cli_config_directory()
+
+
+def test_github_cli_config_directory_rejects_case_ambiguous_selector(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = __import__(
+        "research_agent.git_environment",
+        fromlist=["github_cli_config_directory"],
+    )
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "trusted"))
+    monkeypatch.setenv("xdg_config_home", str(tmp_path / "attacker"))
+    with pytest.raises(ValueError, match="ambiguous XDG_CONFIG_HOME"):
+        module.github_cli_config_directory()
+
+
+def test_github_cli_config_directory_rejects_invalid_windows_appdata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = __import__(
+        "research_agent.git_environment",
+        fromlist=["github_cli_config_directory"],
+    )
+    monkeypatch.setattr(module, "_WINDOWS", True)
+    monkeypatch.setenv("APPDATA", "relative-appdata")
+
+    with pytest.raises(ValueError, match="APPDATA.*absolute safe path"):
+        module.github_cli_config_directory()
 
 
 def test_confined_git_environment_rejects_case_insensitive_selector_collisions(

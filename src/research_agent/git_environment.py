@@ -22,6 +22,7 @@ _GITHUB_AUTH_VARIABLES = frozenset({"GH_TOKEN", "GITHUB_TOKEN"})
 _GITHUB_REPOSITORY = re.compile(
     r"^github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
 )
+_WINDOWS = os.name == "nt"
 
 
 def _case_insensitive_matches(
@@ -33,6 +34,51 @@ def _case_insensitive_matches(
         for name, value in values.items()
         if name.upper() == canonical_name
     )
+
+
+def _absolute_safe_path(value: str | Path, *, label: str) -> Path:
+    raw = os.fspath(value)
+    path = Path(raw)
+    if not path.is_absolute() or any(
+        ord(character) < 32 or ord(character) == 127 for character in raw
+    ):
+        raise ValueError(f"{label} must be an absolute safe path")
+    return path.resolve(strict=False)
+
+
+def _environment_path_selector(
+    environment: Mapping[str, str],
+    canonical_name: str,
+) -> str | None:
+    matches = _case_insensitive_matches(environment, canonical_name)
+    if len(matches) > 1:
+        raise ValueError(f"GitHub CLI config has ambiguous {canonical_name} selectors")
+    return None if not matches else matches[0][1]
+
+
+def github_cli_config_directory(
+    config_directory: Path | None = None,
+) -> Path:
+    """Resolve the exact OS-standard ``gh`` config directory.
+
+    A caller may bypass ambient path selectors only with an independently
+    trusted explicit directory.
+    """
+
+    if config_directory is not None:
+        return _absolute_safe_path(
+            config_directory,
+            label="GitHub CLI config directory",
+        )
+    selector = "APPDATA" if _WINDOWS else "XDG_CONFIG_HOME"
+    configured_root = _environment_path_selector(os.environ, selector)
+    if configured_root is not None:
+        root = _absolute_safe_path(configured_root, label=selector)
+        return (root / ("GitHub CLI" if _WINDOWS else "gh")).resolve(strict=False)
+    if _WINDOWS:
+        raise ValueError("GitHub CLI APPDATA config root is unavailable")
+    root = _absolute_safe_path(Path.home(), label="GitHub CLI user home")
+    return (root / ".config" / "gh").resolve(strict=False)
 
 
 def confined_git_environment(
@@ -134,12 +180,7 @@ def confined_github_environment(
 
     if _GITHUB_REPOSITORY.fullmatch(repository) is None:
         raise ValueError("GitHub CLI repository identifier is invalid")
-    config = config_directory.expanduser()
-    if not config.is_absolute() or any(
-        ord(character) < 32 or ord(character) == 127 for character in str(config)
-    ):
-        raise ValueError("GitHub CLI config directory must be an absolute safe path")
-    config = config.resolve(strict=False)
+    config = github_cli_config_directory(config_directory)
     environment = {
         name: value
         for name, value in confined_git_environment().items()
@@ -178,6 +219,8 @@ def confined_github_environment(
             "GH_REPO": repository,
             "GH_CONFIG_DIR": str(config),
             "GH_PROMPT_DISABLED": "1",
+            "GH_NO_UPDATE_NOTIFIER": "1",
+            "GH_NO_EXTENSION_UPDATE_NOTIFIER": "1",
             **authentication,
         }
     )
