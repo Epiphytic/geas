@@ -318,6 +318,132 @@ def test_github_cli_forge_authentication_preflight_fails_closed() -> None:
     assert tuple(calls) == before
 
 
+def test_github_cli_forge_scrubs_ambient_selectors_and_binds_exact_repository(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = __import__(
+        "research_agent.repository_publisher",
+        fromlist=["GitHubCliForgeClient"],
+    )
+    hostile = {
+        "GH_HOST": "enterprise.example",
+        "gh_repo": "enterprise.example/attacker/other",
+        "Gh_Config_Dir": str(tmp_path / "attacker-config"),
+        "GH_HTTP_UNIX_SOCKET": str(tmp_path / "attacker.sock"),
+        "GITHUB_TOKEN": "ambient-token-must-not-be-inherited",
+        "git_dir": str(tmp_path / "attacker.git"),
+        "GiT_OBJECT_DIRECTORY": str(tmp_path / "attacker-objects"),
+    }
+    for name, value in hostile.items():
+        monkeypatch.setenv(name, value)
+    calls: list[tuple[tuple[str, ...], dict[str, str]]] = []
+    results = iter(
+        (
+            subprocess.CompletedProcess((), 0, "", ""),
+            subprocess.CompletedProcess((), 0, "[]\n", ""),
+            subprocess.CompletedProcess(
+                (), 0, "https://github.com/example/gold/pull/7\n", ""
+            ),
+        )
+    )
+
+    def run(command: tuple[str, ...], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append((command, dict(kwargs["env"])))
+        return next(results)
+
+    monkeypatch.setattr(module.subprocess, "run", run)
+    trusted_config = tmp_path / "trusted-gh-config"
+    forge = module.GitHubCliForgeClient(
+        executable="/usr/bin/gh",
+        config_directory=trusted_config,
+    )
+
+    forge.assert_authenticated(repository=REPOSITORY)
+    forge.upsert_pull_request(
+        repository=REPOSITORY,
+        head="geas/publish/abc",
+        base="main",
+        title="geas: deterministic update",
+        body="Exact receipt.",
+    )
+
+    assert len(calls) == 3
+    for _command, environment in calls:
+        assert environment["GH_HOST"] == "github.com"
+        assert environment["GH_REPO"] == "github.com/example/gold"
+        assert environment["GH_CONFIG_DIR"] == str(trusted_config.resolve())
+        assert environment["GH_PROMPT_DISABLED"] == "1"
+        assert "GITHUB_TOKEN" not in environment
+        assert "gh_repo" not in environment
+        assert "Gh_Config_Dir" not in environment
+        assert "GH_HTTP_UNIX_SOCKET" not in environment
+        assert "git_dir" not in environment
+        assert "GiT_OBJECT_DIRECTORY" not in environment
+    list_command = calls[1][0]
+    create_command = calls[2][0]
+    assert list_command[list_command.index("--repo") + 1] == "github.com/example/gold"
+    assert create_command[create_command.index("--repo") + 1] == "github.com/example/gold"
+
+
+def test_confined_git_environment_rejects_case_insensitive_selector_collisions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = __import__(
+        "research_agent.git_environment",
+        fromlist=["confined_git_environment"],
+    )
+    monkeypatch.setenv("git_dir", "/attacker/repository.git")
+    monkeypatch.setenv("GiT_WORK_TREE", "/attacker/worktree")
+
+    environment = module.confined_git_environment()
+
+    assert "git_dir" not in environment
+    assert "GiT_WORK_TREE" not in environment
+    with pytest.raises(ValueError, match="forbidden selectors"):
+        module.confined_git_environment({"gIt_DiR": "/attacker/repository.git"})
+    with pytest.raises(ValueError, match="colliding names"):
+        module.confined_git_environment(
+            {
+                "GIT_INDEX_FILE": "/trusted/index",
+                "git_index_file": "/attacker/index",
+            }
+        )
+
+
+def test_confined_github_environment_accepts_only_explicit_canonical_auth(
+    tmp_path: Path,
+) -> None:
+    module = __import__(
+        "research_agent.git_environment",
+        fromlist=["confined_github_environment"],
+    )
+    arguments = {
+        "repository": "github.com/example/gold",
+        "config_directory": tmp_path / "gh",
+    }
+
+    environment = module.confined_github_environment(
+        **arguments,
+        auth_environment={"GH_TOKEN": "trusted-token"},
+    )
+
+    assert environment["GH_TOKEN"] == "trusted-token"
+    with pytest.raises(ValueError, match="forbidden selectors"):
+        module.confined_github_environment(
+            **arguments,
+            auth_environment={"gh_host": "enterprise.example"},
+        )
+    with pytest.raises(ValueError, match="colliding names"):
+        module.confined_github_environment(
+            **arguments,
+            auth_environment={
+                "GH_TOKEN": "trusted-token",
+                "gh_token": "attacker-token",
+            },
+        )
+
+
 @pytest.mark.parametrize(
     ("producer", "path", "role"),
     (

@@ -19,7 +19,10 @@ from research_agent.capabilities import (
     CapabilityGrant,
     _https_url,
 )
-from research_agent.git_environment import confined_git_environment
+from research_agent.git_environment import (
+    confined_git_environment,
+    confined_github_environment,
+)
 from research_agent.publishing import (
     PathRole,
     ProducerReceiptVerifier,
@@ -96,16 +99,24 @@ class GitHubCliForgeClient:
         *,
         executable: str,
         runner: Callable[[tuple[str, ...]], subprocess.CompletedProcess[str]] | None = None,
+        config_directory: Path | None = None,
+        auth_environment: Mapping[str, str] | None = None,
     ) -> None:
         path = Path(executable)
         if not path.is_absolute():
             raise ValueError("GitHub CLI executable must be an absolute path")
         self.executable = str(path)
-        self.runner = runner or self._run
+        self.runner = runner
+        self.config_directory = (
+            Path.home() / ".config" / "gh"
+            if config_directory is None
+            else config_directory
+        )
+        self.auth_environment = dict(auth_environment or {})
 
     def assert_authenticated(self, *, repository: str) -> None:
         """Fail closed unless ``gh`` has one active GitHub authentication context."""
-        self._slug(repository)
+        slug = self._slug(repository)
         self._checked(
             (
                 self.executable,
@@ -113,7 +124,8 @@ class GitHubCliForgeClient:
                 "status",
                 "--hostname",
                 "github.com",
-            )
+            ),
+            repository=f"github.com/{slug}",
         )
 
     def upsert_pull_request(
@@ -126,6 +138,7 @@ class GitHubCliForgeClient:
         body: str,
     ) -> str:
         slug = self._slug(repository)
+        repository_identifier = f"github.com/{slug}"
         self._branch(head)
         self._branch(base)
         query = (
@@ -133,7 +146,7 @@ class GitHubCliForgeClient:
             "pr",
             "list",
             "--repo",
-            slug,
+            repository_identifier,
             "--head",
             head,
             "--base",
@@ -145,7 +158,7 @@ class GitHubCliForgeClient:
             "--limit",
             "2",
         )
-        listed = self._checked(query)
+        listed = self._checked(query, repository=repository_identifier)
         try:
             values = json.loads(listed.stdout)
         except (json.JSONDecodeError, TypeError):
@@ -172,12 +185,13 @@ class GitHubCliForgeClient:
                     "edit",
                     url,
                     "--repo",
-                    slug,
+                    repository_identifier,
                     "--title",
                     title,
                     "--body",
                     body,
-                )
+                ),
+                repository=repository_identifier,
             )
             return url
         created = self._checked(
@@ -186,7 +200,7 @@ class GitHubCliForgeClient:
                 "pr",
                 "create",
                 "--repo",
-                slug,
+                repository_identifier,
                 "--head",
                 head,
                 "--base",
@@ -195,7 +209,8 @@ class GitHubCliForgeClient:
                 title,
                 "--body",
                 body,
-            )
+            ),
+            repository=repository_identifier,
         )
         return self._pull_request_url(slug, created.stdout.strip())
 
@@ -207,6 +222,7 @@ class GitHubCliForgeClient:
         pull_request_url: str,
     ) -> None:
         slug = self._slug(repository)
+        repository_identifier = f"github.com/{slug}"
         self._branch(head)
         url = self._pull_request_url(slug, pull_request_url)
         self._checked(
@@ -216,20 +232,39 @@ class GitHubCliForgeClient:
                 "merge",
                 url,
                 "--repo",
-                slug,
+                repository_identifier,
                 "--auto",
                 "--merge",
-            )
+            ),
+            repository=repository_identifier,
         )
 
-    def _checked(self, command: tuple[str, ...]) -> subprocess.CompletedProcess[str]:
-        result = self.runner(command)
+    def _checked(
+        self,
+        command: tuple[str, ...],
+        *,
+        repository: str,
+    ) -> subprocess.CompletedProcess[str]:
+        result = (
+            self.runner(command)
+            if self.runner is not None
+            else self._run(command, repository=repository)
+        )
         if result.returncode != 0:
             raise PublicationError("GitHub CLI operation failed")
         return result
 
-    def _run(self, command: tuple[str, ...]) -> subprocess.CompletedProcess[str]:
-        environment = confined_git_environment({"GH_PROMPT_DISABLED": "1"})
+    def _run(
+        self,
+        command: tuple[str, ...],
+        *,
+        repository: str,
+    ) -> subprocess.CompletedProcess[str]:
+        environment = confined_github_environment(
+            repository=repository,
+            config_directory=self.config_directory,
+            auth_environment=self.auth_environment,
+        )
         return subprocess.run(
             command,
             env=environment,

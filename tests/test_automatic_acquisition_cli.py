@@ -31,6 +31,7 @@ from research_agent.bootstrap_models import (
 )
 from research_agent.capabilities import (
     Capability,
+    CapabilityDecision,
     CapabilityGrant,
     CapabilityRequest,
     CapabilityResources,
@@ -48,6 +49,7 @@ from research_agent.repository_catalog import (
     CatalogOntology,
     RepositoryCatalog,
     ResolvedRepositoryCatalog,
+    load_catalog,
     ontology_bundle_sha256,
 )
 from research_agent.source_intent import (
@@ -1207,6 +1209,178 @@ def _bootstrap_skill_receipt(
     )
 
 
+def _multi_ontology_bootstrap_receipt(repository: Path) -> RepositoryBootstrapReceipt:
+    receipt = _bootstrap_skill_receipt(repository)
+    catalog = load_catalog(repository / "geas.yaml")
+    gold = catalog.ontologies[0]
+    silver_root = repository / "ontology" / "silver"
+    silver_root.mkdir(parents=True)
+    silver_content = b"topic: Silver\n"
+    (silver_root / "build.yaml").write_bytes(silver_content)
+    silver_file = CatalogFile(
+        path=Path("build.yaml"),
+        sha256=hashlib.sha256(silver_content).hexdigest(),
+        size_bytes=len(silver_content),
+    )
+    silver = CatalogOntology(
+        name="silver",
+        description="Silver ontology",
+        path=Path("ontology/silver"),
+        files=(silver_file,),
+        bundle_sha256="0" * 64,
+    )
+    silver = silver.model_copy(update={"bundle_sha256": ontology_bundle_sha256(silver)})
+    (repository / "geas.yaml").write_text(
+        RepositoryCatalog(ontologies=(gold, silver)).model_dump_json(indent=2)
+    )
+    subprocess.run(
+        (
+            "git",
+            "-C",
+            str(repository),
+            "add",
+            "geas.yaml",
+            "ontology/silver/build.yaml",
+        ),
+        check=True,
+    )
+    subprocess.run(
+        ("git", "-C", str(repository), "commit", "--amend", "--no-edit"),
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    commit = subprocess.run(
+        ("git", "-C", str(repository), "rev-parse", "HEAD"),
+        text=True,
+        capture_output=True,
+        check=True,
+    ).stdout.strip()
+
+    gold_skill_root = repository / ".agents" / "skills" / "gold"
+    gold_manifest = SkillManifest.model_validate_json(
+        (gold_skill_root / "geas-skill.json").read_bytes()
+    )
+    gold_manifest = SkillManifest.model_validate(
+        {
+            **gold_manifest.model_dump(mode="python"),
+            "ontology": gold_manifest.ontology.model_copy(
+                update={"commit": commit, "ontology_commit": commit}
+            ),
+        }
+    )
+    (gold_skill_root / "geas-skill.json").write_bytes(
+        canonical_manifest_bytes(gold_manifest)
+    )
+
+    silver_skill_root = repository / ".agents" / "skills" / "silver"
+    silver_skill_root.mkdir(parents=True)
+    silver_skill_content = b"# Silver research skill\n"
+    (silver_skill_root / "SKILL.md").write_bytes(silver_skill_content)
+    silver_inventory = (
+        SkillFile(
+            path="SKILL.md",
+            sha256=hashlib.sha256(silver_skill_content).hexdigest(),
+        ),
+    )
+    silver_manifest = SkillManifest(
+        format_version=2,
+        skill=SkillIdentity(name="silver"),
+        ontology=OntologyIdentity(
+            name="silver",
+            repository_url=REPOSITORY,
+            branch="main",
+            commit=commit,
+            active_ref="refs/heads/main",
+            ontology_commit=commit,
+            subscription_name="gold",
+            catalog_path="geas.yaml",
+            ontology_path="ontology/silver",
+            bundle_sha256=silver.bundle_sha256,
+        ),
+        geas=GeasIdentity(
+            project_url="https://github.com/Epiphytic/geas",
+            version="1.0.0",
+            commit=None,
+        ),
+        projection=ProjectionIdentity(
+            snapshot_id="truth:sha256:silver",
+            topic_concept_id="concept:silver",
+        ),
+        artifact=PortableArtifactIdentity(
+            role="knowledge-projection",
+            content_sha256="e" * 64,
+            input_revision="f" * 64,
+        ),
+        files=silver_inventory,
+        snapshot_sha256=snapshot_digest(silver_inventory),
+    )
+    (silver_skill_root / "geas-skill.json").write_bytes(
+        canonical_manifest_bytes(silver_manifest)
+    )
+
+    generic_root = repository / ".agents" / "skills" / "geas"
+    generic_root.mkdir(parents=True)
+    generic_content = b"# Generic Geas skill\n"
+    (generic_root / "SKILL.md").write_bytes(generic_content)
+    generic_inventory = (
+        SkillFile(
+            path="SKILL.md",
+            sha256=hashlib.sha256(generic_content).hexdigest(),
+        ),
+    )
+    generic_manifest = SkillManifest(
+        format_version=1,
+        skill=SkillIdentity(name="geas"),
+        ontology=OntologyIdentity(
+            name="geas",
+            repository_url="https://github.com/Epiphytic/geas.git",
+            branch="main",
+            commit="0" * 40,
+        ),
+        geas=GeasIdentity(
+            project_url="https://github.com/Epiphytic/geas",
+            version="1.0.0",
+            commit=None,
+        ),
+        projection=ProjectionIdentity(
+            snapshot_id="builtin:geas",
+            topic_concept_id="builtin:geas",
+        ),
+        files=generic_inventory,
+        snapshot_sha256=snapshot_digest(generic_inventory),
+    )
+    (generic_root / "geas-skill.json").write_bytes(
+        canonical_manifest_bytes(generic_manifest)
+    )
+
+    managed_paths = tuple(
+        ManagedPath(
+            path=path.relative_to(repository).as_posix(),
+            sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+            role="manifest" if path.name == "geas-skill.json" else "skill",
+        )
+        for path in sorted((repository / ".agents" / "skills").rglob("*"))
+        if path.is_file()
+    )
+    request = receipt.request.model_copy(update={"commit_sha256": commit})
+    assert receipt.verified is not None
+    verified = receipt.verified.model_copy(
+        update={
+            "commit_sha256": commit,
+            "ontology_paths": ("ontology/gold", "ontology/silver"),
+            "bundle_sha256": tuple(sorted((gold.bundle_sha256, silver.bundle_sha256))),
+        }
+    )
+    return receipt.model_copy(
+        update={
+            "request": request,
+            "verified": verified,
+            "managed_paths": managed_paths,
+        }
+    )
+
+
 def test_bootstrap_publication_manifest_requires_complete_receipt_owned_snapshot(
     tmp_path: Path,
 ) -> None:
@@ -1247,6 +1421,41 @@ def test_bootstrap_publication_manifest_rejects_cross_paired_catalog_identity(
 
     with pytest.raises(ValueError, match="exact verified catalog entry"):
         cli._bootstrap_publication_manifests(tmp_path, cross_paired)
+
+
+def test_bootstrap_publication_manifest_requires_ontology_path_bijection(
+    tmp_path: Path,
+) -> None:
+    receipt = _multi_ontology_bootstrap_receipt(tmp_path)
+    silver_manifest_path = (
+        tmp_path / ".agents" / "skills" / "silver" / "geas-skill.json"
+    )
+    silver_manifest = SkillManifest.model_validate_json(silver_manifest_path.read_bytes())
+    gold_manifest = SkillManifest.model_validate_json(
+        (tmp_path / ".agents" / "skills" / "gold" / "geas-skill.json").read_bytes()
+    )
+    duplicate = SkillManifest.model_validate(
+        {
+            **silver_manifest.model_dump(mode="python"),
+            "ontology": gold_manifest.ontology,
+        }
+    )
+    silver_manifest_path.write_bytes(canonical_manifest_bytes(duplicate))
+    duplicate_digest = hashlib.sha256(silver_manifest_path.read_bytes()).hexdigest()
+    receipt = receipt.model_copy(
+        update={
+            "managed_paths": tuple(
+                item.model_copy(update={"sha256": duplicate_digest})
+                if item.path == ".agents/skills/silver/geas-skill.json"
+                else item
+                for item in receipt.managed_paths
+            )
+        }
+    )
+
+    with pytest.raises(ValueError, match="bijection"):
+        cli._bootstrap_publication_manifests(tmp_path, receipt)
+    assert cli._prior_receipt_publication_targets(receipt, repository=tmp_path) is None
 
 
 def _git_publication_grant(
@@ -1303,6 +1512,150 @@ def _publication_args(config_path: Path, *, message: str = "refresh gold") -> ob
         publish="pull-request",
         message=message,
     )
+
+
+def test_final_publication_authority_uses_each_manifest_own_bundle_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = tmp_path / "repository"
+    receipt = _multi_ontology_bootstrap_receipt(repository)
+    config_path = tmp_path / "config.yaml"
+    UserConfigManager(config_path).replace(
+        GeasUserConfig(version=2, profiles={"default": GeasProfile(ontology_git=None)}),
+        upgrade_version=True,
+    )
+    observed: list[CapabilityRequest] = []
+
+    class Evaluator:
+        def evaluate(self, request: CapabilityRequest) -> CapabilityDecision:
+            observed.append(request)
+            return CapabilityDecision(
+                request=request,
+                decision="allow",
+                effective_capabilities=request.capabilities,
+                reason="fixture allow",
+                evaluator_version="fixture/1",
+                decided_at=NOW,
+            )
+
+    publisher_arguments: dict[str, object] = {}
+
+    class Publisher:
+        def __init__(self, **kwargs: object) -> None:
+            publisher_arguments.update(kwargs)
+
+        def publish(self, request: object) -> PublishResult:
+            return PublishResult(
+                request_id=request.id,
+                published=True,
+                reason="fixture published",
+                completed_at=NOW,
+            )
+
+    monkeypatch.setattr(
+        cli,
+        "_selected_capability_evaluator",
+        lambda *_args, **_kwargs: Evaluator(),
+    )
+    monkeypatch.setattr(cli, "GitRepositoryPublisher", Publisher)
+
+    cli._publish_repository_receipt(
+        _publication_args(config_path),
+        receipt.request,
+        receipt,
+    )
+
+    gold = SkillManifest.model_validate_json(
+        (repository / ".agents" / "skills" / "gold" / "geas-skill.json").read_bytes()
+    )
+    silver = SkillManifest.model_validate_json(
+        (repository / ".agents" / "skills" / "silver" / "geas-skill.json").read_bytes()
+    )
+    by_path = {request.path: request.bundle_sha256 for request in observed}
+    assert by_path
+    assert {
+        digest
+        for path, digest in by_path.items()
+        if path.startswith(".agents/skills/geas/")
+    } == {None}
+    assert {
+        digest
+        for path, digest in by_path.items()
+        if path.startswith(".agents/skills/gold/")
+    } == {gold.ontology.bundle_sha256}
+    assert {
+        digest
+        for path, digest in by_path.items()
+        if path.startswith(".agents/skills/silver/")
+    } == {silver.ontology.bundle_sha256}
+    assert publisher_arguments["capability_decision"]
+
+
+def test_one_ontology_cannot_publish_under_a_sibling_bundle_grant(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = tmp_path / "repository"
+    receipt = _multi_ontology_bootstrap_receipt(repository)
+    manifests = cli._bootstrap_publication_manifests(repository, receipt)
+    gold = SkillManifest.model_validate_json(
+        (repository / ".agents" / "skills" / "gold" / "geas-skill.json").read_bytes()
+    )
+    silver = SkillManifest.model_validate_json(
+        (repository / ".agents" / "skills" / "silver" / "geas-skill.json").read_bytes()
+    )
+    grants = tuple(
+        CapabilityGrant(
+            decision="allow",
+            subject=CapabilitySubject(
+                repository=REPOSITORY,
+                refs=("refs/heads/main",),
+                paths=(item.path,),
+                bundle_sha256=(
+                    (silver.ontology.bundle_sha256,)
+                    if item.path.startswith(".agents/skills/gold/")
+                    else (gold.ontology.bundle_sha256,)
+                    if item.path.startswith(".agents/skills/silver/")
+                    else "*"
+                ),
+            ),
+            capabilities=(Capability.GIT_DIRECT_PUSH,),
+            resources=CapabilityResources(git_refs=("refs/heads/main",)),
+            expires_at=None,
+            created_at=NOW,
+            created_via="manual",
+        )
+        for manifest in manifests
+        for item in manifest.paths
+    )
+    config_path = tmp_path / "config.yaml"
+    UserConfigManager(config_path).replace(
+        GeasUserConfig(
+            version=2,
+            profiles={
+                "default": GeasProfile(
+                    ontology_git=None,
+                    capability_grants=grants,
+                )
+            },
+        ),
+        upgrade_version=True,
+    )
+    monkeypatch.setattr(
+        cli,
+        "GitRepositoryPublisher",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("publisher constructed through a sibling bundle grant")
+        ),
+    )
+
+    with pytest.raises(PermissionError, match=r"\.agents/skills/(?:gold|silver)/"):
+        cli._publish_repository_receipt(
+            _publication_args(config_path),
+            receipt.request,
+            receipt,
+        )
 
 
 def test_first_repository_publication_requires_exact_root_local_wildcard_scope(

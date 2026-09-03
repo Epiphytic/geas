@@ -2149,6 +2149,11 @@ def _publish_repository_receipt(
     manifests = _bootstrap_publication_manifests(repository, receipt)
     if not manifests:
         return receipt
+    bundle_by_path = _bootstrap_publication_bundle_by_path(
+        repository,
+        receipt,
+        manifests,
+    )
     manager = _user_config_manager(args)
     _config, _profile_name, profile = _selected_user_config(args, manager)
     evaluator = _selected_capability_evaluator(args, clock=utc_now)
@@ -2158,9 +2163,7 @@ def _publish_repository_receipt(
             request=request,
             path=item.path,
             capability=capability,
-            bundle_sha256=(
-                receipt.verified.bundle_sha256 if receipt.verified is not None else ()
-            ),
+            bundle_sha256=bundle_by_path[item.path],
         )
         for manifest in manifests
         for item in manifest.paths
@@ -2250,24 +2253,25 @@ def _repository_publication_decision(
     request: RepositoryBootstrapRequest,
     path: str,
     capability: Capability,
-    bundle_sha256: Sequence[str],
+    bundle_sha256: str | None,
 ) -> CapabilityDecision:
-    values: tuple[str | None, ...] = (*tuple(sorted(set(bundle_sha256))), None)
-    for digest in values:
-        decision = evaluator.evaluate(
-            CapabilityRequest(
-                authority_repository=request.repository,
-                target_repository=request.repository,
-                capabilities=(capability,),
-                ref=request.ref,
-                path=path,
-                bundle_sha256=digest,
-                dirty=True,
-                requested_at=utc_now(),
-            )
-        )
-        if decision.allowed and not decision.delegation_chain:
-            return decision
+    capability_request = CapabilityRequest(
+        authority_repository=request.repository,
+        target_repository=request.repository,
+        capabilities=(capability,),
+        ref=request.ref,
+        path=path,
+        bundle_sha256=bundle_sha256,
+        dirty=True,
+        requested_at=utc_now(),
+    )
+    decision = evaluator.evaluate(capability_request)
+    if (
+        decision.request == capability_request
+        and decision.allowed
+        and not decision.delegation_chain
+    ):
+        return decision
     raise PermissionError(
         f"repository publication path lacks exact {capability.value} authority: {path}"
     )
@@ -2312,6 +2316,7 @@ def _bootstrap_publication_manifests(
         ):
             roots.add(Path(*parts[:3]).as_posix())
     manifests: list[PublicationManifest] = []
+    exported_ontology_paths: list[str] = []
     receipt_sha256 = receipt.id.rsplit(":", 1)[-1]
     for root_value in sorted(roots, key=lambda value: value.encode("utf-8")):
         root = repository / root_value
@@ -2364,6 +2369,7 @@ def _bootstrap_publication_manifests(
                     "exported skill producer differs from its bootstrap verification "
                     "identity or exact verified catalog entry"
                 )
+            exported_ontology_paths.append(ontology.ontology_path)
         producer = (
             PublicationProducer.GENERIC_SKILL
             if skill_name == "geas"
@@ -2379,7 +2385,50 @@ def _bootstrap_publication_manifests(
                 ),
             )
         )
+    if (
+        len(exported_ontology_paths) != len(set(exported_ontology_paths))
+        or set(exported_ontology_paths) != set(verified.ontology_paths)
+        or len(exported_ontology_paths) != len(verified.ontology_paths)
+    ):
+        raise ValueError(
+            "exported skill manifests must form an exact ontology path bijection"
+        )
     return tuple(manifests)
+
+
+def _bootstrap_publication_bundle_by_path(
+    repository: Path,
+    receipt: RepositoryBootstrapReceipt,
+    manifests: Sequence[PublicationManifest],
+) -> dict[str, str | None]:
+    """Bind each receipt-owned publication leaf to its producer's bundle."""
+
+    repository = repository.resolve(strict=True)
+    expected = _bootstrap_publication_manifests(repository, receipt)
+    if tuple(manifests) != expected:
+        raise ValueError("publication manifests differ from the bootstrap receipt")
+    result: dict[str, str | None] = {}
+    for manifest in manifests:
+        roots = {
+            Path(*Path(item.path).parts[:3]).as_posix() for item in manifest.paths
+        }
+        if len(roots) != 1:
+            raise ValueError("publication manifest crosses skill roots")
+        root_value = roots.pop()
+        if manifest.producer is PublicationProducer.GENERIC_SKILL:
+            bundle_sha256 = None
+        elif manifest.producer is PublicationProducer.EXPORTED_SKILL:
+            _snapshot, skill_manifest = resolve_skill_snapshot(
+                repository / root_value
+            )
+            bundle_sha256 = skill_manifest.ontology.bundle_sha256
+        else:
+            raise ValueError("bootstrap publication contains an unsupported producer")
+        for item in manifest.paths:
+            if item.path in result:
+                raise ValueError("bootstrap publication contains duplicate paths")
+            result[item.path] = bundle_sha256
+    return result
 
 
 @dataclass(frozen=True)
