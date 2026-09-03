@@ -153,6 +153,8 @@ class PinnedHttpsClient:
                 headers={key: value for key, value in response.getheaders()},
                 body=b"".join(chunks),
             )
+        except TimeoutError as error:
+            raise RemoteFetchError("bounded HTTPS request timed out") from error
         except (OSError, http.client.HTTPException) as error:
             raise RemoteFetchError("bounded HTTPS request failed") from error
         finally:
@@ -408,6 +410,8 @@ class ConditionalHttpsTransport:
             if size > maximum or decoder.unconsumed_tail:
                 raise RemoteFetchError("HTTPS response exceeded the decoded size limit")
             pieces.append(piece)
+        if not decoder.eof or decoder.unused_data:
+            raise RemoteFetchError("invalid compressed HTTPS response")
         tail = decoder.flush(maximum - size + 1)
         if size + len(tail) > maximum:
             raise RemoteFetchError("HTTPS response exceeded the decoded size limit")
@@ -464,7 +468,7 @@ class ConditionalHttpsTransport:
         if stripped.startswith(("{", "[")):
             try:
                 json.loads(text)
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, ValueError):
                 return "application/octet-stream"
             return "application/json"
         if content and ConditionalHttpsTransport._valid_text(text):
@@ -566,19 +570,29 @@ class PinnedHttpsFetcher:
         max_bytes: int = 25_000_000,
         max_redirects: int = 3,
         timeout_seconds: int = 30,
+        dns_resolver: Callable[[str], tuple[str, ...]] | None = None,
     ) -> None:
         self.max_bytes = max_bytes
         self.max_redirects = max_redirects
         self.timeout_seconds = timeout_seconds
+        self.dns_resolver = dns_resolver or self._resolve_all
 
-    def fetch(self, url: str) -> FetchedDocument:
+    def fetch(
+        self,
+        url: str,
+        *,
+        before_request: Callable[[str], None] | None = None,
+    ) -> FetchedDocument:
         requested = self._validated_url(url)
         current = requested
         redirects: list[str] = []
         for _ in range(self.max_redirects + 1):
-            address = self._public_ipv4(current)
+            if before_request is not None:
+                before_request(current)
+            address = self._public_address(current)
             parsed = urllib.parse.urlsplit(current)
             assert parsed.hostname is not None
+            pinned_address = f"[{address}]" if ":" in address else address
             with tempfile.TemporaryDirectory(prefix="research-agent-fetch-") as directory:
                 root = Path(directory)
                 headers_path = root / "headers"
@@ -603,7 +617,7 @@ class PinnedHttpsFetcher:
                     "--max-filesize",
                     str(self.max_bytes),
                     "--resolve",
-                    f"{parsed.hostname}:443:{address}",
+                    f"{parsed.hostname}:443:{pinned_address}",
                     "--dump-header",
                     str(headers_path),
                     "--output",
@@ -612,14 +626,17 @@ class PinnedHttpsFetcher:
                     "%{http_code}",
                     current,
                 ]
-                completed = subprocess.run(
-                    command,
-                    capture_output=True,
-                    timeout=self.timeout_seconds + 5,
-                    check=False,
-                    close_fds=True,
-                    env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"},
-                )
+                try:
+                    completed = subprocess.run(
+                        command,
+                        capture_output=True,
+                        timeout=self.timeout_seconds + 5,
+                        check=False,
+                        close_fds=True,
+                        env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"},
+                    )
+                except subprocess.TimeoutExpired:
+                    raise RemoteFetchError("bounded HTTPS fetch timed out") from None
                 if completed.returncode != 0:
                     raise RemoteFetchError("bounded HTTPS fetch failed")
                 try:
@@ -669,25 +686,29 @@ class PinnedHttpsFetcher:
             raise RemoteFetchError("remote URL must use the default HTTPS port")
         return urllib.parse.urlunsplit(("https", hostname, parsed.path or "/", parsed.query, ""))
 
-    @staticmethod
-    def _public_ipv4(url: str) -> str:
+    def _public_address(self, url: str) -> str:
         hostname = urllib.parse.urlsplit(url).hostname
         assert hostname is not None
         try:
-            addresses = socket.getaddrinfo(hostname, 443, type=socket.SOCK_STREAM)
-        except socket.gaierror:
+            addresses = tuple(sorted(set(self.dns_resolver(hostname))))
+        except (OSError, socket.gaierror):
             raise RemoteFetchError("remote hostname did not resolve") from None
-        public = sorted(
-            {
-                item[4][0]
-                for item in addresses
-                if isinstance(ipaddress.ip_address(item[4][0]), ipaddress.IPv4Address)
-                and ipaddress.ip_address(item[4][0]).is_global
-            }
+        if not addresses:
+            raise RemoteFetchError("remote hostname did not resolve")
+        try:
+            parsed = tuple(ipaddress.ip_address(address) for address in addresses)
+        except ValueError:
+            raise RemoteFetchError("remote hostname resolved to an invalid address") from None
+        if any(not address.is_global for address in parsed):
+            raise RemoteFetchError("remote hostname resolved to a non-public address")
+        selected = min(parsed, key=lambda address: (address.version, address.packed))
+        return str(selected)
+
+    @staticmethod
+    def _resolve_all(hostname: str) -> tuple[str, ...]:
+        return tuple(
+            item[4][0] for item in socket.getaddrinfo(hostname, 443, type=socket.SOCK_STREAM)
         )
-        if not public:
-            raise RemoteFetchError("remote hostname has no public IPv4 address")
-        return public[0]
 
     @staticmethod
     def _media_type(header_type: str, url: str, content: bytes) -> str:

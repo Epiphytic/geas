@@ -1,6 +1,7 @@
 import gzip
 import socket
 import ssl
+import zlib
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -13,6 +14,7 @@ from research_agent.remote_acquisition import (
     ConditionalHttpsTransport,
     FetchedDocument,
     LicenseGatedAcquirer,
+    PinnedHttpsClient,
     PinnedHttpsFetcher,
     RemoteFetchError,
     SourceFetchConstraint,
@@ -304,6 +306,26 @@ def test_conditional_transport_rejects_mixed_dns_answers_before_http() -> None:
     assert client.calls == []
 
 
+def test_conditional_transport_accepts_all_public_ipv6_answers() -> None:
+    """An IPv6-only public host is valid when every answer is public."""
+    client = _ConditionalClient(
+        [ConditionalHttpResponse(status=200, body=b"%PDF-1.7\n")]
+    )
+    transport = ConditionalHttpsTransport(
+        dns_resolver=lambda _: (
+            "2001:4860:4860::8888",
+            "2001:4860:4860::8844",
+        ),
+        http_client=client,
+        capability_evaluator=_AllowEvaluator(),
+    )
+
+    result = transport.fetch(_source_request())
+
+    assert result.media_type == "application/pdf"
+    assert client.calls[0]["address"] == "2001:4860:4860::8844"
+
+
 def test_conditional_transport_returns_typed_rate_limit_constraint() -> None:
     """Treating a rate limit as a fetch failure would incorrectly retry around access controls."""
     transport = ConditionalHttpsTransport(
@@ -418,6 +440,75 @@ def test_conditional_transport_rechecks_redirect_scope_and_bounds_decompression(
     )
     with pytest.raises(RemoteFetchError, match="decoded size"):
         bounded.fetch(_source_request())
+
+
+@pytest.mark.parametrize(
+    "location",
+    (
+        "https://user:password@issuer.example/final.pdf",
+        "https://issuer.example:444/final.pdf",
+    ),
+)
+def test_conditional_transport_rejects_credential_or_port_changing_redirect(
+    location: str,
+) -> None:
+    """A redirect cannot introduce credentials or move to a non-default port."""
+    client = _ConditionalClient(
+        [ConditionalHttpResponse(status=302, headers={"Location": location})]
+    )
+    transport = ConditionalHttpsTransport(
+        dns_resolver=lambda _: ("8.8.8.8",),
+        http_client=client,
+        capability_evaluator=_AllowEvaluator(),
+    )
+
+    with pytest.raises(RemoteFetchError, match="unsafe"):
+        transport.fetch(_source_request())
+
+    assert len(client.calls) == 1
+
+
+def test_conditional_transport_rejects_redirect_exhaustion_without_extra_io() -> None:
+    """The configured redirect count is a hard upper bound on network requests."""
+    client = _ConditionalClient(
+        [
+            ConditionalHttpResponse(status=302, headers={"Location": "/one.pdf"}),
+            ConditionalHttpResponse(status=302, headers={"Location": "/two.pdf"}),
+        ]
+    )
+    request = _source_request().model_copy(update={"max_redirects": 1})
+    transport = ConditionalHttpsTransport(
+        dns_resolver=lambda _: ("8.8.8.8",),
+        http_client=client,
+        capability_evaluator=_AllowEvaluator(),
+    )
+
+    with pytest.raises(RemoteFetchError, match="redirect limit"):
+        transport.fetch(request)
+
+    assert [call["url"] for call in client.calls] == [
+        "https://issuer.example/report.pdf",
+        "https://issuer.example/one.pdf",
+    ]
+
+
+@pytest.mark.parametrize("stage", ("connect", "read"))
+def test_conditional_transport_normalizes_connection_and_read_timeouts(stage: str) -> None:
+    """Both production timeout stages must fail as bounded transport errors."""
+
+    class TimeoutClient:
+        def request(self, **kwargs: object) -> ConditionalHttpResponse:
+            del kwargs
+            raise TimeoutError(stage)
+
+    transport = ConditionalHttpsTransport(
+        dns_resolver=lambda _: ("8.8.8.8",),
+        http_client=TimeoutClient(),
+        capability_evaluator=_AllowEvaluator(),
+    )
+
+    with pytest.raises(RemoteFetchError, match="timed out"):
+        transport.fetch(_source_request())
 
 
 def test_conditional_transport_treats_503_as_rate_limited_and_rejects_unknown_binary() -> None:
@@ -542,6 +633,245 @@ def test_conditional_transport_sniffs_and_validates_the_full_bounded_body(
 
     assert result.constraint is SourceFetchConstraint.UNSUPPORTED_MEDIA_TYPE
     assert result.content == b""
+
+
+def test_conditional_transport_treats_bounded_large_integer_json_as_unsupported() -> None:
+    """Python's integer digit guard is invalid JSON input, not a transport crash."""
+    body = b'{"number":' + b"9" * 5_000 + b"}"
+    request = _source_request().model_copy(
+        update={
+            "accepted_media_types": ("application/json",),
+            "max_wire_bytes": 10_000,
+            "max_decoded_bytes": 10_000,
+        }
+    )
+    transport = ConditionalHttpsTransport(
+        dns_resolver=lambda _: ("8.8.8.8",),
+        http_client=_ConditionalClient(
+            [
+                ConditionalHttpResponse(
+                    status=200,
+                    headers={"Content-Type": "application/json"},
+                    body=body,
+                )
+            ]
+        ),
+        capability_evaluator=_AllowEvaluator(),
+    )
+
+    result = transport.fetch(request)
+
+    assert result.constraint is SourceFetchConstraint.UNSUPPORTED_MEDIA_TYPE
+    assert result.content == b""
+
+
+@pytest.mark.parametrize(
+    ("encoding", "body"),
+    (
+        ("gzip", b"not-gzip"),
+        ("gzip", gzip.compress(b"safe text")[:-1]),
+        ("gzip", gzip.compress(b"safe text") + b"trailing"),
+        ("gzip", gzip.compress(b"safe text") + gzip.compress(b"evil text")),
+        ("deflate", b"not-deflate"),
+        ("deflate", zlib.compress(b"safe text")[:-1]),
+        ("deflate", zlib.compress(b"safe text") + b"trailing"),
+        ("deflate", zlib.compress(b"safe text") + zlib.compress(b"evil text")),
+    ),
+)
+def test_conditional_transport_rejects_malformed_incomplete_or_appended_compression(
+    encoding: str, body: bytes
+) -> None:
+    """Only one complete compressed member may produce admissible source bytes."""
+    request = _source_request().model_copy(update={"accepted_media_types": ("text/plain",)})
+    transport = ConditionalHttpsTransport(
+        dns_resolver=lambda _: ("8.8.8.8",),
+        http_client=_ConditionalClient(
+            [
+                ConditionalHttpResponse(
+                    status=200,
+                    headers={
+                        "Content-Type": "text/plain",
+                        "Content-Encoding": encoding,
+                    },
+                    body=body,
+                )
+            ]
+        ),
+        capability_evaluator=_AllowEvaluator(),
+    )
+
+    with pytest.raises(RemoteFetchError, match="compressed HTTPS response"):
+        transport.fetch(request)
+
+
+def test_pinned_https_client_enforces_wire_ceiling_while_reading(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The production client must stop on the first byte beyond its wire budget."""
+
+    class FakeSocket:
+        def settimeout(self, value: int) -> None:
+            assert value == 11
+
+    class FakeResponse:
+        status = 200
+
+        def __init__(self) -> None:
+            self.chunks = [b"12345", b"6", b""]
+
+        def read(self, amount: int) -> bytes:
+            assert amount == 6
+            return self.chunks.pop(0)
+
+        def getheaders(self) -> list[tuple[str, str]]:
+            return []
+
+    class FakeConnection:
+        sock = FakeSocket()
+
+        def __init__(self, *, hostname: str, address: str, timeout: int) -> None:
+            assert (hostname, address, timeout) == ("issuer.example", "8.8.8.8", 7)
+
+        def request(self, method: str, path: str, headers: dict[str, str]) -> None:
+            assert (method, path, headers) == ("GET", "/report.pdf", {})
+
+        def getresponse(self) -> FakeResponse:
+            return FakeResponse()
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(
+        "research_agent.remote_acquisition._PinnedHttpsConnection", FakeConnection
+    )
+
+    with pytest.raises(RemoteFetchError, match="compressed size"):
+        PinnedHttpsClient().request(
+            url="https://issuer.example/report.pdf",
+            address="8.8.8.8",
+            headers={},
+            connect_timeout_seconds=7,
+            read_timeout_seconds=11,
+            max_wire_bytes=5,
+        )
+
+
+@pytest.mark.parametrize("stage", ("connect", "read"))
+def test_pinned_https_client_normalizes_production_timeouts(
+    monkeypatch: pytest.MonkeyPatch, stage: str
+) -> None:
+    """Socket timeouts from either production stage need one bounded public error."""
+
+    class FakeSocket:
+        def settimeout(self, value: int) -> None:
+            assert value == 11
+
+    class FakeResponse:
+        status = 200
+
+        def read(self, amount: int) -> bytes:
+            del amount
+            raise TimeoutError("read")
+
+        def getheaders(self) -> list[tuple[str, str]]:
+            return []
+
+    class FakeConnection:
+        sock = FakeSocket()
+
+        def __init__(self, **kwargs: object) -> None:
+            del kwargs
+
+        def request(self, method: str, path: str, headers: dict[str, str]) -> None:
+            del method, path, headers
+            if stage == "connect":
+                raise TimeoutError("connect")
+
+        def getresponse(self) -> FakeResponse:
+            return FakeResponse()
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(
+        "research_agent.remote_acquisition._PinnedHttpsConnection", FakeConnection
+    )
+
+    with pytest.raises(RemoteFetchError, match="timed out"):
+        PinnedHttpsClient().request(
+            url="https://issuer.example/report.pdf",
+            address="8.8.8.8",
+            headers={},
+            connect_timeout_seconds=7,
+            read_timeout_seconds=11,
+            max_wire_bytes=5,
+        )
+
+
+def test_legacy_pinned_fetcher_authorizes_before_dns_and_rejects_mixed_answers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The production GitHub fetch boundary must fail closed on a mixed DNS set."""
+    events: list[str] = []
+    monkeypatch.setattr(
+        "research_agent.remote_acquisition.subprocess.run",
+        lambda *args, **kwargs: pytest.fail("curl must not run for mixed DNS"),
+    )
+    fetcher = PinnedHttpsFetcher(
+        dns_resolver=lambda host: events.append(f"dns:{host}")
+        or ("8.8.8.8", "127.0.0.1")
+    )
+
+    with pytest.raises(RemoteFetchError, match="non-public"):
+        fetcher.fetch(
+            "https://api.github.com/repos/Example/Research",
+            before_request=lambda url: events.append(f"authorize:{url}"),
+        )
+
+    assert events == [
+        "authorize:https://api.github.com/repos/Example/Research",
+        "dns:api.github.com",
+    ]
+
+
+def test_legacy_pinned_fetcher_supports_an_all_public_ipv6_dns_set(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The production curl boundary should pin a public IPv6 address deterministically."""
+    events: list[str] = []
+
+    class Completed:
+        returncode = 0
+        stdout = b"200"
+
+    def run(command: list[str], **kwargs: object) -> Completed:
+        del kwargs
+        resolution = command[command.index("--resolve") + 1]
+        events.append(f"curl:{resolution}")
+        Path(command[command.index("--dump-header") + 1]).write_bytes(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n"
+        )
+        Path(command[command.index("--output") + 1]).write_bytes(b"{}")
+        return Completed()
+
+    monkeypatch.setattr("research_agent.remote_acquisition.shutil.which", lambda _: "/curl")
+    monkeypatch.setattr("research_agent.remote_acquisition.subprocess.run", run)
+    fetcher = PinnedHttpsFetcher(
+        dns_resolver=lambda host: events.append(f"dns:{host}")
+        or ("2001:4860:4860::8888", "2001:4860:4860::8844")
+    )
+
+    result = fetcher.fetch(
+        "https://api.github.com/repos/Example/Research",
+        before_request=lambda url: events.append(f"authorize:{url}"),
+    )
+
+    assert result.content == b"{}"
+    assert events == [
+        "authorize:https://api.github.com/repos/Example/Research",
+        "dns:api.github.com",
+        "curl:api.github.com:443:[2001:4860:4860::8844]",
+    ]
 
 
 @pytest.mark.parametrize("encoding", ("utf-16", "utf-32"))

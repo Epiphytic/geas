@@ -3,6 +3,8 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import urllib.parse
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -68,6 +70,12 @@ class FakeTransport:
             return self.responses[url]
         except KeyError:
             raise RemoteFetchError("fixture route unavailable") from None
+
+    def get_json_authorized(
+        self, url: str, before_request: Callable[[str], None]
+    ) -> dict[str, object]:
+        before_request(url)
+        return self.get_json(url)
 
 
 def _hit(locator: str, rank: int = 1) -> dict[str, object]:
@@ -213,8 +221,8 @@ def test_github_source_adapter_preserves_legacy_immutable_readme_result(tmp_path
             kind=DiscoveryKind.GITHUB_REPOSITORY,
             locator="https://github.com/Example/Research",
         ),
-        allowed_hosts=("github.com",),
-        allowed_path_prefixes=("/Example/",),
+        allowed_hosts=("api.github.com", "github.com"),
+        allowed_path_prefixes=("/Example/", "/repos/Example/Research"),
         accepted_media_types=("text/markdown",),
         refresh=SourceRefreshPolicy(interval_seconds=60, max_items=1, max_depth=0),
         required=True,
@@ -252,8 +260,8 @@ def test_github_repository_candidate_is_a_depth_zero_direct_source(tmp_path: Pat
             kind=DiscoveryKind.GITHUB_REPOSITORY,
             locator="https://github.com/Example/Research",
         ),
-        allowed_hosts=("github.com",),
-        allowed_path_prefixes=("/Example/",),
+        allowed_hosts=("api.github.com", "github.com"),
+        allowed_path_prefixes=("/Example/", "/repos/Example/Research"),
         accepted_media_types=("text/markdown",),
         refresh=SourceRefreshPolicy(interval_seconds=60, max_items=1, max_depth=0),
         required=True,
@@ -265,4 +273,86 @@ def test_github_repository_candidate_is_a_depth_zero_direct_source(tmp_path: Pat
 
     assert [candidate.locator for candidate in adapter.discover(intent)] == [
         "https://github.com/Example/Research"
+    ]
+
+
+def test_github_adapter_authorizes_each_exact_api_hop_before_dns_and_io(
+    tmp_path: Path,
+) -> None:
+    """The semantic repository URL cannot authorize three different API requests."""
+    content = b"# Research\n"
+    responses = _responses(content)
+    events: list[str] = []
+
+    class EventEvaluator:
+        def evaluate(self, request: CapabilityRequest) -> CapabilityDecision:
+            events.append(f"authorize:{request.capabilities[0].value}:{request.target}")
+            parsed = urllib.parse.urlsplit(request.target or "")
+            allowed = request.host == parsed.hostname and (
+                request.capabilities != (Capability.SOURCE_FETCH,)
+                or (
+                    request.host == "api.github.com"
+                    and parsed.path.startswith("/repos/Example/Research")
+                )
+            )
+            return CapabilityDecision(
+                request=request,
+                decision="allow" if allowed else "deny",
+                effective_capabilities=request.capabilities if allowed else (),
+                reason="fixture",
+                evaluator_version="fixture/1",
+                decided_at=NOW,
+            )
+
+    class EventTransport(FakeTransport):
+        def get_json_authorized(
+            self, url: str, before_request: Callable[[str], None]
+        ) -> dict[str, object]:
+            before_request(url)
+            host = urllib.parse.urlsplit(url).hostname
+            events.append(f"dns:{host}")
+            events.append(f"http:{url}")
+            return self.get_json(url)
+
+    adapter = GitHubRepositorySourceAdapter(
+        GitHubDiscoveryAcquirer(
+            store=ImmutableStore(tmp_path / "data"),
+            transport=EventTransport(responses),
+            clock=lambda: NOW,
+        ),
+        capability_evaluator=EventEvaluator(),
+        capability_request=_capability_request,
+    )
+    intent = SourceIntent(
+        id="github-research",
+        role="repository",
+        discovery=SourceDiscovery(
+            kind=DiscoveryKind.GITHUB_REPOSITORY,
+            locator="https://github.com/Example/Research",
+        ),
+        allowed_hosts=("api.github.com", "github.com"),
+        allowed_path_prefixes=("/Example/", "/repos/Example/Research"),
+        accepted_media_types=("text/markdown",),
+        refresh=SourceRefreshPolicy(interval_seconds=60, max_items=1, max_depth=0),
+        required=True,
+        priority=1,
+        associations=SourceAssociations(),
+        temporal=SourceTemporalPolicy(field="observed_at", retention="latest"),
+        created_at=NOW,
+    )
+
+    adapter.fetch(adapter.discover(intent)[0])
+
+    api = "https://api.github.com/repos/Example/Research"
+    actual = [event for event in events if "api.github.com" in event]
+    assert actual == [
+        f"authorize:source.fetch:{api}",
+        "dns:api.github.com",
+        f"http:{api}",
+        f"authorize:source.fetch:{api}/commits/main",
+        "dns:api.github.com",
+        f"http:{api}/commits/main",
+        f"authorize:source.fetch:{api}/readme?ref={'a' * 40}",
+        "dns:api.github.com",
+        f"http:{api}/readme?ref={'a' * 40}",
     ]

@@ -8,7 +8,7 @@ import urllib.parse
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 from pydantic import Field
 
@@ -23,7 +23,7 @@ from research_agent.discovery import (
 )
 from research_agent.models import StrictModel, utc_now
 from research_agent.parsing import ParsedDocumentManager, ParsedIngestReceipt
-from research_agent.remote_acquisition import PinnedHttpsFetcher, RemoteFetchError
+from research_agent.remote_acquisition import FetchedDocument, PinnedHttpsFetcher, RemoteFetchError
 from research_agent.source_intent import (
     DiscoveryKind,
     SourceCandidate,
@@ -42,15 +42,30 @@ class JsonBytesTransport(Protocol):
     def get_json(self, url: str) -> dict[str, object]: ...
 
 
+@runtime_checkable
+class AuthorizedJsonBytesTransport(Protocol):
+    def get_json_authorized(
+        self, url: str, before_request: Callable[[str], None]
+    ) -> dict[str, object]: ...
+
+
 class PinnedJsonTransport:
     def __init__(self, fetcher: PinnedHttpsFetcher | None = None) -> None:
         self.fetcher = fetcher or PinnedHttpsFetcher(max_bytes=5_000_000)
 
     def get_json(self, url: str) -> dict[str, object]:
-        fetched = self.fetcher.fetch(url)
+        return self._decode(self.fetcher.fetch(url))
+
+    def get_json_authorized(
+        self, url: str, before_request: Callable[[str], None]
+    ) -> dict[str, object]:
+        return self._decode(self.fetcher.fetch(url, before_request=before_request))
+
+    @staticmethod
+    def _decode(fetched: FetchedDocument) -> dict[str, object]:
         try:
             value = json.loads(fetched.content)
-        except (json.JSONDecodeError, UnicodeDecodeError):
+        except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
             raise RemoteFetchError("official repository API returned invalid JSON") from None
         if not isinstance(value, dict):
             raise RemoteFetchError("official repository API returned a non-object")
@@ -168,6 +183,7 @@ class GitHubDiscoveryAcquirer:
         *,
         discovery_label: str,
         limit: int = 20,
+        request_authorizer: Callable[[str], None] | None = None,
     ) -> DiscoveryAcquisitionReceipt:
         """Acquire eligible repositories from transient discovery metadata."""
         if limit < 1 or limit > 100:
@@ -193,7 +209,12 @@ class GitHubDiscoveryAcquirer:
         hashes: dict[str, list[str]] = {}
         for hit, owner, name in selected:
             try:
-                item = self._acquire(hit, owner, name)
+                item = self._acquire(
+                    hit,
+                    owner,
+                    name,
+                    request_authorizer=request_authorizer,
+                )
             except (DiscoveryAcquisitionError, RemoteFetchError) as error:
                 constraint = self._constraint(hit, error_type=type(error).__name__)
                 constraints.append(constraint)
@@ -222,21 +243,32 @@ class GitHubDiscoveryAcquirer:
             connector_version=self.version,
         )
 
-    def _acquire(self, hit: DiscoveryHit, owner: str, name: str) -> AcquiredRepository:
+    def _acquire(
+        self,
+        hit: DiscoveryHit,
+        owner: str,
+        name: str,
+        *,
+        request_authorizer: Callable[[str], None] | None,
+    ) -> AcquiredRepository:
         repository = f"{owner}/{name}"
         api = f"https://api.github.com/repos/{owner}/{name}"
-        metadata = self.transport.get_json(api)
+        metadata = self._get_json(api, request_authorizer=request_authorizer)
         canonical = self._required_string(metadata, "html_url")
         if self._repository(canonical) != (owner, name):
             raise DiscoveryAcquisitionError("official API repository identity mismatch")
         default_branch = self._required_string(metadata, "default_branch")
-        commit = self.transport.get_json(
-            f"{api}/commits/{urllib.parse.quote(default_branch, safe='')}"
+        commit = self._get_json(
+            f"{api}/commits/{urllib.parse.quote(default_branch, safe='')}",
+            request_authorizer=request_authorizer,
         )
         commit_sha = self._required_string(commit, "sha").casefold()
         if not re.fullmatch(r"[0-9a-f]{40}", commit_sha):
             raise DiscoveryAcquisitionError("official API returned an invalid commit")
-        readme = self.transport.get_json(f"{api}/readme?ref={commit_sha}")
+        readme = self._get_json(
+            f"{api}/readme?ref={commit_sha}",
+            request_authorizer=request_authorizer,
+        )
         readme_path = self._required_string(readme, "path")
         readme_sha = self._required_string(readme, "sha").casefold()
         if (
@@ -325,6 +357,20 @@ class GitHubDiscoveryAcquirer:
             acquisition_attempt=attempt,
         )
 
+    def _get_json(
+        self,
+        url: str,
+        *,
+        request_authorizer: Callable[[str], None] | None,
+    ) -> dict[str, object]:
+        if request_authorizer is None:
+            return self.transport.get_json(url)
+        if not isinstance(self.transport, AuthorizedJsonBytesTransport):
+            raise DiscoveryAcquisitionError(
+                "authorized repository acquisition requires a capability-aware transport"
+            )
+        return self.transport.get_json_authorized(url, request_authorizer)
+
     def _source_digest(self, source_id: str) -> str:
         matches = [
             value["content_sha256"]
@@ -403,8 +449,13 @@ class GitHubRepositorySourceAdapter:
     def _require(self, intent: SourceIntent, locator: str, capability: Capability) -> None:
         if self.capability_evaluator is None or self.capability_request is None:
             raise PermissionError("GitHub source adapter requires a capability evaluator")
+        if not intent.permits_locator(locator):
+            raise PermissionError("GitHub source request is outside the source intent")
+        parsed = urllib.parse.urlsplit(locator)
         decision = self.capability_evaluator.evaluate(
-            self.capability_request(intent, locator, capability)
+            self.capability_request(intent, locator, capability).model_copy(
+                update={"host": parsed.hostname, "target": locator}
+            )
         )
         if decision.decision != "allow" or capability not in decision.effective_capabilities:
             raise PermissionError(f"GitHub source adapter lacks {capability.value} authority")
@@ -429,7 +480,6 @@ class GitHubRepositorySourceAdapter:
         except KeyError:
             raise DiscoveryAcquisitionError("candidate was not emitted by this adapter") from None
         authorize_candidate(candidate, intent)
-        self._require(intent, candidate.locator, Capability.SOURCE_FETCH)
         self._require(intent, candidate.locator, Capability.SOURCE_ARCHIVE)
         self._require(intent, candidate.locator, Capability.SOURCE_EXTRACT)
         hit = DiscoveryHit(
@@ -442,7 +492,12 @@ class GitHubRepositorySourceAdapter:
             acquisition_eligible=True,
         )
         receipt = self.acquirer.acquire_hits(
-            (hit,), discovery_label=f"source-intent:{intent.id}", limit=1
+            (hit,),
+            discovery_label=f"source-intent:{intent.id}",
+            limit=1,
+            request_authorizer=lambda locator: self._require(
+                intent, locator, Capability.SOURCE_FETCH
+            ),
         )
         if not receipt.acquired:
             raise DiscoveryAcquisitionError("GitHub repository acquisition was constrained")
