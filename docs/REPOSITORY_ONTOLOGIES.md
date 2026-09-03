@@ -58,6 +58,78 @@ authority can never override the winning local denial for its target.
 Existing `ontology-subscribe`, snapshot, and `skill-*` commands remain useful as
 the component-level lifecycle described below.
 
+## Authorize publication before remote or catalog inspection
+
+A first remote install and a first `--current-repository` install have an
+unknown closed publication manifest: before catalog verification and skill
+generation, Geas cannot know every future skill name and leaf path. Because
+publication is the default, the command must find a root-local grant for the
+exact repository and writable ref before remote inspection, forge
+authentication, recovery, or local mutation. That pre-scope must use
+paths: `"*"` and bundle_sha256: `"*"`.
+
+For the default pull-request mode, add one grant shaped like this to the
+selected version 2 profile's `capability_grants`. This is a grant object, not a
+complete `config.yaml`; preserve the other profile fields written by
+`geas config-init`.
+
+<!-- PUBLICATION_PRESCOPE_GRANT_START -->
+```yaml
+decision: allow
+subject:
+  repository: https://github.com/example/gold
+  refs:
+    - refs/heads/main
+  paths: "*"
+  bundle_sha256: "*"
+capabilities:
+  - git.pull_request
+delegable_capabilities: []
+resources:
+  git_refs:
+    - refs/heads/main
+max_delegation_depth: 0
+expires_at: null
+created_at: 2026-09-03T00:00:00Z
+created_via: manual
+```
+<!-- PUBLICATION_PRESCOPE_GRANT_END -->
+
+The wildcard selectors grant only the named Git capability for that exact
+repository and ref. They do not grant `repository.read`, trust delegation,
+source access, provider or model use, knowledge promotion, another ref, or
+another Git capability. Direct push needs a separate grant containing only
+`git.direct_push` and still requires the explicit `--direct-push` flag;
+delegation cannot supply it.
+
+An operator who wants path-specific publication authority can split local
+installation from publication:
+
+<!-- PATH_SPECIFIC_PUBLICATION_FLOW_START -->
+```console
+$ geas repository-install gold https://github.com/example/gold.git --ref refs/heads/main --trust-repository --link --publish none
+```
+
+Inspect the command's verified JSON receipt and every complete generated skill
+manifest. Add exact local grants for every receipt-owned leaf: exported skill
+leaves bind to their own ontology producer's exact bundle digest, while generic
+skill leaves use exact paths and the bundle wildcard because they carry no
+ontology bundle. Then request publication:
+
+```console
+$ geas repository-update gold
+```
+<!-- PATH_SPECIFIC_PUBLICATION_FLOW_END -->
+
+An update may use those exact receipt leaves for preauthorization only when it
+can reconstruct one complete, durable, non-pending receipt locally, verify
+every owned byte and manifest hash, cover the generic skill plus every verified
+ontology skill exactly once, and resolve each exported leaf to one unambiguous
+bundle. Ambiguity falls back to the wildcard pre-scope, including an incomplete
+receipt or a prospective new path, skill name, or bundle. In either case, Geas
+reauthorizes the exact actual manifest immediately before the publisher or
+forge performs an effect.
+
 ## Use a catalog from the current repository
 
 From anywhere inside a Git worktree containing an applicable `geas.yaml`, run:

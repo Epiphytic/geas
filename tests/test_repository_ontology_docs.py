@@ -1,11 +1,19 @@
 from __future__ import annotations
 
 import shlex
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 import yaml
 
+from research_agent.capabilities import (
+    Capability,
+    CapabilityGrant,
+    CapabilityRequest,
+    CapabilityResources,
+    DeterministicCapabilityEvaluator,
+)
 from research_agent.cli import _build_parser
 from research_agent.source_intent import DiscoveryKind, SourceIntent
 
@@ -34,6 +42,13 @@ def _commands_between(text: str, start_marker: str, end_marker: str) -> tuple[st
 
 def _normalized_text(*documents: str) -> str:
     return " ".join("\n".join(documents).split())
+
+
+def _yaml_between(text: str, start_marker: str, end_marker: str) -> object:
+    start = text.index(start_marker)
+    end = text.index(end_marker)
+    fenced = text[start:end]
+    return yaml.safe_load(fenced.split("```yaml", maxsplit=1)[1].rsplit("```", maxsplit=1)[0])
 
 
 def _concrete_geas_commands(document: Path) -> tuple[str, ...]:
@@ -141,6 +156,98 @@ def test_task7_repository_workflow_reference_matches_cli_after_fan_in() -> None:
         "repository-remove",
         "ontology-update",
     ]
+
+
+def test_first_publication_prescope_example_is_valid_and_grants_only_pull_requests() -> None:
+    document = _yaml_between(
+        GUIDE.read_text(),
+        "<!-- PUBLICATION_PRESCOPE_GRANT_START -->",
+        "<!-- PUBLICATION_PRESCOPE_GRANT_END -->",
+    )
+    grant = CapabilityGrant.model_validate(document)
+
+    assert grant.capabilities == (Capability.GIT_PULL_REQUEST,)
+    assert grant.delegable_capabilities == ()
+    assert grant.subject.repository == "https://github.com/example/gold"
+    assert grant.subject.refs == ("refs/heads/main",)
+    assert grant.subject.paths == "*"
+    assert grant.subject.bundle_sha256 == "*"
+    assert grant.resources == CapabilityResources(git_refs=("refs/heads/main",))
+    assert grant.max_delegation_depth == 0
+
+    now = datetime(2026, 9, 3, 12, 0, tzinfo=UTC)
+    evaluator = DeterministicCapabilityEvaluator((grant,), {}, clock=lambda: now)
+
+    def decision(
+        capability: Capability,
+        *,
+        repository: str = "https://github.com/example/gold",
+        ref: str = "refs/heads/main",
+    ) -> str:
+        return evaluator.evaluate(
+            CapabilityRequest(
+                authority_repository=repository,
+                target_repository=repository,
+                capabilities=(capability,),
+                ref=ref,
+                path=".geas-publication-preauthorization",
+                dirty=False,
+                requested_at=now,
+            )
+        ).decision
+
+    assert decision(Capability.GIT_PULL_REQUEST) == "allow"
+    assert decision(Capability.GIT_DIRECT_PUSH) == "deny"
+    assert decision(
+        Capability.GIT_PULL_REQUEST,
+        repository="https://github.com/example/other",
+    ) == "deny"
+    assert decision(Capability.GIT_PULL_REQUEST, ref="refs/heads/other") == "deny"
+
+
+def test_path_specific_publication_flow_is_parseable_and_fail_closed() -> None:
+    commands = _commands_between(
+        GUIDE.read_text(),
+        "<!-- PATH_SPECIFIC_PUBLICATION_FLOW_START -->",
+        "<!-- PATH_SPECIFIC_PUBLICATION_FLOW_END -->",
+    )
+    parser = _build_parser()
+    choices = next(
+        action.choices
+        for action in parser._actions  # noqa: SLF001 - executable CLI documentation
+        if getattr(action, "choices", None)
+    )
+    if "repository-install" not in choices:
+        pytest.skip("Task 7 CLI fan-in is not present on this branch")
+
+    assert commands == (
+        "geas repository-install gold https://github.com/example/gold.git "
+        "--ref refs/heads/main --trust-repository --link --publish none",
+        "geas repository-update gold",
+    )
+    install, publish = (
+        parser.parse_args(shlex.split(command)[1:]) for command in commands
+    )
+
+    assert install.command == "repository-install"
+    assert install.publish == "none"
+    assert install.direct_push is False
+    assert publish.command == "repository-update"
+    assert publish.publish == "pull-request"
+    assert publish.direct_push is False
+
+    repository = _normalized_text(GUIDE.read_text())
+    readme = _normalized_text(README.read_text())
+    for text in (repository, readme):
+        assert "unknown closed publication manifest" in text
+        assert "root-local" in text
+        assert "exact repository and writable ref" in text
+        assert "paths: `\"*\"`" in text
+        assert "bundle_sha256: `\"*\"`" in text
+    assert "only the named Git capability" in repository
+    assert "complete, durable, non-pending receipt" in repository
+    assert "every receipt-owned leaf" in repository
+    assert "Ambiguity falls back to the wildcard pre-scope" in repository
 
 
 def test_docs_cover_bootstrap_delegation_publication_and_recovery_boundaries() -> None:

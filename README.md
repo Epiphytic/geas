@@ -271,6 +271,30 @@ geas repository-update gold
 geas repository-remove gold
 ```
 
+Before a first remote or current-worktree install can publish, Geas does not
+yet know the closed set of skill names and files it will produce. That unknown
+closed publication manifest requires a root-local `git.pull_request` grant for
+the exact repository and writable ref with paths: `"*"` and
+bundle_sha256: `"*"`. Those wildcard selectors grant only the named Git
+capability; they do not grant repository reads, trust, source access, model
+use, promotion, or direct push.
+
+For path-specific authority, install locally first with `--publish none`:
+
+```bash
+geas repository-install gold https://github.com/example/gold.git \
+  --ref refs/heads/main \
+  --trust-repository \
+  --link \
+  --publish none
+```
+
+Inspect the verified JSON receipt and complete generated skill manifests, add
+exact grants for every receipt-owned leaf and its producer bundle, then run
+`geas repository-update gold` to request publication. If the prior receipt is
+incomplete or the future path, skill name, or bundle is ambiguous, publication
+again requires the wildcard pre-scope.
+
 Use `--read-only` instead of `--trust-repository` when only verified ontology
 reads are wanted. Full trust is still bounded to the verified snapshot: its
 default depth permits one delegation edge, and `--delegate-depth N` is an
