@@ -22,6 +22,23 @@ CHILD = "https://github.com/example/child"
 OTHER = "https://github.com/example/other"
 TARGET = "https://github.com/example/target"
 DIGEST = "a" * 64
+MANIFEST_SHA256 = "b" * 64
+CATALOG_COMMIT = "c" * 40
+
+
+def _verified_manifest(
+    repository: str,
+    manifest: DelegationManifest,
+    *,
+    manifest_sha256: str = MANIFEST_SHA256,
+    catalog_commit: str = CATALOG_COMMIT,
+) -> dict[str, object]:
+    return {
+        "repository": repository,
+        "manifest": manifest,
+        "manifest_sha256": manifest_sha256,
+        "catalog_commit": catalog_commit,
+    }
 
 
 def _grant(
@@ -34,6 +51,13 @@ def _grant(
     capabilities: tuple[Capability, ...] = (Capability.SOURCE_FETCH,),
     delegable_capabilities: tuple[Capability, ...] = (),
     delegated_repositories: tuple[str, ...] | str = (),
+    hosts: tuple[str, ...] | str = "*",
+    path_prefixes: tuple[str, ...] | str = "*",
+    connectors: tuple[str, ...] | str = "*",
+    providers: tuple[str, ...] | str = "*",
+    models: tuple[str, ...] | str = "*",
+    data_classes: tuple[str, ...] | str = "*",
+    git_refs: tuple[str, ...] | str = "*",
     max_delegation_depth: int = 0,
     expires_at: datetime | None = None,
 ) -> CapabilityGrant:
@@ -47,7 +71,16 @@ def _grant(
         ),
         capabilities=capabilities,
         delegable_capabilities=delegable_capabilities,
-        resources=CapabilityResources(delegated_repositories=delegated_repositories),
+        resources=CapabilityResources(
+            delegated_repositories=delegated_repositories,
+            hosts=hosts,
+            path_prefixes=path_prefixes,
+            connectors=connectors,
+            providers=providers,
+            models=models,
+            data_classes=data_classes,
+            git_refs=git_refs,
+        ),
         max_delegation_depth=max_delegation_depth,
         expires_at=expires_at,
         created_at=NOW - timedelta(days=1),
@@ -65,6 +98,24 @@ def _request(
     bundle_sha256: str | None = DIGEST,
     dirty: bool = False,
 ) -> CapabilityRequest:
+    selectors: dict[str, str] = {}
+    if capability in {
+        Capability.SOURCE_DISCOVER,
+        Capability.SOURCE_FETCH,
+        Capability.SOURCE_ARCHIVE,
+        Capability.SOURCE_EXTRACT,
+    }:
+        selectors = {
+            "connector": "crossref",
+            "host": "api.example.invalid",
+            "target": "https://api.example.invalid/records/1",
+        }
+    elif capability is Capability.MODEL_EXTERNAL:
+        selectors = {
+            "provider": "openai",
+            "model": "gpt-5",
+            "data_class": "public",
+        }
     return CapabilityRequest(
         authority_repository=authority_repository,
         target_repository=target_repository,
@@ -74,6 +125,7 @@ def _request(
         bundle_sha256=bundle_sha256,
         dirty=dirty,
         requested_at=NOW,
+        **selectors,
     )
 
 
@@ -88,6 +140,160 @@ def test_equal_specificity_deny_wins_for_one_atomic_capability() -> None:
     ).evaluate(_request(Capability.SOURCE_FETCH, path="ontology/a"))
 
     assert decision.allowed is False
+
+
+@pytest.mark.parametrize(
+    "capability",
+    (
+        Capability.SOURCE_DISCOVER,
+        Capability.SOURCE_FETCH,
+        Capability.SOURCE_ARCHIVE,
+        Capability.SOURCE_EXTRACT,
+    ),
+)
+@pytest.mark.parametrize("missing", ("connector", "host", "target"))
+def test_source_requests_require_every_normalized_resource_selector(
+    capability: Capability,
+    missing: str,
+) -> None:
+    raw = _request(capability).model_dump(mode="json")
+    raw.pop(missing)
+
+    with pytest.raises(ValidationError, match="supplied together"):
+        CapabilityRequest.model_validate(raw)
+
+    for selector in ("connector", "host", "target"):
+        raw.pop(selector, None)
+    request = CapabilityRequest.model_validate(raw)
+
+    assert not _evaluator(_grant()).evaluate(request).allowed
+
+
+def test_source_request_derives_host_from_canonical_credential_free_target() -> None:
+    normalized = CapabilityRequest(
+        authority_repository=ROOT,
+        target_repository=ROOT,
+        capabilities=(Capability.SOURCE_FETCH,),
+        ref="refs/heads/main",
+        path="ontology/a",
+        bundle_sha256=DIGEST,
+        connector="crossref",
+        host="API.EXAMPLE.INVALID.",
+        target="https://API.EXAMPLE.INVALID:443/records/1",
+        requested_at=NOW,
+    )
+
+    assert normalized.host == "api.example.invalid"
+    assert normalized.target == "https://api.example.invalid/records/1"
+
+    with pytest.raises(ValidationError, match="host.*target|target.*host"):
+        CapabilityRequest(
+            **{
+                **normalized.model_dump(mode="python"),
+                "host": "other.example.invalid",
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "target",
+    (
+        "https://user:secret@api.example.invalid/records/1",
+        "https://api.example.invalid/records/1?token=secret",
+        "ssh://git@api.example.invalid/records/1",
+        "https://api.example.invalid/%41",
+        "https://api.example.invalid/records\\1",
+    ),
+)
+def test_source_request_rejects_unsafe_targets(target: str) -> None:
+    raw = _request(Capability.SOURCE_FETCH).model_dump(mode="python")
+    raw["target"] = target
+
+    with pytest.raises(ValidationError):
+        CapabilityRequest.model_validate(raw)
+
+
+def test_explicit_empty_source_resource_grants_no_authority() -> None:
+    grant = _grant(hosts=(), path_prefixes=(), connectors=())
+
+    assert not _evaluator(grant).evaluate(_request(Capability.SOURCE_FETCH)).allowed
+
+
+def test_model_external_requires_and_matches_each_resource_dimension() -> None:
+    request = _request(Capability.MODEL_EXTERNAL)
+    matching = _grant(
+        capabilities=(Capability.MODEL_EXTERNAL,),
+        providers=("openai",),
+        models=("gpt-5",),
+        data_classes=("public",),
+    )
+    wrong_model = matching.model_copy(
+        update={"resources": matching.resources.model_copy(update={"models": ("gpt-4",)})}
+    )
+
+    assert _evaluator(matching).evaluate(request).allowed
+    assert not _evaluator(wrong_model).evaluate(request).allowed
+
+    raw = request.model_dump(mode="json")
+    for selector in ("provider", "model", "data_class"):
+        missing = dict(raw)
+        missing.pop(selector)
+        with pytest.raises(ValidationError, match="supplied together"):
+            CapabilityRequest.model_validate(missing)
+        for key in ("provider", "model", "data_class"):
+            missing.pop(key, None)
+        denied = CapabilityRequest.model_validate(missing)
+        assert not _evaluator(matching).evaluate(denied).allowed
+
+
+def test_model_external_target_is_omitted_or_safe_and_never_retains_credentials() -> None:
+    request = _request(Capability.MODEL_EXTERNAL)
+    assert request.target is None
+
+    raw = request.model_dump(mode="python")
+    raw["target"] = "https://user:secret@example.invalid/v1"
+    with pytest.raises(ValidationError):
+        CapabilityRequest.model_validate(raw)
+
+
+def test_irrelevant_git_ref_does_not_make_source_allow_more_specific_than_deny() -> None:
+    allow = _grant(git_refs=("refs/heads/main",))
+    deny = _grant("deny")
+
+    assert not _evaluator(allow, deny).evaluate(_request(Capability.SOURCE_FETCH)).allowed
+
+
+def test_irrelevant_additional_capability_does_not_defeat_equal_source_deny() -> None:
+    allow = _grant(capabilities=(Capability.SOURCE_FETCH,))
+    deny = _grant(
+        "deny",
+        capabilities=(Capability.REPOSITORY_READ, Capability.SOURCE_FETCH),
+    )
+
+    assert not _evaluator(allow, deny).evaluate(_request(Capability.SOURCE_FETCH)).allowed
+
+
+def test_final_effective_resource_intersection_must_match_actual_request() -> None:
+    source = _grant(
+        capabilities=(Capability.SOURCE_FETCH,),
+        hosts=("api.example.invalid",),
+        path_prefixes=("/records",),
+        connectors=("crossref",),
+    )
+    repository = _grant(
+        capabilities=(Capability.REPOSITORY_READ,),
+        hosts=(),
+        path_prefixes=(),
+        connectors=(),
+    )
+    request = CapabilityRequest(
+        **{
+            **_request(Capability.SOURCE_FETCH).model_dump(mode="python"),
+            "capabilities": (Capability.REPOSITORY_READ, Capability.SOURCE_FETCH),
+        }
+    )
+
+    assert not _evaluator(source, repository).evaluate(request).allowed
 
 
 @pytest.mark.parametrize(
@@ -133,12 +339,10 @@ def test_dirty_bytes_are_not_covered_by_branch_only_allow() -> None:
 
 
 def test_expiry_is_exclusive_at_the_clock_boundary() -> None:
-    before = _evaluator(_grant(expires_at=NOW + timedelta(microseconds=1))).evaluate(
-        _request(Capability.SOURCE_FETCH)
-    )
-    at_boundary = _evaluator(_grant(expires_at=NOW)).evaluate(
-        _request(Capability.SOURCE_FETCH)
-    )
+    before = _evaluator(
+        _grant(expires_at=NOW + timedelta(microseconds=1))
+    ).evaluate(_request(Capability.SOURCE_FETCH))
+    at_boundary = _evaluator(_grant(expires_at=NOW)).evaluate(_request(Capability.SOURCE_FETCH))
 
     assert before.allowed
     assert not at_boundary.allowed
@@ -181,6 +385,9 @@ def _entry(
         Capability.TRUST_DELEGATE,
     ),
     delegated_repositories: tuple[str, ...] = (),
+    hosts: tuple[str, ...] | str = "*",
+    path_prefixes: tuple[str, ...] | str = "*",
+    connectors: tuple[str, ...] | str = "*",
     max_delegation_depth: int = 1,
     expires_at: datetime | None = None,
 ) -> DelegationEntry:
@@ -193,7 +400,16 @@ def _entry(
         ),
         capabilities=capabilities,
         delegable_capabilities=delegable_capabilities,
-        resources=CapabilityResources(delegated_repositories=delegated_repositories),
+        resources=CapabilityResources(
+            delegated_repositories=delegated_repositories,
+            hosts=hosts,
+            path_prefixes=path_prefixes,
+            connectors=connectors,
+            providers="*",
+            models="*",
+            data_classes="*",
+            git_refs="*",
+        ),
         max_delegation_depth=max_delegation_depth,
         expires_at=expires_at,
     )
@@ -224,10 +440,11 @@ def _evaluate_chain(*, root_depth: int, child_declared_depth: int):
     evaluator = DeterministicCapabilityEvaluator(
         (_delegating_root(depth=root_depth),),
         {
-            ROOT: DelegationManifest(
-                delegations=(
-                    _entry(CHILD, max_delegation_depth=child_declared_depth),
-                )
+            ROOT: _verified_manifest(
+                ROOT,
+                DelegationManifest(
+                    delegations=(_entry(CHILD, max_delegation_depth=child_declared_depth),)
+                ),
             )
         },
         clock=lambda: NOW,
@@ -257,13 +474,11 @@ def test_child_depth_is_parent_minus_one_intersected_with_declaration() -> None:
 def test_wildcard_delegated_repository_scope_allows_declared_child() -> None:
     evaluator = DeterministicCapabilityEvaluator(
         (_delegating_root(depth=1, repositories="*"),),
-        {ROOT: DelegationManifest(delegations=(_entry(CHILD),))},
+        {ROOT: _verified_manifest(ROOT, DelegationManifest(delegations=(_entry(CHILD),)))},
         clock=lambda: NOW,
     )
 
-    decision = evaluator.evaluate(
-        _request(Capability.SOURCE_FETCH, target_repository=CHILD)
-    )
+    decision = evaluator.evaluate(_request(Capability.SOURCE_FETCH, target_repository=CHILD))
 
     assert decision.allowed
 
@@ -287,7 +502,7 @@ def test_wildcard_delegated_repository_scope_allows_declared_child() -> None:
 def test_delegation_edge_requires_all_parent_authority(root: CapabilityGrant) -> None:
     evaluator = DeterministicCapabilityEvaluator(
         (root,),
-        {ROOT: DelegationManifest(delegations=(_entry(CHILD),))},
+        {ROOT: _verified_manifest(ROOT, DelegationManifest(delegations=(_entry(CHILD),)))},
         clock=lambda: NOW,
     )
 
@@ -307,20 +522,26 @@ def test_intermediate_local_allow_intersects_and_local_deny_blocks() -> None:
         max_delegation_depth=1,
     )
     manifests = {
-        ROOT: DelegationManifest(
-            delegations=(
-                _entry(CHILD, delegated_repositories=(TARGET,), max_delegation_depth=1),
-            )
+        ROOT: _verified_manifest(
+            ROOT,
+            DelegationManifest(
+                delegations=(
+                    _entry(CHILD, delegated_repositories=(TARGET,), max_delegation_depth=1),
+                )
+            ),
         ),
-        CHILD: DelegationManifest(
-            delegations=(
-                _entry(
-                    TARGET,
-                    capabilities=(Capability.SOURCE_FETCH,),
-                    delegable_capabilities=(),
-                    max_delegation_depth=0,
-                ),
-            )
+        CHILD: _verified_manifest(
+            CHILD,
+            DelegationManifest(
+                delegations=(
+                    _entry(
+                        TARGET,
+                        capabilities=(Capability.SOURCE_FETCH,),
+                        delegable_capabilities=(),
+                        max_delegation_depth=0,
+                    ),
+                )
+            ),
         ),
     }
 
@@ -346,20 +567,26 @@ def test_intermediate_local_trust_delegate_deny_stops_onward_traversal() -> None
         delegated_repositories=(TARGET,),
     )
     manifests = {
-        ROOT: DelegationManifest(
-            delegations=(
-                _entry(CHILD, delegated_repositories=(TARGET,), max_delegation_depth=1),
-            )
+        ROOT: _verified_manifest(
+            ROOT,
+            DelegationManifest(
+                delegations=(
+                    _entry(CHILD, delegated_repositories=(TARGET,), max_delegation_depth=1),
+                )
+            ),
         ),
-        CHILD: DelegationManifest(
-            delegations=(
-                _entry(
-                    TARGET,
-                    capabilities=(Capability.SOURCE_FETCH,),
-                    delegable_capabilities=(),
-                    max_delegation_depth=0,
-                ),
-            )
+        CHILD: _verified_manifest(
+            CHILD,
+            DelegationManifest(
+                delegations=(
+                    _entry(
+                        TARGET,
+                        capabilities=(Capability.SOURCE_FETCH,),
+                        delegable_capabilities=(),
+                        max_delegation_depth=0,
+                    ),
+                )
+            ),
         ),
     }
 
@@ -372,70 +599,161 @@ def test_intermediate_local_trust_delegate_deny_stops_onward_traversal() -> None
     assert not decision.allowed
 
 
+def test_intermediate_effective_resources_must_match_actual_request() -> None:
+    intermediate_delegate = _grant(
+        repository=CHILD,
+        capabilities=(Capability.SOURCE_FETCH, Capability.TRUST_DELEGATE),
+        delegable_capabilities=(Capability.SOURCE_FETCH, Capability.TRUST_DELEGATE),
+        delegated_repositories=(TARGET,),
+        hosts=(),
+        path_prefixes=(),
+        connectors=(),
+        max_delegation_depth=1,
+    )
+    manifests = {
+        ROOT: _verified_manifest(
+            ROOT,
+            DelegationManifest(
+                delegations=(
+                    _entry(CHILD, delegated_repositories=(TARGET,), max_delegation_depth=1),
+                )
+            ),
+        ),
+        CHILD: _verified_manifest(
+            CHILD,
+            DelegationManifest(
+                delegations=(
+                    _entry(
+                        TARGET,
+                        capabilities=(Capability.SOURCE_FETCH,),
+                        delegable_capabilities=(),
+                        max_delegation_depth=0,
+                    ),
+                )
+            ),
+        ),
+    }
+
+    decision = DeterministicCapabilityEvaluator(
+        (_delegating_root(depth=2), intermediate_delegate),
+        manifests,
+        clock=lambda: NOW,
+    ).evaluate(_request(Capability.SOURCE_FETCH, target_repository=TARGET))
+
+    assert not decision.allowed
+
+
 def test_expired_intermediate_and_attempted_widening_fail_closed() -> None:
-    expired = DelegationManifest(
-        delegations=(_entry(CHILD, expires_at=NOW),)
-    )
-    widening = DelegationManifest(
-        delegations=(_entry(CHILD, delegated_repositories=(OTHER,)),)
-    )
+    expired = DelegationManifest(delegations=(_entry(CHILD, expires_at=NOW),))
+    widening = DelegationManifest(delegations=(_entry(CHILD, delegated_repositories=(OTHER,)),))
     root = _delegating_root(depth=2, repositories=(CHILD, TARGET))
     request = _request(Capability.SOURCE_FETCH, target_repository=CHILD)
 
-    assert not DeterministicCapabilityEvaluator(
-        (root,), {ROOT: expired}, clock=lambda: NOW
-    ).evaluate(request).allowed
-    assert not DeterministicCapabilityEvaluator(
-        (root,), {ROOT: widening}, clock=lambda: NOW
-    ).evaluate(request).allowed
+    assert (
+        not DeterministicCapabilityEvaluator(
+            (root,), {ROOT: _verified_manifest(ROOT, expired)}, clock=lambda: NOW
+        )
+        .evaluate(request)
+        .allowed
+    )
+    assert (
+        not DeterministicCapabilityEvaluator(
+            (root,), {ROOT: _verified_manifest(ROOT, widening)}, clock=lambda: NOW
+        )
+        .evaluate(request)
+        .allowed
+    )
 
 
 def test_cycles_are_rejected_before_a_request_is_evaluated() -> None:
     manifests = {
-        ROOT: DelegationManifest(delegations=(_entry(CHILD),)),
-        CHILD: DelegationManifest(delegations=(_entry(ROOT),)),
+        ROOT: _verified_manifest(ROOT, DelegationManifest(delegations=(_entry(CHILD),))),
+        CHILD: _verified_manifest(CHILD, DelegationManifest(delegations=(_entry(ROOT),))),
     }
 
     with pytest.raises(ValueError, match="cycle|repeated"):
-        DeterministicCapabilityEvaluator(
-            (_delegating_root(depth=2),), manifests, clock=lambda: NOW
-        )
+        DeterministicCapabilityEvaluator((_delegating_root(depth=2),), manifests, clock=lambda: NOW)
 
 
 def test_multiple_valid_chains_choose_lexically_first_chain() -> None:
     root = _delegating_root(depth=2, repositories=(CHILD, OTHER, TARGET))
     manifests = {
-        ROOT: DelegationManifest(
-            delegations=(
-                _entry(CHILD, delegated_repositories=(TARGET,)),
-                _entry(OTHER, delegated_repositories=(TARGET,)),
-            )
+        ROOT: _verified_manifest(
+            ROOT,
+            DelegationManifest(
+                delegations=(
+                    _entry(CHILD, delegated_repositories=(TARGET,)),
+                    _entry(OTHER, delegated_repositories=(TARGET,)),
+                )
+            ),
         ),
-        CHILD: DelegationManifest(
-            delegations=(
-                _entry(
-                    TARGET,
-                    capabilities=(Capability.SOURCE_FETCH,),
-                    delegable_capabilities=(),
-                    max_delegation_depth=0,
-                ),
-            )
+        CHILD: _verified_manifest(
+            CHILD,
+            DelegationManifest(
+                delegations=(
+                    _entry(
+                        TARGET,
+                        capabilities=(Capability.SOURCE_FETCH,),
+                        delegable_capabilities=(),
+                        max_delegation_depth=0,
+                    ),
+                )
+            ),
         ),
-        OTHER: DelegationManifest(
-            delegations=(
-                _entry(
-                    TARGET,
-                    capabilities=(Capability.SOURCE_FETCH,),
-                    delegable_capabilities=(),
-                    max_delegation_depth=0,
-                ),
-            )
+        OTHER: _verified_manifest(
+            OTHER,
+            DelegationManifest(
+                delegations=(
+                    _entry(
+                        TARGET,
+                        capabilities=(Capability.SOURCE_FETCH,),
+                        delegable_capabilities=(),
+                        max_delegation_depth=0,
+                    ),
+                )
+            ),
         ),
     }
 
-    decision = DeterministicCapabilityEvaluator(
-        (root,), manifests, clock=lambda: NOW
-    ).evaluate(_request(Capability.SOURCE_FETCH, target_repository=TARGET))
+    decision = DeterministicCapabilityEvaluator((root,), manifests, clock=lambda: NOW).evaluate(
+        _request(Capability.SOURCE_FETCH, target_repository=TARGET)
+    )
 
     assert decision.allowed
     assert decision.delegation_chain == (ROOT, CHILD, TARGET)
+
+
+def test_parsed_manifest_without_verified_bytes_and_commit_is_rejected() -> None:
+    with pytest.raises(ValueError, match="verified|sha256|commit"):
+        DeterministicCapabilityEvaluator(
+            (_delegating_root(depth=1),),
+            {ROOT: DelegationManifest(delegations=(_entry(CHILD),))},
+            clock=lambda: NOW,
+        )
+
+
+def test_manifest_bytes_and_catalog_commit_bind_delegated_receipts() -> None:
+    manifest = DelegationManifest(delegations=(_entry(CHILD),))
+
+    def evaluate(*, manifest_sha256: str, catalog_commit: str):
+        return DeterministicCapabilityEvaluator(
+            (_delegating_root(depth=1),),
+            {
+                ROOT: _verified_manifest(
+                    ROOT,
+                    manifest,
+                    manifest_sha256=manifest_sha256,
+                    catalog_commit=catalog_commit,
+                )
+            },
+            clock=lambda: NOW,
+        ).evaluate(_request(Capability.SOURCE_FETCH, target_repository=CHILD))
+
+    first = evaluate(manifest_sha256="1" * 64, catalog_commit="2" * 40)
+    different_bytes = evaluate(manifest_sha256="3" * 64, catalog_commit="2" * 40)
+    different_commit = evaluate(manifest_sha256="1" * 64, catalog_commit="4" * 40)
+
+    assert first.allowed and different_bytes.allowed and different_commit.allowed
+    assert first.manifest_sha256s == ("1" * 64,)
+    assert first.catalog_commits == ("2" * 40,)
+    assert len({first.id, different_bytes.id, different_commit.id}) == 3

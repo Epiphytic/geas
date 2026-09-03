@@ -8,8 +8,9 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
+from pathlib import PurePosixPath
 from typing import Literal, Protocol
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 from pydantic import Field, field_validator, model_validator
 
@@ -33,6 +34,8 @@ class Capability(StrEnum):
 _REF = re.compile(r"^refs/(?:heads|tags)/[A-Za-z0-9][A-Za-z0-9._/-]*$")
 _HEX = re.compile(r"^[0-9a-f]{64}$")
 _HOST = re.compile(r"^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$")
+_RESOURCE_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]*$")
+_GIT_OBJECT_ID = re.compile(r"^[0-9a-f]{40,64}$")
 
 
 def _https_url(value: object, *, label: str) -> str:
@@ -59,6 +62,92 @@ def _https_url(value: object, *, label: str) -> str:
     if not path or "/../" in f"/{path}/" or "//" in path:
         raise ValueError(f"{label} path is unsafe")
     return urlunsplit(("https", parsed.hostname.lower(), path, "", ""))
+
+
+def _repository_identity(value: object, *, label: str) -> str:
+    """Normalize repository identity without granting network authority."""
+    raw = str(value)
+    if not raw or any(ord(character) < 32 or ord(character) == 127 for character in raw):
+        raise ValueError(f"{label} is invalid")
+    if raw.startswith("/"):
+        pure = PurePosixPath(raw)
+        if raw == "/" or pure.as_posix() != raw or any(part in {".", ".."} for part in pure.parts):
+            raise ValueError(f"{label} must be a normalized absolute repository path")
+        return raw
+    parsed = urlsplit(raw)
+    if parsed.scheme not in {"https", "ssh"}:
+        raise ValueError(f"{label} uses an unsupported repository transport")
+    if parsed.password is not None or (
+        parsed.username is not None and not (parsed.scheme == "ssh" and parsed.username == "git")
+    ):
+        raise ValueError(f"{label} cannot embed credentials")
+    if not parsed.hostname or parsed.query or parsed.fragment:
+        raise ValueError(f"{label} must be a credential-free repository identity")
+    try:
+        port_number = parsed.port
+    except ValueError as error:
+        raise ValueError(f"{label} port is invalid") from error
+    decoded_path = unquote(parsed.path)
+    pure_path = PurePosixPath(decoded_path)
+    if (
+        not decoded_path
+        or pure_path.as_posix() != decoded_path
+        or any(part in {"", ".", ".."} for part in pure_path.parts)
+    ):
+        raise ValueError(f"{label} path is unsafe")
+    host = parsed.hostname.lower()
+    path = parsed.path.rstrip("/").removesuffix(".git")
+    if (
+        host == "github.com"
+        and port_number is None
+        and (parsed.scheme == "https" or parsed.username == "git")
+    ):
+        return f"https://github.com/{path.lstrip('/')}"
+    rendered_host = f"[{host}]" if ":" in host else host
+    username = "git@" if parsed.username == "git" else ""
+    port = f":{port_number}" if port_number is not None else ""
+    return f"{parsed.scheme.lower()}://{username}{rendered_host}{port}{path}"
+
+
+def _source_target(value: object) -> tuple[str, str]:
+    """Return a canonical source URL and its independently derived host."""
+    raw = str(value)
+    parsed = urlsplit(raw)
+    try:
+        port = parsed.port
+    except ValueError as error:
+        raise ValueError("source target must be a safe credential-free HTTPS URL") from error
+    if (
+        parsed.scheme.lower() != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or port not in (None, 443)
+        or parsed.query
+        or parsed.fragment
+        or any(ord(character) < 32 or ord(character) == 127 for character in raw)
+    ):
+        raise ValueError("source target must be a safe credential-free HTTPS URL")
+    host = _host(parsed.hostname)
+    path = parsed.path or "/"
+    decoded = unquote(path)
+    if (
+        not path.startswith("/")
+        or decoded != path
+        or "\\" in path
+        or "//" in path
+        or any(part in {".", ".."} for part in PurePosixPath(decoded).parts)
+        or any(ord(character) < 32 or ord(character) == 127 for character in decoded)
+    ):
+        raise ValueError("source target path is unsafe")
+    return urlunsplit(("https", host, path, "", "")), host
+
+
+def _resource_identifier(value: object, *, label: str) -> str:
+    raw = str(value)
+    if not _RESOURCE_IDENTIFIER.fullmatch(raw):
+        raise ValueError(f"{label} must be a normalized resource identifier")
+    return raw
 
 
 def _relative_path(value: object, *, label: str, allow_root: bool = False) -> str:
@@ -93,6 +182,8 @@ def _path_prefix(value: object) -> str:
 
 def _ref(value: object) -> str:
     raw = str(value)
+    if _GIT_OBJECT_ID.fullmatch(raw):
+        return raw
     if (
         not _REF.fullmatch(raw)
         or "//" in raw
@@ -140,7 +231,7 @@ class CapabilitySubject(StrictModel):
     @field_validator("repository", mode="before")
     @classmethod
     def normalize_repository(cls, value: object) -> str:
-        return _https_url(value, label="repository")
+        return _repository_identity(value, label="repository")
 
     @field_validator("refs", mode="before")
     @classmethod
@@ -189,7 +280,7 @@ class CapabilityResources(StrictModel):
         if value == "*":
             return "*"
         repositories = tuple(
-            _https_url(item, label="delegated repository")
+            _repository_identity(item, label="delegated repository")
             for item in value  # type: ignore[arg-type]
         )
         return _ordered(repositories, label="delegated_repositories")
@@ -220,9 +311,10 @@ class CapabilityResources(StrictModel):
     def normalize_identifiers(cls, value: object) -> tuple[str, ...] | Literal["*"]:
         if value == "*":
             return "*"
-        values = tuple(str(item) for item in value)  # type: ignore[arg-type]
-        if any(not item or item.strip() != item for item in values):
-            raise ValueError("resource identifiers must be non-empty normalized strings")
+        values = tuple(
+            _resource_identifier(item, label="resource identifier")
+            for item in value  # type: ignore[arg-type]
+        )
         return _ordered(values, label="resource identifiers")
 
 
@@ -272,13 +364,58 @@ class CapabilityRequest(StrictModel):
     connector: str | None = None
     host: str | None = None
     target: str | None = None
+    provider: str | None = None
+    model: str | None = None
+    data_class: str | None = None
     dirty: bool = False
     requested_at: datetime
+
+    @model_validator(mode="before")
+    @classmethod
+    def resources_are_complete_and_bound(cls, value: object) -> object:
+        if not isinstance(value, Mapping):
+            return value
+        normalized = dict(value)
+        capabilities = {
+            item.value if isinstance(item, Capability) else str(item)
+            for item in normalized.get("capabilities", ())
+        }
+        source_capabilities = {
+            Capability.SOURCE_DISCOVER.value,
+            Capability.SOURCE_FETCH.value,
+            Capability.SOURCE_ARCHIVE.value,
+            Capability.SOURCE_EXTRACT.value,
+        }
+        if capabilities.intersection(source_capabilities):
+            supplied = tuple(
+                normalized.get(selector) is not None for selector in ("connector", "host", "target")
+            )
+            if any(supplied):
+                if not all(supplied):
+                    raise ValueError(
+                        "source capability resource selectors must be supplied together"
+                    )
+                canonical_target, derived_host = _source_target(normalized["target"])
+                claimed_host = _host(normalized["host"])
+                if claimed_host != derived_host:
+                    raise ValueError("source request host must match the host derived from target")
+                normalized["target"] = canonical_target
+                normalized["host"] = derived_host
+        elif normalized.get("target") is not None:
+            normalized["target"] = _resource_identifier(normalized["target"], label="target")
+        if Capability.MODEL_EXTERNAL.value in capabilities:
+            supplied = tuple(
+                normalized.get(selector) is not None
+                for selector in ("provider", "model", "data_class")
+            )
+            if any(supplied) and not all(supplied):
+                raise ValueError("model.external resource selectors must be supplied together")
+        return normalized
 
     @field_validator("authority_repository", "target_repository", mode="before")
     @classmethod
     def normalize_repositories(cls, value: object) -> str:
-        return _https_url(value, label="repository")
+        return _repository_identity(value, label="repository")
 
     @field_validator("ref", mode="before")
     @classmethod
@@ -294,6 +431,15 @@ class CapabilityRequest(StrictModel):
     @classmethod
     def normalize_host(cls, value: object) -> str | None:
         return None if value is None else _host(value)
+
+    @field_validator("connector", "provider", "model", "data_class", mode="before")
+    @classmethod
+    def normalize_resource_identifiers(cls, value: object) -> str | None:
+        return (
+            None
+            if value is None
+            else _resource_identifier(value, label="request resource selector")
+        )
 
     @field_validator("capabilities")
     @classmethod
@@ -323,6 +469,8 @@ class CapabilityDecision(StrictModel):
     evaluator_version: str
     decided_at: datetime
     manifest_ids: tuple[str, ...] = ()
+    manifest_sha256s: tuple[str, ...] = ()
+    catalog_commits: tuple[str, ...] = ()
     effective_resources: CapabilityResources = Field(default_factory=CapabilityResources)
     effective_remaining_depth: int = Field(default=0, ge=0, le=32)
 
@@ -338,10 +486,32 @@ class CapabilityDecision(StrictModel):
     def normalize_grant_ids(cls, value: tuple[str, ...]) -> tuple[str, ...]:
         return _ordered(value, label="receipt identities")
 
+    @field_validator("manifest_sha256s", mode="before")
+    @classmethod
+    def normalize_manifest_sha256s(cls, value: object) -> tuple[str, ...]:
+        return _ordered(
+            tuple(
+                _sha256(item, label="manifest_sha256")
+                for item in value  # type: ignore[arg-type]
+            ),
+            label="manifest_sha256s",
+        )
+
+    @field_validator("catalog_commits", mode="before")
+    @classmethod
+    def normalize_catalog_commits(cls, value: object) -> tuple[str, ...]:
+        commits = tuple(str(item) for item in value)  # type: ignore[arg-type]
+        if any(not _GIT_OBJECT_ID.fullmatch(item) for item in commits):
+            raise ValueError("catalog commits must be lowercase full Git object IDs")
+        return _ordered(commits, label="catalog_commits")
+
     @field_validator("delegation_chain", mode="before")
     @classmethod
     def preserve_ordered_delegation_chain(cls, value: object) -> tuple[str, ...]:
-        chain = tuple(_https_url(item, label="delegation repository") for item in value)  # type: ignore[arg-type]
+        chain = tuple(
+            _repository_identity(item, label="delegation repository")
+            for item in value  # type: ignore[arg-type]
+        )
         if len(chain) != len(set(chain)):
             raise ValueError("delegation_chain must not repeat repository identities")
         return chain
@@ -428,6 +598,38 @@ class DelegationManifest(StrictModel):
         return content_id("delegation-manifest", self.model_dump(mode="json"))
 
 
+class VerifiedDelegationManifest(StrictModel):
+    """A parsed manifest bound to catalog-verified bytes and Git truth."""
+
+    version: Literal[1] = 1
+    repository: str
+    manifest: DelegationManifest
+    manifest_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    catalog_commit: str = Field(pattern=r"^[0-9a-f]{40,64}$")
+
+    @field_validator("repository", mode="before")
+    @classmethod
+    def normalize_repository(cls, value: object) -> str:
+        return _repository_identity(value, label="verified delegation repository")
+
+    @field_validator("manifest_sha256", mode="before")
+    @classmethod
+    def normalize_manifest_sha256(cls, value: object) -> str:
+        return _sha256(value, label="manifest_sha256")
+
+    @field_validator("catalog_commit", mode="before")
+    @classmethod
+    def normalize_catalog_commit(cls, value: object) -> str:
+        raw = str(value)
+        if not _GIT_OBJECT_ID.fullmatch(raw):
+            raise ValueError("catalog_commit must be a lowercase full Git object ID")
+        return raw
+
+    @property
+    def id(self) -> str:
+        return content_id("verified-delegation-manifest", self.model_dump(mode="json"))
+
+
 class CapabilityEvaluator(Protocol):
     def evaluate(self, request: CapabilityRequest) -> CapabilityDecision: ...
 
@@ -470,17 +672,29 @@ def _subject_specificity(subject: CapabilitySubject) -> int:
     )
 
 
-def _resource_specificity(resources: CapabilityResources) -> tuple[int, int]:
-    values: tuple[tuple[str, ...] | Literal["*"], ...] = (
-        resources.delegated_repositories,
-        resources.hosts,
-        resources.path_prefixes,
-        resources.connectors,
-        resources.providers,
-        resources.models,
-        resources.data_classes,
-        resources.git_refs,
-    )
+def _resource_specificity(
+    resources: CapabilityResources,
+    capability: Capability,
+) -> tuple[int, int]:
+    if capability is Capability.TRUST_DELEGATE:
+        values = (resources.delegated_repositories,)
+    elif capability in {
+        Capability.SOURCE_DISCOVER,
+        Capability.SOURCE_FETCH,
+        Capability.SOURCE_ARCHIVE,
+        Capability.SOURCE_EXTRACT,
+    }:
+        values = (resources.hosts, resources.path_prefixes, resources.connectors)
+    elif capability is Capability.MODEL_EXTERNAL:
+        values = (resources.providers, resources.models, resources.data_classes)
+    elif capability in {
+        Capability.GIT_PULL_REQUEST,
+        Capability.GIT_AUTO_MERGE,
+        Capability.GIT_DIRECT_PUSH,
+    }:
+        values = (resources.git_refs,)
+    else:
+        values = ()
     constrained = sum(value != "*" and bool(value) for value in values)
     cardinality = sum(len(value) for value in values if value != "*")
     return constrained, -cardinality
@@ -560,21 +774,32 @@ def _resources_match(
         Capability.SOURCE_ARCHIVE,
         Capability.SOURCE_EXTRACT,
     }:
-        if request.connector is not None and not _selected(
-            resources.connectors, request.connector
-        ):
+        if request.connector is None or request.host is None or request.target is None:
             return False
-        if request.host is not None and not _selected(resources.hosts, request.host):
+        try:
+            canonical_target, derived_host = _source_target(request.target)
+        except ValueError:
             return False
-        if request.target is not None:
-            parsed = urlsplit(request.target)
-            path = parsed.path if parsed.scheme else request.target
-            prefixes = resources.path_prefixes
-            if prefixes != "*" and not any(path.startswith(prefix) for prefix in prefixes):
-                return False
-    if capability is Capability.MODEL_EXTERNAL and request.target is not None:
-        scopes = (resources.providers, resources.models, resources.data_classes)
-        return any(_selected(scope, request.target) for scope in scopes)
+        if canonical_target != request.target or derived_host != request.host:
+            return False
+        if not _selected(resources.connectors, request.connector):
+            return False
+        if not _selected(resources.hosts, request.host):
+            return False
+        path = urlsplit(request.target).path
+        prefixes = resources.path_prefixes
+        return prefixes == "*" or any(
+            prefix == "/" or path == prefix.rstrip("/") or path.startswith(f"{prefix.rstrip('/')}/")
+            for prefix in prefixes
+        )
+    if capability is Capability.MODEL_EXTERNAL:
+        if request.provider is None or request.model is None or request.data_class is None:
+            return False
+        return (
+            _selected(resources.providers, request.provider)
+            and _selected(resources.models, request.model)
+            and _selected(resources.data_classes, request.data_class)
+        )
     if capability in {
         Capability.GIT_PULL_REQUEST,
         Capability.GIT_AUTO_MERGE,
@@ -612,28 +837,38 @@ class _EffectiveGrant:
     remaining_depth: int
     grant_ids: tuple[str, ...]
     manifest_ids: tuple[str, ...]
+    manifest_sha256s: tuple[str, ...]
+    catalog_commits: tuple[str, ...]
     chain: tuple[str, ...]
 
 
 class DeterministicCapabilityEvaluator:
     """Resolve trusted local grants without deriving authority from requested data."""
 
-    version = "1"
+    version = "2"
 
     def __init__(
         self,
         grants: Sequence[CapabilityGrant],
-        manifests: Mapping[str, DelegationManifest],
+        manifests: Mapping[str, VerifiedDelegationManifest | Mapping[str, object]],
         *,
         clock: Callable[[], datetime],
         yolo: bool = False,
     ) -> None:
         self.grants = tuple(grants)
-        normalized_manifests: dict[str, DelegationManifest] = {}
-        for repository, manifest in manifests.items():
-            normalized = _https_url(repository, label="delegation repository")
+        normalized_manifests: dict[str, VerifiedDelegationManifest] = {}
+        for repository, manifest_value in manifests.items():
+            normalized = _repository_identity(repository, label="delegation repository")
             if normalized in normalized_manifests:
                 raise ValueError("duplicate normalized delegation repository")
+            try:
+                manifest = VerifiedDelegationManifest.model_validate(manifest_value)
+            except (TypeError, ValueError) as error:
+                raise ValueError(
+                    "delegation manifest requires verified sha256 and catalog commit context"
+                ) from error
+            if manifest.repository != normalized:
+                raise ValueError("verified delegation repository does not match mapping key")
             normalized_manifests[normalized] = manifest
         self.manifests = normalized_manifests
         self.clock = clock
@@ -677,6 +912,8 @@ class DeterministicCapabilityEvaluator:
                         remaining_depth=0,
                         grant_ids=(),
                         manifest_ids=(),
+                        manifest_sha256s=(),
+                        catalog_commits=(),
                         chain=(),
                     )
                 )
@@ -709,11 +946,32 @@ class DeterministicCapabilityEvaluator:
         )
         for state in effective_states:
             effective_resources = _intersect_resources(effective_resources, state.resources)
+        if any(
+            not _resources_match(effective_resources, capability, request)
+            for capability in request.capabilities
+        ):
+            return self._decision(
+                request,
+                allowed=False,
+                grants=(),
+                now=now,
+                reason="effective resource intersection does not authorize the request",
+            )
         state_grant_ids = tuple(
             sorted({identifier for state in effective_states for identifier in state.grant_ids})
         )
         state_manifest_ids = tuple(
             sorted({identifier for state in effective_states for identifier in state.manifest_ids})
+        )
+        state_manifest_sha256s = tuple(
+            sorted(
+                {identifier for state in effective_states for identifier in state.manifest_sha256s}
+            )
+        )
+        state_catalog_commits = tuple(
+            sorted(
+                {identifier for state in effective_states for identifier in state.catalog_commits}
+            )
         )
         return CapabilityDecision(
             request=request,
@@ -729,6 +987,8 @@ class DeterministicCapabilityEvaluator:
             evaluator_version=self.version,
             decided_at=now,
             manifest_ids=state_manifest_ids,
+            manifest_sha256s=state_manifest_sha256s,
+            catalog_commits=state_catalog_commits,
             effective_resources=effective_resources,
             effective_remaining_depth=min(
                 (state.remaining_depth for state in effective_states), default=0
@@ -743,6 +1003,8 @@ class DeterministicCapabilityEvaluator:
             remaining_depth=grant.max_delegation_depth,
             grant_ids=(grant.id,),
             manifest_ids=(),
+            manifest_sha256s=(),
+            catalog_commits=(),
             chain=(),
         )
 
@@ -797,13 +1059,17 @@ class DeterministicCapabilityEvaluator:
                 remaining_depth=grant.max_delegation_depth,
                 grant_ids=(grant.id,),
                 manifest_ids=(),
+                manifest_sha256s=(),
+                catalog_commits=(),
                 chain=(request.authority_repository,),
             )
             assert origin_winner is not None
             assert delegate_winner is not None
             state = self._intersect_local(state, origin_winner)
             state = self._intersect_local(state, delegate_winner)
-            if capability in state.delegable_capabilities:
+            if capability in state.delegable_capabilities and _resources_match(
+                state.resources, capability, request
+            ):
                 candidates.extend(self._walk(request, capability, state, now=now))
         return min(candidates, key=lambda item: item.chain) if candidates else None
 
@@ -821,6 +1087,8 @@ class DeterministicCapabilityEvaluator:
             remaining_depth=min(state.remaining_depth, grant.max_delegation_depth),
             grant_ids=(*state.grant_ids, grant.id),
             manifest_ids=state.manifest_ids,
+            manifest_sha256s=state.manifest_sha256s,
+            catalog_commits=state.catalog_commits,
             chain=state.chain,
         )
 
@@ -833,15 +1101,15 @@ class DeterministicCapabilityEvaluator:
         now: datetime,
     ) -> tuple[_EffectiveGrant, ...]:
         parent = state.chain[-1]
-        manifest = self.manifests.get(parent)
-        if manifest is None or state.remaining_depth <= 0:
+        verified_manifest = self.manifests.get(parent)
+        if verified_manifest is None or state.remaining_depth <= 0:
             return ()
         if Capability.TRUST_DELEGATE not in state.capabilities:
             return ()
         if capability not in state.delegable_capabilities:
             return ()
         candidates: list[_EffectiveGrant] = []
-        for entry in manifest.delegations:
+        for entry in verified_manifest.manifest.delegations:
             child = entry.subject.repository
             if child in state.chain:
                 continue
@@ -872,9 +1140,19 @@ class DeterministicCapabilityEvaluator:
                     entry.max_delegation_depth,
                 ),
                 grant_ids=state.grant_ids,
-                manifest_ids=(*state.manifest_ids, manifest.id),
+                manifest_ids=(*state.manifest_ids, verified_manifest.id),
+                manifest_sha256s=(
+                    *state.manifest_sha256s,
+                    verified_manifest.manifest_sha256,
+                ),
+                catalog_commits=(
+                    *state.catalog_commits,
+                    verified_manifest.catalog_commit,
+                ),
                 chain=(*state.chain, child),
             )
+            if not _resources_match(next_state.resources, capability, request):
+                continue
             local = self._winning_local(
                 request,
                 capability,
@@ -885,6 +1163,8 @@ class DeterministicCapabilityEvaluator:
                 if local.decision == "deny":
                     continue
                 next_state = self._intersect_local(next_state, local)
+                if not _resources_match(next_state.resources, capability, request):
+                    continue
             if capability not in next_state.capabilities:
                 continue
             if child == request.target_repository:
@@ -900,6 +1180,8 @@ class DeterministicCapabilityEvaluator:
                     if local_delegate.decision == "deny":
                         continue
                     next_state = self._intersect_local(next_state, local_delegate)
+                    if not _resources_match(next_state.resources, capability, request):
+                        continue
                 if capability not in next_state.delegable_capabilities:
                     continue
                 candidates.extend(self._walk(request, capability, next_state, now=now))
@@ -915,9 +1197,9 @@ class DeterministicCapabilityEvaluator:
             if repository in visited:
                 return
             visiting.add(repository)
-            manifest = self.manifests.get(repository)
-            if manifest is not None:
-                for entry in manifest.delegations:
+            verified_manifest = self.manifests.get(repository)
+            if verified_manifest is not None:
+                for entry in verified_manifest.manifest.delegations:
                     if entry.subject.repository in self.manifests:
                         visit(entry.subject.repository)
             visiting.remove(repository)
@@ -953,8 +1235,7 @@ class DeterministicCapabilityEvaluator:
             matching,
             key=lambda grant: (
                 _subject_specificity(grant.subject),
-                -len(grant.capabilities),
-                _resource_specificity(grant.resources),
+                _resource_specificity(grant.resources, capability),
                 grant.decision == "deny",
                 grant.id,
             ),

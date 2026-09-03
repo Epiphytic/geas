@@ -22,6 +22,7 @@ from research_agent.capabilities import (
     CapabilityResources,
     CapabilitySubject,
     DeterministicCapabilityEvaluator,
+    VerifiedDelegationManifest,
 )
 from research_agent.models import StrictModel, canonical_json, utc_now
 from research_agent.removal_journal import (
@@ -386,11 +387,16 @@ def evaluate_repository_read(
             return legacy
     if catalog.repository_identity is None:
         raise ValueError("repository catalog has no trust identity")
-    manifests = (
-        {catalog.repository_identity: catalog.delegation_manifest}
-        if catalog.delegation_manifest is not None
-        else {}
-    )
+    manifests = {}
+    if catalog.delegation_manifest is not None:
+        if catalog.delegation_manifest_sha256 is None or catalog.commit is None:
+            raise ValueError("verified delegation manifest lacks byte or Git commit identity")
+        manifests[catalog.repository_identity] = VerifiedDelegationManifest(
+            repository=catalog.repository_identity,
+            manifest=catalog.delegation_manifest,
+            manifest_sha256=catalog.delegation_manifest_sha256,
+            catalog_commit=catalog.commit,
+        )
     try:
         decision = DeterministicCapabilityEvaluator(
             profile.effective_capability_grants(),

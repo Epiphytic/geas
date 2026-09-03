@@ -7,7 +7,11 @@ from pathlib import Path
 import pytest
 import yaml
 
-from research_agent.capabilities import Capability
+from research_agent.capabilities import (
+    Capability,
+    CapabilityRequest,
+    DeterministicCapabilityEvaluator,
+)
 from research_agent.ontology_trust import TrustRule
 from research_agent.user_config import (
     DEFAULT_CONFIG_FILENAMES,
@@ -117,6 +121,72 @@ def test_explicit_upgrade_writes_strict_v2_capability_grants(tmp_path: Path) -> 
         "created_at": "2026-09-02T00:00:00Z",
         "created_via": "manual",
     }
+
+
+@pytest.mark.parametrize(
+    ("repository", "ref"),
+    (
+        ("/srv/geas/ontologies", "refs/heads/main"),
+        ("ssh://git@example.invalid/~/Owner/Example", "d" * 40),
+    ),
+    ids=("machine-local", "non-github-ssh"),
+)
+def test_v1_repository_identities_survive_v2_upgrade_load_and_evaluation(
+    tmp_path: Path,
+    repository: str,
+    ref: str,
+) -> None:
+    manager = UserConfigManager(tmp_path / "config.yaml")
+    manager.root.mkdir(parents=True, exist_ok=True)
+    rule = TrustRule(
+        decision="allow",
+        repository=repository,
+        refs=(ref,),
+        paths=(Path("ontology/a"),),
+        bundle_sha256=("a" * 64,),
+        created_at="2026-09-02T00:00:00Z",
+        created_via="manual",
+    )
+    config = GeasUserConfig(
+        profiles={"default": GeasProfile(ontology_git=None, trust_rules=(rule,))}
+    )
+
+    manager.replace(config, upgrade_version=True)
+    loaded = manager.load()
+    grant = loaded.profiles["default"].capability_grants[0]
+    decision = DeterministicCapabilityEvaluator(
+        (grant,), {}, clock=lambda: rule.created_at
+    ).evaluate(
+        CapabilityRequest(
+            authority_repository=repository,
+            target_repository=repository,
+            capabilities=(Capability.REPOSITORY_READ,),
+            ref=ref,
+            path="ontology/a",
+            bundle_sha256="a" * 64,
+            requested_at=rule.created_at,
+        )
+    )
+
+    assert loaded.version == 2
+    assert grant.subject.repository == repository
+    assert decision.allowed
+    if repository.startswith("ssh://"):
+        absolute_remote = "ssh://git@example.invalid/Owner/Example"
+        widened = DeterministicCapabilityEvaluator(
+            (grant,), {}, clock=lambda: rule.created_at
+        ).evaluate(
+            CapabilityRequest(
+                authority_repository=absolute_remote,
+                target_repository=absolute_remote,
+                capabilities=(Capability.REPOSITORY_READ,),
+                ref=ref,
+                path="ontology/a",
+                bundle_sha256="a" * 64,
+                requested_at=rule.created_at,
+            )
+        )
+        assert not widened.allowed
 
 
 def test_v2_rejects_legacy_rules_and_duplicate_normalized_grant_selectors() -> None:

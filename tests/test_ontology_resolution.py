@@ -198,6 +198,49 @@ def test_version_two_repository_read_grant_marks_candidate_trusted(tmp_path: Pat
     assert catalog.candidates[0].authorization == "rule"
 
 
+@pytest.mark.parametrize("remote", (None, "git@example.invalid:Owner/Example.git"))
+def test_upgraded_v1_machine_local_and_ssh_rules_remain_usable_when_listing(
+    tmp_path: Path,
+    remote: str | None,
+) -> None:
+    repository = _repository(tmp_path / "repository", "trusted")
+    if remote is None:
+        identity = str(repository)
+    else:
+        _git(repository, "remote", "add", "origin", remote)
+        identity = "ssh://git@example.invalid/~/Owner/Example"
+    manager = _manager(
+        tmp_path,
+        GeasProfile(
+            ontology_git=None,
+            trust_rules=(
+                TrustRule(
+                    decision="allow",
+                    repository=identity,
+                    refs="*",
+                    paths="*",
+                    bundle_sha256="*",
+                    created_at=datetime(2026, 9, 2, tzinfo=UTC),
+                    created_via="manual",
+                ),
+            ),
+        ),
+    )
+    manager.replace(manager.load(), upgrade_version=True)
+
+    catalog = resolve_ontology_catalog(
+        user_config=manager.load(),
+        manager=manager,
+        cwd=repository,
+        yolo=False,
+        prompt=None,
+    )
+
+    assert catalog.candidates[0].repository_identity == identity
+    assert catalog.candidates[0].trust_status == "trusted"
+    assert catalog.candidates[0].authorization == "rule"
+
+
 def test_yolo_authorizes_repository_candidate_without_persisting_configuration(
     tmp_path: Path,
 ) -> None:

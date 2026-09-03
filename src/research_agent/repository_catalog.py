@@ -282,6 +282,12 @@ class ResolvedRepositoryCatalog(StrictModel):
             item is not None for item in metadata
         ):
             raise ValueError("verified delegation metadata must be complete")
+        if self.delegation_manifest is not None and (
+            self.repository_identity is None or self.commit is None
+        ):
+            raise ValueError(
+                "verified delegation metadata requires repository identity and catalog commit"
+            )
         if self.repository_root is None:
             if self.discovery_start is not None or any(
                 item is not None for item in metadata
