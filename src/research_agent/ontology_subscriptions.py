@@ -235,6 +235,14 @@ class _BootstrapSubscriptionJournal(StrictModel):
             or self.quarantine is None
         ):
             raise ValueError("subscription replacement journal requires prior ownership")
+        if self.action == "remove" and (
+            self.old_subscription_sha256 is None
+            or self.old_checkout_inode is None
+            or self.new_subscription_sha256 is not None
+            or self.new_checkout_inode is not None
+            or self.quarantine is None
+        ):
+            raise ValueError("subscription removal journal requires exact prior ownership")
         if (self.phase == "completed") != (self.receipt is not None):
             raise ValueError("subscription journal completion and receipt must agree")
         if self.receipt is not None and (
@@ -1016,7 +1024,6 @@ class SubscriptionManager:
         ownership: BootstrapSubscriptionOwnershipReceipt,
     ) -> BootstrapSubscriptionMutationReceipt:
         """Remove only one exact owned declaration, checkout, and receipt leaf."""
-        self._recover_all_removals()
         validate_subscription_name(name)
         self._validate_bootstrap_operation(
             operation_key, name, "subscription_remove"
@@ -1082,6 +1089,12 @@ class SubscriptionManager:
             upgrade_version=config.version == 2,
         )
         identity = destination.stat(follow_symlinks=False)
+        operation_digest = operation_key.rsplit(":", 1)[-1]
+        quarantine = destination.with_name(
+            f".{destination.name}.remove-bootstrap-{operation_digest}"
+        )
+        if quarantine.exists() or quarantine.is_symlink():
+            raise ValueError("bootstrap subscription removal quarantine already exists")
         journal = _BootstrapSubscriptionJournal(
             phase="prepared",
             operation_key=operation_key,
@@ -1093,6 +1106,7 @@ class SubscriptionManager:
             new_subscription_sha256=None,
             checkout=validated.checkout,
             staging=validated.checkout,
+            quarantine=quarantine.relative_to(self.config_manager.root),
             verified_commit=ownership.verified_commit,
             old_checkout_device=identity.st_dev,
             old_checkout_inode=identity.st_ino,
@@ -1112,6 +1126,9 @@ class SubscriptionManager:
         subscription: OntologySubscription,
     ) -> BootstrapSubscriptionMutationReceipt:
         destination = self.config_manager.subscription_checkout(subscription)
+        if journal.quarantine is None:
+            raise ValueError("bootstrap subscription removal quarantine is missing")
+        quarantine = self.config_manager._confined_state_path(journal.quarantine)
         evidence_path = self.config_manager._confined_state_path(
             Path(ownership.evidence_path)
         )
@@ -1120,27 +1137,182 @@ class SubscriptionManager:
             self._assert_named_subscription_absent(journal.bootstrap_name)
             if destination.exists() or destination.is_symlink():
                 raise ValueError("removed bootstrap subscription checkout reappeared")
+            if quarantine.exists() or quarantine.is_symlink():
+                raise ValueError("removed bootstrap subscription quarantine reappeared")
             if evidence_path.exists() or evidence_path.is_symlink():
                 raise ValueError("removed bootstrap subscription evidence reappeared")
             return journal.receipt
         current_sha256 = self.config_manager.config_sha256()
-        if current_sha256 == journal.before_config_sha256:
-            self._assert_subscription_ownership(ownership, subscription)
-            config = self.config_manager.load()
-            self.config_manager.validate_subscription_removal(
-                config,
-                profile_name=journal.profile_name,
-                subscription_name=journal.bootstrap_name,
-                expected_checkout=destination,
-            )
-            self.unsubscribe(journal.bootstrap_name, remove_checkout=True)
-            if self.config_manager.config_sha256() != journal.after_config_sha256:
-                raise RuntimeError("bootstrap subscription removal config identity changed")
-        elif current_sha256 != journal.after_config_sha256:
+        if current_sha256 not in {
+            journal.before_config_sha256,
+            journal.after_config_sha256,
+        }:
+            raise RuntimeError("Geas user config changed during subscription removal")
+
+        if journal.phase == "prepared":
+            target_exists = destination.exists() or destination.is_symlink()
+            quarantine_exists = quarantine.exists() or quarantine.is_symlink()
+            if target_exists and quarantine_exists:
+                raise ValueError(
+                    "bootstrap subscription removal target and quarantine both exist"
+                )
+            if current_sha256 == journal.after_config_sha256:
+                if target_exists or not quarantine_exists:
+                    raise ValueError(
+                        "bootstrap subscription removal state lacks its owned quarantine"
+                    )
+                self._assert_quarantined_bootstrap_subscription(
+                    journal,
+                    ownership,
+                    subscription,
+                    quarantine,
+                    configured=False,
+                )
+                journal = journal.model_copy(update={"phase": "config_committed"})
+                self.config_manager._write_bootstrap_state(journal_path, journal)
+            else:
+                if target_exists:
+                    self._assert_subscription_ownership(ownership, subscription)
+                    config = self.config_manager.load()
+                    self.config_manager.validate_subscription_removal(
+                        config,
+                        profile_name=journal.profile_name,
+                        subscription_name=journal.bootstrap_name,
+                        expected_checkout=destination,
+                    )
+                    self._verify_repository_identity(
+                        destination,
+                        subscription,
+                        expected_commit=ownership.verified_commit,
+                    )
+                    self._assert_checkout_identity(
+                        destination,
+                        device=journal.old_checkout_device,
+                        inode=journal.old_checkout_inode,
+                        label="owned bootstrap subscription checkout",
+                    )
+                    os.replace(destination, quarantine)
+                    sync_removal_parent(self.config_manager.root, journal.quarantine)
+                elif quarantine_exists:
+                    self._assert_quarantined_bootstrap_subscription(
+                        journal,
+                        ownership,
+                        subscription,
+                        quarantine,
+                        configured=True,
+                    )
+                else:
+                    raise ValueError("owned bootstrap subscription checkout is missing")
+                journal = journal.model_copy(update={"phase": "staged"})
+                self.config_manager._write_bootstrap_state(journal_path, journal)
+
+        if journal.phase == "staged":
+            current_sha256 = self.config_manager.config_sha256()
+            if current_sha256 == journal.before_config_sha256:
+                self._assert_quarantined_bootstrap_subscription(
+                    journal,
+                    ownership,
+                    subscription,
+                    quarantine,
+                    configured=True,
+                )
+                config = self.config_manager.load()
+
+                def remove_subscription(profile: GeasProfile) -> GeasProfile:
+                    normalized = profile.normalized_subscriptions(
+                        freshness=config.ontology_freshness
+                    )
+                    current = normalized.get(journal.bootstrap_name)
+                    if (
+                        current is None
+                        or _subscription_identity_sha256(current)
+                        != journal.old_subscription_sha256
+                    ):
+                        raise ValueError(
+                            "owned bootstrap subscription config identity changed"
+                        )
+                    explicit = dict(profile.subscriptions)
+                    explicit.pop(journal.bootstrap_name, None)
+                    updates: dict[str, object] = {"subscriptions": explicit}
+                    if journal.bootstrap_name == "primary":
+                        updates["ontology_git"] = None
+                    return profile.model_copy(update=updates)
+
+                try:
+                    mutation = self.config_manager.mutate_profile_expected(
+                        operation_key=journal.operation_key,
+                        profile_name=journal.profile_name,
+                        bootstrap_name=journal.bootstrap_name,
+                        kind="subscription_remove",
+                        expected_config_sha256=journal.before_config_sha256,
+                        mutate=remove_subscription,
+                        upgrade_version=config.version == 2,
+                    )
+                    if mutation.after_config_sha256 != journal.after_config_sha256:
+                        raise RuntimeError(
+                            "bootstrap subscription removal config identity changed"
+                        )
+                except BaseException:
+                    if self.config_manager.config_sha256() == journal.before_config_sha256:
+                        self._assert_quarantined_bootstrap_subscription(
+                            journal,
+                            ownership,
+                            subscription,
+                            quarantine,
+                            configured=True,
+                        )
+                        if destination.exists() or destination.is_symlink():
+                            raise ValueError(
+                                "bootstrap subscription removal destination reappeared"
+                            ) from None
+                        os.replace(quarantine, destination)
+                        sync_removal_parent(self.config_manager.root, journal.checkout)
+                        journal = journal.model_copy(update={"phase": "prepared"})
+                        self.config_manager._write_bootstrap_state(journal_path, journal)
+                    raise
+            elif current_sha256 == journal.after_config_sha256:
+                self._assert_quarantined_bootstrap_subscription(
+                    journal,
+                    ownership,
+                    subscription,
+                    quarantine,
+                    configured=False,
+                )
+                mutation = self._subscription_config_receipt(
+                    journal, "subscription_remove"
+                )
+            else:
+                raise RuntimeError("Geas user config changed during subscription removal")
+            journal = journal.model_copy(update={"phase": "config_committed"})
+            self.config_manager._write_bootstrap_state(journal_path, journal)
+        else:
+            mutation = self._subscription_config_receipt(journal, "subscription_remove")
+
+        if journal.phase != "config_committed":
+            raise ValueError("bootstrap subscription removal journal has an invalid phase")
+        if self.config_manager.config_sha256() != journal.after_config_sha256:
             raise RuntimeError("Geas user config changed during subscription removal")
         self._assert_named_subscription_absent(journal.bootstrap_name)
         if destination.exists() or destination.is_symlink():
             raise ValueError("bootstrap subscription checkout remains after removal")
+        if quarantine.exists() or quarantine.is_symlink():
+            self._assert_quarantined_bootstrap_subscription(
+                journal,
+                ownership,
+                subscription,
+                quarantine,
+                configured=False,
+            )
+            if self.config_manager.config_sha256() != journal.after_config_sha256:
+                raise RuntimeError("Geas user config changed before checkout deletion")
+            self._assert_checkout_identity(
+                quarantine,
+                device=journal.old_checkout_device,
+                inode=journal.old_checkout_inode,
+                label="quarantined bootstrap subscription checkout",
+            )
+            shutil.rmtree(quarantine)
+            sync_removal_parent(self.config_manager.root, journal.quarantine)
         evidence = self.config_manager._load_bootstrap_state(evidence_path)
         if evidence is not None:
             expected = canonical_json(ownership.model_dump(mode="json")) + b"\n"
@@ -1162,6 +1334,71 @@ class SubscriptionManager:
         completed = journal.model_copy(update={"phase": "completed", "receipt": receipt})
         self.config_manager._write_bootstrap_state(journal_path, completed)
         return receipt
+
+    def _assert_quarantined_bootstrap_subscription(
+        self,
+        journal: _BootstrapSubscriptionJournal,
+        ownership: BootstrapSubscriptionOwnershipReceipt,
+        subscription: OntologySubscription,
+        quarantine: Path,
+        *,
+        configured: bool,
+    ) -> None:
+        """Rebind a removal quarantine to exact live ownership before mutation."""
+        self._assert_checkout_identity(
+            quarantine,
+            device=journal.old_checkout_device,
+            inode=journal.old_checkout_inode,
+            label="quarantined bootstrap subscription checkout",
+        )
+        if (
+            journal.old_checkout_device != ownership.checkout_device
+            or journal.old_checkout_inode != ownership.checkout_inode
+        ):
+            raise ValueError("bootstrap subscription removal ownership identity changed")
+        if configured:
+            self._assert_subscription_ownership(
+                ownership,
+                subscription,
+                checkout_override=quarantine,
+            )
+        else:
+            config = self.config_manager.load()
+            self.config_manager.validate_subscription_layout(config)
+            self._assert_named_subscription_absent(journal.bootstrap_name)
+            destination = self.config_manager.subscription_checkout(subscription)
+            for profile in config.profiles.values():
+                for current in profile.normalized_subscriptions(
+                    freshness=config.ontology_freshness
+                ).values():
+                    candidate = self.config_manager.subscription_checkout(current)
+                    if (
+                        candidate in (destination, quarantine)
+                        or candidate.is_relative_to(destination)
+                        or destination.is_relative_to(candidate)
+                        or candidate.is_relative_to(quarantine)
+                        or quarantine.is_relative_to(candidate)
+                    ):
+                        raise ValueError(
+                            "bootstrap subscription removal overlaps configured checkout"
+                        )
+            evidence_path = self.config_manager._confined_state_path(
+                Path(ownership.evidence_path)
+            )
+            expected_evidence_path = self._bootstrap_subscription_evidence_path(
+                ownership.bootstrap_name,
+                ownership.operation_key,
+            )
+            if evidence_path != expected_evidence_path:
+                raise ValueError("bootstrap subscription ownership evidence path changed")
+            expected = canonical_json(ownership.model_dump(mode="json")) + b"\n"
+            if self.config_manager._load_bootstrap_state(evidence_path) != expected:
+                raise ValueError("bootstrap subscription ownership evidence changed")
+        self._verify_repository_identity(
+            quarantine,
+            subscription,
+            expected_commit=ownership.verified_commit,
+        )
 
     def _finalize_bootstrap_subscription(
         self,
@@ -1318,6 +1555,10 @@ class SubscriptionManager:
                 f".{destination.name}.bootstrap-{operation_digest}.old"
             ).relative_to(self.config_manager.root)
             if action == "replace"
+            else destination.with_name(
+                f".{destination.name}.remove-bootstrap-{operation_digest}"
+            ).relative_to(self.config_manager.root)
+            if action == "remove"
             else None
         )
         if action == "remove":
