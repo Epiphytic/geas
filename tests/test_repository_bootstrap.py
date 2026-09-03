@@ -1094,3 +1094,187 @@ def test_remove_resumes_each_subphase_only_after_owned_paths_are_absent(
     assert not (root / manifest.path).exists()
     assert len(calls[interrupted_step]) == 2
     assert len(set(calls[interrupted_step])) == 1
+
+
+@pytest.mark.parametrize(
+    ("completed_effect", "interrupted_effect"),
+    (("subscription", "hydrate"), ("generic", "export")),
+)
+def test_update_resumes_after_completed_in_place_producer_effect(
+    tmp_path: Path, completed_effect: str, interrupted_effect: str
+) -> None:
+    """Catches old hashes overriding a durable candidate receipt for the same path."""
+    root = tmp_path / "state"
+    old_request = _request()
+    candidate_request = _request(commit_sha256="c" * 40)
+    calls: dict[str, list[str]] = {}
+    interrupted = {interrupted_effect: True}
+
+    def verify(request: RepositoryBootstrapRequest) -> VerifiedRepositoryBootstrap:
+        return _verified(commit_sha256=request.commit_sha256)
+
+    def replace_in_place(operation: BootstrapOperation, effect: str) -> tuple[ManagedPath, ...]:
+        calls.setdefault(effect, []).append(operation.idempotency_key)
+        relative = (
+            "subscriptions/example.json"
+            if effect == "subscription"
+            else ".agents/skills/example/SKILL.md"
+        )
+        role = "manifest" if effect == "subscription" else "skill"
+        return (_written_path(root, relative, f"candidate-{effect}\n", role),)
+
+    def maybe_interrupt(
+        operation: BootstrapOperation, effect: str
+    ) -> tuple[ManagedPath, ...]:
+        if operation.request.commit_sha256 == "a" * 40:
+            return ()
+        calls.setdefault(effect, []).append(operation.idempotency_key)
+        if interrupted.pop(effect, False):
+            raise RuntimeError(f"interrupt {effect}")
+        return ()
+
+    def subscribe(_operation: BootstrapOperation) -> tuple[ManagedPath, ...]:
+        return (
+            _written_path(
+                root, "subscriptions/example.json", "old-subscription\n", "manifest"
+            ),
+        )
+
+    def install_skill(operation: BootstrapOperation) -> tuple[ManagedPath, ...]:
+        if operation.request.commit_sha256 == "a" * 40:
+            return (_written_path(root, ".agents/skills/example/SKILL.md", "old-skill\n", "skill"),)
+        return replace_in_place(operation, "generic")
+
+    common: dict[str, object] = {
+        "root": root,
+        "verify": verify,
+        "subscribe": subscribe,
+        "replace_subscription": lambda _old, candidate: replace_in_place(
+            candidate, "subscription"
+        ),
+        "hydrate_artifacts": lambda operation: maybe_interrupt(operation, "hydrate"),
+        "install_generic_skill": install_skill,
+        "export_catalog_skills": lambda operation: maybe_interrupt(operation, "export"),
+    }
+    _manager(tmp_path, **common).install(old_request)
+    with pytest.raises(RuntimeError, match=f"interrupt {interrupted_effect}"):
+        _manager(tmp_path, **common).update(candidate_request)
+
+    updated = _manager(tmp_path, **common).update(candidate_request)
+
+    assert updated.request == candidate_request
+    assert (root / "subscriptions/example.json").read_text() == "candidate-subscription\n"
+    assert (root / ".agents/skills/example/SKILL.md").read_text() == "candidate-generic\n"
+    assert len(calls[interrupted_effect]) == 2
+    assert len(set(calls[interrupted_effect])) == 1
+    assert completed_effect in calls
+
+
+def test_update_resume_does_not_exclude_changed_old_only_path(tmp_path: Path) -> None:
+    """Catches one completed in-place effect disabling checks for unrelated old paths."""
+    root = tmp_path / "state"
+
+    def verify(request: RepositoryBootstrapRequest) -> VerifiedRepositoryBootstrap:
+        return _verified(commit_sha256=request.commit_sha256)
+
+    def subscribe(operation: BootstrapOperation) -> tuple[ManagedPath, ...]:
+        content = "old\n" if operation.request.commit_sha256 == "a" * 40 else "candidate\n"
+        return (_written_path(root, "subscriptions/example.json", content, "manifest"),)
+
+    def install_skill(_operation: BootstrapOperation) -> tuple[ManagedPath, ...]:
+        return (_written_path(root, ".agents/skills/example/SKILL.md", "old-skill\n", "skill"),)
+
+    def interrupt_candidate_hydrate(
+        operation: BootstrapOperation,
+    ) -> tuple[ManagedPath, ...]:
+        if operation.request.commit_sha256 == "a" * 40:
+            return ()
+        raise RuntimeError("pending hydrate")
+
+    common: dict[str, object] = {
+        "root": root,
+        "verify": verify,
+        "subscribe": subscribe,
+        "replace_subscription": lambda _old, candidate: subscribe(candidate),
+        "install_generic_skill": install_skill,
+        "hydrate_artifacts": interrupt_candidate_hydrate,
+    }
+    _manager(tmp_path, **common).install(_request())
+    with pytest.raises(RuntimeError, match="pending hydrate"):
+        _manager(tmp_path, **common).update(_request(commit_sha256="c" * 40))
+
+    old_only = root / ".agents" / "skills" / "example" / "SKILL.md"
+    old_only.write_text("operator changed\n")
+    with pytest.raises(ValueError, match="managed path was modified"):
+        _manager(tmp_path, **common).update(_request(commit_sha256="c" * 40))
+
+    assert old_only.read_text() == "operator changed\n"
+
+
+def test_final_receipt_cleanup_revalidates_candidate_bytes_and_keeps_journal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches post-receipt candidate modification being blessed by journal cleanup."""
+    root = tmp_path / "state"
+
+    def verify(request: RepositoryBootstrapRequest) -> VerifiedRepositoryBootstrap:
+        return _verified(commit_sha256=request.commit_sha256)
+
+    manager = _manager(
+        tmp_path,
+        root=root,
+        verify=verify,
+        hydrate_artifacts=lambda _operation: (
+            _written_path(root, "candidate/snapshot", "candidate\n", "snapshot"),
+        ),
+    )
+    manager.install(_request())
+    monkeypatch.setattr(
+        manager,
+        "_remove_update_journal",
+        lambda _name: (_ for _ in ()).throw(RuntimeError("after receipt")),
+    )
+    with pytest.raises(RuntimeError, match="after receipt"):
+        manager.update(_request(commit_sha256="c" * 40))
+
+    candidate = root / "candidate" / "snapshot"
+    candidate.write_text("operator changed\n")
+    journal = root / "repository-bootstrap" / "example.update.json"
+    with pytest.raises(ValueError, match="managed path was modified"):
+        _manager(tmp_path, root=root, verify=verify).update(
+            _request(commit_sha256="c" * 40)
+        )
+
+    assert journal.exists()
+    assert candidate.read_text() == "operator changed\n"
+
+
+def test_final_receipt_cleanup_rejects_non_final_journal_phase(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catches candidate receipt identity alone authorizing journal deletion."""
+    root = tmp_path / "state"
+
+    def verify(request: RepositoryBootstrapRequest) -> VerifiedRepositoryBootstrap:
+        return _verified(commit_sha256=request.commit_sha256)
+
+    manager = _manager(tmp_path, root=root, verify=verify)
+    manager.install(_request())
+    monkeypatch.setattr(
+        manager,
+        "_remove_update_journal",
+        lambda _name: (_ for _ in ()).throw(RuntimeError("after receipt")),
+    )
+    with pytest.raises(RuntimeError, match="after receipt"):
+        manager.update(_request(commit_sha256="c" * 40))
+
+    journal = root / "repository-bootstrap" / "example.update.json"
+    payload = json.loads(journal.read_text())
+    payload["phase"] = "obsolete_paths_removed"
+    journal.write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match="FINALIZING"):
+        _manager(tmp_path, root=root, verify=verify).update(
+            _request(commit_sha256="c" * 40)
+        )
+
+    assert journal.exists()

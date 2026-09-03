@@ -565,7 +565,7 @@ class RepositoryBootstrapManager:
             if item.path not in {candidate.path for candidate in journal.candidate_managed_paths}
         )
         if self._update_before(journal, RepositoryUpdatePhase.OBSOLETE_PATHS_PENDING):
-            self._assert_owned_paths(journal.old_managed_paths)
+            self._assert_owned_paths(obsolete)
         elif journal.phase is RepositoryUpdatePhase.OBSOLETE_PATHS_PENDING:
             self._assert_paths_exact_or_absent(obsolete)
         else:
@@ -610,6 +610,11 @@ class RepositoryBootstrapManager:
             self._assert_complete_install(receipt)
             return None
         if self._receipt_is_completed_candidate(receipt, journal):
+            if journal.phase is not RepositoryUpdatePhase.FINALIZING:
+                raise ValueError(
+                    "completed candidate receipt requires a FINALIZING update journal"
+                )
+            self._assert_update_journal_files(journal)
             return receipt
         raise ValueError("repository update ownership receipt conflicts with its journal")
 
