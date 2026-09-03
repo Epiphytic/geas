@@ -41,7 +41,11 @@ from research_agent.store import ImmutableStore
 
 
 class RemoteFetchError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, request_count: int = 0) -> None:
+        super().__init__(message)
+        if request_count < 0:
+            raise ValueError("request count cannot be negative")
+        self.request_count = request_count
 
 
 class SourceFetchConstraint(StrEnum):
@@ -197,6 +201,27 @@ class ConditionalHttpsTransport:
     def fetch(
         self, request: SourceFetchRequest, *, prior: SourceValidator | None = None
     ) -> SourceFetchResult:
+        request_count = [0]
+        try:
+            return self._fetch(request, prior=prior, request_count=request_count)
+        except RemoteFetchError as error:
+            exact_count = request_count[0]
+            if error.request_count == exact_count:
+                raise
+            raise RemoteFetchError(str(error), request_count=exact_count) from error
+        except Exception as error:
+            raise RemoteFetchError(
+                "bounded HTTPS request failed",
+                request_count=request_count[0],
+            ) from error
+
+    def _fetch(
+        self,
+        request: SourceFetchRequest,
+        *,
+        prior: SourceValidator | None,
+        request_count: list[int],
+    ) -> SourceFetchResult:
         current = self._authorize_url(request, request.locator)
         requested = current
         redirects: list[str] = []
@@ -212,6 +237,7 @@ class ConditionalHttpsTransport:
             self._require_capability(request, current)
             address = self._public_address(parsed.hostname)
             try:
+                request_count[0] += 1
                 response = self.http_client.request(
                     url=current,
                     address=address,

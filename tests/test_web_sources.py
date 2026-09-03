@@ -15,6 +15,7 @@ from research_agent.source_intent import (
     SourceRefreshPolicy,
     SourceTemporalPolicy,
 )
+from research_agent.source_work import SourceOperationError
 from research_agent.web_sources import (
     DirectUrlAdapter,
     FeedAdapter,
@@ -282,6 +283,34 @@ def test_mojeek_children_are_depth_one_and_discovery_is_authorized_before_search
     ]
     assert events == ["authorize:source.discover", "search"]
     assert isinstance(adapter, SourceAdapter)
+
+
+def test_lazy_mojeek_failure_reports_its_attempted_request() -> None:
+    def lazy_search(intent: SourceIntent):
+        del intent
+
+        def results():
+            raise RuntimeError("lazy transport failure")
+            yield "/unreachable.pdf"
+
+        return results()
+
+    intent = _enumeration_intent(
+        DiscoveryKind.MOJEEK, "https://issuer.example/news/search"
+    )
+    adapter = MojeekSourceAdapter(
+        search=lazy_search,
+        transport=FixtureTransport(b""),
+        clock=lambda: NOW,
+        capability_evaluator=AllowEvaluator(),
+        capability_request=_capability_request,
+    )
+
+    with pytest.raises(SourceOperationError) as caught:
+        adapter.discover(intent)
+
+    assert caught.value.request_count == 1
+    assert adapter.last_discovery_request_count == 1
 
 
 def test_each_enumerated_child_is_authorized_only_when_it_is_fetched() -> None:

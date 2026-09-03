@@ -414,6 +414,35 @@ def test_conditional_transport_reauthorizes_then_reresolves_every_redirect() -> 
     ]
 
 
+def test_conditional_transport_reports_exact_attempts_after_redirect_failure() -> None:
+    class FailingSecondRequest:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def request(self, **kwargs: object) -> ConditionalHttpResponse:
+            del kwargs
+            self.calls += 1
+            if self.calls == 1:
+                return ConditionalHttpResponse(
+                    status=302,
+                    headers={"Location": "/second.pdf"},
+                )
+            raise RemoteFetchError("second request failed")
+
+    client = FailingSecondRequest()
+    transport = ConditionalHttpsTransport(
+        dns_resolver=lambda _: ("8.8.8.8",),
+        http_client=client,
+        capability_evaluator=_AllowEvaluator(),
+    )
+
+    with pytest.raises(RemoteFetchError) as caught:
+        transport.fetch(_source_request())
+
+    assert client.calls == 2
+    assert caught.value.request_count == 2
+
+
 def test_conditional_transport_rechecks_redirect_scope_and_bounds_decompression() -> None:
     """Skipping redirect validation or bounded inflation enables SSRF and memory exhaustion."""
     transport = ConditionalHttpsTransport(

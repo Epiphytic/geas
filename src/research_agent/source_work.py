@@ -394,20 +394,41 @@ class AnchorGroundedSourceExtractionAdapter:
             raise ValueError("extraction provider is absent from trusted registry")
         if config.provider != trusted_provider:
             raise ValueError("extraction config differs from trusted provider registry")
-        if manager.model != trusted_provider.model:
-            raise ValueError("extraction manager model differs from trusted provider config")
-        client_config = getattr(manager.client, "config", None)
-        if client_config != trusted_provider:
-            raise ValueError("extraction client differs from trusted provider configuration")
-        if getattr(manager.client, "name", None) != manager.provider:
-            raise ValueError("extraction manager differs from trusted provider name")
-        if client_config.external and getattr(manager.client, "gate", None) is None:
-            raise ValueError("external extraction requires model-policy and budget gate")
         self.manager = manager
         self.config = config
-        self.provider = trusted_provider
+        self._provider_name = manager.provider
+        self._provider = trusted_provider
+        self._client = manager.client
+        self._gate = getattr(manager.client, "gate", None)
         self.validator_version = manager.version
-        self.external = client_config.external
+        self._validate_current_client()
+
+    @property
+    def external(self) -> bool:
+        self._validate_current_client()
+        return self._provider.external
+
+    def _validate_current_client(self) -> None:
+        from research_agent.providers import ModelClient
+
+        if not isinstance(self.manager.client, ModelClient):
+            raise ValueError("extraction requires the trusted ModelClient implementation")
+        if self.manager.client is not self._client:
+            raise ValueError("extraction manager client identity changed")
+        if self.manager.provider != self._provider_name:
+            raise ValueError("extraction manager differs from trusted provider name")
+        if self.manager.model != self._provider.model:
+            raise ValueError("extraction manager model differs from trusted provider config")
+        if self.manager.client.name != self._provider_name:
+            raise ValueError("extraction client differs from trusted provider name")
+        if self.manager.client.config != self._provider:
+            raise ValueError("extraction client differs from trusted provider configuration")
+        if self.manager.client.parameters != self.config.model_parameters:
+            raise ValueError("extraction client parameters differ from trusted configuration")
+        if self.manager.client.gate is not self._gate:
+            raise ValueError("extraction model-policy and budget gate identity changed")
+        if self._provider.external and self._gate is None:
+            raise ValueError("external extraction requires model-policy and budget gate")
 
     def propose(
         self,
@@ -416,6 +437,7 @@ class AnchorGroundedSourceExtractionAdapter:
         structural_derivation_id: str,
         anchor_ids: tuple[str, ...],
     ) -> ExtractionProposalReceipt:
+        self._validate_current_client()
         receipt = self.manager.propose(
             question=self.config.question,
             structural_derivation_id=structural_derivation_id,
@@ -1404,6 +1426,22 @@ class SourceWorkCoordinator:
                                 now,
                             )
                             candidate_complete = False
+                        elif self._threat_blocks_extraction(current, source_id):
+                            constraint_ids.append(
+                                self._constraint(
+                                    intent,
+                                    candidate,
+                                    "source policy blocks threatened evidence",
+                                    now,
+                                    constraint_type="threat_blocked",
+                                )
+                            )
+                            current = self._advance(
+                                current,
+                                SourceWorkPhase.EXTRACTION_CONSTRAINED,
+                                now,
+                            )
+                            candidate_complete = False
                         else:
                             proposal_ids.extend(self._propose(current, source_id))
                             current = self._advance(
@@ -1478,36 +1516,50 @@ class SourceWorkCoordinator:
         source_id: str | None,
     ) -> bool:
         result = self._result(item)
-        ids = tuple(str(value) for value in result.get("threat_observation_ids", ()))
-        if not ids:
-            return False
-        requested = set(ids)
-        observations = tuple(
-            ThreatObservation.model_validate(value)
-            for value in self.store.iter_records("threat-observation")
-            if value.get("id") in requested
-        )
-        if {observation.id for observation in observations} != requested:
-            raise ValueError("source work references missing threat observations")
-        target_id = str(result.get("derived_source_version_id") or source_id or "")
-        if not target_id:
-            raise ValueError("threat policy requires an immutable source identity")
-        decision = self.source_policy.evaluate(
-            target=ThreatTarget(source_version=target_id),
-            workflow_id=item.lineage_id,
-            stage=PolicyStage.EXTRACTION,
-            observations=observations,
-        )
-        self.store.put_record("policy-decision", decision)
-        blocked_status = any(
-            observation.status in {ThreatStatus.SUSPECTED, ThreatStatus.CONFIRMED}
-            for observation in observations
-        )
-        blocked_action = decision.action in {
-            PolicyAction.DENY,
-            PolicyAction.QUARANTINE,
-            PolicyAction.ALLOW_METADATA_ONLY,
+        source_versions = {
+            value
+            for value in (
+                source_id,
+                result.get("source_version_id"),
+                result.get("derived_source_version_id"),
+            )
+            if isinstance(value, str) and value
         }
+        if not source_versions:
+            raise ValueError("threat policy requires an immutable source identity")
+        records = tuple(self.store.iter_records("threat-observation"))
+        blocked_status = False
+        blocked_action = False
+        for target_id in sorted(source_versions):
+            persisted = tuple(
+                ThreatObservation.model_validate(value)
+                for value in records
+                if value.get("target", {}).get("source_version") == target_id
+            )
+            superseded = {
+                observation.supersedes
+                for observation in persisted
+                if observation.supersedes is not None
+            }
+            observations = tuple(
+                observation for observation in persisted if observation.id not in superseded
+            )
+            decision = self.source_policy.evaluate(
+                target=ThreatTarget(source_version=target_id),
+                workflow_id=item.lineage_id,
+                stage=PolicyStage.EXTRACTION,
+                observations=observations,
+            )
+            self.store.put_record("policy-decision", decision)
+            blocked_status = blocked_status or any(
+                observation.status in {ThreatStatus.SUSPECTED, ThreatStatus.CONFIRMED}
+                for observation in observations
+            )
+            blocked_action = blocked_action or decision.action in {
+                PolicyAction.DENY,
+                PolicyAction.QUARANTINE,
+                PolicyAction.ALLOW_METADATA_ONLY,
+            }
         return blocked_status or blocked_action
 
     @staticmethod

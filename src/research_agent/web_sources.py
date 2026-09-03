@@ -189,7 +189,7 @@ class _BaseAdapter:
         try:
             return self.transport.fetch(request, prior=prior)
         except Exception as error:
-            attempted = int(getattr(error, "request_count", 1))
+            attempted = int(getattr(error, "request_count", 0))
             raise SourceOperationError(
                 "source transport failed", request_count=attempted
             ) from error
@@ -306,20 +306,26 @@ class MojeekSourceAdapter(_BaseAdapter):
         discovered_at = self.clock()
         self._require_capability(intent, intent.discovery.locator, Capability.SOURCE_DISCOVER)
         self._intents[intent.id] = intent
+        self.last_discovery_request_count = 1
         try:
             links = self.search(intent)
+            candidates = self._materialize(
+                intent,
+                links,
+                discovered_at=discovered_at,
+                edge_depth=1,
+            )
         except Exception as error:
+            attempted = int(
+                getattr(error, "request_count", self.last_discovery_request_count)
+            )
+            self.last_discovery_request_count = attempted
             raise SourceOperationError(
                 "source discovery failed",
-                request_count=int(getattr(error, "request_count", 1)),
+                request_count=attempted,
             ) from error
         self.last_discovery_request_count = int(getattr(self.search, "last_request_count", 1))
-        return self._materialize(
-            intent,
-            links,
-            discovered_at=discovered_at,
-            edge_depth=1,
-        )
+        return candidates
 
 
 def _xml_root(content: bytes) -> ElementTree.Element:

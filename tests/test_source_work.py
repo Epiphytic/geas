@@ -15,7 +15,18 @@ from research_agent.capabilities import (
     CapabilityRequest,
 )
 from research_agent.extraction import AnchorGroundedExtractionManager
-from research_agent.models import ModelParameters, ProviderConfig, canonical_json
+from research_agent.models import (
+    Detector,
+    DetectorKind,
+    ModelParameters,
+    ProviderConfig,
+    ThreatObservation,
+    ThreatSeverity,
+    ThreatStatus,
+    ThreatTarget,
+    canonical_json,
+    content_id,
+)
 from research_agent.providers import ModelClient
 from research_agent.source_intent import (
     DiscoveryKind,
@@ -689,6 +700,70 @@ def test_external_client_cannot_be_labeled_local_by_extraction_config(tmp_path: 
         )
 
 
+def test_extraction_revalidates_current_client_before_provider_call(tmp_path: Path) -> None:
+    local = ProviderConfig(
+        kind="openai_compatible",
+        base_url="http://127.0.0.1:11434/v1",
+        model="fixture",
+        external=False,
+        max_output_tokens=4096,
+    )
+    external = ProviderConfig(
+        kind="openai_compatible",
+        base_url="https://model.example/v1",
+        model="fixture",
+        external=True,
+        max_output_tokens=4096,
+    )
+
+    class MutableClient(ModelClient):
+        def __init__(self) -> None:
+            super().__init__("provider", local)
+            self.calls = 0
+
+        def complete_json(self, **kwargs):
+            del kwargs
+            self.calls += 1
+            return {"version": 1, "concepts": [], "claims": [], "controversies": [], "gaps": []}
+
+    store = ImmutableStore(tmp_path)
+    client = MutableClient()
+    manager = AnchorGroundedExtractionManager(
+        store=store,
+        client=client,
+        provider="provider",
+        model="fixture",
+        clock=lambda: NOW,
+    )
+    extraction = AnchorGroundedSourceExtractionAdapter(
+        manager,
+        SourceExtractionConfig(
+            question="What changed?",
+            provider=local,
+            max_output_tokens=4096,
+            model_parameters=ModelParameters(),
+        ),
+        provider_registry={"provider": local},
+    )
+    client.config = external
+
+    with pytest.raises(ValueError, match="trusted provider"):
+        SourceWorkCoordinator(
+            store=store,
+            work_store=ImmutableSourceWorkStore(store),
+            adapter=_Adapter(),
+            capability_evaluator=_AllowEvaluator(),
+            capability_request=_request,
+            authority=AUTHORITY,
+            ontology_bundle_sha256=BUNDLE,
+            extraction=extraction,
+            clock=lambda: NOW,
+            monotonic=lambda: 0.0,
+        ).run_due((_intent(),), now=NOW)
+
+    assert client.calls == 0
+
+
 def test_suspected_source_never_reaches_extraction(tmp_path: Path) -> None:
     store = ImmutableStore(tmp_path)
     extractor = _Extractor(store)
@@ -699,6 +774,47 @@ def test_suspected_source_never_reaches_extraction(tmp_path: Path) -> None:
     ).run_due((_intent(),), now=NOW)
 
     assert tuple(store.iter_records("threat-observation"))
+    assert extractor.calls == []
+    assert receipt.proposal_ids == ()
+    assert receipt.complete is False
+
+
+def test_new_threat_after_anchor_checkpoint_blocks_resumed_extraction(tmp_path: Path) -> None:
+    def interrupt(phase: SourceWorkPhase) -> None:
+        if phase is SourceWorkPhase.ANCHORS_SELECTED:
+            raise SourceWorkInterruption("fixture interruption")
+
+    with pytest.raises(SourceWorkInterruption):
+        _coordinator(tmp_path, after_phase=interrupt).run_due((_intent(),), now=NOW)
+
+    store = ImmutableStore(tmp_path)
+    selected = next(
+        value
+        for value in store.iter_records("source-work-result")
+        if "anchor_ids" in value
+    )
+    target = ThreatTarget(source_version=selected["derived_source_version_id"])
+    fields = {
+        "target": target,
+        "threat_type": "late_reviewed_prompt_injection",
+        "status": ThreatStatus.SUSPECTED,
+        "detected_at": NOW + timedelta(seconds=1),
+        "detector": Detector(
+            kind=DetectorKind.HUMAN,
+            id="reviewer:fixture",
+            version="1",
+        ),
+        "evidence": ("evidence:late-review",),
+        "severity": ThreatSeverity.HIGH,
+    }
+    store.put_record(
+        "threat-observation",
+        ThreatObservation(id=content_id("threat-observation", fields), **fields),
+    )
+    extractor = _Extractor(store)
+
+    receipt = _coordinator(tmp_path, extractor=extractor).run_due((_intent(),), now=NOW)
+
     assert extractor.calls == []
     assert receipt.proposal_ids == ()
     assert receipt.complete is False
