@@ -12,6 +12,7 @@ from pydantic import ValidationError
 from research_agent.agent_skills import (
     GeasIdentity,
     OntologyIdentity,
+    PortableArtifactIdentity,
     ProjectionIdentity,
     SkillFile,
     SkillIdentity,
@@ -61,6 +62,38 @@ def test_manifest_round_trip_is_canonical_and_has_one_trailing_newline() -> None
     decoded = json.loads(encoded)
     assert list(decoded) == sorted(decoded)
     assert SkillManifest.model_validate(decoded) == manifest
+
+
+def test_bootstrap_aware_catalog_manifest_uses_format_two() -> None:
+    """Catches a format-two marker detached from complete catalog provenance."""
+    bare = _manifest().model_copy(update={"format_version": 2})
+    catalog = _manifest().model_copy(
+        update={
+            "format_version": 1,
+            "ontology": OntologyIdentity(
+                name="test-ontology",
+                repository_url="https://example.test/ontology.git",
+                branch="main",
+                commit=COMMIT,
+                active_ref="refs/heads/main",
+                ontology_commit=COMMIT,
+                subscription_name="example",
+                catalog_path="geas.yaml",
+                ontology_path="ontology/example",
+                bundle_sha256=SHA256,
+            ),
+            "artifact": PortableArtifactIdentity(
+                role="knowledge-projection",
+                content_sha256=SHA256,
+                input_revision=SHA256,
+            ),
+        }
+    )
+
+    with pytest.raises(ValidationError, match="format 2"):
+        SkillManifest.model_validate_json(canonical_manifest_bytes(bare))
+    with pytest.raises(ValidationError, match="format 2"):
+        SkillManifest.model_validate_json(canonical_manifest_bytes(catalog))
 
 
 def test_manifest_requires_format_version_and_safe_ontology_identity() -> None:
@@ -547,9 +580,7 @@ def test_render_ontology_skill_keeps_hostile_cross_record_link_labels_inert() ->
     )
     index = files[Path("references/index.md")].decode()
     hostile_line = next(
-        line
-        for line in index.splitlines()
-        if line.startswith("- [") and "attacker.invalid" in line
+        line for line in index.splitlines() if line.startswith("- [") and "attacker.invalid" in line
     )
 
     # An unescaped closing bracket has an even number of preceding backslashes.

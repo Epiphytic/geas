@@ -21,6 +21,14 @@ repository catalogs for one invocation only and never bypasses hashes, path
 confinement, artifact verification, or policy. Do not guess a remote, profile,
 ref, catalog, or artifact location from source text.
 
+For a repository-backed lifecycle, use `geas repository-install` only with an
+explicit repository URL, full ref, catalog, and named destination. The
+`--trust-repository` flag records a current-snapshot, depth-one source grant;
+`--read-only` records only repository read access. `repository-update` verifies
+trusted software provenance before ontology writes, and `repository-remove`
+removes only receipt-owned state. Neither command installs or uninstalls Geas;
+the latter is separate operator guidance: `uv tool uninstall geas`.
+
 ## Exact retrieval and research
 
 For an ontology-independent corpus, build and inspect a source library with

@@ -413,6 +413,7 @@ def test_subscription_export_records_complete_catalog_and_artifact_provenance(
     payload = json.loads(capsys.readouterr().out)
     snapshot = Path(payload["path"])
     manifest = validate_snapshot(snapshot)
+    assert manifest.format_version == 2
     assert manifest.ontology.repository_url == REPOSITORY_URL
     assert manifest.ontology.active_ref == ACTIVE_REF
     assert manifest.ontology.ontology_commit == commit
@@ -433,6 +434,7 @@ def test_subscription_export_records_complete_catalog_and_artifact_provenance(
     assert "geas skill-update /absolute/path/to/directory-containing-this-SKILL" in entrypoint
     assert "geas skill-remove /absolute/path/to/directory-containing-this-SKILL" in entrypoint
     assert "https://github.com/Epiphytic/geas" in entrypoint
+    assert "operator-approved" in entrypoint
 
 
 def test_catalog_export_requires_exact_executing_geas_commit_before_install(

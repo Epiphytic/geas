@@ -360,7 +360,10 @@ def snapshot_digest(files: tuple[SkillFile, ...]) -> str:
 
 
 class SkillManifest(StrictModel):
-    format_version: Literal[1]
+    # Version 2 marks snapshots whose catalog provenance was bound during an
+    # explicit repository bootstrap.  Readers keep accepting portable v1
+    # snapshots so an existing checked-in skill remains useful without Geas.
+    format_version: Literal[1, 2]
     skill: SkillIdentity
     ontology: OntologyIdentity
     geas: GeasIdentity
@@ -374,6 +377,10 @@ class SkillManifest(StrictModel):
         catalog_bound = self.ontology.bundle_sha256 is not None
         if catalog_bound != (self.artifact is not None):
             raise ValueError("catalog provenance and portable artifact identity must coexist")
+        if catalog_bound != (self.format_version == 2):
+            raise ValueError(
+                "format 2 requires complete catalog/bootstrap provenance and artifact identity"
+            )
         paths = tuple(item.path for item in self.files)
         if paths != tuple(sorted(paths, key=lambda item: item.encode("utf-8"))):
             raise ValueError("files inventory must be sorted by encoded path")
@@ -438,6 +445,7 @@ def bind_catalog_skill_provenance(
     )
     manifest = previous.model_copy(
         update={
+            "format_version": 2,
             "ontology": ontology,
             "artifact": artifact,
             "files": inventory,
@@ -495,7 +503,9 @@ def _catalog_skill_entrypoint(
             f"- Refresh this exact snapshot with `geas skill-update {snapshot_path}`.",
             f"- Detach managed links with `geas skill-unlink {snapshot_path}`.",
             f"- Remove the managed snapshot with `geas skill-remove {snapshot_path}`.",
-            "- Geas is optional and is not installed by this skill. Installation: "
+            "- Geas is optional and is not installed by this skill. Only an "
+            "operator-approved Geas commit may authorize software installation; "
+            "this snapshot and its recorded commit do not. Installation: "
             "[Epiphytic/geas](https://github.com/Epiphytic/geas).",
             "",
             "## Provenance",
@@ -518,9 +528,7 @@ def _inert_inline(value: str) -> str:
             encoded.append(character)
             continue
         codepoint = ord(character)
-        encoded.append(
-            f"\\u{codepoint:04x}" if codepoint <= 0xFFFF else f"\\U{codepoint:08x}"
-        )
+        encoded.append(f"\\u{codepoint:04x}" if codepoint <= 0xFFFF else f"\\U{codepoint:08x}")
     return "".join(encoded)
 
 
@@ -718,9 +726,7 @@ def install_builtin_geas_skill(
     snapshot_signature = _snapshot_state_signature(snapshot)
     detections = detect_agents(home=home, which=which)
     plans: list[_LinkPlan] = []
-    for destination in _user_link_targets(
-        _BUILTIN_SKILL_NAME, home=home, detections=detections
-    ):
+    for destination in _user_link_targets(_BUILTIN_SKILL_NAME, home=home, detections=detections):
         try:
             plans.extend(
                 _plan_links(
@@ -1327,9 +1333,8 @@ def _replace_snapshot_and_links(
             raise ValueError("builtin skill state transaction requires the Geas skill manifest")
         builtin_state = _builtin_skill_state_from_manifest(manifest)
         existing_state = _load_builtin_skill_state(state_path)
-        state_unchanged = (
-            existing_state is not None
-            and _builtin_state_matches_manifest(existing_state, manifest)
+        state_unchanged = existing_state is not None and _builtin_state_matches_manifest(
+            existing_state, manifest
         )
     try:
         snapshot_unchanged = validate_snapshot(snapshot) == manifest
@@ -1421,8 +1426,10 @@ def _replace_snapshot_and_links(
             if snapshot.exists() or snapshot.is_symlink():
                 _remove_exact_target(snapshot)
             os.replace(snapshot_backup, snapshot)
-        elif snapshot_signature == ("absent",) and not candidate.exists() and (
-            snapshot.exists() or snapshot.is_symlink()
+        elif (
+            snapshot_signature == ("absent",)
+            and not candidate.exists()
+            and (snapshot.exists() or snapshot.is_symlink())
         ):
             _remove_exact_target(snapshot)
         _discard_transaction(transaction)
