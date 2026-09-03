@@ -3,12 +3,14 @@ from __future__ import annotations
 import hashlib
 import http.client
 import ipaddress
+import json
 import mimetypes
 import shutil
 import socket
 import ssl
 import subprocess
 import tempfile
+import unicodedata
 import urllib.parse
 import zlib
 from collections.abc import Callable, Mapping
@@ -205,8 +207,8 @@ class ConditionalHttpsTransport:
         for _ in range(request.max_redirects + 1):
             parsed = urllib.parse.urlsplit(current)
             assert parsed.hostname is not None
-            address = self._public_address(parsed.hostname)
             self._require_capability(request, current)
+            address = self._public_address(parsed.hostname)
             try:
                 response = self.http_client.request(
                     url=current,
@@ -439,23 +441,62 @@ class ConditionalHttpsTransport:
 
     @staticmethod
     def _sniff_media(claimed: str, url: str, content: bytes) -> str:
-        stripped = content.lstrip()
-        lowered = stripped[:512].lower()
         if content.startswith(b"%PDF-"):
             return "application/pdf"
-        if lowered.startswith((b"<!doctype html", b"<html")):
-            return "text/html"
-        if stripped.startswith((b"{", b"[")):
-            return "application/json"
-        if stripped.startswith(b"<"):
+        xml_text = ConditionalHttpsTransport._decoded_xml_text(content)
+        if xml_text is not None and xml_text.lstrip().startswith("<"):
+            lowered = xml_text.lstrip()[:512].casefold()
+            if lowered.startswith(("<!doctype html", "<html")):
+                return (
+                    "text/html"
+                    if ConditionalHttpsTransport._valid_text(xml_text)
+                    else "application/octet-stream"
+                )
             return (
                 "application/xml"
                 if ConditionalHttpsTransport._secure_xml(content)
                 else "application/octet-stream"
             )
-        if content and all(byte in {9, 10, 13} or 32 <= byte < 127 for byte in content[:4096]):
+        text = ConditionalHttpsTransport._decoded_utf8_text(content)
+        if text is None:
+            return "application/octet-stream"
+        stripped = text.lstrip()
+        if stripped.startswith(("{", "[")):
+            try:
+                json.loads(text)
+            except json.JSONDecodeError:
+                return "application/octet-stream"
+            return "application/json"
+        if content and ConditionalHttpsTransport._valid_text(text):
             return "text/plain"
         return "application/octet-stream"
+
+    @staticmethod
+    def _decoded_utf8_text(content: bytes) -> str | None:
+        try:
+            return content.decode("utf-8-sig")
+        except UnicodeDecodeError:
+            return None
+
+    @staticmethod
+    def _decoded_xml_text(content: bytes) -> str | None:
+        encoding = "utf-8-sig"
+        if content.startswith((b"\xff\xfe\x00\x00", b"\x00\x00\xfe\xff")):
+            encoding = "utf-32"
+        elif content.startswith((b"\xff\xfe", b"\xfe\xff")):
+            encoding = "utf-16"
+        try:
+            return content.decode(encoding)
+        except UnicodeDecodeError:
+            return None
+
+    @staticmethod
+    def _valid_text(text: str) -> bool:
+        return all(
+            character in {"\t", "\n", "\r"}
+            or unicodedata.category(character) != "Cc"
+            for character in text
+        )
 
     @staticmethod
     def _claimed_type_conflicts(claimed: str, sniffed: str) -> bool:
@@ -476,14 +517,8 @@ class ConditionalHttpsTransport:
 
     @staticmethod
     def _secure_xml(content: bytes) -> bool:
-        encoding = "utf-8"
-        if content.startswith((b"\xff\xfe\x00\x00", b"\x00\x00\xfe\xff")):
-            encoding = "utf-32"
-        elif content.startswith((b"\xff\xfe", b"\xfe\xff")):
-            encoding = "utf-16"
-        try:
-            text = content.decode(encoding)
-        except UnicodeDecodeError:
+        text = ConditionalHttpsTransport._decoded_xml_text(content)
+        if text is None or not ConditionalHttpsTransport._valid_text(text):
             return False
         if "<!DOCTYPE" in text.upper() or "<!ENTITY" in text.upper():
             return False

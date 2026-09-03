@@ -7,7 +7,7 @@ import re
 from datetime import datetime
 from enum import StrEnum
 from fnmatch import fnmatchcase
-from typing import Literal, Protocol
+from typing import Literal, Protocol, runtime_checkable
 from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
 from pydantic import Field, field_validator, model_validator
@@ -51,27 +51,39 @@ def _source_url(value: object) -> str:
         pass
     else:
         raise ValueError("locator must name a hostname, not an IP address")
-    decoded_path = parsed.path
-    for _ in range(4):
-        if re.search(r"%(?:2f|5c)", decoded_path, flags=re.IGNORECASE):
+    if not parsed.path.startswith("/"):
+        raise ValueError("locator path is unsafe")
+    inspection_path = parsed.path
+    for _ in range(16):
+        if (
+            "//" in inspection_path
+            or "\\" in inspection_path
+            or any(
+                ord(character) < 32 or ord(character) == 127
+                for character in inspection_path
+            )
+            or any(segment in {".", ".."} for segment in inspection_path.split("/"))
+            or re.search(r"%(?:2f|5c|0[0-9a-f]|1[0-9a-f]|7f)", inspection_path, re.I)
+        ):
             raise ValueError("locator path is unsafe")
-        next_path = unquote(decoded_path)
-        if next_path == decoded_path:
+        if not re.search(r"%[0-9A-Fa-f]{2}", inspection_path):
             break
-        decoded_path = next_path
+        try:
+            next_path = unquote(inspection_path, errors="strict")
+        except UnicodeDecodeError as error:
+            raise ValueError("locator path has invalid percent-encoded text") from error
+        if next_path == inspection_path:
+            break
+        inspection_path = next_path
     else:
         raise ValueError("locator path has excessive percent encoding")
-    if (
-        not parsed.path.startswith("/")
-        or "//" in decoded_path
-        or "\\" in decoded_path
-        or any(ord(character) < 32 or ord(character) == 127 for character in decoded_path)
-        or any(segment in {".", ".."} for segment in decoded_path.split("/"))
-    ):
-        raise ValueError("locator path is unsafe")
-    canonical_path = quote(decoded_path, safe="/:@!$&'()*+,;=-._~")
-    if unquote(canonical_path) != decoded_path:
-        raise ValueError("locator path is not canonically encodable")
+    # Preserve the request's encoding layers: decoding here would make a
+    # different resource (for example, `%2520` is not `%20`).  Encode only raw
+    # Unicode and canonicalize the hexadecimal spelling of existing escapes.
+    canonical_path = quote(parsed.path, safe="/:@!$&'()*+,;=-._~%")
+    canonical_path = re.sub(
+        r"%[0-9A-Fa-f]{2}", lambda match: match.group(0).upper(), canonical_path
+    )
     return urlunsplit(("https", parsed.hostname.lower(), canonical_path, parsed.query, ""))
 
 
@@ -320,6 +332,7 @@ def authorize_candidate(
     return candidate
 
 
+@runtime_checkable
 class SourceAdapter(Protocol):
     adapter_id: str
     version: str

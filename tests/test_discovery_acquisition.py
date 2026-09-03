@@ -18,6 +18,7 @@ from research_agent.discovery_acquisition import (
 from research_agent.remote_acquisition import RemoteFetchError
 from research_agent.source_intent import (
     DiscoveryKind,
+    SourceAdapter,
     SourceAssociations,
     SourceDiscovery,
     SourceIntent,
@@ -230,3 +231,38 @@ def test_github_source_adapter_preserves_legacy_immutable_readme_result(tmp_path
     assert acquired.snapshot.commit_sha == "a" * 40
     assert acquired.parsed_ingest.derived_source_version_id == acquired.snapshot.source_version_id
     assert checkpoint.result_sha256 == acquired.snapshot.source_content_sha256
+    assert isinstance(adapter, SourceAdapter)
+
+
+def test_github_repository_candidate_is_a_depth_zero_direct_source(tmp_path: Path) -> None:
+    """A declared repository is not an enumerated child and remains valid at depth zero."""
+    adapter = GitHubRepositorySourceAdapter(
+        GitHubDiscoveryAcquirer(
+            store=ImmutableStore(tmp_path / "data"),
+            transport=FakeTransport(_responses(b"# Research\n")),
+            clock=lambda: NOW,
+        ),
+        capability_evaluator=AllowEvaluator(),
+        capability_request=_capability_request,
+    )
+    intent = SourceIntent(
+        id="github-research",
+        role="repository",
+        discovery=SourceDiscovery(
+            kind=DiscoveryKind.GITHUB_REPOSITORY,
+            locator="https://github.com/Example/Research",
+        ),
+        allowed_hosts=("github.com",),
+        allowed_path_prefixes=("/Example/",),
+        accepted_media_types=("text/markdown",),
+        refresh=SourceRefreshPolicy(interval_seconds=60, max_items=1, max_depth=0),
+        required=True,
+        priority=1,
+        associations=SourceAssociations(),
+        temporal=SourceTemporalPolicy(field="observed_at", retention="latest"),
+        created_at=NOW,
+    )
+
+    assert [candidate.locator for candidate in adapter.discover(intent)] == [
+        "https://github.com/Example/Research"
+    ]

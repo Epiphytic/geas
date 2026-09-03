@@ -121,6 +121,58 @@ def test_percent_normalization_is_idempotent_without_raw_percent() -> None:
     assert second.locator == first.locator
 
 
+@pytest.mark.parametrize(
+    ("raw", "canonical"),
+    (
+        ("https://issuer.example/a%2520b.pdf", "https://issuer.example/a%2520b.pdf"),
+        ("https://issuer.example/a%2541b.pdf", "https://issuer.example/a%2541b.pdf"),
+        ("https://issuer.example/a%25b.pdf", "https://issuer.example/a%25b.pdf"),
+        ("https://issuer.example/a%2ab.pdf", "https://issuer.example/a%2Ab.pdf"),
+    ),
+)
+def test_percent_normalization_preserves_semantic_layers_and_is_idempotent(
+    raw: str, canonical: str
+) -> None:
+    """Canonicalization must not turn a server-visible literal escape into decoded data."""
+    first = _candidate(raw)
+    second = _candidate(first.locator)
+
+    assert first.locator == canonical
+    assert second.locator == canonical
+
+
+@pytest.mark.parametrize(
+    "locator",
+    (
+        "https://issuer.example/a%",
+        "https://issuer.example/a%2",
+        "https://issuer.example/a%zz",
+        "https://issuer.example/news%252fprivate.pdf",
+        "https://issuer.example/news%255cprivate.pdf",
+        "https://issuer.example/%252e%252e/private.pdf",
+        "https://issuer.example/a%2500b.pdf",
+        "https://issuer.example/a%257fb.pdf",
+    ),
+)
+def test_percent_normalization_rejects_malformed_or_eventually_unsafe_paths(
+    locator: str,
+) -> None:
+    """Inspection must follow nested escapes without rewriting their resource semantics."""
+    with pytest.raises(ValidationError):
+        _candidate(locator)
+
+
+def test_document_glob_is_segment_safe() -> None:
+    """A star in one segment must never authorize a slash-delimited descendant."""
+    authority = _intent().model_copy(update={"document_patterns": ("/news/*.pdf",)})
+    allowed = _candidate("https://issuer.example/news/report.pdf")
+    nested = _candidate("https://issuer.example/news/archive/report.pdf")
+
+    assert authorize_candidate(allowed, authority) == allowed
+    with pytest.raises(SourceAuthorizationError, match="document pattern"):
+        authorize_candidate(nested, authority)
+
+
 def test_intent_normalizes_associations_and_rejects_invalid_document_glob() -> None:
     """Allowing unsafe globs makes path selection ambiguous and broadens authority."""
     assert _intent().associations.concepts == ("concept:a",)

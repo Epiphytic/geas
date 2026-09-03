@@ -1,4 +1,6 @@
 import gzip
+import socket
+import ssl
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -16,6 +18,7 @@ from research_agent.remote_acquisition import (
     SourceFetchConstraint,
     SourceFetchRequest,
     SourceValidator,
+    _PinnedHttpsConnection,
 )
 from research_agent.store import ImmutableStore
 
@@ -97,6 +100,35 @@ class _AllowEvaluator:
             evaluator_version="fixture/1",
             decided_at=INSTANT,
         )
+
+
+class _EventEvaluator:
+    def __init__(self, events: list[str], *, allowed: bool = True) -> None:
+        self.events = events
+        self.allowed = allowed
+
+    def evaluate(self, request: CapabilityRequest) -> CapabilityDecision:
+        self.events.append(f"authorize:{request.target}")
+        return CapabilityDecision(
+            request=request,
+            decision="allow" if self.allowed else "deny",
+            effective_capabilities=request.capabilities if self.allowed else (),
+            reason="fixture",
+            evaluator_version="fixture/1",
+            decided_at=INSTANT,
+        )
+
+
+class _EventClient:
+    def __init__(
+        self, events: list[str], responses: list[ConditionalHttpResponse]
+    ) -> None:
+        self.events = events
+        self.responses = responses
+
+    def request(self, **kwargs: object) -> ConditionalHttpResponse:
+        self.events.append(f"http:{kwargs['url']}@{kwargs['address']}")
+        return self.responses.pop(0)
 
 
 def _source_request() -> SourceFetchRequest:
@@ -301,6 +333,65 @@ def test_conditional_transport_requires_evaluator_before_http() -> None:
     assert client.calls == []
 
 
+def test_conditional_transport_authorizes_before_dns_on_denied_and_allowed_paths() -> None:
+    """DNS itself is an outbound effect and may not precede source-fetch authorization."""
+    denied_events: list[str] = []
+    denied = ConditionalHttpsTransport(
+        dns_resolver=lambda host: denied_events.append(f"dns:{host}") or ("8.8.8.8",),
+        http_client=_EventClient(denied_events, []),
+        capability_evaluator=_EventEvaluator(denied_events, allowed=False),
+    )
+    with pytest.raises(RemoteFetchError, match="denied"):
+        denied.fetch(_source_request())
+    assert denied_events == ["authorize:https://issuer.example/report.pdf"]
+
+    allowed_events: list[str] = []
+    allowed = ConditionalHttpsTransport(
+        dns_resolver=lambda host: allowed_events.append(f"dns:{host}") or ("8.8.8.8",),
+        http_client=_EventClient(
+            allowed_events,
+            [ConditionalHttpResponse(status=200, body=b"%PDF-1.7\n")],
+        ),
+        capability_evaluator=_EventEvaluator(allowed_events),
+    )
+    allowed.fetch(_source_request())
+    assert allowed_events == [
+        "authorize:https://issuer.example/report.pdf",
+        "dns:issuer.example",
+        "http:https://issuer.example/report.pdf@8.8.8.8",
+    ]
+
+
+def test_conditional_transport_reauthorizes_then_reresolves_every_redirect() -> None:
+    """Each redirect is a fresh network effect and must repeat authorization before DNS."""
+    events: list[str] = []
+    responses = [
+        ConditionalHttpResponse(status=302, headers={"Location": "/second.pdf"}),
+        ConditionalHttpResponse(status=302, headers={"Location": "/final.pdf"}),
+        ConditionalHttpResponse(status=200, body=b"%PDF-1.7\n"),
+    ]
+    transport = ConditionalHttpsTransport(
+        dns_resolver=lambda host: events.append(f"dns:{host}") or ("8.8.8.8",),
+        http_client=_EventClient(events, responses),
+        capability_evaluator=_EventEvaluator(events),
+    )
+
+    result = transport.fetch(_source_request())
+
+    assert result.final_url == "https://issuer.example/final.pdf"
+    assert events == [
+        "authorize:https://issuer.example/report.pdf",
+        "dns:issuer.example",
+        "http:https://issuer.example/report.pdf@8.8.8.8",
+        "authorize:https://issuer.example/second.pdf",
+        "dns:issuer.example",
+        "http:https://issuer.example/second.pdf@8.8.8.8",
+        "authorize:https://issuer.example/final.pdf",
+        "dns:issuer.example",
+        "http:https://issuer.example/final.pdf@8.8.8.8",
+    ]
+
+
 def test_conditional_transport_rechecks_redirect_scope_and_bounds_decompression() -> None:
     """Skipping redirect validation or bounded inflation enables SSRF and memory exhaustion."""
     transport = ConditionalHttpsTransport(
@@ -415,3 +506,201 @@ def test_conditional_transport_rejects_opaque_octet_stream_and_malformed_xml() -
 
     assert opaque.constraint is SourceFetchConstraint.UNSUPPORTED_MEDIA_TYPE
     assert malformed.constraint is SourceFetchConstraint.UNSUPPORTED_MEDIA_TYPE
+
+
+@pytest.mark.parametrize(
+    ("claimed", "body"),
+    (
+        ("application/json", b'{"valid": true}\x00'),
+        ("application/json", b"{" + b" " * 5000 + b"not-json}"),
+        ("text/plain", b"plain" + b"a" * 5000 + b"\x00hidden"),
+        ("text/plain", "plain\u0085hidden".encode()),
+        ("application/octet-stream", b"{" + b"\x00not-json"),
+        ("application/octet-stream", b"plain" + b"a" * 5000 + b"\x00hidden"),
+    ),
+)
+def test_conditional_transport_sniffs_and_validates_the_full_bounded_body(
+    claimed: str, body: bytes
+) -> None:
+    """A benign prefix cannot make malformed or control-bearing bytes admissible."""
+    request = _source_request().model_copy(
+        update={
+            "accepted_media_types": (claimed,),
+            "max_wire_bytes": 10_000,
+            "max_decoded_bytes": 10_000,
+        }
+    )
+    transport = ConditionalHttpsTransport(
+        dns_resolver=lambda _: ("8.8.8.8",),
+        http_client=_ConditionalClient(
+            [ConditionalHttpResponse(status=200, headers={"Content-Type": claimed}, body=body)]
+        ),
+        capability_evaluator=_AllowEvaluator(),
+    )
+
+    result = transport.fetch(request)
+
+    assert result.constraint is SourceFetchConstraint.UNSUPPORTED_MEDIA_TYPE
+    assert result.content == b""
+
+
+@pytest.mark.parametrize("encoding", ("utf-16", "utf-32"))
+def test_conditional_transport_recognizes_secure_bom_xml(encoding: str) -> None:
+    """BOM XML must be decoded before byte-prefix classification and still parsed securely."""
+    body = "<?xml version='1.0'?><rss><channel /></rss>".encode(encoding)
+    request = _source_request().model_copy(
+        update={
+            "accepted_media_types": ("application/rss+xml",),
+            "max_wire_bytes": 1_000,
+            "max_decoded_bytes": 1_000,
+        }
+    )
+    transport = ConditionalHttpsTransport(
+        dns_resolver=lambda _: ("8.8.8.8",),
+        http_client=_ConditionalClient(
+            [
+                ConditionalHttpResponse(
+                    status=200,
+                    headers={"Content-Type": "application/rss+xml"},
+                    body=body,
+                )
+            ]
+        ),
+        capability_evaluator=_AllowEvaluator(),
+    )
+
+    result = transport.fetch(request)
+
+    assert result.media_type == "application/rss+xml"
+    assert result.content == body
+
+
+@pytest.mark.parametrize(
+    "xml",
+    (
+        "<?xml version='1.0'?><rss><broken></rss>",
+        "<?xml version='1.0'?><!DOCTYPE rss><rss />",
+        "<?xml version='1.0'?><!DOCTYPE rss [<!ENTITY x 'boom'>]><rss>&x;</rss>",
+    ),
+)
+def test_conditional_transport_rejects_malformed_or_active_bom_xml(xml: str) -> None:
+    """Changing byte encoding must not bypass XML syntax or entity restrictions."""
+    body = xml.encode("utf-16")
+    request = _source_request().model_copy(
+        update={
+            "accepted_media_types": ("application/rss+xml",),
+            "max_wire_bytes": 2_000,
+            "max_decoded_bytes": 2_000,
+        }
+    )
+    transport = ConditionalHttpsTransport(
+        dns_resolver=lambda _: ("8.8.8.8",),
+        http_client=_ConditionalClient(
+            [
+                ConditionalHttpResponse(
+                    status=200,
+                    headers={"Content-Type": "application/rss+xml"},
+                    body=body,
+                )
+            ]
+        ),
+        capability_evaluator=_AllowEvaluator(),
+    )
+
+    result = transport.fetch(request)
+
+    assert result.constraint is SourceFetchConstraint.UNSUPPORTED_MEDIA_TYPE
+
+
+def test_conditional_transport_enforces_decoded_ceiling_before_bom_xml_sniff() -> None:
+    """Secure XML recognition must not weaken the decoded response ceiling."""
+    body = gzip.compress(("<rss>" + "x" * 200 + "</rss>").encode("utf-16"))
+    request = _source_request().model_copy(
+        update={"accepted_media_types": ("application/rss+xml",), "max_decoded_bytes": 100}
+    )
+    transport = ConditionalHttpsTransport(
+        dns_resolver=lambda _: ("8.8.8.8",),
+        http_client=_ConditionalClient(
+            [
+                ConditionalHttpResponse(
+                    status=200,
+                    headers={
+                        "Content-Type": "application/rss+xml",
+                        "Content-Encoding": "gzip",
+                    },
+                    body=body,
+                )
+            ]
+        ),
+        capability_evaluator=_AllowEvaluator(),
+    )
+
+    with pytest.raises(RemoteFetchError, match="decoded size"):
+        transport.fetch(request)
+
+
+def test_conditional_transport_parses_http_date_retry_after_with_one_clock_sample() -> None:
+    """Date-form Retry-After must be deterministic under an injected advancing clock."""
+    calls = 0
+
+    def clock() -> datetime:
+        nonlocal calls
+        calls += 1
+        return datetime(2026, 8, 3, 0, 0, calls, tzinfo=UTC)
+
+    transport = ConditionalHttpsTransport(
+        dns_resolver=lambda _: ("8.8.8.8",),
+        http_client=_ConditionalClient(
+            [
+                ConditionalHttpResponse(
+                    status=503,
+                    headers={"Retry-After": "Mon, 03 Aug 2026 00:01:01 GMT"},
+                )
+            ]
+        ),
+        capability_evaluator=_AllowEvaluator(),
+        clock=clock,
+    )
+
+    result = transport.fetch(_source_request())
+
+    assert result.constraint is SourceFetchConstraint.RATE_LIMITED
+    assert result.retry_after == 60
+    assert calls == 1
+
+
+def test_pinned_https_connection_uses_selected_ip_and_original_hostname_for_tls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The production boundary must pin the validated IP without disabling hostname TLS."""
+    events: list[object] = []
+    raw_socket = object()
+
+    class FakeContext:
+        check_hostname = True
+        verify_mode = ssl.CERT_REQUIRED
+
+        def wrap_socket(self, sock: object, *, server_hostname: str) -> object:
+            events.append(("tls", sock, server_hostname))
+            return object()
+
+    monkeypatch.setattr(
+        socket,
+        "create_connection",
+        lambda address, timeout: events.append(("connect", address, timeout)) or raw_socket,
+    )
+    connection = _PinnedHttpsConnection(
+        hostname="issuer.example", address="8.8.8.8", timeout=7
+    )
+    assert connection._context.check_hostname is True
+    assert connection._context.verify_mode == ssl.CERT_REQUIRED
+    connection._context = FakeContext()  # type: ignore[assignment]
+
+    connection.connect()
+
+    assert connection._context.check_hostname is True
+    assert connection._context.verify_mode == ssl.CERT_REQUIRED
+    assert events == [
+        ("connect", ("8.8.8.8", 443), 7),
+        ("tls", raw_socket, "issuer.example"),
+    ]
