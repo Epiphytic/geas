@@ -13,14 +13,21 @@ from datetime import datetime
 from pathlib import Path, PurePosixPath
 from typing import Protocol
 
-from research_agent.capabilities import Capability, CapabilityDecision, CapabilityGrant
+from research_agent.capabilities import (
+    Capability,
+    CapabilityDecision,
+    CapabilityGrant,
+    _https_url,
+)
 from research_agent.publishing import (
     PathRole,
+    ProducerReceiptVerifier,
     PublicationManifest,
     PublicationManifestPath,
     PublishMode,
     PublishRequest,
     PublishResult,
+    capability_decision_set_sha256,
     classify_managed_path,
     required_capabilities,
 )
@@ -63,6 +70,21 @@ class PromotionVerifier(Protocol):
     ) -> None: ...
 
 
+class GitRemoteTransport(Protocol):
+    """Transport an exact repository endpoint; injected fakes keep tests offline."""
+
+    def ls_remote(self, *, endpoint: str, ref: str) -> str: ...
+
+    def push(
+        self,
+        *,
+        endpoint: str,
+        commit: str,
+        ref: str,
+        expected: str | None,
+    ) -> subprocess.CompletedProcess[str]: ...
+
+
 class GitRepositoryPublisher:
     """Publish exact manifest-owned paths without using the operator's Git index."""
 
@@ -71,7 +93,7 @@ class GitRepositoryPublisher:
         *,
         repository: Path,
         manifests: Sequence[PublicationManifest],
-        capability_decision: CapabilityDecision,
+        capability_decision: CapabilityDecision | Sequence[CapabilityDecision],
         forge: ForgeClient | None,
         now: Callable[[], datetime],
         direct_push: bool = False,
@@ -79,10 +101,16 @@ class GitRepositoryPublisher:
         remote: str = "origin",
         grants: Mapping[str, CapabilityGrant] | None = None,
         promotion_verifier: PromotionVerifier | None = None,
+        receipt_verifier: ProducerReceiptVerifier | None = None,
+        remote_transport: GitRemoteTransport | None = None,
     ) -> None:
         self.repository = repository.resolve()
         self.manifests = tuple(manifests)
-        self.capability_decision = capability_decision
+        self.capability_decisions = (
+            (capability_decision,)
+            if isinstance(capability_decision, CapabilityDecision)
+            else tuple(capability_decision)
+        )
         self.forge = forge
         self.now = now
         self.direct_push = direct_push
@@ -90,6 +118,8 @@ class GitRepositoryPublisher:
         self.remote = remote
         self.grants = dict(grants or {})
         self.promotion_verifier = promotion_verifier
+        self.receipt_verifier = receipt_verifier
+        self.remote_transport = remote_transport
 
     def publish(self, request: PublishRequest) -> PublishResult:
         if request.mode is PublishMode.NONE:
@@ -99,18 +129,45 @@ class GitRepositoryPublisher:
                 reason="publication-disabled",
                 completed_at=self.now(),
             )
+        self._verify_producer_receipts()
         items = self._verified_manifest_items(request)
         canonical = request.target_ref == self.canonical_ref
         required = self._authorize(request, items, canonical=canonical)
+        endpoint = self._resolve_remote_endpoint(request.repository)
         if request.mode is PublishMode.DIRECT_PUSH:
-            return self._publish_direct(request, items, required=required, canonical=canonical)
+            return self._publish_direct(
+                request,
+                items,
+                endpoint=endpoint,
+                required=required,
+            )
         return self._publish_pull_request(
             request,
             items,
+            endpoint=endpoint,
             required=required,
             auto_merge=request.mode is PublishMode.AUTO_MERGE,
-            canonical=canonical,
         )
+
+    def _verify_producer_receipts(self) -> None:
+        if self.receipt_verifier is None:
+            raise PublicationError("publication requires a verified producer receipt verifier")
+        validated: list[PublicationManifest] = []
+        for supplied in self.manifests:
+            try:
+                manifest = PublicationManifest.model_validate(
+                    supplied.model_dump(mode="json")
+                )
+            except Exception as error:
+                raise PublicationError("publication manifest schema did not revalidate") from error
+            try:
+                self.receipt_verifier.verify(manifest)
+            except Exception as error:
+                raise PublicationError(
+                    "producer receipt did not verify the exact manifest"
+                ) from error
+            validated.append(manifest)
+        self.manifests = tuple(validated)
 
     def _verified_manifest_items(
         self, request: PublishRequest
@@ -150,20 +207,35 @@ class GitRepositoryPublisher:
             if item_required is None:
                 raise PublicationError("path role is forbidden for this publication mode")
             required.update(item_required)
-        decision = self.capability_decision
-        if request.capability_decision_sha256 != decision.sha256:
+        decisions = self.capability_decisions
+        try:
+            digest = capability_decision_set_sha256(decisions)
+        except ValueError as error:
+            raise PublicationError("capability decision set is invalid") from error
+        if request.capability_decision_sha256 != digest:
             raise PublicationError("publish request does not match its capability decision")
-        decided = decision.request
-        if (
-            decision.decision != "allow"
-            or decided.target_repository != request.repository
-            or decided.ref != request.target_ref
-            or {item.path for item in items} != {decided.path}
-            or not required.issubset(decision.effective_capabilities)
-        ):
+        by_path = {decision.request.path: decision for decision in decisions}
+        if set(by_path) != {item.path for item in items}:
             raise PublicationError("capability decision does not authorize exact publication")
-        if Capability.GIT_DIRECT_PUSH in required and decision.delegation_chain:
-            self._verify_delegated_direct_push(decision)
+        for item in items:
+            decision = by_path[item.path]
+            decided = decision.request
+            item_required = required_capabilities(
+                item.role,
+                request.mode,
+                canonical_target=canonical,
+            )
+            if (
+                item_required is None
+                or decision.decision != "allow"
+                or decided.target_repository != request.repository
+                or decided.ref != request.target_ref
+                or decided.path != item.path
+                or not item_required.issubset(decision.effective_capabilities)
+            ):
+                raise PublicationError("capability decision does not authorize exact publication")
+            if Capability.GIT_DIRECT_PUSH in item_required and decision.delegation_chain:
+                self._verify_delegated_direct_push(decision)
         return frozenset(required)
 
     def _verify_delegated_direct_push(self, decision: CapabilityDecision) -> None:
@@ -183,9 +255,9 @@ class GitRepositoryPublisher:
         request: PublishRequest,
         items: Sequence[PublicationManifestPath],
         *,
+        endpoint: str,
         required: frozenset[Capability],
         auto_merge: bool,
-        canonical: bool,
     ) -> PublishResult:
         if self.forge is None:
             raise PublicationError("pull-request publication requires an injected forge client")
@@ -193,12 +265,12 @@ class GitRepositoryPublisher:
         identity = self._publication_identity(request, items)
         commit = self._build_commit(request, items, parent=base, identity=identity)
         if Capability.KNOWLEDGE_AUTO_PROMOTE in required:
-            self._verify_promotion(commit, request, items, canonical=canonical)
+            self._verify_promotion(commit, request, items)
         branch = f"geas/publish/{identity[:20]}"
         branch_ref = f"refs/heads/{branch}"
-        expected = self._remote_object(branch_ref)
+        expected = self._remote_object(endpoint, branch_ref)
         if expected != commit:
-            self._push(commit, branch_ref, expected)
+            self._push(commit, branch_ref, expected, endpoint=endpoint)
         title = f"geas: publish managed changes {identity[:12]}"
         body = (
             f"Deterministic Geas publication `{request.id}`.\n\n"
@@ -233,8 +305,8 @@ class GitRepositoryPublisher:
         request: PublishRequest,
         items: Sequence[PublicationManifestPath],
         *,
+        endpoint: str,
         required: frozenset[Capability],
-        canonical: bool,
     ) -> PublishResult:
         if not self.direct_push:
             raise PublicationError("direct push requires the explicit direct-push flag")
@@ -244,7 +316,7 @@ class GitRepositoryPublisher:
         if active.returncode != 0 or active.stdout.strip() != request.target_ref:
             raise PublicationError("direct push requires HEAD on the exact target branch")
         self._require_only_owned_changes(items)
-        expected = self._remote_object(request.target_ref)
+        expected = self._remote_object(endpoint, request.target_ref)
         local = self._verified_local_commit(request.target_ref)
         head = self._verified_local_commit("HEAD")
         if expected is None or local != expected or head != local:
@@ -252,9 +324,8 @@ class GitRepositoryPublisher:
         identity = self._publication_identity(request, items)
         commit = self._build_commit(request, items, parent=local, identity=identity)
         if Capability.KNOWLEDGE_AUTO_PROMOTE in required:
-            self._verify_promotion(commit, request, items, canonical=canonical)
-        self._push(commit, request.target_ref, expected)
-        self._git("update-ref", request.target_ref, commit, local)
+            self._verify_promotion(commit, request, items)
+        self._push(commit, request.target_ref, expected, endpoint=endpoint)
         return PublishResult(
             request_id=request.id,
             published=True,
@@ -269,10 +340,8 @@ class GitRepositoryPublisher:
         commit: str,
         request: PublishRequest,
         items: Sequence[PublicationManifestPath],
-        *,
-        canonical: bool,
     ) -> None:
-        if not canonical or self.promotion_verifier is None:
+        if self.promotion_verifier is None:
             raise PublicationError(
                 "canonical semantic publication requires existing promotion verification"
             )
@@ -394,8 +463,40 @@ class GitRepositoryPublisher:
         value = self._git("rev-parse", "--verify", f"{ref}^{{commit}}")
         return self._object_id(value, label="local target")
 
-    def _remote_object(self, ref: str) -> str | None:
-        lines = self._git("ls-remote", "--refs", self.remote, ref).splitlines()
+    def _resolve_remote_endpoint(self, repository: str) -> str:
+        self._reject_url_rewrites()
+        configured = self._configured_remote_url()
+        if self._canonical_endpoint(configured) != self._canonical_endpoint(repository):
+            raise PublicationError("configured repository endpoint does not match authority")
+        return configured
+
+    def _reject_url_rewrites(self) -> None:
+        rewrites = self._git_result(
+            "config",
+            "--get-regexp",
+            r"^url\..*\.insteadof$",
+            check=False,
+        )
+        if rewrites.returncode not in {0, 1} or rewrites.stdout:
+            raise PublicationError("publication repository URL rewrites are forbidden")
+
+    def _configured_remote_url(self) -> str:
+        values = self._git("config", "--get-all", f"remote.{self.remote}.url").splitlines()
+        if len(values) != 1:
+            raise PublicationError("publication remote must have one exact repository endpoint")
+        return values[0]
+
+    @staticmethod
+    def _canonical_endpoint(value: str) -> str:
+        normalized = _https_url(value, label="publication repository endpoint")
+        return normalized[:-4] if normalized.endswith(".git") else normalized
+
+    def _remote_object(self, endpoint: str, ref: str) -> str | None:
+        if self.remote_transport is None:
+            output = self._git("ls-remote", "--refs", endpoint, ref)
+        else:
+            output = self.remote_transport.ls_remote(endpoint=endpoint, ref=ref)
+        lines = output.splitlines()
         if not lines:
             return None
         if len(lines) != 1:
@@ -405,21 +506,32 @@ class GitRepositoryPublisher:
             raise PublicationError("remote ref resolution changed")
         return self._object_id(object_id, label="remote target")
 
-    def _push(self, commit: str, ref: str, expected: str | None) -> None:
+    def _push(self, commit: str, ref: str, expected: str | None, *, endpoint: str) -> None:
+        self._reject_url_rewrites()
+        if self._configured_remote_url() != endpoint:
+            raise PublicationError("publication remote configuration changed before mutation")
         lease_expected = expected if expected is not None else ""
-        result = self._git_result(
-            "-c",
-            "core.hooksPath=/dev/null",
-            "push",
-            f"--force-with-lease={ref}:{lease_expected}",
-            self.remote,
-            f"{commit}:{ref}",
-            check=False,
-        )
+        if self.remote_transport is None:
+            result = self._git_result(
+                "-c",
+                "core.hooksPath=/dev/null",
+                "push",
+                f"--force-with-lease={ref}:{lease_expected}",
+                endpoint,
+                f"{commit}:{ref}",
+                check=False,
+            )
+        else:
+            result = self.remote_transport.push(
+                endpoint=endpoint,
+                commit=commit,
+                ref=ref,
+                expected=expected,
+            )
         if result.returncode != 0:
             recovery = (
                 f"git push --force-with-lease={ref}:{expected or ''} "
-                f"{self.remote} {commit}:{ref}"
+                f"{endpoint} {commit}:{ref}"
             )
             raise PublicationError(
                 f"publication push failed under the exact lease; local commit {commit}; "

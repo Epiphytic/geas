@@ -125,11 +125,12 @@ def _pull_request(
     *,
     head_repository: str = REPOSITORY,
     head_sha: str = HEAD_SHA,
+    base_sha: str = "0" * 40,
 ) -> dict[str, object]:
     return {
         "number": PR_NUMBER,
         "state": "open",
-        "base": {"ref": "main", "repo": {"full_name": REPOSITORY}},
+        "base": {"ref": "main", "sha": base_sha, "repo": {"full_name": REPOSITORY}},
         "head": {
             "ref": "feature/skill-sync",
             "sha": head_sha,
@@ -248,6 +249,50 @@ def test_pull_request_must_remain_open_and_match_the_exact_head() -> None:
     retargeted["base"]["ref"] = "release"
     with pytest.raises(ValueError, match="base branch"):
         verify_pull_request(retargeted, source=source)
+
+
+def test_pull_request_file_inventory_is_bound_between_two_exact_head_reads() -> None:
+    before = _pull_request()
+    after = _pull_request(head_sha="2" * 40)
+    allowed = ([{"filename": ".agents/skills/geas/SKILL.md"}],)
+
+    with pytest.raises(ValueError, match="changed while file inventory"):
+        pr_skill_sync.bind_pull_request_file_inventory(
+            allowed,
+            before=before,
+            after=after,
+            source=_source(),
+        )
+
+
+def test_allowed_old_inventory_cannot_hide_an_unsafe_new_head(tmp_path: Path) -> None:
+    repository = tmp_path / "repository"
+    _git(tmp_path, "init", str(repository))
+    (repository / "README.md").write_text("base\n")
+    _git(repository, "add", "README.md")
+    _git(repository, "commit", "-m", "base")
+    base = _git(repository, "rev-parse", "HEAD").stdout.strip()
+    skill = repository / ".agents" / "skills" / "geas" / "SKILL.md"
+    skill.parent.mkdir(parents=True)
+    skill.write_text("allowed\n")
+    _git(repository, "add", ".agents/skills/geas/SKILL.md")
+    _git(repository, "commit", "-m", "allowed")
+    unsafe = repository / "src" / "unsafe.py"
+    unsafe.parent.mkdir()
+    unsafe.write_text("unsafe = True\n")
+    _git(repository, "add", "src/unsafe.py")
+    _git(repository, "commit", "-m", "unsafe new head")
+    head = _git(repository, "rev-parse", "HEAD").stdout.strip()
+    pull_request = _pull_request(head_sha=head, base_sha=base)
+
+    with pytest.raises(ValueError, match="outside the two allowed skill roots"):
+        pr_skill_sync.bind_pull_request_file_inventory(
+            ([{"filename": ".agents/skills/geas/SKILL.md"}],),
+            before=pull_request,
+            after=pull_request,
+            source=_source(head_sha=head),
+            repository=repository,
+        )
 
 
 @pytest.mark.parametrize(
@@ -780,6 +825,14 @@ def test_workflows_pin_actions_and_keep_token_exchange_after_all_gates() -> None
         "scope": "Epiphytic/.github",
         "identity": "geas-pr-skill-sync",
     }
+    writeback_text = writeback_path.read_text()
+    assert writeback_text.count("bind-files") >= 2
+    assert writeback_text.index("validate-policy") < writeback_text.index("octo-sts/action@")
+    assert '-f commit_id="$GEAS_EXPECTED_HEAD"' in writeback_text
+    assert "verify-review" in writeback_text
+    assert writeback_text.index("verify-review") < writeback_text.index(
+        "Enable ruleset-gated squash auto-merge"
+    )
     for document in (regeneration, writeback):
         for job in document["jobs"].values():
             for step in job["steps"]:
@@ -830,6 +883,39 @@ def test_org_policy_contract_is_exact_and_rejects_broader_permissions(tmp_path: 
         validate_org_sts_policy(policy)
 
 
+def test_approval_receipt_is_bound_to_the_exact_verified_head() -> None:
+    expected = "a" * 40
+    review = {
+        "state": "APPROVED",
+        "commit_id": expected,
+        "pull_request_url": f"https://api.github.com/repos/{REPOSITORY}/pulls/{PR_NUMBER}",
+    }
+
+    assert pr_skill_sync.verify_pull_request_review(
+        review,
+        source=_source(),
+        expected_head=expected,
+    ).commit_id == expected
+
+    raced = dict(review, commit_id="b" * 40)
+    with pytest.raises(ValueError, match="review commit"):
+        pr_skill_sync.verify_pull_request_review(
+            raced,
+            source=_source(),
+            expected_head=expected,
+        )
+
+
+def test_app_installation_docs_cover_policy_and_target_repositories() -> None:
+    root = Path(__file__).resolve().parents[1]
+    docs = (root / "docs" / "GITHUB_APP_AUTOMATION.md").read_text()
+
+    assert "both selected repositories" in docs
+    assert "`Epiphytic/geas`" in docs
+    assert "`Epiphytic/.github`" in docs
+    assert "validate-policy" in docs
+
+
 def test_protected_evaluation_exchanges_token_only_after_all_read_only_checks(
     tmp_path: Path,
 ) -> None:
@@ -855,6 +941,12 @@ def test_protected_evaluation_exchanges_token_only_after_all_read_only_checks(
     )
     event = _workflow_event(head_sha=head)
     pull_request = _pull_request(head_sha=head)
+    inventory = pr_skill_sync.bind_pull_request_file_inventory(
+        ({"filename": ".agents/skills/geas/SKILL.md"},),
+        before=pull_request,
+        after=pull_request,
+        source=source,
+    )
     exchanged: list[str] = []
     evaluate = pr_skill_sync.evaluate_protected_workflow
 
@@ -862,7 +954,7 @@ def test_protected_evaluation_exchanges_token_only_after_all_read_only_checks(
         event=event,
         pull_request=pull_request,
         current_pull_request=pull_request,
-        pull_request_files=({"filename": ".agents/skills/geas/SKILL.md"},),
+        pull_request_files=inventory,
         artifact=artifact,
         comparison_repository=worktree,
         sts_policy=policy,
@@ -933,21 +1025,21 @@ def test_protected_evaluation_denials_have_no_token_or_write_side_effect(
     exchanged: list[str] = []
     before = _git(remote, "for-each-ref", "--format=%(refname):%(objectname)").stdout
     evaluate = pr_skill_sync.evaluate_protected_workflow
+    inventory = pr_skill_sync.PullRequestFileInventory.model_construct(
+        head_sha=head,
+        paths=(
+            "src/research_agent/unsafe.py"
+            if mutation == "path"
+            else ".agents/skills/geas/SKILL.md",
+        ),
+    )
 
     with pytest.raises(ValueError):
         evaluate(
             event=event,
             pull_request=pull_request,
             current_pull_request=current,
-            pull_request_files=(
-                {
-                    "filename": (
-                        "src/research_agent/unsafe.py"
-                        if mutation == "path"
-                        else ".agents/skills/geas/SKILL.md"
-                    )
-                },
-            ),
+            pull_request_files=inventory,
             artifact=artifact,
             comparison_repository=worktree,
             sts_policy=policy,

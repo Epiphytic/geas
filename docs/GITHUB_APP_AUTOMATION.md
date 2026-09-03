@@ -8,10 +8,13 @@ depend on the App.
 
 ## Fixed identities and permissions
 
-The organization is `Epiphytic` (GitHub organization ID `228616596`). The only
-repository in scope is `Epiphytic/geas` (repository ID `1320458746`, repository
-name `geas`). Install the GitHub App only on that selected repository. Give the
-installation these repository permissions:
+The organization is `Epiphytic` (GitHub organization ID `228616596`). Install
+the GitHub App on both selected repositories: the publication target
+`Epiphytic/geas` (repository ID `1320458746`, repository name `geas`) and the
+protected identity-policy repository `Epiphytic/.github`. The STS identity below
+still issues a token scoped only to repository `geas`; access to `.github` lets
+the STS deployment resolve the protected policy without organization-wide
+repository access. Give the installation these repository permissions:
 
 - Contents: read and write, for the exact manifest-owned skill write-back and
   the eventual merge.
@@ -57,7 +60,9 @@ credentials disabled. It builds a closed artifact containing only:
 
 `.github/workflows/pr-skill-writeback.yml` is triggered by `workflow_run` and
 checks out trusted code from `refs/heads/main`. Before requesting the App token,
-it performs all initial reads with the ordinary read-scoped token and rejects:
+it fetches the protected identity policy at `refs/heads/main`, runs the trusted
+`validate-policy` CLI command, and performs all other initial reads with the
+ordinary read-scoped token. It rejects:
 
 - a fork, failed run, wrong repository ID, workflow name/path/event, or PR;
 - a closed, retargeted, renamed, or advanced pull request;
@@ -66,16 +71,22 @@ it performs all initial reads with the ordinary read-scoped token and rejects:
 - a broadened STS subject, claim, permission, repository, or App identity.
 
 The PR is re-queried and the exact head is revalidated immediately before OIDC
-exchange. After exchange, protected code copies inert, independently verified
-bytes and pushes only the two roots with
+exchange. Each GitHub file listing is bracketed by two exact PR-state reads and
+must equal a local, rename-disabled Git diff of the verified base and head
+commits; this prevents a stale or ABA file response from hiding an unsafe path.
+The complete inventory is fetched and rebound immediately before exchange and
+again after write-back. After exchange, protected code copies inert,
+independently verified bytes and pushes only the two roots with
 `--force-with-lease=refs/heads/<head>:<expected-sha>`. PR-controlled Python,
 shell, hooks, filters, and build commands never run with the App token. In
 particular, do not replace this design with `pull_request_target` checkout or
 execution.
 
 The workflow then re-queries the PR before App approval and again before
-auto-merge. Auto-merge uses the exact post-writeback head SHA and remains
-subject to repository rulesets and required checks. Knowledge promotions,
+auto-merge. The approval request includes `commit_id` for the exact verified
+post-writeback head, and protected code validates the returned review's commit
+and PR identity. Auto-merge uses that same head SHA and remains subject to
+repository rulesets and required checks. Knowledge promotions,
 source cards, accepted ontology records, and policy files are not eligible for
 this default artifact workflow; they additionally require an effective local
 `knowledge.auto_promote` grant and successful existing promotion verification.
@@ -103,8 +114,8 @@ the exact App installation selection and policy claims; validate the policy and
 exercise a same-repository test PR before restoring unattended auto-merge.
 
 To remove automation, disable the write-back workflow first, remove the
-`geas-pr-skill-sync` STS identity, revoke the App installation from `geas`, and
-then delete unused App credentials and deployment configuration. Confirm that
-no queued `workflow_run` can exchange a token. Leave branch protections and
-read-only PR checks in place unless the repository owner separately approves
-their removal.
+`geas-pr-skill-sync` STS identity, revoke the App installation from both `geas`
+and `.github`, and then delete unused App credentials and deployment
+configuration. Confirm that no queued `workflow_run` can exchange a token.
+Leave branch protections and read-only PR checks in place unless the repository
+owner separately approves their removal.

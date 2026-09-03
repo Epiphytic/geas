@@ -27,6 +27,7 @@ from research_agent.publishing import (
 
 NOW = datetime(2026, 9, 3, 12, 0, tzinfo=UTC)
 REPOSITORY = "https://github.com/example/gold"
+_LOCAL_REMOTES: dict[Path, Path] = {}
 
 
 def _git(repository: Path, *arguments: str, check: bool = True) -> str:
@@ -57,11 +58,33 @@ def _repository(tmp_path: Path) -> tuple[Path, Path]:
     _git(worktree, "add", "README.md")
     _git(worktree, "commit", "-m", "initial")
     _git(worktree, "push", "-u", "origin", "main")
+    _git(worktree, "remote", "set-url", "origin", REPOSITORY)
+    _LOCAL_REMOTES[worktree.resolve()] = remote.resolve()
     return remote, worktree
+
+
+def _producer(role: PathRole, path: str):
+    producer = publishing.PublicationProducer
+    if role is PathRole.GENERIC_SKILL:
+        return producer.GENERIC_SKILL
+    if role is PathRole.EXPORTED_SKILL:
+        return producer.EXPORTED_SKILL
+    if role is PathRole.GENERATED_PROJECTION:
+        return producer.GENERATED_PROJECTION
+    if role is PathRole.EXTRACTION_PROPOSAL:
+        return producer.EXTRACTION_PROPOSAL
+    if "/promotions/" in path:
+        return producer.KNOWLEDGE_PROMOTION
+    if "/sources/" in path:
+        return producer.SOURCE_CARD
+    if path.startswith("config/"):
+        return producer.POLICY
+    return producer.ACCEPTED_KNOWLEDGE
 
 
 def _manifest(worktree: Path, path: str, role: PathRole) -> PublicationManifest:
     return PublicationManifest(
+        producer=_producer(role, path),
         receipt_sha256="a" * 64,
         paths=(
             {
@@ -140,15 +163,63 @@ class _PromotionVerifier:
         self.calls.append(values)
 
 
+class _ReceiptVerifier:
+    def __init__(self, manifests: tuple[PublicationManifest, ...]) -> None:
+        self.manifests = manifests
+        self.calls: list[PublicationManifest] = []
+
+    def verify(self, manifest: PublicationManifest) -> None:
+        self.calls.append(manifest)
+        if manifest not in self.manifests:
+            raise ValueError("receipt does not bind manifest")
+
+
+class _LocalRemoteTransport:
+    def __init__(self, worktree: Path) -> None:
+        self.worktree = worktree
+        self.remote = _LOCAL_REMOTES[worktree.resolve()]
+
+    def ls_remote(self, *, endpoint: str, ref: str) -> str:
+        assert endpoint == REPOSITORY
+        return _git(self.remote, "for-each-ref", "--format=%(objectname)%09%(refname)", ref)
+
+    def push(
+        self,
+        *,
+        endpoint: str,
+        commit: str,
+        ref: str,
+        expected: str | None,
+    ) -> subprocess.CompletedProcess[str]:
+        assert endpoint == REPOSITORY
+        lease_expected = expected or ""
+        return subprocess.run(
+            (
+                "git",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "push",
+                f"--force-with-lease={ref}:{lease_expected}",
+                str(self.remote),
+                f"{commit}:{ref}",
+            ),
+            cwd=self.worktree,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+
 def _publisher(
     worktree: Path,
     manifest: PublicationManifest,
-    decision: CapabilityDecision,
+    decision: CapabilityDecision | tuple[CapabilityDecision, ...],
     *,
     direct_push: bool = False,
     forge: _Forge | None = None,
     grants: dict[str, CapabilityGrant] | None = None,
     promotion_verifier: _PromotionVerifier | None = None,
+    receipt_verifier: _ReceiptVerifier | None | object = ...,
 ):
     publisher_type = (
         __import__(
@@ -165,6 +236,10 @@ def _publisher(
         direct_push=direct_push,
         grants=grants,
         promotion_verifier=promotion_verifier,
+        receipt_verifier=(
+            _ReceiptVerifier((manifest,)) if receipt_verifier is ... else receipt_verifier
+        ),
+        remote_transport=_LocalRemoteTransport(worktree),
     )
 
 
@@ -261,42 +336,47 @@ def test_literal_path_role_matrix_is_enforced_for_every_mode() -> None:
 def test_classifier_uses_normalized_paths_and_exact_strict_manifest_entries() -> None:
     manifest_type = publishing.PublicationManifest
     classify = publishing.classify_managed_path
-    manifest = manifest_type(
-        receipt_sha256="a" * 64,
-        paths=(
-            {
-                "path": ".agents/skills/gold/SKILL.md",
-                "role": PathRole.EXPORTED_SKILL,
-                "sha256": "1" * 64,
-            },
-            {
-                "path": "ontology/gold/generated/query.ttl",
-                "role": PathRole.GENERATED_PROJECTION,
-                "sha256": "2" * 64,
-            },
-            {
-                "path": "ontology/gold/candidates/run-1.yaml",
-                "role": PathRole.EXTRACTION_PROPOSAL,
-                "sha256": "3" * 64,
-            },
-            {
-                "path": "ontology/gold/promotions/run-1.json",
-                "role": PathRole.CANONICAL_KNOWLEDGE,
-                "sha256": "4" * 64,
-            },
-            {
-                "path": "config/source-policy.yaml",
-                "role": PathRole.CANONICAL_KNOWLEDGE,
-                "sha256": "5" * 64,
-            },
+    specifications = (
+        (
+            publishing.PublicationProducer.EXPORTED_SKILL,
+            ".agents/skills/gold/SKILL.md",
+            PathRole.EXPORTED_SKILL,
+        ),
+        (
+            publishing.PublicationProducer.GENERATED_PROJECTION,
+            "ontology/gold/generated/query.ttl",
+            PathRole.GENERATED_PROJECTION,
+        ),
+        (
+            publishing.PublicationProducer.EXTRACTION_PROPOSAL,
+            "ontology/gold/candidates/run-1.yaml",
+            PathRole.EXTRACTION_PROPOSAL,
+        ),
+        (
+            publishing.PublicationProducer.KNOWLEDGE_PROMOTION,
+            "ontology/gold/promotions/run-1.json",
+            PathRole.CANONICAL_KNOWLEDGE,
+        ),
+        (
+            publishing.PublicationProducer.POLICY,
+            "config/source-policy.yaml",
+            PathRole.CANONICAL_KNOWLEDGE,
         ),
     )
+    manifests = tuple(
+        manifest_type(
+            producer=producer,
+            receipt_sha256=f"{index:x}" * 64,
+            paths=({"path": path, "role": role, "sha256": f"{index:x}" * 64},),
+        )
+        for index, (producer, path, role) in enumerate(specifications, start=1)
+    )
 
-    assert classify(".agents/skills/geas/SKILL.md", manifests=(manifest,)) is PathRole.GENERIC_SKILL
-    for item in manifest.paths:
-        assert classify(item.path, manifests=(manifest,)) is item.role
-    assert classify("config/operator-notes.yaml", manifests=(manifest,)) is PathRole.UNCLASSIFIED
-    assert classify("README.md", manifests=(manifest,)) is PathRole.UNCLASSIFIED
+    assert classify(".agents/skills/geas/SKILL.md", manifests=manifests) is PathRole.GENERIC_SKILL
+    for manifest in manifests:
+        assert classify(manifest.paths[0].path, manifests=manifests) is manifest.paths[0].role
+    assert classify("config/operator-notes.yaml", manifests=manifests) is PathRole.UNCLASSIFIED
+    assert classify("README.md", manifests=manifests) is PathRole.UNCLASSIFIED
 
 
 def test_runtime_paths_cannot_be_reclassified_by_a_manifest() -> None:
@@ -311,17 +391,19 @@ def test_runtime_paths_cannot_be_reclassified_by_a_manifest() -> None:
     )
 
     for index, path in enumerate(runtime_paths):
-        manifest = manifest_type(
-            receipt_sha256="b" * 64,
-            paths=(
-                {
-                    "path": path,
-                    "role": PathRole.GENERATED_PROJECTION,
-                    "sha256": f"{index + 1:x}" * 64,
-                },
-            ),
-        )
-        assert classify(path, manifests=(manifest,)) is PathRole.RUNTIME_STORE
+        with pytest.raises(ValueError, match="producer path"):
+            manifest_type(
+                producer=publishing.PublicationProducer.GENERATED_PROJECTION,
+                receipt_sha256="b" * 64,
+                paths=(
+                    {
+                        "path": path,
+                        "role": PathRole.GENERATED_PROJECTION,
+                        "sha256": f"{index + 1:x}" * 64,
+                    },
+                ),
+            )
+        assert classify(path) is PathRole.RUNTIME_STORE
 
 
 def test_publish_none_preserves_local_changes_without_git_or_forge_mutation(
@@ -429,6 +511,7 @@ def test_request_role_claim_cannot_override_manifest_classification(tmp_path: Pa
         capability_decision=decision,
         forge=forge,
         now=lambda: NOW,
+        receipt_verifier=_ReceiptVerifier(()),
     )
     before = _git(remote, "for-each-ref", "--format=%(refname):%(objectname)")
 
@@ -439,7 +522,281 @@ def test_request_role_claim_cannot_override_manifest_classification(tmp_path: Pa
     assert forge.upserts == []
 
 
-def test_capability_decision_cannot_authorize_additional_manifest_paths(
+def test_repository_authority_must_match_the_configured_remote_endpoint(
+    tmp_path: Path,
+) -> None:
+    remote, worktree = _repository(tmp_path)
+    path = ".agents/skills/gold/SKILL.md"
+    (worktree / path).parent.mkdir(parents=True)
+    (worktree / path).write_text("generated\n")
+    decision = _decision(path=path, capabilities=(Capability.GIT_PULL_REQUEST,))
+    request = _request(path, PathRole.EXPORTED_SKILL, decision)
+    forge = _Forge()
+    before = _git(remote, "for-each-ref", "--format=%(refname):%(objectname)")
+    _git(worktree, "remote", "set-url", "origin", "https://github.com/example/other")
+
+    with pytest.raises(PermissionError, match="repository endpoint"):
+        _publisher(
+            worktree,
+            _manifest(worktree, path, PathRole.EXPORTED_SKILL),
+            decision,
+            forge=forge,
+        ).publish(request)
+
+    assert _git(remote, "for-each-ref", "--format=%(refname):%(objectname)") == before
+    assert forge.upserts == []
+
+
+def test_remote_config_race_cannot_redirect_a_direct_push(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture_root = tmp_path / "a"
+    fixture_root.mkdir()
+    remote_a, worktree = _repository(fixture_root)
+    remote_b = tmp_path / "remote-b.git"
+    _git(tmp_path, "clone", "--bare", str(remote_a), str(remote_b))
+    path = ".agents/skills/gold/SKILL.md"
+    (worktree / path).parent.mkdir(parents=True)
+    (worktree / path).write_text("generated\n")
+    decision = _decision(path=path, capabilities=(Capability.GIT_DIRECT_PUSH,))
+    request = _request(path, PathRole.EXPORTED_SKILL, decision, mode=PublishMode.DIRECT_PUSH)
+    publisher = _publisher(
+        worktree,
+        _manifest(worktree, path, PathRole.EXPORTED_SKILL),
+        decision,
+        direct_push=True,
+    )
+    original_probe = publisher._remote_object
+    initial_b = _git(remote_b, "rev-parse", "refs/heads/main")
+
+    def probe_then_redirect(endpoint: str, ref: str) -> str | None:
+        result = original_probe(endpoint, ref)
+        _git(worktree, "remote", "set-url", "origin", str(remote_b))
+        return result
+
+    monkeypatch.setattr(publisher, "_remote_object", probe_then_redirect)
+
+    with pytest.raises(PermissionError, match="remote configuration changed"):
+        publisher.publish(request)
+
+    assert _git(remote_b, "rev-parse", "refs/heads/main") == initial_b
+
+
+def test_url_rewrite_race_is_rejected_before_direct_push(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture_root = tmp_path / "a"
+    fixture_root.mkdir()
+    remote_a, worktree = _repository(fixture_root)
+    remote_b = tmp_path / "remote-b.git"
+    _git(tmp_path, "clone", "--bare", str(remote_a), str(remote_b))
+    path = ".agents/skills/gold/SKILL.md"
+    (worktree / path).parent.mkdir(parents=True)
+    (worktree / path).write_text("generated\n")
+    decision = _decision(path=path, capabilities=(Capability.GIT_DIRECT_PUSH,))
+    request = _request(path, PathRole.EXPORTED_SKILL, decision, mode=PublishMode.DIRECT_PUSH)
+    publisher = _publisher(
+        worktree,
+        _manifest(worktree, path, PathRole.EXPORTED_SKILL),
+        decision,
+        direct_push=True,
+    )
+    original_probe = publisher._remote_object
+    initial_a = _git(remote_a, "rev-parse", "refs/heads/main")
+    initial_b = _git(remote_b, "rev-parse", "refs/heads/main")
+
+    def probe_then_add_rewrite(endpoint: str, ref: str) -> str | None:
+        result = original_probe(endpoint, ref)
+        _git(worktree, "config", f"url.{remote_b.resolve().as_uri()}.insteadOf", REPOSITORY)
+        return result
+
+    monkeypatch.setattr(publisher, "_remote_object", probe_then_add_rewrite)
+
+    with pytest.raises(PermissionError, match="URL rewrites"):
+        publisher.publish(request)
+
+    assert _git(remote_a, "rev-parse", "refs/heads/main") == initial_a
+    assert _git(remote_b, "rev-parse", "refs/heads/main") == initial_b
+
+
+def test_manifest_role_requires_a_supported_producer_specific_path_schema() -> None:
+    producer = publishing.PublicationProducer
+
+    with pytest.raises(ValueError, match="producer path"):
+        PublicationManifest(
+            producer=producer.GENERATED_PROJECTION,
+            receipt_sha256="a" * 64,
+            paths=(
+                {
+                    "path": "README.md",
+                    "role": PathRole.GENERATED_PROJECTION,
+                    "sha256": "b" * 64,
+                },
+            ),
+        )
+
+    with pytest.raises(ValueError, match="producer"):
+        PublicationManifest(
+            producer="unsupported",
+            receipt_sha256="a" * 64,
+            paths=(
+                {
+                    "path": "ontology/gold/generated/query.ttl",
+                    "role": PathRole.GENERATED_PROJECTION,
+                    "sha256": "b" * 64,
+                },
+            ),
+        )
+
+
+def test_unverified_producer_receipt_cannot_publish(tmp_path: Path) -> None:
+    remote, worktree = _repository(tmp_path)
+    path = ".agents/skills/gold/SKILL.md"
+    (worktree / path).parent.mkdir(parents=True)
+    (worktree / path).write_text("generated\n")
+    decision = _decision(path=path, capabilities=(Capability.GIT_PULL_REQUEST,))
+    request = _request(path, PathRole.EXPORTED_SKILL, decision)
+    before = _git(remote, "for-each-ref", "--format=%(refname):%(objectname)")
+
+    with pytest.raises(PermissionError, match="producer receipt verifier"):
+        _publisher(
+            worktree,
+            _manifest(worktree, path, PathRole.EXPORTED_SKILL),
+            decision,
+            forge=_Forge(),
+            receipt_verifier=None,
+        ).publish(request)
+
+    assert _git(remote, "for-each-ref", "--format=%(refname):%(objectname)") == before
+
+
+def test_verified_receipt_must_bind_the_complete_exact_manifest(tmp_path: Path) -> None:
+    remote, worktree = _repository(tmp_path)
+    path = ".agents/skills/gold/SKILL.md"
+    (worktree / path).parent.mkdir(parents=True)
+    (worktree / path).write_text("generated\n")
+    verified = _manifest(worktree, path, PathRole.EXPORTED_SKILL)
+    forged = verified.model_copy(update={"receipt_sha256": "f" * 64})
+    decision = _decision(path=path, capabilities=(Capability.GIT_PULL_REQUEST,))
+    request = _request(path, PathRole.EXPORTED_SKILL, decision)
+    before = _git(remote, "for-each-ref", "--format=%(refname):%(objectname)")
+
+    with pytest.raises(PermissionError, match="exact manifest"):
+        _publisher(
+            worktree,
+            forged,
+            decision,
+            forge=_Forge(),
+            receipt_verifier=_ReceiptVerifier((verified,)),
+        ).publish(request)
+
+    assert _git(remote, "for-each-ref", "--format=%(refname):%(objectname)") == before
+
+
+def test_publisher_revalidates_manifest_models_before_trusting_the_adapter(
+    tmp_path: Path,
+) -> None:
+    remote, worktree = _repository(tmp_path)
+    path = ".agents/skills/gold/SKILL.md"
+    (worktree / path).parent.mkdir(parents=True)
+    (worktree / path).write_text("generated\n")
+    valid = _manifest(worktree, path, PathRole.EXPORTED_SKILL)
+    forged = valid.model_copy(
+        update={"producer": publishing.PublicationProducer.GENERATED_PROJECTION}
+    )
+    decision = _decision(path=path, capabilities=(Capability.GIT_PULL_REQUEST,))
+    request = _request(path, PathRole.EXPORTED_SKILL, decision)
+    before = _git(remote, "for-each-ref", "--format=%(refname):%(objectname)")
+
+    with pytest.raises(PermissionError, match="manifest schema"):
+        _publisher(
+            worktree,
+            forged,
+            decision,
+            forge=_Forge(),
+            receipt_verifier=_ReceiptVerifier((forged,)),
+        ).publish(request)
+
+    assert _git(remote, "for-each-ref", "--format=%(refname):%(objectname)") == before
+
+
+def test_manifest_paths_reject_traversal_and_symlinks_before_remote_mutation(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match="normalized relative path"):
+        PublicationManifest(
+            producer=publishing.PublicationProducer.EXPORTED_SKILL,
+            receipt_sha256="a" * 64,
+            paths=(
+                {
+                    "path": ".agents/skills/gold/../../../README.md",
+                    "role": PathRole.EXPORTED_SKILL,
+                    "sha256": "b" * 64,
+                },
+            ),
+        )
+
+    remote, worktree = _repository(tmp_path)
+    path = ".agents/skills/gold/SKILL.md"
+    outside = tmp_path / "outside"
+    outside.write_text("outside\n")
+    (worktree / path).parent.mkdir(parents=True)
+    (worktree / path).symlink_to(outside)
+    manifest = _manifest(worktree, path, PathRole.EXPORTED_SKILL)
+    decision = _decision(path=path, capabilities=(Capability.GIT_PULL_REQUEST,))
+    request = _request(path, PathRole.EXPORTED_SKILL, decision)
+    before = _git(remote, "for-each-ref", "--format=%(refname):%(objectname)")
+
+    with pytest.raises(PermissionError, match="symbolic link"):
+        _publisher(worktree, manifest, decision, forge=_Forge()).publish(request)
+
+    assert _git(remote, "for-each-ref", "--format=%(refname):%(objectname)") == before
+
+
+def test_each_manifest_path_has_an_exact_capability_decision(
+    tmp_path: Path,
+) -> None:
+    _remote, worktree = _repository(tmp_path)
+    paths = (
+        ".agents/skills/gold/SKILL.md",
+        ".agents/skills/gold/references/guide.md",
+    )
+    for path in paths:
+        (worktree / path).parent.mkdir(parents=True, exist_ok=True)
+        (worktree / path).write_text(f"{path}\n")
+    manifest = PublicationManifest(
+        producer=publishing.PublicationProducer.EXPORTED_SKILL,
+        receipt_sha256="a" * 64,
+        paths=tuple(
+            {
+                "path": path,
+                "role": PathRole.EXPORTED_SKILL,
+                "sha256": hashlib.sha256((worktree / path).read_bytes()).hexdigest(),
+            }
+            for path in paths
+        ),
+    )
+    decisions = tuple(
+        _decision(path=path, capabilities=(Capability.GIT_PULL_REQUEST,)) for path in paths
+    )
+    request = PublishRequest(
+        repository=REPOSITORY,
+        target_ref="refs/heads/main",
+        paths=tuple(PublishPath(path=path, role=PathRole.EXPORTED_SKILL) for path in paths),
+        capability_decision_sha256=publishing.capability_decision_set_sha256(decisions),
+        created_at=NOW,
+    )
+    forge = _Forge()
+
+    result = _publisher(worktree, manifest, decisions, forge=forge).publish(request)
+
+    assert result.published is True
+    assert len(forge.upserts) == 1
+
+
+def test_one_path_denial_stops_multi_path_publication_before_side_effects(
     tmp_path: Path,
 ) -> None:
     remote, worktree = _repository(tmp_path)
@@ -451,6 +808,7 @@ def test_capability_decision_cannot_authorize_additional_manifest_paths(
         (worktree / path).parent.mkdir(parents=True, exist_ok=True)
         (worktree / path).write_text(f"{path}\n")
     manifest = PublicationManifest(
+        producer=publishing.PublicationProducer.EXPORTED_SKILL,
         receipt_sha256="a" * 64,
         paths=tuple(
             {
@@ -461,19 +819,35 @@ def test_capability_decision_cannot_authorize_additional_manifest_paths(
             for path in paths
         ),
     )
-    decision = _decision(path=paths[0], capabilities=(Capability.GIT_PULL_REQUEST,))
+    allowed = _decision(path=paths[0], capabilities=(Capability.GIT_PULL_REQUEST,))
+    denied_request = CapabilityRequest(
+        authority_repository=REPOSITORY,
+        target_repository=REPOSITORY,
+        capabilities=(Capability.GIT_PULL_REQUEST,),
+        ref="refs/heads/main",
+        path=paths[1],
+        requested_at=NOW,
+    )
+    denied = CapabilityDecision(
+        request=denied_request,
+        decision="deny",
+        reason="fixture deny",
+        evaluator_version="fixture/1",
+        decided_at=NOW,
+    )
+    decisions = (allowed, denied)
     request = PublishRequest(
         repository=REPOSITORY,
         target_ref="refs/heads/main",
         paths=tuple(PublishPath(path=path, role=PathRole.EXPORTED_SKILL) for path in paths),
-        capability_decision_sha256=decision.sha256,
+        capability_decision_sha256=publishing.capability_decision_set_sha256(decisions),
         created_at=NOW,
     )
     forge = _Forge()
     before = _git(remote, "for-each-ref", "--format=%(refname):%(objectname)")
 
     with pytest.raises(PermissionError, match="exact publication"):
-        _publisher(worktree, manifest, decision, forge=forge).publish(request)
+        _publisher(worktree, manifest, decisions, forge=forge).publish(request)
 
     assert _git(remote, "for-each-ref", "--format=%(refname):%(objectname)") == before
     assert forge.upserts == []
@@ -500,7 +874,7 @@ def test_direct_push_requires_capability_explicit_flag_and_branch_ref(
     (worktree / path).write_text("generated\n")
     if target_ref.startswith("refs/tags/"):
         _git(worktree, "tag", target_ref.removeprefix("refs/tags/"))
-        _git(worktree, "push", "origin", target_ref)
+        _git(worktree, "push", str(remote), target_ref)
     decision = _decision(path=path, capabilities=capabilities, target_ref=target_ref)
     request = _request(
         path,
@@ -530,9 +904,21 @@ def test_direct_push_rejects_dirty_unowned_paths_before_remote_mutation(
     (worktree / path).parent.mkdir(parents=True)
     (worktree / path).write_text("generated\n")
     (worktree / "operator-notes.txt").write_text("not owned\n")
+    (worktree / "README.md").write_text("staged operator edit\n")
+    _git(worktree, "add", "README.md")
     decision = _decision(path=path, capabilities=(Capability.GIT_DIRECT_PUSH,))
     request = _request(path, PathRole.EXPORTED_SKILL, decision, mode=PublishMode.DIRECT_PUSH)
     before = _git(remote, "rev-parse", "refs/heads/main")
+    git_dir = Path(_git(worktree, "rev-parse", "--git-dir"))
+    if not git_dir.is_absolute():
+        git_dir = worktree / git_dir
+    before_index = (git_dir / "index").read_bytes()
+    before_status = subprocess.run(
+        ("git", "status", "--porcelain=v2", "-z", "--untracked-files=all"),
+        cwd=worktree,
+        capture_output=True,
+        check=True,
+    ).stdout
 
     with pytest.raises(PermissionError, match="only manifest-owned"):
         _publisher(
@@ -543,6 +929,13 @@ def test_direct_push_rejects_dirty_unowned_paths_before_remote_mutation(
         ).publish(request)
 
     assert _git(remote, "rev-parse", "refs/heads/main") == before
+    assert (git_dir / "index").read_bytes() == before_index
+    assert subprocess.run(
+        ("git", "status", "--porcelain=v2", "-z", "--untracked-files=all"),
+        cwd=worktree,
+        capture_output=True,
+        check=True,
+    ).stdout == before_status
 
 
 def test_direct_push_requires_head_to_be_the_exact_target_branch(tmp_path: Path) -> None:
@@ -615,10 +1008,16 @@ def test_direct_push_uses_exact_lease_and_preserves_commit_on_lease_failure(
     original_push = publisher._push
     observed: list[tuple[str, str, str | None]] = []
 
-    def move_then_push(commit: str, ref: str, expected: str | None) -> None:
+    def move_then_push(
+        commit: str,
+        ref: str,
+        expected: str | None,
+        *,
+        endpoint: str,
+    ) -> None:
         observed.append((commit, ref, expected))
         _advance_remote(tmp_path, remote, name="lease-racer")
-        original_push(commit, ref, expected)
+        original_push(commit, ref, expected, endpoint=endpoint)
 
     monkeypatch.setattr(publisher, "_push", move_then_push)
 
@@ -631,8 +1030,54 @@ def test_direct_push_uses_exact_lease_and_preserves_commit_on_lease_failure(
     assert observed[0][2] is not None
     assert (
         f"git push --force-with-lease=refs/heads/main:{observed[0][2]} "
-        f"origin {commit}:refs/heads/main"
+        f"{REPOSITORY} {commit}:refs/heads/main"
     ) in str(error.value)
+
+
+def test_direct_push_preserves_checked_out_ref_index_worktree_and_status(
+    tmp_path: Path,
+) -> None:
+    remote, worktree = _repository(tmp_path)
+    path = ".agents/skills/gold/SKILL.md"
+    (worktree / path).parent.mkdir(parents=True)
+    (worktree / path).write_text("generated\n")
+    decision = _decision(path=path, capabilities=(Capability.GIT_DIRECT_PUSH,))
+    request = _request(path, PathRole.EXPORTED_SKILL, decision, mode=PublishMode.DIRECT_PUSH)
+    publisher = _publisher(
+        worktree,
+        _manifest(worktree, path, PathRole.EXPORTED_SKILL),
+        decision,
+        direct_push=True,
+    )
+    git_dir = Path(_git(worktree, "rev-parse", "--git-dir"))
+    if not git_dir.is_absolute():
+        git_dir = worktree / git_dir
+    before = {
+        "head": _git(worktree, "rev-parse", "HEAD"),
+        "symbolic_head": _git(worktree, "symbolic-ref", "HEAD"),
+        "status": subprocess.run(
+            ("git", "status", "--porcelain=v2", "-z", "--untracked-files=all"),
+            cwd=worktree,
+            capture_output=True,
+            check=True,
+        ).stdout,
+        "index": (git_dir / "index").read_bytes(),
+        "bytes": (worktree / path).read_bytes(),
+    }
+
+    result = publisher.publish(request)
+
+    assert _git(remote, "rev-parse", "refs/heads/main") == result.commit_sha256
+    assert _git(worktree, "rev-parse", "HEAD") == before["head"]
+    assert _git(worktree, "symbolic-ref", "HEAD") == before["symbolic_head"]
+    assert subprocess.run(
+        ("git", "status", "--porcelain=v2", "-z", "--untracked-files=all"),
+        cwd=worktree,
+        capture_output=True,
+        check=True,
+    ).stdout == before["status"]
+    assert (git_dir / "index").read_bytes() == before["index"]
+    assert (worktree / path).read_bytes() == before["bytes"]
 
 
 def test_delegated_direct_push_must_be_in_capability_and_delegable_sets(
@@ -737,6 +1182,31 @@ def test_canonical_semantic_push_requires_both_capabilities_and_promotion_verifi
     assert len(verifier.calls) == 1
     assert verifier.calls[0]["commit"] == result.commit_sha256
     assert verifier.calls[0]["canonical_ref"] == "refs/heads/main"
+
+
+def test_canonical_semantic_pull_request_requires_only_review_capability(
+    tmp_path: Path,
+) -> None:
+    _remote, worktree = _repository(tmp_path)
+    path = "ontology/gold/promotions/run-1.json"
+    (worktree / path).parent.mkdir(parents=True)
+    (worktree / path).write_text('{"promotion":true}\n')
+    decision = _decision(path=path, capabilities=(Capability.GIT_PULL_REQUEST,))
+    request = _request(path, PathRole.CANONICAL_KNOWLEDGE, decision)
+    verifier = _PromotionVerifier()
+    forge = _Forge()
+
+    result = _publisher(
+        worktree,
+        _manifest(worktree, path, PathRole.CANONICAL_KNOWLEDGE),
+        decision,
+        forge=forge,
+        promotion_verifier=verifier,
+    ).publish(request)
+
+    assert result.reason == "pull-request-upserted"
+    assert len(forge.upserts) == 1
+    assert verifier.calls == []
 
 
 def test_artifact_auto_merge_uses_distinct_capability_and_one_forge_request(
