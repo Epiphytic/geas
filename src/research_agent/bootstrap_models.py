@@ -7,7 +7,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Literal, Protocol
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, ValidationInfo, field_validator, model_validator
 
 from research_agent.capabilities import (
     CapabilityGrant,
@@ -508,13 +508,16 @@ class RepositoryBootstrapRequest(StrictModel):
 
     @field_validator("current_worktree", mode="before")
     @classmethod
-    def absolute_worktree(cls, value: object) -> Path | None:
+    def absolute_worktree(
+        cls, value: object, info: ValidationInfo
+    ) -> Path | str | None:
         if value is None:
             return None
         path = Path(value)
         if not path.is_absolute():
             raise ValueError("current_worktree must be absolute")
-        return path.resolve(strict=False)
+        resolved = path.resolve(strict=False)
+        return str(resolved) if info.mode == "json" else resolved
 
     @model_validator(mode="after")
     def invocation_scope_requires_trust_repository(self) -> RepositoryBootstrapRequest:
@@ -607,13 +610,16 @@ class VerifiedRepositoryBootstrap(StrictModel):
 
     @field_validator("current_worktree", mode="before")
     @classmethod
-    def absolute_worktree(cls, value: object) -> Path | None:
+    def absolute_worktree(
+        cls, value: object, info: ValidationInfo
+    ) -> Path | str | None:
         if value is None:
             return None
         path = Path(value)
         if not path.is_absolute():
             raise ValueError("current_worktree must be absolute")
-        return path.resolve(strict=False)
+        resolved = path.resolve(strict=False)
+        return str(resolved) if info.mode == "json" else resolved
 
     @property
     def id(self) -> str:

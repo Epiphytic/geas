@@ -12,7 +12,7 @@ from typing import Literal
 from uuid import uuid4
 
 import yaml
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, PrivateAttr, ValidationError, field_validator, model_validator
 
 from research_agent.agent_skills import BuiltinSkillReceipt, install_builtin_geas_skill
 from research_agent.bootstrap_models import (
@@ -265,6 +265,7 @@ class GeasUserConfig(StrictModel):
     ontology_freshness: OntologyFreshnessConfig = Field(default_factory=OntologyFreshnessConfig)
     ontology_defaults: OntologyBuildDefaults = Field(default_factory=OntologyBuildDefaults)
     profiles: dict[str, GeasProfile]
+    _source_config_sha256: str | None = PrivateAttr(default=None)
 
     @field_validator("default_profile")
     @classmethod
@@ -356,32 +357,33 @@ class UserConfigManager:
         self.last_builtin_skill_receipt: BuiltinSkillReceipt | None = None
 
     def load(self) -> GeasUserConfig:
-        if not self.path.is_file():
-            raise ValueError(f"Geas user config does not exist: {self.path}")
-        config = GeasUserConfig.from_yaml(self.path)
-        self.validate_subscription_layout(config)
-        return config
+        value, config = self._validated_config_bytes()
+        return self._bind_config_identity(config, value)
 
     def load_or_create(self, *, update_defaults: bool = False) -> GeasUserConfig:
         with self._config_lock():
             if self.path.exists():
-                raw = yaml.safe_load(self.path.read_text())
+                source = self.path.read_bytes()
+                raw = yaml.safe_load(source)
                 config = GeasUserConfig.model_validate(raw)
                 self.validate_subscription_layout(config)
                 explicit = config.explicit_dict()
                 if _fill_missing(raw, explicit):
+                    source = yaml.safe_dump(
+                        raw,
+                        sort_keys=False,
+                        allow_unicode=True,
+                    ).encode()
                     _atomic_write(
                         self.path,
-                        yaml.safe_dump(
-                            raw,
-                            sort_keys=False,
-                            allow_unicode=True,
-                        ).encode(),
+                        source,
                     )
             else:
                 config = GeasUserConfig.default()
                 self.validate_subscription_layout(config)
-                _atomic_write(self.path, config.explicit_yaml().encode())
+                source = config.explicit_yaml().encode()
+                _atomic_write(self.path, source)
+            config = self._bind_config_identity(config, source)
         self._ensure_secret_scaffold()
         self.last_defaults_receipt = self.install_defaults(update=update_defaults)
         return config
@@ -651,6 +653,11 @@ class UserConfigManager:
         )
         self.validate_subscription_layout(updated)
         return updated, updated.explicit_yaml().encode()
+
+    @staticmethod
+    def _bind_config_identity(config: GeasUserConfig, value: bytes) -> GeasUserConfig:
+        object.__setattr__(config, "_source_config_sha256", _sha256(value))
+        return config
 
     def record_bootstrap_grant(
         self,
@@ -1317,40 +1324,88 @@ class UserConfigManager:
         path.unlink()
         _fsync_directory(path.parent)
 
-    def replace(self, config: GeasUserConfig, *, upgrade_version: bool = False) -> None:
-        """Atomically replace trusted user configuration with a validated value."""
-        validated = GeasUserConfig.model_validate(config.model_dump(mode="python"))
-        if upgrade_version and validated.version == 1:
-            validated = GeasUserConfig.model_validate(
-                {
-                    **validated.model_dump(mode="python"),
-                    "version": 2,
-                    "profiles": {
-                        name: {
-                            **profile.model_dump(mode="python"),
-                            "trust_rules": (),
-                            "capability_grants": profile.effective_capability_grants(),
-                        }
-                        for name, profile in validated.profiles.items()
-                    },
-                }
-            )
-        elif validated.version == 2 and not upgrade_version:
-            raise ValueError("writing version 2 capability grants requires upgrade_version=True")
-        self.validate_subscription_layout(validated)
+    def replace(
+        self,
+        config: GeasUserConfig,
+        *,
+        upgrade_version: bool = False,
+        expected_config_sha256: str | None = None,
+    ) -> None:
+        """CAS-replace trusted config from an exact loaded or explicit identity."""
+        bound_identity = config._source_config_sha256
         with self._config_lock():
+            validated = GeasUserConfig.model_validate(config.model_dump(mode="python"))
+            if upgrade_version and validated.version == 1:
+                validated = GeasUserConfig.model_validate(
+                    {
+                        **validated.model_dump(mode="python"),
+                        "version": 2,
+                        "profiles": {
+                            name: {
+                                **profile.model_dump(mode="python"),
+                                "trust_rules": (),
+                                "capability_grants": profile.effective_capability_grants(),
+                            }
+                            for name, profile in validated.profiles.items()
+                        },
+                    }
+                )
+            elif validated.version == 2 and not upgrade_version:
+                raise ValueError(
+                    "writing version 2 capability grants requires upgrade_version=True"
+                )
+            self.validate_subscription_layout(validated)
+            if expected_config_sha256 is not None and not re.fullmatch(
+                r"[0-9a-f]{64}", expected_config_sha256
+            ):
+                raise ValueError("expected Geas user config identity is invalid")
+            if (
+                expected_config_sha256 is not None
+                and bound_identity is not None
+                and expected_config_sha256 != bound_identity
+            ):
+                raise ValueError("loaded and explicit Geas config identities disagree")
+            expected = expected_config_sha256 or bound_identity
             if self.path.is_symlink():
                 raise ValueError("Geas user config cannot be a symbolic link")
-            _atomic_write(self.path, validated.explicit_yaml().encode())
+            rendered = validated.explicit_yaml().encode()
+            if self.path.exists():
+                before, _current = self._validated_config_bytes()
+                before_sha256 = _sha256(before)
+                if expected is None and before != rendered:
+                    raise RuntimeError(
+                        "Geas user config replacement requires an exact loaded identity"
+                    )
+                if expected is not None and before_sha256 != expected:
+                    raise RuntimeError(
+                        "Geas user config changed before atomic replacement"
+                    )
+                if before != rendered:
+                    _atomic_write(self.path, rendered)
+            else:
+                if expected is not None:
+                    raise RuntimeError(
+                        "Geas user config changed before atomic replacement"
+                    )
+                _atomic_write(self.path, rendered)
+            self._bind_config_identity(config, rendered)
 
     def _validated_config_bytes(self) -> tuple[bytes, GeasUserConfig]:
         if self.path.is_symlink() or not self.path.is_file():
             raise ValueError(f"Geas user config does not exist or is unsafe: {self.path}")
         value = self.path.read_bytes()
         try:
-            config = GeasUserConfig.model_validate(yaml.safe_load(value))
-        except (ValueError, yaml.YAMLError) as error:
+            raw = yaml.safe_load(value)
+        except yaml.YAMLError as error:
             raise ValueError("invalid Geas user configuration bytes") from error
+        try:
+            config = GeasUserConfig.model_validate(raw)
+        except ValidationError as error:
+            messages = "; ".join(
+                str(item["msg"])
+                for item in error.errors(include_url=False, include_input=False)
+            )
+            raise ValueError(f"invalid Geas user configuration: {messages}") from error
         self.validate_subscription_layout(config)
         return value, config
 
@@ -1363,15 +1418,38 @@ class UserConfigManager:
         with _exclusive_file_lock(lock_path):
             yield
 
-    def restore_bytes(self, value: bytes) -> None:
+    def restore_bytes(
+        self,
+        value: bytes,
+        *,
+        expected_config_sha256: str | None,
+    ) -> None:
         """Atomically restore an exact previously validated configuration snapshot."""
-        try:
-            GeasUserConfig.model_validate(yaml.safe_load(value))
-        except (ValueError, yaml.YAMLError) as error:
-            raise ValueError("cannot restore invalid Geas user configuration bytes") from error
         with self._config_lock():
+            try:
+                restored = GeasUserConfig.model_validate(yaml.safe_load(value))
+                self.validate_subscription_layout(restored)
+            except (ValueError, yaml.YAMLError) as error:
+                raise ValueError(
+                    "cannot restore invalid Geas user configuration bytes"
+                ) from error
+            if expected_config_sha256 is not None and not re.fullmatch(
+                r"[0-9a-f]{64}", expected_config_sha256
+            ):
+                raise ValueError("expected Geas user config identity is invalid")
             if self.path.is_symlink():
                 raise ValueError("Geas user config cannot be a symbolic link")
+            if self.path.exists():
+                before, _current = self._validated_config_bytes()
+                if (
+                    expected_config_sha256 is None
+                    or _sha256(before) != expected_config_sha256
+                ):
+                    raise RuntimeError(
+                        "Geas user config changed before atomic restoration"
+                    )
+            elif expected_config_sha256 is not None:
+                raise RuntimeError("Geas user config changed before atomic restoration")
             _atomic_write(self.path, value)
 
     def ontology_root(self, profile: GeasProfile) -> Path:

@@ -319,7 +319,7 @@ def test_subscribe_rejects_new_nested_checkout_before_repository_work(
         ontology_git=None,
         subscriptions={"outer": _subscription(checkout="repositories/outer")},
     )
-    manager.replace(GeasUserConfig(profiles={"default": profile}))
+    _replace_current(manager, GeasUserConfig(profiles={"default": profile}))
     before = manager.path.read_bytes()
     calls: list[str] = []
     subscriptions = SubscriptionManager(
@@ -349,7 +349,8 @@ def test_subscribe_rejects_cross_profile_checkout_overlap_before_repository_work
     tmp_path: Path, new_checkout: str
 ) -> None:
     manager = _configured_manager(tmp_path)
-    manager.replace(
+    _replace_current(
+        manager,
         GeasUserConfig(
             profiles={
                 "default": GeasProfile(ontology_git=None),
@@ -490,7 +491,7 @@ def test_sync_processes_requested_subscriptions_in_sorted_order_and_keeps_succes
             ),
         },
     )
-    manager.replace(GeasUserConfig(profiles={"default": profile}))
+    _replace_current(manager, GeasUserConfig(profiles={"default": profile}))
 
     class FakeRepository:
         def __init__(self, checkout: Path, subscription: OntologySubscription) -> None:
@@ -537,7 +538,7 @@ def test_sync_catches_arbitrary_exception_and_continues_to_later_sibling(
             "beta": _subscription(checkout="beta"),
         },
     )
-    manager.replace(GeasUserConfig(profiles={"default": profile}))
+    _replace_current(manager, GeasUserConfig(profiles={"default": profile}))
 
     class Repository:
         def __init__(self, checkout: Path, subscription: OntologySubscription) -> None:
@@ -577,7 +578,8 @@ def test_sync_catches_arbitrary_exception_and_continues_to_later_sibling(
 
 def test_sync_propagates_process_control_base_exception(tmp_path: Path) -> None:
     manager = _configured_manager(tmp_path)
-    manager.replace(
+    _replace_current(
+        manager,
         GeasUserConfig(
             profiles={
                 "default": GeasProfile(
@@ -615,6 +617,11 @@ def _configured_manager(tmp_path: Path) -> UserConfigManager:
     manager.root.mkdir(parents=True)
     manager.replace(GeasUserConfig(profiles={"default": GeasProfile(ontology_git=None)}))
     return manager
+
+
+def _replace_current(manager: UserConfigManager, config: GeasUserConfig) -> None:
+    expected = manager.config_sha256() if manager.path.is_file() else None
+    manager.replace(config, expected_config_sha256=expected)
 
 
 class _StagingRepository:
@@ -730,7 +737,7 @@ def test_subscribe_validates_constructed_input_before_any_write(tmp_path: Path) 
 
 
 @pytest.mark.parametrize("failure", ("fetch", "catalog", "trust"))
-def test_subscribe_failure_restores_config_and_removes_only_temporary_checkout(
+def test_subscribe_failure_preserves_config_and_removes_only_temporary_checkout(
     tmp_path: Path, failure: str
 ) -> None:
     manager = _configured_manager(tmp_path)
@@ -773,7 +780,11 @@ def test_subscribe_failure_restores_config_and_removes_only_temporary_checkout(
     with pytest.raises((RuntimeError, ValueError), match="injected"):
         subscriptions.subscribe("sample", _subscription())
 
-    assert manager.path.read_bytes() == before
+    if failure == "trust":
+        assert "temporary" in manager.load().profiles
+        assert manager.path.read_bytes() != before
+    else:
+        assert manager.path.read_bytes() == before
     assert not (manager.root / "subscriptions" / "sample").exists()
     assert not tuple((manager.root / "subscriptions").glob(".sample.tmp-*"))
 
@@ -816,7 +827,8 @@ def test_subscribe_update_uses_new_checkout_and_preserves_previous_checkout(
 ) -> None:
     manager = _configured_manager(tmp_path)
     previous = _subscription(checkout="subscriptions/previous")
-    manager.replace(
+    _replace_current(
+        manager,
         GeasUserConfig(
             profiles={
                 "default": GeasProfile(
@@ -864,7 +876,7 @@ def _manager_with_subscription(
     manager = _configured_manager(tmp_path)
     subscription = _subscription()
     profile = GeasProfile(ontology_git=None, subscriptions={"sample": subscription})
-    manager.replace(GeasUserConfig(profiles={"default": profile}))
+    _replace_current(manager, GeasUserConfig(profiles={"default": profile}))
     checkout = _removable_checkout(manager, subscription)
     return manager, subscription, checkout
 
@@ -1096,7 +1108,8 @@ def test_explicit_subscription_serializes_strict_freshness(tmp_path: Path) -> No
             )
         }
     )
-    manager.replace(
+    _replace_current(
+        manager,
         GeasUserConfig(
             profiles={
                 "default": GeasProfile(
