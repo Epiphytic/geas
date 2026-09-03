@@ -103,16 +103,57 @@ def _push(
     )
 
 
-def test_git_environment_disables_prompts_hooks_replacements_and_credential_helpers() -> None:
+def test_git_environment_disables_prompts_hooks_replacements_and_credential_helpers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    poisoned = (
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_NAMESPACE",
+        "GIT_SHALLOW_FILE",
+        "GIT_CONFIG",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_SYSTEM",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_KEY_0",
+        "GIT_CONFIG_VALUE_0",
+        "GIT_SSH_COMMAND",
+    )
+    for name in poisoned:
+        monkeypatch.setenv(name, "/tmp/attacker-controlled")
+
     environment = OntologyRepositoryManager._git_environment()
 
+    assert all(
+        name not in environment
+        for name in (
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_COMMON_DIR",
+            "GIT_INDEX_FILE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_NAMESPACE",
+            "GIT_SHALLOW_FILE",
+            "GIT_CONFIG",
+            "GIT_SSH_COMMAND",
+        )
+    )
     assert environment["GIT_TERMINAL_PROMPT"] == "0"
     assert environment["GIT_NO_REPLACE_OBJECTS"] == "1"
+    assert environment["GIT_CONFIG_NOSYSTEM"] == "1"
+    assert environment["GIT_CONFIG_GLOBAL"] == os.devnull
+    assert environment["GIT_CONFIG_SYSTEM"] == os.devnull
     assert environment["GIT_CONFIG_COUNT"] == "2"
     assert environment["GIT_CONFIG_KEY_0"] == "core.hooksPath"
     assert environment["GIT_CONFIG_VALUE_0"] == os.devnull
     assert environment["GIT_CONFIG_KEY_1"] == "credential.helper"
     assert environment["GIT_CONFIG_VALUE_1"] == ""
+    assert environment["GIT_AUTHOR_NAME"] == "Geas Test"
 
 
 def test_legacy_push_denies_without_injected_exact_capability_before_checkout_mutation(

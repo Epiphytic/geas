@@ -51,6 +51,7 @@ from research_agent.capabilities import (
     DeterministicCapabilityEvaluator,
     VerifiedDelegationManifest,
     _ref,
+    _relative_path,
 )
 from research_agent.catalog_skill_export import export_catalog_skill
 from research_agent.citations import CitationDocumentManager, IdentifierKind
@@ -490,8 +491,8 @@ class _SourceAdapterRouter:
     """Route every source work item to the adapter declared by its trusted intent."""
 
     def __init__(self, adapters: Mapping[DiscoveryKind, SourceAdapter]) -> None:
-        if set(adapters) != set(DiscoveryKind):
-            raise ValueError("source adapter router requires every supported discovery kind")
+        if not adapters or not set(adapters).issubset(set(DiscoveryKind)):
+            raise ValueError("source adapter router requires supported discovery kinds")
         self.adapters = dict(adapters)
         self._active: SourceAdapter | None = None
         self._candidate_adapters: dict[str, SourceAdapter] = {}
@@ -1479,21 +1480,24 @@ def _ontology_update_service(args: argparse.Namespace) -> OntologyUpdateService:
         raise ValueError(
             f"ontology-update provider is not configured: {config.provider}"
         ) from None
-    research_policy = ResearchPolicy.from_yaml(args.research_policy)
-    mojeek_policy = research_policy.provider("connector:mojeek")
     uses_mojeek = any(
         intent.discovery.kind is DiscoveryKind.MOJEEK
         for intent in config.source_intent
     )
-    if uses_mojeek and not mojeek_policy.enabled:
-        raise ValueError("ontology-update declares a disabled Mojeek source intent")
+    mojeek_policy = None
+    if uses_mojeek:
+        mojeek_policy = ResearchPolicy.from_yaml(args.research_policy).provider(
+            "connector:mojeek"
+        )
+        if not mojeek_policy.enabled:
+            raise ValueError("ontology-update declares a disabled Mojeek source intent")
     _load_allowed_secrets(
         args,
         allowed_names=frozenset(
             value
             for value in (
                 provider.api_key_env,
-                mojeek_policy.credential_env if uses_mojeek else None,
+                mojeek_policy.credential_env if mojeek_policy is not None else None,
             )
             if value
         ),
@@ -1570,32 +1574,33 @@ def _ontology_update_service(args: argparse.Namespace) -> OntologyUpdateService:
         "capability_evaluator": evaluator,
         "capability_request": request_factory.for_adapter,
     }
-    mojeek_search = _MojeekIntentSearch(
-        MojeekDiscoveryConnector(
-            HttpsMojeekTransport(api_key_env=mojeek_policy.credential_env)
-        ),
-        max_requests_per_run=mojeek_policy.max_requests_per_run,
-    )
-    mojeek_adapter = MojeekSourceAdapter(
-        search=mojeek_search,
-        **adapter_arguments,
-    )
-    mojeek_adapter.max_discovery_requests = min(
-        mojeek_policy.max_requests_per_run,
-        mojeek_search.connector.manifest.max_pages,
-    )
     adapters: dict[DiscoveryKind, SourceAdapter] = {
         DiscoveryKind.DIRECT_URL: DirectUrlAdapter(**adapter_arguments),
         DiscoveryKind.RSS_ATOM: FeedAdapter(**adapter_arguments),
         DiscoveryKind.SITEMAP: SitemapAdapter(**adapter_arguments),
         DiscoveryKind.HTTPS_HTML: HtmlDiscoveryAdapter(**adapter_arguments),
-        DiscoveryKind.MOJEEK: mojeek_adapter,
         DiscoveryKind.GITHUB_REPOSITORY: GitHubRepositorySourceAdapter(
             GitHubDiscoveryAcquirer(store=store, clock=utc_now),
             capability_evaluator=evaluator,
             capability_request=request_factory.for_adapter,
         ),
     }
+    if mojeek_policy is not None:
+        mojeek_search = _MojeekIntentSearch(
+            MojeekDiscoveryConnector(
+                HttpsMojeekTransport(api_key_env=mojeek_policy.credential_env)
+            ),
+            max_requests_per_run=mojeek_policy.max_requests_per_run,
+        )
+        mojeek_adapter = MojeekSourceAdapter(
+            search=mojeek_search,
+            **adapter_arguments,
+        )
+        mojeek_adapter.max_discovery_requests = min(
+            mojeek_policy.max_requests_per_run,
+            mojeek_search.connector.manifest.max_pages,
+        )
+        adapters[DiscoveryKind.MOJEEK] = mojeek_adapter
     coordinator = SourceWorkCoordinator(
         store=store,
         work_store=ImmutableSourceWorkStore(store),
@@ -1686,6 +1691,7 @@ class _RepositoryPublicationScope:
 
     repository: str
     ref: str
+    publication_targets: tuple[tuple[str, str | None], ...] | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -1694,6 +1700,89 @@ class _RepositoryPublicationScope:
             normalized_repository_identity(self.repository),
         )
         object.__setattr__(self, "ref", _ref(self.ref))
+        if self.publication_targets is None:
+            return
+        targets = tuple(
+            sorted(
+                {
+                    (
+                        _relative_path(path, label="publication path"),
+                        (
+                            None
+                            if bundle_sha256 is None
+                            else validate_bundle_sha256(bundle_sha256)
+                        ),
+                    )
+                    for path, bundle_sha256 in self.publication_targets
+                },
+                key=lambda item: (
+                    item[0].encode("utf-8"),
+                    b"" if item[1] is None else item[1].encode("ascii"),
+                ),
+            )
+        )
+        object.__setattr__(self, "publication_targets", targets or None)
+
+
+def _prior_receipt_publication_targets(
+    receipt: RepositoryBootstrapReceipt,
+    *,
+    repository: Path,
+) -> tuple[tuple[str, str | None], ...] | None:
+    """Return a locally reverified complete skill leaf set, or require broad scope."""
+    if (
+        receipt.verified is None
+        or BootstrapPhase.COMPLETED not in receipt.completed_phases
+        or receipt.pending_phase is not None
+        or receipt.update_candidate is not None
+        or receipt.removal_pending
+        or receipt.removed
+    ):
+        return None
+    try:
+        repository = repository.resolve(strict=True)
+        manifests = _bootstrap_publication_manifests(repository, receipt)
+    except (OSError, ValueError):
+        return None
+    generic = tuple(
+        manifest
+        for manifest in manifests
+        if manifest.producer is PublicationProducer.GENERIC_SKILL
+    )
+    exported = tuple(
+        manifest
+        for manifest in manifests
+        if manifest.producer is PublicationProducer.EXPORTED_SKILL
+    )
+    if (
+        len(generic) != 1
+        or len(exported) != len(receipt.verified.ontology_paths)
+        or len(manifests) != len(generic) + len(exported)
+    ):
+        return None
+    targets: list[tuple[str, str | None]] = []
+    exported_roots: set[str] = set()
+    for manifest in manifests:
+        root = Path(*Path(manifest.paths[0].path).parts[:3])
+        if any(
+            Path(*Path(item.path).parts[:3]) != root
+            for item in manifest.paths
+        ):
+            return None
+        bundle_sha256 = None
+        if manifest.producer is PublicationProducer.EXPORTED_SKILL:
+            if root.as_posix() in exported_roots:
+                return None
+            exported_roots.add(root.as_posix())
+            try:
+                _snapshot, skill_manifest = resolve_skill_snapshot(repository / root)
+            except (OSError, ValueError):
+                return None
+            bundle_sha256 = skill_manifest.ontology.bundle_sha256
+            if bundle_sha256 not in receipt.verified.bundle_sha256:
+                return None
+        targets.extend((item.path, bundle_sha256) for item in manifest.paths)
+    return tuple(targets)
 
 
 def _initial_repository_publication_scope(
@@ -1711,9 +1800,19 @@ def _initial_repository_publication_scope(
             manager,
             validate_subscription_name(args.name),
         )
+        _config, profile_name, _profile = _selected_user_config(args, manager)
+        repository = (
+            previous.request.current_worktree
+            if previous.request.current_worktree is not None
+            else manager.root / "subscriptions" / profile_name / previous.request.name
+        )
         return _RepositoryPublicationScope(
             repository=previous.request.repository,
             ref=args.active_ref or previous.request.ref,
+            publication_targets=_prior_receipt_publication_targets(
+                previous,
+                repository=repository,
+            ),
         )
     if not args.current_repository:
         validate_subscription_name(args.name)
@@ -1954,44 +2053,83 @@ def _preauthorize_repository_publication(
     manager = _user_config_manager(args)
     _config, _profile_name, profile = _selected_user_config(args, manager)
     evaluator = _selected_capability_evaluator(args, clock=utc_now)
-    fallback_paths = (
-        ".agents/skills/geas/SKILL.md",
-        ".geas/skills/geas/SKILL.md",
+    publication_targets = (
+        request.publication_targets
+        if isinstance(request, _RepositoryPublicationScope)
+        else None
     )
-    for grant in profile.effective_capability_grants():
-        if (
-            grant.decision != "allow"
-            or capability not in grant.capabilities
-            or grant.subject.repository != request.repository
-        ):
-            continue
-        paths = grant.subject.paths if grant.subject.paths != "*" else fallback_paths
-        bundles: tuple[str | None, ...] = (
-            grant.subject.bundle_sha256
-            if grant.subject.bundle_sha256 != "*"
-            else (None,)
-        )
-        for path in paths:
-            for bundle_sha256 in bundles:
-                decision = evaluator.evaluate(
-                    CapabilityRequest(
-                        authority_repository=request.repository,
-                        target_repository=request.repository,
-                        capabilities=(capability,),
-                        ref=request.ref,
-                        path=path,
-                        bundle_sha256=bundle_sha256,
-                        dirty=True,
-                        requested_at=utc_now(),
-                    )
+    if publication_targets is not None:
+        for path, bundle_sha256 in publication_targets:
+            decision = evaluator.evaluate(
+                CapabilityRequest(
+                    authority_repository=request.repository,
+                    target_repository=request.repository,
+                    capabilities=(capability,),
+                    ref=request.ref,
+                    path=path,
+                    bundle_sha256=bundle_sha256,
+                    dirty=True,
+                    requested_at=utc_now(),
                 )
-                if decision.allowed and not decision.delegation_chain:
-                    if mode is PublishMode.PULL_REQUEST:
-                        _github_forge_client(request.repository)
-                    return
-    raise PermissionError(
-        f"repository publication requires an exact root-local {capability.value} grant"
-    )
+            )
+            if not decision.allowed or decision.delegation_chain:
+                raise PermissionError(
+                    "repository publication path lacks exact "
+                    f"{capability.value} authority: {path}"
+                )
+    else:
+        now = utc_now()
+        grants = profile.effective_capability_grants()
+        overlapping_denials = tuple(
+            grant
+            for grant in grants
+            if grant.decision == "deny"
+            and capability in grant.capabilities
+            and grant.subject.repository == request.repository
+            and (grant.expires_at is None or now < grant.expires_at)
+            and (grant.subject.refs == "*" or request.ref in grant.subject.refs)
+            and (
+                grant.resources.git_refs == "*"
+                or request.ref in grant.resources.git_refs
+            )
+        )
+        eligible = tuple(
+            grant
+            for grant in grants
+            if grant.decision == "allow"
+            and grant.capabilities == (capability,)
+            and not grant.delegable_capabilities
+            and grant.subject.repository == request.repository
+            and grant.subject.refs == (request.ref,)
+            and grant.subject.paths == "*"
+            and grant.subject.bundle_sha256 == "*"
+            and grant.resources.git_refs == (request.ref,)
+            and (grant.expires_at is None or now < grant.expires_at)
+        )
+        probe = evaluator.evaluate(
+            CapabilityRequest(
+                authority_repository=request.repository,
+                target_repository=request.repository,
+                capabilities=(capability,),
+                ref=request.ref,
+                path=".geas-publication-preauthorization",
+                dirty=False,
+                requested_at=now,
+            )
+        )
+        eligible_ids = {grant.id for grant in eligible}
+        if (
+            overlapping_denials
+            or not probe.allowed
+            or probe.delegation_chain
+            or not eligible_ids.intersection(probe.grant_ids)
+        ):
+            raise PermissionError(
+                "repository publication requires an exact root-local "
+                f"{capability.value} grant with wildcard paths and bundle"
+            )
+    if mode is PublishMode.PULL_REQUEST:
+        _github_forge_client(request.repository)
 
 
 def _publish_repository_receipt(

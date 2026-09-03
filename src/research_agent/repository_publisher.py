@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
 import subprocess
 import tempfile
@@ -20,6 +19,7 @@ from research_agent.capabilities import (
     CapabilityGrant,
     _https_url,
 )
+from research_agent.git_environment import confined_git_environment
 from research_agent.publishing import (
     PathRole,
     ProducerReceiptVerifier,
@@ -229,11 +229,7 @@ class GitHubCliForgeClient:
         return result
 
     def _run(self, command: tuple[str, ...]) -> subprocess.CompletedProcess[str]:
-        environment = {
-            **os.environ,
-            "GH_PROMPT_DISABLED": "1",
-            "GIT_TERMINAL_PROMPT": "0",
-        }
+        environment = confined_git_environment({"GH_PROMPT_DISABLED": "1"})
         return subprocess.run(
             command,
             env=environment,
@@ -771,7 +767,7 @@ class GitRepositoryPublisher:
         result = subprocess.run(
             ("git", *arguments),
             cwd=self.repository,
-            env={**os.environ, "GIT_TERMINAL_PROMPT": "0", **(extra_env or {})},
+            env=confined_git_environment(extra_env),
             input=input_bytes,
             capture_output=True,
             check=True,
@@ -788,7 +784,7 @@ class GitRepositoryPublisher:
             return subprocess.run(
                 ("git", *arguments),
                 cwd=self.repository,
-                env={**os.environ, "GIT_TERMINAL_PROMPT": "0", **(extra_env or {})},
+                env=confined_git_environment(extra_env),
                 text=True,
                 capture_output=True,
                 check=check,

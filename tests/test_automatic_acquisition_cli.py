@@ -494,6 +494,220 @@ def test_current_install_initial_publication_scope_uses_only_read_only_local_git
     assert scope.ref == "refs/heads/main"
 
 
+def test_current_repository_identity_ignores_another_repository_from_git_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def repository_fixture(path: Path, *, name: str, remote: str, content: bytes) -> str:
+        ontology = path / "ontology" / name
+        ontology.mkdir(parents=True)
+        source = ontology / "source.txt"
+        source.write_bytes(content)
+        catalog_file = CatalogFile(
+            path=Path("source.txt"),
+            sha256=hashlib.sha256(content).hexdigest(),
+            size_bytes=len(content),
+        )
+        catalog_ontology = CatalogOntology(
+            name=name,
+            description=f"{name} ontology",
+            path=Path("ontology") / name,
+            files=(catalog_file,),
+            bundle_sha256="0" * 64,
+        )
+        catalog_ontology = catalog_ontology.model_copy(
+            update={"bundle_sha256": ontology_bundle_sha256(catalog_ontology)}
+        )
+        (path / "geas.yaml").write_text(
+            RepositoryCatalog(ontologies=(catalog_ontology,)).model_dump_json(indent=2)
+        )
+        subprocess.run(
+            ("git", "init", "--initial-branch=main", str(path)),
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        subprocess.run(
+            ("git", "-C", str(path), "remote", "add", "origin", remote),
+            check=True,
+        )
+        subprocess.run(
+            ("git", "-C", str(path), "add", "geas.yaml", f"ontology/{name}/source.txt"),
+            check=True,
+        )
+        subprocess.run(
+            (
+                "git",
+                "-C",
+                str(path),
+                "-c",
+                "user.name=Geas Test",
+                "-c",
+                "user.email=geas@example.invalid",
+                "commit",
+                "-m",
+                f"fixture {name}",
+            ),
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+        return subprocess.run(
+            ("git", "-C", str(path), "rev-parse", "HEAD"),
+            text=True,
+            capture_output=True,
+            check=True,
+        ).stdout.strip()
+
+    repository_a = tmp_path / "repository-a"
+    repository_b = tmp_path / "repository-b"
+    remote_a = "https://github.com/example/repository-a"
+    remote_b = "https://github.com/example/repository-b"
+    commit_a = repository_fixture(
+        repository_a,
+        name="alpha",
+        remote=remote_a,
+        content=b"repository A\n",
+    )
+    repository_fixture(
+        repository_b,
+        name="beta",
+        remote=remote_b,
+        content=b"repository B\n",
+    )
+    config_path = tmp_path / "config" / "config.yaml"
+    UserConfigManager(config_path).replace(
+        GeasUserConfig(profiles={"default": GeasProfile(ontology_git=None)})
+    )
+    monkeypatch.chdir(repository_a)
+    monkeypatch.setenv("GIT_DIR", str(repository_b / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(repository_b))
+    monkeypatch.setenv("GIT_INDEX_FILE", str(repository_b / ".git" / "index"))
+    scope_args = cli._build_parser().parse_args(
+        [
+            "--geas-config",
+            str(config_path),
+            "repository-install",
+            "--current-repository",
+        ]
+    )
+    request_args = cli._build_parser().parse_args(
+        [
+            "--geas-config",
+            str(config_path),
+            "repository-install",
+            "--current-repository",
+            "--publish",
+            "none",
+        ]
+    )
+
+    scope = cli._initial_repository_publication_scope(scope_args, action="install")
+    request = cli._repository_bootstrap_request(request_args, action="install")
+
+    assert scope is not None
+    assert scope.repository == remote_a
+    assert request.repository == remote_a
+    assert request.commit_sha256 == commit_a
+    assert request.current_worktree == repository_a.resolve()
+    assert request.ontology_paths == ()
+
+
+def test_update_publication_scope_uses_every_path_from_the_exact_prior_receipt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = tmp_path / "repository"
+    receipt = _bootstrap_skill_receipt(repository)
+    assert (
+        cli._prior_receipt_publication_targets(
+            receipt,
+            repository=repository,
+        )
+        is None
+    )
+    generic_root = repository / ".agents" / "skills" / "geas"
+    generic_root.mkdir(parents=True)
+    generic_content = b"# Generic Geas skill\n"
+    (generic_root / "SKILL.md").write_bytes(generic_content)
+    generic_inventory = (
+        SkillFile(
+            path="SKILL.md",
+            sha256=hashlib.sha256(generic_content).hexdigest(),
+        ),
+    )
+    generic_manifest = SkillManifest(
+        format_version=1,
+        skill=SkillIdentity(name="geas"),
+        ontology=OntologyIdentity(
+            name="geas",
+            repository_url="https://github.com/Epiphytic/geas.git",
+            branch="main",
+            commit="0" * 40,
+        ),
+        geas=GeasIdentity(
+            project_url="https://github.com/Epiphytic/geas",
+            version="1.0.0",
+            commit=None,
+        ),
+        projection=ProjectionIdentity(
+            snapshot_id="builtin:geas",
+            topic_concept_id="builtin:geas",
+        ),
+        files=generic_inventory,
+        snapshot_sha256=snapshot_digest(generic_inventory),
+    )
+    (generic_root / "geas-skill.json").write_bytes(
+        canonical_manifest_bytes(generic_manifest)
+    )
+    generic_paths = tuple(
+        ManagedPath(
+            path=path.relative_to(repository).as_posix(),
+            sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+            role="manifest" if path.name == "geas-skill.json" else "skill",
+        )
+        for path in sorted(generic_root.rglob("*"))
+        if path.is_file()
+    )
+    receipt = receipt.model_copy(
+        update={"managed_paths": (*receipt.managed_paths, *generic_paths)}
+    )
+    config_path = tmp_path / "config" / "config.yaml"
+    UserConfigManager(config_path).replace(
+        GeasUserConfig(profiles={"default": GeasProfile(ontology_git=None)})
+    )
+    monkeypatch.setattr(
+        cli,
+        "_load_repository_bootstrap_receipt",
+        lambda _manager, _name: receipt,
+    )
+    args = cli._build_parser().parse_args(
+        [
+            "--geas-config",
+            str(config_path),
+            "repository-update",
+            "gold",
+            "--direct-push",
+        ]
+    )
+
+    scope = cli._initial_repository_publication_scope(args, action="update")
+
+    assert scope is not None
+    assert scope.publication_targets == (
+        (".agents/skills/geas/SKILL.md", None),
+        (".agents/skills/geas/geas-skill.json", None),
+        (
+            ".agents/skills/gold/SKILL.md",
+            receipt.verified.bundle_sha256[0],
+        ),
+        (
+            ".agents/skills/gold/geas-skill.json",
+            receipt.verified.bundle_sha256[0],
+        ),
+    )
+
+
 def test_verified_repository_request_must_match_initial_publication_scope_before_lifecycle(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -551,7 +765,7 @@ def test_repository_pull_request_authentication_failure_precedes_lifecycle_const
                 "default": GeasProfile(
                     ontology_git=None,
                     capability_grants=(
-                        _git_publication_grant(
+                        _git_prepublication_grant(
                             capability=Capability.GIT_PULL_REQUEST
                         ),
                     ),
@@ -643,6 +857,57 @@ def test_repository_pull_request_grant_denial_precedes_forge_calls(
 
     with pytest.raises(PermissionError, match="exact root-local git.pull_request"):
         cli._preauthorize_repository_publication(args, request)
+
+
+def test_remote_install_partial_path_grant_denies_before_any_downstream_effect(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    UserConfigManager(config_path).replace(
+        GeasUserConfig(
+            version=2,
+            profiles={
+                "default": GeasProfile(
+                    ontology_git=None,
+                    capability_grants=(
+                        _git_publication_grant(
+                            capability=Capability.GIT_PULL_REQUEST
+                        ),
+                    ),
+                )
+            },
+        ),
+        upgrade_version=True,
+    )
+    forbidden = {
+        "forge": lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("forge authentication ran after partial grant")
+        ),
+        "request": lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("remote verification ran after partial grant")
+        ),
+        "service": lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("lifecycle construction ran after partial grant")
+        ),
+        "recovery": lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("filesystem recovery ran after partial grant")
+        ),
+    }
+    monkeypatch.setattr(cli, "_github_forge_client", forbidden["forge"])
+    monkeypatch.setattr(cli, "_repository_bootstrap_request", forbidden["request"])
+    monkeypatch.setattr(cli, "_repository_bootstrap_service", forbidden["service"])
+    monkeypatch.setattr(cli, "recover_managed_removals", forbidden["recovery"])
+
+    with pytest.raises(PermissionError, match="exact root-local git.pull_request"):
+        _run_main(
+            monkeypatch,
+            "--geas-config",
+            str(config_path),
+            "repository-install",
+            "gold",
+            REPOSITORY,
+        )
 
 
 def test_repository_publication_rejects_tag_before_authority_or_forge_calls(
@@ -1008,6 +1273,27 @@ def _git_publication_grant(
     )
 
 
+def _git_prepublication_grant(
+    *,
+    ref: str = "refs/heads/main",
+    capability: Capability = Capability.GIT_DIRECT_PUSH,
+) -> CapabilityGrant:
+    return CapabilityGrant(
+        decision="allow",
+        subject=CapabilitySubject(
+            repository=REPOSITORY,
+            refs=(ref,),
+            paths="*",
+            bundle_sha256="*",
+        ),
+        capabilities=(capability,),
+        resources=CapabilityResources(git_refs=(ref,)),
+        expires_at=None,
+        created_at=NOW,
+        created_via="manual",
+    )
+
+
 def _publication_args(config_path: Path, *, message: str = "refresh gold") -> object:
     return SimpleNamespace(
         geas_config=config_path,
@@ -1019,7 +1305,7 @@ def _publication_args(config_path: Path, *, message: str = "refresh gold") -> ob
     )
 
 
-def test_repository_direct_publication_preauthorizes_exact_root_local_grant(
+def test_first_repository_publication_requires_exact_root_local_wildcard_scope(
     tmp_path: Path,
 ) -> None:
     config_path = tmp_path / "config.yaml"
@@ -1029,7 +1315,7 @@ def test_repository_direct_publication_preauthorizes_exact_root_local_grant(
             profiles={
                 "default": GeasProfile(
                     ontology_git=None,
-                    capability_grants=(_git_publication_grant(),),
+                    capability_grants=(_git_prepublication_grant(),),
                 )
             },
         ),
@@ -1045,6 +1331,73 @@ def test_repository_direct_publication_preauthorizes_exact_root_local_grant(
             _publication_args(config_path),
             changed_ref,
         )
+
+
+def test_prior_receipt_publication_scope_requires_every_complete_path(
+    tmp_path: Path,
+) -> None:
+    config_path = tmp_path / "config.yaml"
+    generic = ".agents/skills/geas/SKILL.md"
+    ontology = ".agents/skills/gold/SKILL.md"
+    scope = cli._RepositoryPublicationScope(
+        repository=REPOSITORY,
+        ref="refs/heads/main",
+        publication_targets=((generic, None), (ontology, "a" * 64)),
+    )
+    partial = CapabilityGrant(
+        decision="allow",
+        subject=CapabilitySubject(
+            repository=REPOSITORY,
+            refs=("refs/heads/main",),
+            paths=(ontology,),
+            bundle_sha256="*",
+        ),
+        capabilities=(Capability.GIT_DIRECT_PUSH,),
+        resources=CapabilityResources(git_refs=("refs/heads/main",)),
+        expires_at=None,
+        created_at=NOW,
+        created_via="manual",
+    )
+    UserConfigManager(config_path).replace(
+        GeasUserConfig(
+            version=2,
+            profiles={
+                "default": GeasProfile(
+                    ontology_git=None,
+                    capability_grants=(partial,),
+                )
+            },
+        ),
+        upgrade_version=True,
+    )
+
+    with pytest.raises(PermissionError, match=generic):
+        cli._preauthorize_repository_publication(
+            _publication_args(config_path),
+            scope,
+        )
+
+    complete = partial.model_copy(
+        update={
+            "subject": partial.subject.model_copy(
+                update={"paths": (generic, ontology)}
+            )
+        }
+    )
+    UserConfigManager(config_path).replace(
+        GeasUserConfig(
+            version=2,
+            profiles={
+                "default": GeasProfile(
+                    ontology_git=None,
+                    capability_grants=(complete,),
+                )
+            },
+        ),
+        upgrade_version=True,
+    )
+
+    cli._preauthorize_repository_publication(_publication_args(config_path), scope)
 
 
 def test_repository_publication_invokes_one_publisher_with_operator_message(
@@ -1780,16 +2133,34 @@ def test_ontology_init_direct_push_denial_precedes_configuration_writes(
     assert not (manager.root / "ontologies" / "gold").exists()
 
 
-def test_ontology_update_factory_composes_real_verified_service_and_all_adapters(
+@pytest.mark.parametrize(
+    ("discovery_kind", "locator", "connector"),
+    (
+        (
+            DiscoveryKind.DIRECT_URL,
+            "https://issuer.example/report.txt",
+            "source:direct-url",
+        ),
+        (
+            DiscoveryKind.MOJEEK,
+            "https://api.mojeek.com/search",
+            "source:mojeek",
+        ),
+    ),
+)
+def test_ontology_update_factory_only_loads_mojeek_for_selected_intents(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    discovery_kind: DiscoveryKind,
+    locator: str,
+    connector: str,
 ) -> None:
     repository = tmp_path / "repository"
     ontology = repository / "ontology" / "gold"
     ontology.mkdir(parents=True)
     source_intent = _intent(
-        DiscoveryKind.DIRECT_URL,
-        "https://issuer.example/report.txt",
+        discovery_kind,
+        locator,
     )
     build = OntologyBuildConfig.from_defaults(
         GeasUserConfig.default().ontology_defaults,
@@ -1855,9 +2226,9 @@ def test_ontology_update_factory_composes_real_verified_service_and_all_adapters
             Capability.SOURCE_FETCH,
         ),
         resources=CapabilityResources(
-            hosts=("issuer.example",),
+            hosts=source_intent.allowed_hosts,
             path_prefixes=("/",),
-            connectors=("source:direct-url",),
+            connectors=(connector,),
         ),
         expires_at=None,
         created_at=NOW,
@@ -1891,12 +2262,14 @@ def test_ontology_update_factory_composes_real_verified_service_and_all_adapters
         or frozenset(),
     )
     root = Path(__file__).resolve().parents[1]
-    research_policy = tmp_path / "research-policy.yaml"
-    research_policy.write_text(
-        (root / "config" / "research-policy.yaml")
-        .read_text()
-        .replace("MOJEEK_API_KEY", "TRUSTED_MOJEEK_KEY")
-    )
+    research_policy = tmp_path / "missing-research-policy.yaml"
+    if discovery_kind is DiscoveryKind.MOJEEK:
+        research_policy = tmp_path / "research-policy.yaml"
+        research_policy.write_text(
+            (root / "config" / "research-policy.yaml")
+            .read_text()
+            .replace("MOJEEK_API_KEY", "TRUSTED_MOJEEK_KEY")
+        )
     args = SimpleNamespace(
         name="gold",
         root=tmp_path / "runtime",
@@ -1922,19 +2295,28 @@ def test_ontology_update_factory_composes_real_verified_service_and_all_adapters
         ref="refs/heads/main",
         path="ontology/gold",
     )
-    assert set(coordinator.adapter.adapters) == set(DiscoveryKind)
-    mojeek = coordinator.adapter.adapters[DiscoveryKind.MOJEEK]
-    assert mojeek.search.connector.transport.api_key_env == "TRUSTED_MOJEEK_KEY"
-    assert mojeek.max_discovery_requests == min(
-        ResearchPolicy.from_yaml(research_policy)
-        .provider("connector:mojeek")
-        .max_requests_per_run,
-        mojeek.search.connector.manifest.max_pages,
-    )
+    assert discovery_kind in coordinator.adapter.adapters
+    if discovery_kind is DiscoveryKind.MOJEEK:
+        mojeek = coordinator.adapter.adapters[DiscoveryKind.MOJEEK]
+        assert mojeek.search.connector.transport.api_key_env == "TRUSTED_MOJEEK_KEY"
+        assert mojeek.max_discovery_requests == min(
+            ResearchPolicy.from_yaml(research_policy)
+            .provider("connector:mojeek")
+            .max_requests_per_run,
+            mojeek.search.connector.manifest.max_pages,
+        )
+    else:
+        assert DiscoveryKind.MOJEEK not in coordinator.adapter.adapters
     assert coordinator.ontology_bundle_sha256 == bundle
     assert coordinator.library_manifest is not None
     assert coordinator.library_database == (
         tmp_path / "runtime" / "ontologies" / "gold" / "library.sqlite"
     )
     assert coordinator.extraction is not None
-    assert loaded_secret_names == [frozenset()]
+    assert loaded_secret_names == [
+        (
+            frozenset({"TRUSTED_MOJEEK_KEY"})
+            if discovery_kind is DiscoveryKind.MOJEEK
+            else frozenset()
+        )
+    ]

@@ -16,6 +16,7 @@ from pydantic import Field
 
 from research_agent.capabilities import Capability, CapabilityDecision
 from research_agent.credential_scanning import contains_possible_credential
+from research_agent.git_environment import confined_git_environment
 from research_agent.models import StrictModel, utc_now
 from research_agent.ontology_subscriptions import OntologySubscription
 from research_agent.user_config import OntologyGitConfig
@@ -668,16 +669,7 @@ class OntologyRepositoryManager:
 
     @staticmethod
     def _git_environment() -> dict[str, str]:
-        return {
-            **os.environ,
-            "GIT_TERMINAL_PROMPT": "0",
-            "GIT_NO_REPLACE_OBJECTS": "1",
-            "GIT_CONFIG_COUNT": "2",
-            "GIT_CONFIG_KEY_0": "core.hooksPath",
-            "GIT_CONFIG_VALUE_0": os.devnull,
-            "GIT_CONFIG_KEY_1": "credential.helper",
-            "GIT_CONFIG_VALUE_1": "",
-        }
+        return confined_git_environment()
 
 
 def _normalized_url(value: str) -> str:

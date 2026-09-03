@@ -22,6 +22,7 @@ from yaml.events import (
 )
 
 from research_agent.capabilities import DelegationManifest
+from research_agent.git_environment import confined_git_environment
 from research_agent.models import StrictModel, canonical_json
 
 _CATALOG_NAME = "geas.yaml"
@@ -627,6 +628,7 @@ def _git_file_state(
     if commit is None:
         listing = subprocess.run(
             ("git", "-C", str(worktree), "ls-files", "--stage", "-z", "--", relative),
+            env=confined_git_environment(),
             check=False,
             capture_output=True,
         )
@@ -634,6 +636,7 @@ def _git_file_state(
     else:
         listing = subprocess.run(
             ("git", "-C", str(worktree), "ls-tree", "-z", commit, "--", relative),
+            env=confined_git_environment(),
             check=False,
             capture_output=True,
         )
@@ -654,6 +657,7 @@ def _git_file_state(
         raise ValueError("authority file must be a tracked regular Git blob")
     content = subprocess.run(
         ("git", "-C", str(worktree), "cat-file", "blob", spec),
+        env=confined_git_environment(),
         check=False,
         capture_output=True,
     )
@@ -899,6 +903,7 @@ def _seed_glob_paths(workspace: Path, pattern: str) -> tuple[Path, ...]:
     relative_pattern = _relative_path(pattern, label="workspace seed bundle glob")
     completed = subprocess.run(
         ("git", "-C", str(workspace), "ls-tree", "-r", "--name-only", "-z", "HEAD", "--"),
+        env=confined_git_environment(),
         check=False,
         capture_output=True,
     )
@@ -1078,6 +1083,7 @@ def _catalog_workspace(catalog_path: Path) -> Path:
 def _git(directory: Path, *arguments: str, required: bool = True) -> str:
     completed = subprocess.run(
         ("git", "-C", str(directory), *arguments),
+        env=confined_git_environment(),
         check=False,
         capture_output=True,
         text=True,
