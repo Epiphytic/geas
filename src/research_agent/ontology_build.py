@@ -11,6 +11,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
 from typing import Literal
@@ -79,6 +80,8 @@ from research_agent.promotion import GitPromotionManager
 from research_agent.providers import ModelClient, ModelOutputTruncatedError, load_provider_configs
 from research_agent.render import render_topic_markdown
 from research_agent.research import DiscoveryExecutor
+from research_agent.source_intent import SourceIntent
+from research_agent.source_work import SourceUpdateReceipt, SourceWorkCoordinator
 from research_agent.store import ImmutableStore
 from research_agent.structure import AnchorKind, StructuralAnchor
 from research_agent.truth import TruthManager, TruthPolicy
@@ -111,6 +114,21 @@ class OntologyBuildConfig(OntologyBuildDefaults):
     queries: tuple[str, ...] = ()
     output_directory: Path
     tainted_source_index: Path | None = None
+    source_intent: tuple[SourceIntent, ...] = ()
+
+    @field_validator("source_intent")
+    @classmethod
+    def source_intents_are_sorted_and_unique(
+        cls, value: tuple[SourceIntent, ...]
+    ) -> tuple[SourceIntent, ...]:
+        identifiers = tuple(item.id for item in value)
+        if len(set(identifiers)) != len(identifiers):
+            raise ValueError("ontology source_intent ids must be unique")
+        if identifiers != tuple(
+            sorted(identifiers, key=lambda item: item.encode("utf-8"))
+        ):
+            raise ValueError("ontology source_intent must be sorted by UTF-8 id")
+        return value
 
     @field_validator("topic_recorded_by")
     @classmethod
@@ -178,6 +196,34 @@ class OntologyBuildConfig(OntologyBuildDefaults):
             sort_keys=False,
             allow_unicode=True,
         )
+
+
+class OntologyUpdateService:
+    """Dispatch due source work for a named, already-authorized ontology."""
+
+    def __init__(
+        self,
+        *,
+        configs: Mapping[str, OntologyBuildConfig],
+        coordinators: Mapping[str, SourceWorkCoordinator],
+    ) -> None:
+        self.configs = dict(configs)
+        self.coordinators = dict(coordinators)
+
+    def update(self, name: str, *, now: datetime) -> SourceUpdateReceipt:
+        config = self.configs.get(name)
+        if config is None:
+            raise ValueError(f"unknown ontology: {name}")
+        if not config.source_intent:
+            return SourceUpdateReceipt(
+                source_intent_id="source-update-batch",
+                complete=True,
+                finalized_at=now,
+            )
+        coordinator = self.coordinators.get(name)
+        if coordinator is None:
+            raise ValueError(f"ontology source coordinator is unavailable: {name}")
+        return coordinator.run_due(config.source_intent, now=now)
 
 
 class TokenLimitExhaustion(StrictModel):
@@ -345,6 +391,7 @@ class OntologyBuilder:
         ontology_config_path: Path | None = None,
         force_refresh: bool = False,
         force_reextract: bool = False,
+        source_work_coordinator: SourceWorkCoordinator | None = None,
     ) -> None:
         self.config = config
         self.root = root.resolve()
@@ -364,10 +411,16 @@ class OntologyBuilder:
         )
         self.force_refresh = force_refresh
         self.force_reextract = force_reextract
+        self.source_work_coordinator = source_work_coordinator
         self.store = ImmutableStore(self.root)
-        self.config_sha256 = hashlib.sha256(canonical_json(config)).hexdigest()
-        discovery_fields = config.model_dump(
-            exclude={
+        config_fields = config.model_dump()
+        if not config.source_intent:
+            # Preserve all legacy checkpoint/build identities when the new
+            # source declaration surface is absent.
+            config_fields.pop("source_intent")
+            config_fields.pop("source_work")
+        self.config_sha256 = hashlib.sha256(canonical_json(config_fields)).hexdigest()
+        discovery_exclusions = {
                 "provider",
                 "acceptance",
                 "scope_criteria",
@@ -392,7 +445,11 @@ class OntologyBuilder:
                 "output_directory",
                 "tainted_source_index",
             }
-        )
+        discovery_fields = {
+            key: value
+            for key, value in config_fields.items()
+            if key not in discovery_exclusions
+        }
         self.discovery_config_sha256 = hashlib.sha256(
             canonical_json(discovery_fields)
         ).hexdigest()
@@ -456,6 +513,25 @@ class OntologyBuilder:
                     current=index,
                     total=len(seed_paths),
                 )
+
+        if self.config.source_intent:
+            if self.source_work_coordinator is None:
+                raise ValueError(
+                    "source_intent requires an authorized source-work coordinator"
+                )
+            source_update = self.source_work_coordinator.run_due(
+                self.config.source_intent,
+                now=utc_now(),
+            )
+            if not source_update.complete:
+                failures.append("source-work:incomplete")
+            self.progress.event(
+                "source-work",
+                "completed" if source_update.complete else "incomplete",
+                "Processed declared ontology sources",
+                source_intent_count=len(source_update.source_intent_ids),
+                source_version_count=len(source_update.source_version_ids),
+            )
 
         query_strings = self._queries()
         snapshots = self._snapshots()
@@ -1496,18 +1572,38 @@ class OntologyBuilder:
         # The manager preserves caller order; ordinal order makes context coherent.
         return tuple(item[2] for item in sorted(selected, key=lambda item: item[1]))
 
-    def _parsed_receipt(self, snapshot: RepositorySnapshot) -> dict[str, object] | None:
+    def _parsed_receipt(
+        self, snapshot: RepositorySnapshot | str
+    ) -> dict[str, object] | None:
+        source_version_id = (
+            snapshot.source_version_id
+            if isinstance(snapshot, RepositorySnapshot)
+            else snapshot
+        )
+        from research_agent.parsing import select_parsed_sources
+
+        try:
+            parsed = select_parsed_sources(self.store, (source_version_id,))
+        except ValueError:
+            # Receipts predate the generic parsed-source record. Preserve legacy
+            # GitHub snapshots by falling back to their structural derivation.
+            parsed = ()
+        if parsed:
+            return {
+                "structural_derivation_id": parsed[-1].structural_derivation_id,
+                "threat_observation_ids": parsed[-1].threat_observation_ids,
+            }
         derivations = [
             value
             for value in self.store.iter_records("structural-derivation")
-            if value.get("source_version_id") == snapshot.source_version_id
+            if value.get("source_version_id") == source_version_id
         ]
         if not derivations:
             return None
         threat_ids = [
             value["id"]
             for value in self.store.iter_records("threat-observation")
-            if value.get("target", {}).get("source_version") == snapshot.source_version_id
+            if value.get("target", {}).get("source_version") == source_version_id
         ]
         return {
             "structural_derivation_id": derivations[-1]["id"],

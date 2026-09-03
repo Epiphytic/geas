@@ -5,6 +5,7 @@ import json
 import os
 import re
 import sqlite3
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
@@ -241,8 +242,14 @@ class SourceLibraryBuilder:
         }
     )
 
-    def __init__(self, *, store: ImmutableStore) -> None:
+    def __init__(
+        self,
+        *,
+        store: ImmutableStore,
+        clock: Callable[[], datetime] = utc_now,
+    ) -> None:
         self.store = store
+        self.clock = clock
 
     def build(
         self,
@@ -294,7 +301,7 @@ class SourceLibraryBuilder:
             "version": 1,
             "library_id": manifest.id,
             "manifest_sha256": manifest_sha256,
-            "created_at": utc_now(),
+            "created_at": self.clock(),
             "source_version_ids": selected_original_ids,
             "text_derivation_ids": tuple(item.id for item in selected_derivations),
             "repository_snapshot_ids": tuple(sorted(selected_repository_ids)),

@@ -8,6 +8,7 @@ from research_agent.parsing import (
     DocumentParserRegistry,
     ParsedDocumentManager,
     ParserError,
+    select_parsed_sources,
 )
 from research_agent.sandbox import BubblewrapSandbox
 from research_agent.store import ImmutableStore
@@ -139,3 +140,46 @@ def test_pdf_uses_native_sandbox_and_records_runtime(monkeypatch) -> None:
     assert result.parser_runtime == "bubblewrap_native"
     assert observed["input_bytes"] == b"%PDF fixture"
     assert observed["arguments"][-2:] == ("-", "-")
+
+
+def test_parse_existing_source_reuses_immutable_original_and_is_idempotent(tmp_path) -> None:
+    store = ImmutableStore(tmp_path / "data")
+    source = store.ingest_bytes(
+        b"# Existing source\n\nExact evidence.\n",
+        source_uri="https://issuer.example/source.md",
+        media_type="text/markdown",
+        connector_id="connector:web",
+        license="CC-BY-4.0",
+        acquired_at=INSTANT,
+    )
+    manager = ParsedDocumentManager(store=store, clock=lambda: INSTANT)
+
+    first = manager.parse_source(source.id)
+    second = manager.parse_source(source.id)
+
+    assert first == second
+    assert first.original_source_version_id == source.id
+    assert len(
+        [item for item in store.iter_records("source-version") if item["id"] == source.id]
+    ) == 1
+    receipts = list(store.iter_records("parsed-ingest-receipt"))
+    assert len(receipts) == 1
+
+
+def test_generic_parsed_source_selection_accepts_original_or_derived_identity(tmp_path) -> None:
+    store = ImmutableStore(tmp_path / "data")
+    receipt = ParsedDocumentManager(store=store, clock=lambda: INSTANT).ingest(
+        b"<h1>Derived identity</h1>",
+        source_uri="https://issuer.example/source.html",
+        media_type="text/html",
+        connector_id="connector:web",
+        license=None,
+    )
+
+    by_original = select_parsed_sources(store, (receipt.original_source_version_id,))
+    by_derived = select_parsed_sources(store, (receipt.derived_source_version_id,))
+
+    assert by_original == by_derived
+    assert by_original[0].original_source_version_id == receipt.original_source_version_id
+    assert by_original[0].derived_source_version_id == receipt.derived_source_version_id
+    assert by_original[0].structural_derivation_id == receipt.structural_derivation_id
