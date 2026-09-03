@@ -48,6 +48,8 @@ class _LinkCollector(HTMLParser):
 class _BaseAdapter:
     adapter_id = "source:web"
     version = "1"
+    max_fetch_requests = 4
+    max_discovery_requests = 4
     discovery_kind: DiscoveryKind
 
     def __init__(
@@ -65,7 +67,7 @@ class _BaseAdapter:
         self.capability_request = capability_request
         self._intents: dict[str, SourceIntent] = {}
         self.last_fetch: dict[str, SourceFetchResult] = {}
-        self._validators: dict[str, SourceValidator] = {}
+        self.last_discovery_request_count = 0
 
     def _check_kind(self, intent: SourceIntent) -> None:
         if intent.discovery.kind is not self.discovery_kind:
@@ -149,10 +151,16 @@ class _BaseAdapter:
                     intent, candidate.locator, Capability.SOURCE_FETCH
                 ),
             ),
-            prior=self._validators.get(candidate.id),
+            prior=(
+                SourceValidator(etag=prior.etag, last_modified=prior.last_modified)
+                if prior is not None
+                and prior.prior_source_version_id is not None
+                and prior.prior_source_record_sha256 is not None
+                and (prior.etag or prior.last_modified)
+                else None
+            ),
         )
         self.last_fetch[candidate.id] = result
-        self._validators[candidate.id] = result.validator
         phase = (
             SourceWorkPhase.NOT_MODIFIED
             if result.status == 304
@@ -164,6 +172,11 @@ class _BaseAdapter:
             work_item_id=candidate.id,
             phase=phase,
             result_sha256=hashlib.sha256(result.content).hexdigest() if result.content else None,
+            etag=result.validator.etag,
+            last_modified=result.validator.last_modified,
+            constraint=result.constraint.value if result.constraint is not None else None,
+            retry_after=result.retry_after,
+            request_count=1 + len(result.redirect_chain),
             recorded_at=self.clock(),
         )
 
@@ -171,10 +184,12 @@ class _BaseAdapter:
 class DirectUrlAdapter(_BaseAdapter):
     adapter_id = "source:direct-url"
     discovery_kind = DiscoveryKind.DIRECT_URL
+    max_discovery_requests = 0
 
     def discover(self, intent: SourceIntent) -> tuple[SourceCandidate, ...]:
         self._check_kind(intent)
         self._intents[intent.id] = intent
+        self.last_discovery_request_count = 0
         # This intentionally performs no I/O. Fetch remains separately authorized.
         return self._materialize(
             intent,
@@ -193,6 +208,7 @@ class FeedAdapter(_BaseAdapter):
         discovered_at = self.clock()
         self._require_capability(intent, intent.discovery.locator, Capability.SOURCE_DISCOVER)
         result = self.transport.fetch(self._request(intent))
+        self.last_discovery_request_count = 1 + len(result.redirect_chain)
         if result.status != 200 or result.constraint is not None:
             return ()
         self._intents[intent.id] = intent
@@ -213,6 +229,7 @@ class SitemapAdapter(_BaseAdapter):
         discovered_at = self.clock()
         self._require_capability(intent, intent.discovery.locator, Capability.SOURCE_DISCOVER)
         result = self.transport.fetch(self._request(intent))
+        self.last_discovery_request_count = 1 + len(result.redirect_chain)
         if result.status != 200 or result.constraint is not None:
             return ()
         self._intents[intent.id] = intent
@@ -233,6 +250,7 @@ class HtmlDiscoveryAdapter(_BaseAdapter):
         discovered_at = self.clock()
         self._require_capability(intent, intent.discovery.locator, Capability.SOURCE_DISCOVER)
         result = self.transport.fetch(self._request(intent))
+        self.last_discovery_request_count = 1 + len(result.redirect_chain)
         if result.status != 200 or result.constraint is not None:
             return ()
         self._intents[intent.id] = intent
@@ -249,6 +267,7 @@ class MojeekSourceAdapter(_BaseAdapter):
 
     adapter_id = "source:mojeek"
     discovery_kind = DiscoveryKind.MOJEEK
+    max_discovery_requests = 1
 
     def __init__(
         self,

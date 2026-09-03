@@ -1,9 +1,11 @@
+import hashlib
 import io
 import zipfile
 from datetime import UTC, datetime
 
 import pytest
 
+from research_agent.models import canonical_json
 from research_agent.parsing import (
     DocumentParserRegistry,
     ParsedDocumentManager,
@@ -159,9 +161,9 @@ def test_parse_existing_source_reuses_immutable_original_and_is_idempotent(tmp_p
 
     assert first == second
     assert first.original_source_version_id == source.id
-    assert len(
-        [item for item in store.iter_records("source-version") if item["id"] == source.id]
-    ) == 1
+    assert (
+        len([item for item in store.iter_records("source-version") if item["id"] == source.id]) == 1
+    )
     receipts = list(store.iter_records("parsed-ingest-receipt"))
     assert len(receipts) == 1
 
@@ -183,3 +185,43 @@ def test_generic_parsed_source_selection_accepts_original_or_derived_identity(tm
     assert by_original[0].original_source_version_id == receipt.original_source_version_id
     assert by_original[0].derived_source_version_id == receipt.derived_source_version_id
     assert by_original[0].structural_derivation_id == receipt.structural_derivation_id
+
+
+def test_parse_duplicate_bytes_requires_exact_acquisition_record(tmp_path) -> None:
+    store = ImmutableStore(tmp_path / "data")
+    content = b"same immutable bytes\n"
+    first = store.ingest_bytes(
+        content,
+        source_uri="https://one.example/source.txt",
+        media_type="text/plain",
+        connector_id="connector:web",
+        license="CC-BY-4.0",
+        acquired_at=INSTANT,
+    )
+    second = store.ingest_bytes(
+        content,
+        source_uri="https://two.example/source.txt",
+        media_type="text/plain",
+        connector_id="connector:web",
+        license="CC-BY-4.0",
+        acquired_at=INSTANT,
+    )
+    assert first.id == second.id
+    manager = ParsedDocumentManager(store=store, clock=lambda: INSTANT)
+
+    with pytest.raises(ValueError, match="ambiguous immutable source acquisition"):
+        manager.parse_source(first.id)
+
+    first_digest = hashlib.sha256(canonical_json(first)).hexdigest()
+    second_digest = hashlib.sha256(canonical_json(second)).hexdigest()
+    manager.parse_source(first.id, source_record_sha256=first_digest)
+    receipt = manager.parse_source(second.id, source_record_sha256=second_digest)
+    assert receipt.original_source_record_sha256 == second_digest
+    with pytest.raises(ValueError, match="ambiguous acquisition identity"):
+        select_parsed_sources(store, (second.id,))
+    selected = select_parsed_sources(
+        store,
+        (second.id,),
+        source_record_sha256s=(second_digest,),
+    )
+    assert selected == (receipt,)

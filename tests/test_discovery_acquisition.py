@@ -202,8 +202,8 @@ def test_acquire_discovery_rejects_malformed_input_and_records_api_failure(
     assert receipt.access_constraints[0].target_id == "discovery-hit:test:1"
 
 
-def test_github_source_adapter_preserves_legacy_immutable_readme_result(tmp_path: Path) -> None:
-    """Replacing the official API path would lose the commit-pinned README contract."""
+def test_github_source_adapter_returns_verified_payload_without_archiving(tmp_path: Path) -> None:
+    """The coordinator, not retrieval, owns immutable archive and parse side effects."""
     content = b"# Research\n"
     adapter = GitHubRepositorySourceAdapter(
         GitHubDiscoveryAcquirer(
@@ -234,11 +234,13 @@ def test_github_source_adapter_preserves_legacy_immutable_readme_result(tmp_path
 
     candidate = adapter.discover(intent)[0]
     checkpoint = adapter.fetch(candidate)
-    acquired = adapter.last_acquired[candidate.id]
+    payload = adapter.payload(candidate, checkpoint)
 
-    assert acquired.snapshot.commit_sha == "a" * 40
-    assert acquired.parsed_ingest.derived_source_version_id == acquired.snapshot.source_version_id
-    assert checkpoint.result_sha256 == acquired.snapshot.source_content_sha256
+    assert payload.source_uri.endswith(f"/{'a' * 40}/README.md")
+    assert payload.content == content
+    assert checkpoint.result_sha256 == hashlib.sha256(content).hexdigest()
+    assert checkpoint.request_count == 3
+    assert tuple(ImmutableStore(tmp_path / "data").iter_records("source-version")) == ()
     assert isinstance(adapter, SourceAdapter)
 
 

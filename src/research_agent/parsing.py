@@ -55,6 +55,7 @@ class TextDerivation(StrictModel):
 
 class ParsedIngestReceipt(StrictModel):
     original_source_version_id: str
+    original_source_record_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     derived_source_version_id: str
     derivation_id: str
     structural_derivation_id: str
@@ -367,22 +368,27 @@ class ParsedDocumentManager:
             persist_receipt=False,
         )
 
-    def parse_source(self, source_version_id: str) -> ParsedIngestReceipt:
+    def parse_source(
+        self,
+        source_version_id: str,
+        *,
+        source_record_sha256: str | None = None,
+    ) -> ParsedIngestReceipt:
         """Parse one already-archived source without recreating its metadata."""
         self.store.initialize()
-        sources = sorted(
-            (
-                SourceVersion.model_validate(value)
-                for value in self.store.iter_records("source-version")
-                if value.get("id") == source_version_id
-            ),
-            key=canonical_json,
+        sources = tuple(
+            (SourceVersion.model_validate(value), hashlib.sha256(canonical_json(value)).hexdigest())
+            for value in self.store.iter_records("source-version")
+            if value.get("id") == source_version_id
         )
         if not sources:
             raise ValueError(f"unknown immutable source version: {source_version_id}")
-        original = sources[0]
+        if source_record_sha256 is not None:
+            sources = tuple(item for item in sources if item[1] == source_record_sha256)
+        if len(sources) != 1:
+            raise ValueError("ambiguous immutable source acquisition identity")
+        original, original_record_hash = sources[0]
         content = self.store.read_blob(original.content_sha256)
-        original_record_hash = self.store.put_record("source-version", original)
         return self._derive(
             original,
             content,
@@ -485,6 +491,7 @@ class ParsedDocumentManager:
         hashes.update(citations.record_hashes)
         receipt = ParsedIngestReceipt(
             original_source_version_id=original.id,
+            original_source_record_sha256=original_record_hash,
             derived_source_version_id=derived.id,
             derivation_id=derivation.id,
             structural_derivation_id=structure.structural_derivation_id,
@@ -504,6 +511,8 @@ class ParsedDocumentManager:
 def select_parsed_sources(
     store: ImmutableStore,
     source_version_ids: tuple[str, ...] = (),
+    *,
+    source_record_sha256s: tuple[str, ...] = (),
 ) -> tuple[ParsedIngestReceipt, ...]:
     """Select generic parsed receipts by original or derived immutable identity."""
     requested = set(source_version_ids)
@@ -526,6 +535,13 @@ def select_parsed_sources(
     threats = tuple(store.iter_records("threat-observation"))
     synthesized: list[ParsedIngestReceipt] = []
     for derivation in derivations:
+        source_hashes = tuple(
+            hashlib.sha256(canonical_json(item)).hexdigest()
+            for item in store.iter_records("source-version")
+            if item.get("id") == derivation.original_source_version_id
+        )
+        if len(source_hashes) != 1:
+            raise ValueError("legacy parsed source has ambiguous acquisition identity")
         matching_structures = tuple(
             item
             for item in structures
@@ -541,6 +557,7 @@ def select_parsed_sources(
             synthesized.append(
                 ParsedIngestReceipt(
                     original_source_version_id=derivation.original_source_version_id,
+                    original_source_record_sha256=source_hashes[0],
                     derived_source_version_id=derivation.derived_source_version_id,
                     derivation_id=derivation.id,
                     structural_derivation_id=str(structure["id"]),
@@ -584,6 +601,23 @@ def select_parsed_sources(
             or item.derived_source_version_id in requested
         )
     )
+    exact_records = set(source_record_sha256s)
+    if exact_records:
+        selected = tuple(
+            item
+            for item in selected
+            if item.original_source_record_sha256 in exact_records
+        )
+    elif requested:
+        for source_id in requested:
+            acquisition_ids = {
+                item.original_source_record_sha256
+                for item in selected
+                if source_id
+                in {item.original_source_version_id, item.derived_source_version_id}
+            }
+            if len(acquisition_ids) > 1:
+                raise ValueError("parsed source selection has ambiguous acquisition identity")
     found = {
         source_id
         for item in selected
