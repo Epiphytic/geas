@@ -5,15 +5,19 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import select
 import shutil
+import signal
 import subprocess
 import threading
+from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
 
+import research_agent.user_config as user_config_module
 from research_agent.bootstrap_models import (
     BootstrapConfigMutationReceipt,
     BootstrapGrantMutationReceipt,
@@ -131,6 +135,45 @@ class _BootstrapRepository:
 
 def _stop_before_config_mutation(**kwargs: object) -> BootstrapConfigMutationReceipt:
     raise RuntimeError("stop after prepared journal")
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX fork semantics")
+def test_config_lock_recursion_state_is_reset_after_fork(tmp_path: Path) -> None:
+    """A child must acquire the filesystem lock instead of inheriting recursion."""
+    manager = _config_manager(tmp_path)
+    read_fd, write_fd = os.pipe()
+    child_pid: int | None = None
+    try:
+        with manager._config_lock():
+            child_pid = os.fork()
+            if child_pid == 0:
+                os.close(read_fd)
+                try:
+                    with UserConfigManager(manager.path)._config_lock():
+                        os.write(write_fd, b"entered")
+                finally:
+                    os._exit(0)
+            os.close(write_fd)
+            write_fd = -1
+            ready, _writable, _exceptional = select.select([read_fd], [], [], 0.25)
+            assert ready == []
+
+        ready, _writable, _exceptional = select.select([read_fd], [], [], 2.0)
+        assert ready == [read_fd]
+        assert os.read(read_fd, 7) == b"entered"
+        waited_pid, status = os.waitpid(child_pid, 0)
+        assert waited_pid == child_pid
+        assert os.waitstatus_to_exitcode(status) == 0
+        child_pid = None
+    finally:
+        os.close(read_fd)
+        if write_fd >= 0:
+            os.close(write_fd)
+        if child_pid is not None:
+            with suppress(ProcessLookupError):
+                os.kill(child_pid, signal.SIGKILL)
+            with suppress(ChildProcessError):
+                os.waitpid(child_pid, 0)
 
 
 def test_record_grant_retry_cannot_claim_matching_bytes_from_another_writer(
@@ -525,7 +568,7 @@ def test_bootstrap_ensure_serializes_checkout_rollback_with_ordinary_subscribe(
     ordinary_finished = threading.Event()
     errors: list[BaseException] = []
 
-    original_mutate = manager.mutate_profile_expected
+    original_mutate = manager.mutate_subscription_profile_expected
 
     def pause_before_config_mutation(**kwargs: object) -> BootstrapConfigMutationReceipt:
         bootstrap_paused.set()
@@ -541,7 +584,9 @@ def test_bootstrap_ensure_serializes_checkout_rollback_with_ordinary_subscribe(
         def assert_removable(self) -> None:
             return None
 
-    monkeypatch.setattr(manager, "mutate_profile_expected", pause_before_config_mutation)
+    monkeypatch.setattr(
+        manager, "mutate_subscription_profile_expected", pause_before_config_mutation
+    )
     bootstrap = SubscriptionManager(
         config_manager=manager,
         profile_name="default",
@@ -917,7 +962,7 @@ def test_replace_subscription_rebases_unrelated_config_change_after_checkout_swa
 
     monkeypatch.setattr(
         manager,
-        "mutate_profile_expected",
+        "mutate_subscription_profile_expected",
         change_unrelated_config_then_stop,
     )
     with pytest.raises(RuntimeError, match="unrelated config change"):
@@ -987,13 +1032,15 @@ def test_replace_subscription_crash_persists_scoped_config_commit_marker(
     )
     assert installed.ownership is not None
     candidate = _subscription(active_ref="refs/heads/stable")
-    original_mutate = manager.mutate_profile_expected
+    original_mutate = manager.mutate_subscription_profile_expected
 
     def mutate_then_crash(**kwargs: object) -> BootstrapConfigMutationReceipt:
         original_mutate(**kwargs)  # type: ignore[arg-type]
         raise RuntimeError("crash after scoped replacement mutation")
 
-    monkeypatch.setattr(manager, "mutate_profile_expected", mutate_then_crash)
+    monkeypatch.setattr(
+        manager, "mutate_subscription_profile_expected", mutate_then_crash
+    )
     with pytest.raises(RuntimeError, match="crash after scoped replacement mutation"):
         service.replace_bootstrap_subscription(
             "gold",
@@ -1050,6 +1097,331 @@ def test_replace_subscription_crash_persists_scoped_config_commit_marker(
     assert (checkout / ".bootstrap-commit").read_text() == "e" * 40
     assert not tuple(checkout.parent.glob(".gold.bootstrap-*.old"))
     assert not tuple(checkout.parent.glob(".gold.bootstrap-*.stage"))
+
+
+@pytest.mark.parametrize(
+    "failure_point",
+    ("applying-marker", "config-write", "commit-marker"),
+)
+def test_replace_subscription_write_ahead_recovery_converges_across_crashes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_point: str,
+) -> None:
+    """Every marker/config boundary is durable and preserves unrelated edits."""
+    manager = _config_manager(tmp_path)
+    _BootstrapRepository.pulls = 0
+    service = SubscriptionManager(
+        config_manager=manager,
+        profile_name="default",
+        catalog_verifier=lambda path: path,
+        authorizer=lambda verified: verified,
+        repository_factory=_BootstrapRepository,
+    )
+    old = _subscription()
+    installed = service.ensure_bootstrap_subscription(
+        "gold",
+        old,
+        operation_key=_INSTALL_KEY,
+        verified_commit="d" * 40,
+    )
+    assert installed.ownership is not None
+    candidate = _subscription(active_ref="refs/heads/stable")
+    original_write_state = UserConfigManager._write_bootstrap_state
+    original_atomic_write = user_config_module._atomic_write
+    injected = False
+
+    def fail_state_write(path: Path, value: object) -> None:
+        nonlocal injected
+        phase = getattr(value, "phase", None)
+        target_phase = (
+            "config_applying" if failure_point == "applying-marker" else "config_committed"
+        )
+        if not injected and phase == target_phase:
+            injected = True
+            raise RuntimeError(f"injected {failure_point} crash")
+        original_write_state(path, value)  # type: ignore[arg-type]
+
+    def fail_config_write(path: Path, value: bytes) -> None:
+        nonlocal injected
+        if not injected and path == manager.path:
+            injected = True
+            raise RuntimeError("injected config-write crash")
+        original_atomic_write(path, value)
+
+    with monkeypatch.context() as crash:
+        if failure_point == "config-write":
+            crash.setattr(user_config_module, "_atomic_write", fail_config_write)
+        else:
+            crash.setattr(
+                UserConfigManager,
+                "_write_bootstrap_state",
+                staticmethod(fail_state_write),
+            )
+        with pytest.raises(RuntimeError, match=f"injected {failure_point} crash"):
+            service.replace_bootstrap_subscription(
+                "gold",
+                old,
+                candidate,
+                operation_key=_UPDATE_KEY,
+                verified_commit="e" * 40,
+                ownership=installed.ownership,
+            )
+    assert injected
+
+    digest = _UPDATE_KEY.rsplit(":", 1)[-1]
+    journal_path = (
+        manager.root
+        / "repository-bootstrap/subscription-mutations/default/gold"
+        / f"{digest}.json"
+    )
+    crashed_journal = json.loads(journal_path.read_text())
+    if failure_point != "applying-marker":
+        assert crashed_journal["phase"] == "config_applying"
+        assert crashed_journal["operation_key"] == _UPDATE_KEY
+        assert crashed_journal["profile_name"] == "default"
+        assert crashed_journal["bootstrap_name"] == "gold"
+        assert crashed_journal["checkout"] == "subscriptions/default/gold"
+
+    contender = UserConfigManager(manager.path)
+    concurrent = contender.load().model_copy(update={"default_profile": "other"})
+    contender.replace(concurrent)
+    after_unrelated = contender.config_sha256()
+
+    fresh = SubscriptionManager(
+        config_manager=UserConfigManager(manager.path),
+        profile_name="default",
+        catalog_verifier=lambda path: path,
+        authorizer=lambda verified: verified,
+        repository_factory=_BootstrapRepository,
+    )
+    replaced = fresh.replace_bootstrap_subscription(
+        "gold",
+        old,
+        candidate,
+        operation_key=_UPDATE_KEY,
+        verified_commit="e" * 40,
+        ownership=installed.ownership,
+    )
+    replayed = fresh.replace_bootstrap_subscription(
+        "gold",
+        old,
+        candidate,
+        operation_key=_UPDATE_KEY,
+        verified_commit="e" * 40,
+        ownership=installed.ownership,
+    )
+
+    assert replayed == replaced
+    assert _BootstrapRepository.pulls == 2
+    current = manager.load()
+    assert current.default_profile == "other"
+    assert current.profiles["default"].subscriptions["gold"] == candidate
+    assert manager.subscription_checkout(candidate).is_dir()
+    assert not tuple(manager.root.glob("**/*.tmp-*"))
+    if failure_point == "commit-marker":
+        assert after_unrelated != replaced.config_mutation.after_config_sha256
+
+
+@pytest.mark.parametrize("action", ("ensure", "remove"))
+def test_each_bootstrap_subscription_action_writes_applying_before_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    action: str,
+) -> None:
+    """Ensure and removal share the same recoverable config write-ahead boundary."""
+    manager = _config_manager(tmp_path)
+    service = SubscriptionManager(
+        config_manager=manager,
+        profile_name="default",
+        catalog_verifier=lambda path: path,
+        authorizer=lambda verified: verified,
+        repository_factory=_BootstrapRepository,
+    )
+    subscription = _subscription()
+    ownership: BootstrapSubscriptionOwnershipReceipt | None = None
+    operation_key = _INSTALL_KEY
+    if action == "remove":
+        installed = service.ensure_bootstrap_subscription(
+            "gold",
+            subscription,
+            operation_key=_INSTALL_KEY,
+            verified_commit="d" * 40,
+        )
+        ownership = installed.ownership
+        assert ownership is not None
+        operation_key = _REMOVE_KEY
+
+    original_atomic_write = user_config_module._atomic_write
+    injected = False
+
+    def fail_config_write(path: Path, value: bytes) -> None:
+        nonlocal injected
+        if not injected and path == manager.path:
+            injected = True
+            raise RuntimeError("injected config-write crash")
+        original_atomic_write(path, value)
+
+    with monkeypatch.context() as crash:
+        crash.setattr(user_config_module, "_atomic_write", fail_config_write)
+        with pytest.raises(RuntimeError, match="injected config-write crash"):
+            if action == "ensure":
+                service.ensure_bootstrap_subscription(
+                    "gold",
+                    subscription,
+                    operation_key=operation_key,
+                    verified_commit="d" * 40,
+                )
+            else:
+                assert ownership is not None
+                service.remove_bootstrap_subscription(
+                    "gold",
+                    subscription,
+                    operation_key=operation_key,
+                    ownership=ownership,
+                )
+
+    digest = operation_key.rsplit(":", 1)[-1]
+    journal_path = (
+        manager.root
+        / "repository-bootstrap/subscription-mutations/default/gold"
+        / f"{digest}.json"
+    )
+    assert json.loads(journal_path.read_text())["phase"] == "config_applying"
+
+    contender = UserConfigManager(manager.path)
+    contender.replace(contender.load().model_copy(update={"default_profile": "other"}))
+    fresh = SubscriptionManager(
+        config_manager=UserConfigManager(manager.path),
+        profile_name="default",
+        catalog_verifier=lambda path: path,
+        authorizer=lambda verified: verified,
+        repository_factory=_BootstrapRepository,
+    )
+    if action == "ensure":
+        recovered = fresh.ensure_bootstrap_subscription(
+            "gold",
+            subscription,
+            operation_key=operation_key,
+            verified_commit="d" * 40,
+        )
+        assert recovered.ownership is not None
+        assert "gold" in manager.load().profiles["default"].subscriptions
+    else:
+        assert ownership is not None
+        recovered = fresh.remove_bootstrap_subscription(
+            "gold",
+            subscription,
+            operation_key=operation_key,
+            ownership=ownership,
+        )
+        assert recovered.ownership is None
+        assert "gold" not in manager.load().profiles["default"].subscriptions
+        assert not manager.subscription_checkout(subscription).exists()
+
+
+@pytest.mark.parametrize("writer", ("replace", "restore", "scoped"))
+def test_config_applying_marker_blocks_foreign_matching_subscription_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    writer: str,
+) -> None:
+    """An ordinary writer cannot create bytes that a pending operation would adopt."""
+    manager = _config_manager(tmp_path)
+    service = SubscriptionManager(
+        config_manager=manager,
+        profile_name="default",
+        catalog_verifier=lambda path: path,
+        authorizer=lambda verified: verified,
+        repository_factory=_BootstrapRepository,
+    )
+    old = _subscription()
+    installed = service.ensure_bootstrap_subscription(
+        "gold",
+        old,
+        operation_key=_INSTALL_KEY,
+        verified_commit="d" * 40,
+    )
+    assert installed.ownership is not None
+    candidate = _subscription(active_ref="refs/heads/stable")
+    original_atomic_write = user_config_module._atomic_write
+    injected = False
+
+    def fail_config_write(path: Path, value: bytes) -> None:
+        nonlocal injected
+        if not injected and path == manager.path:
+            injected = True
+            raise RuntimeError("injected config-write crash")
+        original_atomic_write(path, value)
+
+    with monkeypatch.context() as crash:
+        crash.setattr(user_config_module, "_atomic_write", fail_config_write)
+        with pytest.raises(RuntimeError, match="injected config-write crash"):
+            service.replace_bootstrap_subscription(
+                "gold",
+                old,
+                candidate,
+                operation_key=_UPDATE_KEY,
+                verified_commit="e" * 40,
+                ownership=installed.ownership,
+            )
+
+    contender = UserConfigManager(manager.path)
+    foreign = contender.load()
+    profile = foreign.profiles["default"].model_copy(
+        update={
+            "subscriptions": {
+                **foreign.profiles["default"].subscriptions,
+                "gold": candidate,
+            }
+        }
+    )
+    foreign = foreign.model_copy(
+        update={"profiles": {**foreign.profiles, "default": profile}}
+    )
+    before = manager.path.read_bytes()
+    with pytest.raises(RuntimeError, match="pending bootstrap subscription"):
+        if writer == "replace":
+            contender.replace(foreign)
+        elif writer == "restore":
+            contender.restore_bytes(
+                foreign.explicit_yaml().encode(),
+                expected_config_sha256=contender.config_sha256(),
+            )
+        else:
+            contender.mutate_profile_expected(
+                operation_key=_OTHER_KEY,
+                profile_name="default",
+                bootstrap_name="other-writer",
+                kind="subscription_replace",
+                expected_config_sha256=contender.config_sha256(),
+                mutate=lambda current: current.model_copy(
+                    update={
+                        "subscriptions": {
+                            **current.subscriptions,
+                            "gold": candidate,
+                        }
+                    }
+                ),
+            )
+    assert manager.path.read_bytes() == before
+
+    recovered = SubscriptionManager(
+        config_manager=UserConfigManager(manager.path),
+        profile_name="default",
+        catalog_verifier=lambda path: path,
+        authorizer=lambda verified: verified,
+        repository_factory=_BootstrapRepository,
+    ).replace_bootstrap_subscription(
+        "gold",
+        old,
+        candidate,
+        operation_key=_UPDATE_KEY,
+        verified_commit="e" * 40,
+        ownership=installed.ownership,
+    )
+    assert recovered.ownership is not None
+    assert manager.load().profiles["default"].subscriptions["gold"] == candidate
 
 
 def test_replace_bootstrap_subscription_rejects_changed_old_config_before_pull(

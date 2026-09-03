@@ -297,6 +297,119 @@ class BootstrapSubscriptionMutationReceipt(StrictModel):
         return self
 
 
+class BootstrapSubscriptionJournal(StrictModel):
+    """Durable write-ahead state for one exact subscription mutation."""
+
+    version: Literal[1] = 1
+    phase: Literal[
+        "prepared",
+        "staged",
+        "checkout_swapped",
+        "config_applying",
+        "config_committed",
+        "completed",
+    ]
+    operation_key: str = Field(pattern=_BOOTSTRAP_OPERATION_KEY)
+    profile_name: str = Field(pattern=_BOOTSTRAP_NAME)
+    bootstrap_name: str = Field(pattern=_BOOTSTRAP_NAME)
+    action: Literal["ensure", "replace", "remove"]
+    owner_operation_key: str = Field(pattern=_BOOTSTRAP_OPERATION_KEY)
+    old_subscription_sha256: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$"
+    )
+    new_subscription_sha256: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$"
+    )
+    checkout: Path
+    staging: Path
+    quarantine: Path | None = None
+    verified_commit: str = Field(pattern=r"^[0-9a-f]{40}$")
+    old_checkout_device: int | None = Field(default=None, ge=0)
+    old_checkout_inode: int | None = Field(default=None, gt=0)
+    new_checkout_device: int | None = Field(default=None, ge=0)
+    new_checkout_inode: int | None = Field(default=None, gt=0)
+    before_config_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    after_config_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    receipt: BootstrapSubscriptionMutationReceipt | None = None
+
+    @model_validator(mode="after")
+    def receipt_matches_completion(self) -> BootstrapSubscriptionJournal:
+        operation_digest = self.operation_key.rsplit(":", 1)[-1]
+        expected_checkout = Path(
+            f"subscriptions/{self.profile_name}/{self.bootstrap_name}"
+        )
+        expected_staging = (
+            expected_checkout
+            if self.action == "remove"
+            else expected_checkout.with_name(
+                f".{self.bootstrap_name}.bootstrap-{operation_digest}.stage"
+            )
+        )
+        expected_quarantine = (
+            expected_checkout.with_name(
+                f".{self.bootstrap_name}.bootstrap-{operation_digest}.old"
+            )
+            if self.action == "replace"
+            else expected_checkout.with_name(
+                f".{self.bootstrap_name}.remove-bootstrap-{operation_digest}"
+            )
+            if self.action == "remove"
+            else None
+        )
+        if (
+            self.checkout != expected_checkout
+            or self.staging != expected_staging
+            or self.quarantine != expected_quarantine
+        ):
+            raise ValueError(
+                "subscription journal paths do not match its exact operation"
+            )
+        if (self.old_checkout_device is None) != (self.old_checkout_inode is None):
+            raise ValueError("old checkout identity must be complete")
+        if (self.new_checkout_device is None) != (self.new_checkout_inode is None):
+            raise ValueError("new checkout identity must be complete")
+        if (
+            self.phase != "prepared"
+            and self.action != "remove"
+            and self.new_checkout_inode is None
+        ):
+            raise ValueError("staged subscription journal requires checkout identity")
+        if self.action == "ensure" and (
+            self.old_subscription_sha256 is not None
+            or self.old_checkout_inode is not None
+            or self.quarantine is not None
+        ):
+            raise ValueError("subscription ensure journal cannot claim prior ownership")
+        if self.action == "replace" and (
+            self.old_subscription_sha256 is None
+            or self.old_checkout_inode is None
+            or self.quarantine is None
+        ):
+            raise ValueError("subscription replacement journal requires prior ownership")
+        if self.action == "remove" and (
+            self.old_subscription_sha256 is None
+            or self.old_checkout_inode is None
+            or self.new_subscription_sha256 is not None
+            or self.new_checkout_inode is not None
+            or self.quarantine is None
+        ):
+            raise ValueError("subscription removal journal requires exact prior ownership")
+        if (self.phase == "completed") != (self.receipt is not None):
+            raise ValueError("subscription journal completion and receipt must agree")
+        if self.receipt is not None and (
+            self.receipt.operation_key != self.operation_key
+            or self.receipt.profile_name != self.profile_name
+            or self.receipt.bootstrap_name != self.bootstrap_name
+            or self.receipt.action != self.action
+            or self.receipt.old_subscription_sha256
+            != self.old_subscription_sha256
+            or self.receipt.new_subscription_sha256
+            != self.new_subscription_sha256
+        ):
+            raise ValueError("subscription journal receipt does not match its intent")
+        return self
+
+
 class RepositoryUpdateEffectReceipt(StrictModel):
     """Durable result of one stable-keyed update effect."""
 
