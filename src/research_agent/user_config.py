@@ -20,6 +20,7 @@ from research_agent.bootstrap_models import (
     BootstrapConfigMutationReceipt,
     BootstrapGrantMutationReceipt,
     BootstrapGrantOwnershipReceipt,
+    BootstrapSubscriptionJournal,
 )
 from research_agent.capabilities import (
     Capability,
@@ -59,6 +60,20 @@ _PROFILE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 _CONFIG_LOCKS_GUARD = threading.Lock()
 _CONFIG_LOCKS: dict[str, threading.RLock] = {}
 _CONFIG_LOCK_DEPTH = threading.local()
+_CONFIG_LOCKS_PID = os.getpid()
+
+
+def _reset_config_locks_after_fork() -> None:
+    """Discard process-local recursion state inherited across ``fork()``."""
+    global _CONFIG_LOCKS_GUARD, _CONFIG_LOCKS, _CONFIG_LOCK_DEPTH, _CONFIG_LOCKS_PID
+    _CONFIG_LOCKS_GUARD = threading.Lock()
+    _CONFIG_LOCKS = {}
+    _CONFIG_LOCK_DEPTH = threading.local()
+    _CONFIG_LOCKS_PID = os.getpid()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_config_locks_after_fork)
 
 
 def _compatibility_grant(rule: TrustRule) -> CapabilityGrant:
@@ -378,11 +393,16 @@ class UserConfigManager:
                         sort_keys=False,
                         allow_unicode=True,
                     ).encode()
+                    self._validate_pending_subscription_writes(config, config)
                     _atomic_write(
                         self.path,
                         source,
                     )
             else:
+                if self._pending_subscription_journals():
+                    raise RuntimeError(
+                        "pending bootstrap subscription mutation requires its config"
+                    )
                 config = GeasUserConfig.default()
                 self.validate_subscription_layout(config)
                 source = config.explicit_yaml().encode()
@@ -534,6 +554,249 @@ class UserConfigManager:
         value, _config = self._validated_config_bytes()
         return _sha256(value)
 
+    def _subscription_journal_path_for(
+        self, journal: BootstrapSubscriptionJournal
+    ) -> Path:
+        operation_digest = journal.operation_key.rsplit(":", 1)[-1]
+        return self._confined_state_path(
+            Path("repository-bootstrap")
+            / "subscription-mutations"
+            / journal.profile_name
+            / journal.bootstrap_name
+            / f"{operation_digest}.json"
+        )
+
+    def _pending_subscription_journals(
+        self,
+    ) -> tuple[BootstrapSubscriptionJournal, ...]:
+        root = self._confined_state_path(
+            Path("repository-bootstrap") / "subscription-mutations"
+        )
+        if not root.exists():
+            return ()
+        if root.is_symlink() or not root.is_dir():
+            raise ValueError("bootstrap subscription journal root is unsafe")
+        pending: list[BootstrapSubscriptionJournal] = []
+        for profile_path in sorted(root.iterdir()):
+            if profile_path.is_symlink() or not profile_path.is_dir():
+                raise ValueError("bootstrap subscription journal profile is unsafe")
+            for name_path in sorted(profile_path.iterdir()):
+                if name_path.is_symlink() or not name_path.is_dir():
+                    raise ValueError("bootstrap subscription journal name is unsafe")
+                for path in sorted(name_path.iterdir()):
+                    if path.is_symlink():
+                        raise ValueError("bootstrap subscription journal is unsafe")
+                    if not path.name.endswith(".json"):
+                        continue
+                    if not path.is_file():
+                        raise ValueError("bootstrap subscription journal is unsafe")
+                    try:
+                        journal = BootstrapSubscriptionJournal.model_validate_json(
+                            path.read_bytes()
+                        )
+                    except ValueError as error:
+                        raise ValueError(
+                            "bootstrap subscription mutation journal is invalid"
+                        ) from error
+                    if self._subscription_journal_path_for(journal) != path:
+                        raise ValueError(
+                            "bootstrap subscription journal path does not match its operation"
+                        )
+                    if journal.phase == "config_applying":
+                        pending.append(journal)
+        return tuple(pending)
+
+    @staticmethod
+    def _named_subscription_sha256(
+        config: GeasUserConfig,
+        *,
+        profile_name: str,
+        bootstrap_name: str,
+    ) -> str | None:
+        _, profile = config.profile(profile_name)
+        subscription = profile.normalized_subscriptions(
+            freshness=config.ontology_freshness
+        ).get(bootstrap_name)
+        if subscription is None:
+            return None
+        return _sha256(canonical_json(subscription.model_dump(mode="json")))
+
+    def _validate_pending_subscription_writes(
+        self,
+        before: GeasUserConfig,
+        after: GeasUserConfig,
+        *,
+        active_journal: BootstrapSubscriptionJournal | None = None,
+    ) -> None:
+        for journal in self._pending_subscription_journals():
+            before_identity = self._named_subscription_sha256(
+                before,
+                profile_name=journal.profile_name,
+                bootstrap_name=journal.bootstrap_name,
+            )
+            after_identity = self._named_subscription_sha256(
+                after,
+                profile_name=journal.profile_name,
+                bootstrap_name=journal.bootstrap_name,
+            )
+            if before_identity == after_identity:
+                continue
+            if (
+                active_journal is not None
+                and journal == active_journal
+                and before_identity == journal.old_subscription_sha256
+                and after_identity == journal.new_subscription_sha256
+            ):
+                continue
+            raise RuntimeError(
+                "pending bootstrap subscription mutation owns the named config state"
+            )
+
+    def mutate_subscription_profile_expected(
+        self,
+        *,
+        kind: Literal[
+            "subscription_ensure",
+            "subscription_replace",
+            "subscription_remove",
+        ],
+        expected_config_sha256: str,
+        mutate: Callable[[GeasProfile], GeasProfile],
+        upgrade_version: bool,
+        journal_path: Path,
+        expected_journal: BootstrapSubscriptionJournal,
+        applying_journal: BootstrapSubscriptionJournal,
+        committed_journal: BootstrapSubscriptionJournal,
+    ) -> BootstrapConfigMutationReceipt:
+        """Write applying marker, scoped config, then committed marker under one lock."""
+        expected_prior_phase = (
+            "staged" if expected_journal.action == "remove" else "checkout_swapped"
+        )
+        if expected_journal.phase not in {
+            expected_prior_phase,
+            "config_applying",
+        }:
+            raise ValueError("subscription journal is not ready for config mutation")
+        if kind != f"subscription_{expected_journal.action}":
+            raise ValueError("subscription journal action does not match scoped mutation")
+        if journal_path != self._subscription_journal_path_for(expected_journal):
+            raise ValueError("subscription journal path does not match scoped mutation")
+        expected_applying = expected_journal.model_copy(
+            update={
+                "phase": "config_applying",
+                "before_config_sha256": applying_journal.before_config_sha256,
+                "after_config_sha256": applying_journal.after_config_sha256,
+            }
+        )
+        if (
+            applying_journal != expected_applying
+            or committed_journal
+            != applying_journal.model_copy(update={"phase": "config_committed"})
+            or applying_journal.before_config_sha256 != expected_config_sha256
+        ):
+            raise ValueError("subscription write-ahead states do not match")
+        BootstrapConfigMutationReceipt(
+            operation_key=applying_journal.operation_key,
+            profile_name=applying_journal.profile_name,
+            bootstrap_name=applying_journal.bootstrap_name,
+            kind=kind,
+            before_config_sha256=applying_journal.before_config_sha256,
+            after_config_sha256=applying_journal.after_config_sha256,
+        )
+        with self._config_lock():
+            expected_bytes = (
+                canonical_json(expected_journal.model_dump(mode="json")) + b"\n"
+            )
+            if self._load_bootstrap_state(journal_path) != expected_bytes:
+                raise RuntimeError(
+                    "bootstrap mutation journal changed before scoped mutation"
+                )
+            before, config = self._validated_config_bytes()
+            before_sha256 = _sha256(before)
+            if before_sha256 != expected_config_sha256:
+                raise RuntimeError("Geas user config changed before scoped mutation")
+            updated, after = self._profile_mutation_bytes(
+                config,
+                profile_name=applying_journal.profile_name,
+                mutate=mutate,
+                upgrade_version=upgrade_version,
+            )
+            if _sha256(after) != applying_journal.after_config_sha256:
+                raise ValueError("applying journal does not match config after-state")
+            if self.path.read_bytes() != before:
+                raise RuntimeError("Geas user config changed before atomic replacement")
+            self._validate_pending_subscription_writes(
+                config,
+                updated,
+                active_journal=(
+                    expected_journal
+                    if expected_journal.phase == "config_applying"
+                    else None
+                ),
+            )
+            if applying_journal != expected_journal:
+                self._write_bootstrap_state(journal_path, applying_journal)
+            if after != before:
+                _atomic_write(self.path, after)
+            self._write_bootstrap_state(journal_path, committed_journal)
+            return BootstrapConfigMutationReceipt(
+                operation_key=applying_journal.operation_key,
+                profile_name=applying_journal.profile_name,
+                bootstrap_name=applying_journal.bootstrap_name,
+                kind=kind,
+                before_config_sha256=before_sha256,
+                after_config_sha256=_sha256(after),
+            )
+
+    def commit_applied_subscription_profile(
+        self,
+        *,
+        kind: Literal[
+            "subscription_ensure",
+            "subscription_replace",
+            "subscription_remove",
+        ],
+        journal_path: Path,
+        expected_journal: BootstrapSubscriptionJournal,
+        committed_journal: BootstrapSubscriptionJournal,
+    ) -> BootstrapConfigMutationReceipt:
+        """Commit an applying marker whose exact named config write is already present."""
+        if (
+            expected_journal.phase != "config_applying"
+            or kind != f"subscription_{expected_journal.action}"
+            or journal_path != self._subscription_journal_path_for(expected_journal)
+            or committed_journal
+            != expected_journal.model_copy(update={"phase": "config_committed"})
+        ):
+            raise ValueError("subscription applied marker does not match its operation")
+        with self._config_lock():
+            expected_bytes = (
+                canonical_json(expected_journal.model_dump(mode="json")) + b"\n"
+            )
+            if self._load_bootstrap_state(journal_path) != expected_bytes:
+                raise RuntimeError(
+                    "bootstrap mutation journal changed before commit marker"
+                )
+            _current_bytes, config = self._validated_config_bytes()
+            configured = self._named_subscription_sha256(
+                config,
+                profile_name=expected_journal.profile_name,
+                bootstrap_name=expected_journal.bootstrap_name,
+            )
+            if configured != expected_journal.new_subscription_sha256:
+                raise ValueError(
+                    "subscription applying marker does not match named config state"
+                )
+            self._write_bootstrap_state(journal_path, committed_journal)
+            return BootstrapConfigMutationReceipt(
+                operation_key=expected_journal.operation_key,
+                profile_name=expected_journal.profile_name,
+                bootstrap_name=expected_journal.bootstrap_name,
+                kind=kind,
+                before_config_sha256=expected_journal.before_config_sha256,
+                after_config_sha256=expected_journal.after_config_sha256,
+            )
+
     def mutate_profile_expected(
         self,
         *,
@@ -618,7 +881,7 @@ class UserConfigManager:
             before_sha256 = _sha256(before)
             if before_sha256 != expected_config_sha256:
                 raise RuntimeError("Geas user config changed before scoped mutation")
-            _updated, after = self._profile_mutation_bytes(
+            updated, after = self._profile_mutation_bytes(
                 config,
                 profile_name=profile_name,
                 mutate=mutate,
@@ -632,6 +895,7 @@ class UserConfigManager:
                 != _sha256(after)
             ):
                 raise ValueError("applied state does not match config after-state")
+            self._validate_pending_subscription_writes(config, updated)
             if after != before:
                 _atomic_write(self.path, after)
             if applied_state_path is not None:
@@ -1388,7 +1652,7 @@ class UserConfigManager:
                 raise ValueError("Geas user config cannot be a symbolic link")
             rendered = validated.explicit_yaml().encode()
             if self.path.exists():
-                before, _current = self._validated_config_bytes()
+                before, current = self._validated_config_bytes()
                 before_sha256 = _sha256(before)
                 if expected is None and before != rendered:
                     raise RuntimeError(
@@ -1399,11 +1663,16 @@ class UserConfigManager:
                         "Geas user config changed before atomic replacement"
                     )
                 if before != rendered:
+                    self._validate_pending_subscription_writes(current, validated)
                     _atomic_write(self.path, rendered)
             else:
                 if expected is not None:
                     raise RuntimeError(
                         "Geas user config changed before atomic replacement"
+                    )
+                if self._pending_subscription_journals():
+                    raise RuntimeError(
+                        "pending bootstrap subscription mutation requires its config"
                     )
                 _atomic_write(self.path, rendered)
             self._bind_config_identity(config, rendered)
@@ -1429,6 +1698,8 @@ class UserConfigManager:
 
     @contextmanager
     def _config_lock(self):
+        if os.getpid() != _CONFIG_LOCKS_PID:
+            _reset_config_locks_after_fork()
         self.root.mkdir(parents=True, exist_ok=True)
         lock_path = self.path.with_name(f".{self.path.name}.lock")
         lock_key = os.fspath(lock_path)
@@ -1477,7 +1748,7 @@ class UserConfigManager:
             if self.path.is_symlink():
                 raise ValueError("Geas user config cannot be a symbolic link")
             if self.path.exists():
-                before, _current = self._validated_config_bytes()
+                before, current = self._validated_config_bytes()
                 if (
                     expected_config_sha256 is None
                     or _sha256(before) != expected_config_sha256
@@ -1485,8 +1756,13 @@ class UserConfigManager:
                     raise RuntimeError(
                         "Geas user config changed before atomic restoration"
                     )
+                self._validate_pending_subscription_writes(current, restored)
             elif expected_config_sha256 is not None:
                 raise RuntimeError("Geas user config changed before atomic restoration")
+            elif self._pending_subscription_journals():
+                raise RuntimeError(
+                    "pending bootstrap subscription mutation requires its config"
+                )
             _atomic_write(self.path, value)
 
     def ontology_root(self, profile: GeasProfile) -> Path:
@@ -1651,7 +1927,7 @@ def _exclusive_file_lock(path: Path):
             lock.seek(0)
             msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)
         else:
-            fcntl.flock(lock, fcntl.LOCK_EX)
+            fcntl.lockf(lock, fcntl.LOCK_EX)
         try:
             yield
         finally:
@@ -1659,7 +1935,7 @@ def _exclusive_file_lock(path: Path):
                 lock.seek(0)
                 msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
             else:
-                fcntl.flock(lock, fcntl.LOCK_UN)
+                fcntl.lockf(lock, fcntl.LOCK_UN)
 
 
 def _fsync_directory(path: Path) -> None:
