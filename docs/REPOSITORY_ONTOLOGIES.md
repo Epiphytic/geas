@@ -260,13 +260,11 @@ geas ontology-sync geas-samples --pull
 
 With no names, `ontology-sync` processes every selected-profile subscription
 in sorted order. A sync with neither `--pull` nor `--push` pulls by default.
-Push is available only for writable branch refs and uses the existing confined
-staging, secret scan, and fast-forward protections. The current parser exposes
-`--message`, but the subscription service does not yet forward it; pushed
-commits therefore use the default `geas: update ontologies` message. Do not rely
-on a custom message until that implementation gap is closed. Named operations
-also use the configured freshness window, which defaults to a remote check at
-most once per hour.
+The legacy `ontology-sync --push` does not authorize repository publication;
+an unqualified legacy push fails closed. Use the integrated
+`repository-update` workflow below for pull requests or explicit direct push.
+Named operations also use the configured freshness window, which defaults to a
+remote check at most once per hour.
 
 With the integrated lifecycle, refresh due source intent and repository-owned
 outputs explicitly:
@@ -334,9 +332,12 @@ geas repository-remove gold
 It removes only receipt-owned checkout state, subscriptions, trust entries,
 skills, links, and generated branches. Modified or ambiguous paths fail closed.
 A pre-commit failure removes staging; a post-commit interruption keeps the
-durable phase receipt and its `recovery_command` for verified resume. Geas does
-not guess at rollback ownership. Repository removal does not uninstall Geas;
-`uv tool uninstall geas` is separate operator guidance.
+durable receipt and operation journal. After checking the same software,
+repository identity, arguments, and owned paths, rerun the same repository
+command; Geas verifies the recorded phase before resuming or returning the
+completed receipt. Geas does not guess at rollback ownership. Repository
+removal does not uninstall Geas; `uv tool uninstall geas` is separate operator
+guidance.
 
 ## Command reference
 
@@ -354,7 +355,6 @@ $ geas ontology-subscribe geas-samples https://github.com/Epiphytic/geas.git --r
 $ geas ontology-subscribe service-catalog git@github.com:example/ontologies.git --ref refs/tags/v1.2.0 --catalog services/geas.yaml
 $ geas ontology-sync
 $ geas ontology-sync geas-samples --pull
-$ geas ontology-sync geas-samples --push
 $ geas --yolo list
 $ geas skill-export open-source-research-agents --link
 $ geas skill-export open-source-research-agents --name research-agents --repo /srv/project --force
@@ -400,7 +400,12 @@ into canonical ontology state automatically.
 
 Deterministic artifact auto-merge is an optional, independently configured
 GitHub App workflow; see [GitHub App automation](GITHUB_APP_AUTOMATION.md).
-It requires `git.auto_merge`. It does not imply `knowledge.auto_promote` or
-make semantic knowledge canonical. Common Crawl remains future, browser
-automation remains future, and automated forge approval policy is
-operator-managed rather than a Geas trust source.
+The Task 7 repository CLI creates a pull request by default; it does not select
+the auto-merge publisher route. A trusted integration that invokes the Geas
+publisher auto-merge route requires `git.auto_merge`. The separately protected
+GitHub App workflow does not consult local `git.auto_merge` grants: it applies
+its own protected-code, exact-head, artifact, path, identity, and repository
+policy checks. Neither route implies `knowledge.auto_promote` or makes semantic
+knowledge canonical. Common Crawl remains future, browser automation remains
+future, and automated forge approval policy is operator-managed rather than a
+Geas trust source.

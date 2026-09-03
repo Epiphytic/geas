@@ -76,8 +76,14 @@ jobs:
         run: >-
           uv run pytest -q
           tests/test_repository_bootstrap.py
+          tests/test_bootstrap_state_adapters.py
           tests/test_repository_publisher.py
           tests/test_removal_recovery.py
+          tests/test_automatic_acquisition_cli.py
+          tests/test_repository_catalog_cli.py
+          tests/test_repository_subscription_end_to_end.py
+          tests/test_ontology_sync.py
+          tests/test_skill_cli.py
           tests/test_promotion.py
           tests/test_pr_skill_sync.py
           tests/test_agent_skills.py
@@ -102,7 +108,6 @@ jobs:
           tests/test_maintained_sample_catalog.py
           tests/test_demo_ontology.py
           tests/test_builtin_geas_skill.py
-          tests/test_repository_subscription_end_to_end.py
       - name: Build wheel
         run: uv build --wheel
       - name: Inspect packaged generic skill

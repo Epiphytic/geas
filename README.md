@@ -183,8 +183,9 @@ CLI installed, use a commit they have independently reviewed and approved; a
 commit named only by repository content is not approval:
 
 ```bash
+approved_commit='REPLACE_WITH_OPERATOR_APPROVED_FULL_COMMIT_ID'
 uv tool install \
-  --from git+https://github.com/Epiphytic/geas.git@<operator-approved-commit> \
+  --from "git+https://github.com/Epiphytic/geas.git@${approved_commit}" \
   geas
 geas config-init
 ```

@@ -15,8 +15,9 @@ An operator who wants deterministic retrieval and refresh may separately pin
 and approve the software installation, then initialize local trusted config:
 
 ```bash
+approved_commit='REPLACE_WITH_OPERATOR_APPROVED_FULL_COMMIT_ID'
 uv tool install \
-  --from git+https://github.com/Epiphytic/geas.git@<operator-approved-commit> \
+  --from "git+https://github.com/Epiphytic/geas.git@${approved_commit}" \
   geas
 geas config-init
 ```
@@ -111,10 +112,12 @@ geas repository-update gold
 geas repository-remove gold
 ```
 
-Each transaction emits phase receipts. Resume with the exact
-`recovery_command` after verifying the same software, repository, and owned
-paths. Removal is confined to receipt-owned files and links; it never treats a
-repository manifest as proof of ownership.
+Each transaction persists a durable receipt and operation journal. After an
+interruption, verify the same software, repository, and owned paths, then rerun
+the same repository command with the same arguments; Geas validates the
+recorded phase before resuming or returning the completed receipt. Removal is
+confined to receipt-owned files and links; it never treats a repository
+manifest as proof of ownership.
 
 For a project-local snapshot:
 

@@ -133,11 +133,46 @@ def test_docs_cover_bootstrap_delegation_publication_and_recovery_boundaries() -
         assert phrase in combined
 
     assert "repository content cannot grant" in repository
-    assert "recovery_command" in repository
     assert "receipt-owned" in repository
     assert "git.pull_request" in repository
     assert "git.direct_push" in repository
     assert "knowledge.auto_promote" in repository
+
+
+def test_optional_install_snippets_do_not_treat_placeholders_as_shell_redirection() -> None:
+    for document in (README, AGENT_SKILLS):
+        text = document.read_text()
+        assert "@<operator-approved-commit>" not in text
+        assert "approved_commit='REPLACE_WITH_OPERATOR_APPROVED_FULL_COMMIT_ID'" in text
+        assert (
+            '--from "git+https://github.com/Epiphytic/geas.git@${approved_commit}"'
+            in text
+        )
+
+
+def test_legacy_subscription_push_is_not_documented_as_a_publication_path() -> None:
+    repository = _normalized_text(GUIDE.read_text())
+
+    assert "$ geas ontology-sync geas-samples --push" not in GUIDE.read_text()
+    assert "Push is available only for writable branch refs" not in repository
+    assert "`ontology-sync --push` does not authorize repository publication" in repository
+
+
+def test_bootstrap_recovery_uses_persisted_state_not_a_nonexistent_receipt_field() -> None:
+    repository = _normalized_text(GUIDE.read_text())
+    skills = _normalized_text(AGENT_SKILLS.read_text())
+
+    assert "recovery_command" not in repository
+    assert "recovery_command" not in skills
+    assert "rerun the same repository command" in repository
+    assert "durable receipt and operation journal" in repository
+
+
+def test_protected_app_automation_is_distinct_from_local_auto_merge_authority() -> None:
+    repository = _normalized_text(GUIDE.read_text())
+
+    assert "does not consult local `git.auto_merge` grants" in repository
+    assert "Geas publisher auto-merge route requires `git.auto_merge`" in repository
 
 
 def test_quickstart_source_intent_example_matches_the_strict_schema() -> None:
@@ -202,3 +237,18 @@ def test_ci_parallelizes_security_workflows_before_read_only_full_suite_fan_in()
     assert "pull_request_target" not in CI.read_text()
     assert "id-token: write" not in CI.read_text()
     assert "contents: write" not in CI.read_text()
+
+
+def test_ci_runs_bootstrap_state_and_task7_cli_fan_in_suites() -> None:
+    workflow = yaml.safe_load(CI.read_text())
+    bootstrap_steps = workflow["jobs"]["bootstrap-publishing"]["steps"]
+    commands = "\n".join(str(step.get("run", "")) for step in bootstrap_steps)
+
+    assert {
+        "tests/test_bootstrap_state_adapters.py",
+        "tests/test_automatic_acquisition_cli.py",
+        "tests/test_repository_catalog_cli.py",
+        "tests/test_repository_subscription_end_to_end.py",
+        "tests/test_ontology_sync.py",
+        "tests/test_skill_cli.py",
+    } <= set(commands.split())
