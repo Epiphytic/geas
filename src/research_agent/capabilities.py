@@ -91,7 +91,14 @@ def _path_prefix(value: object) -> str:
 
 def _ref(value: object) -> str:
     raw = str(value)
-    if not _REF.fullmatch(raw) or "//" in raw or ".." in raw or "@{" in raw:
+    if (
+        not _REF.fullmatch(raw)
+        or "//" in raw
+        or ".." in raw
+        or "@{" in raw
+        or raw.endswith("/")
+        or raw.endswith(".lock")
+    ):
         raise ValueError("git ref must be a safe fully-qualified branch or tag ref")
     return raw
 
@@ -279,6 +286,11 @@ class CapabilityRequest(StrictModel):
     def normalize_host(cls, value: object) -> str | None:
         return None if value is None else _host(value)
 
+    @field_validator("capabilities")
+    @classmethod
+    def normalize_capabilities(cls, value: tuple[Capability, ...]) -> tuple[Capability, ...]:
+        return tuple(sorted(set(value), key=lambda item: item.value))
+
     @field_validator("requested_at")
     @classmethod
     def timezone_aware(cls, value: datetime) -> datetime:
@@ -309,10 +321,18 @@ class CapabilityDecision(StrictModel):
     ) -> tuple[Capability, ...]:
         return tuple(sorted(set(value), key=lambda item: item.value))
 
-    @field_validator("grant_ids", "delegation_chain")
+    @field_validator("grant_ids")
     @classmethod
-    def normalize_strings(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+    def normalize_grant_ids(cls, value: tuple[str, ...]) -> tuple[str, ...]:
         return _ordered(value, label="receipt identities")
+
+    @field_validator("delegation_chain", mode="before")
+    @classmethod
+    def preserve_ordered_delegation_chain(cls, value: object) -> tuple[str, ...]:
+        chain = tuple(_https_url(item, label="delegation repository") for item in value)  # type: ignore[arg-type]
+        if len(chain) != len(set(chain)):
+            raise ValueError("delegation_chain must not repeat repository identities")
+        return chain
 
     @field_validator("decided_at")
     @classmethod
@@ -320,6 +340,18 @@ class CapabilityDecision(StrictModel):
         if value.tzinfo is None or value.utcoffset() is None:
             raise ValueError("timestamps must be timezone-aware")
         return value
+
+    @model_validator(mode="after")
+    def effective_capabilities_match_decision(self) -> CapabilityDecision:
+        if self.decision == "deny" and self.effective_capabilities:
+            raise ValueError("denied decisions must have empty effective_capabilities")
+        if self.decision == "allow" and set(self.effective_capabilities) != set(
+            self.request.capabilities
+        ):
+            raise ValueError(
+                "allowed effective_capabilities must exactly match requested capabilities"
+            )
+        return self
 
     @property
     def id(self) -> str:

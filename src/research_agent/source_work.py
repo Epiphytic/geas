@@ -68,6 +68,9 @@ class SourceWorkItem(StrictModel):
     locator: str
     adapter_id: str
     adapter_version: str
+    parser_id: str = Field(min_length=1)
+    parser_version: str = Field(min_length=1)
+    extraction_validator_version: str = Field(min_length=1)
     capability_decision_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     phase: SourceWorkPhase
     predecessor_id: str | None

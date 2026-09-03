@@ -3,12 +3,22 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 import pytest
-from fakes.automatic_acquisition import FakeCapabilityEvaluator, FakeClock
+from fakes.automatic_acquisition import (
+    FakeCapabilityEvaluator,
+    FakeClock,
+    FakeSourceAdapter,
+)
 from pydantic import ValidationError
 
-from research_agent.bootstrap_models import BootstrapPhase, ManagedPath, RepositoryInstallReceipt
+from research_agent.bootstrap_models import (
+    BootstrapPhase,
+    ManagedPath,
+    RepositoryInstallReceipt,
+    RepositoryMutationReceipt,
+)
 from research_agent.capabilities import (
     Capability,
+    CapabilityDecision,
     CapabilityGrant,
     CapabilityRequest,
     CapabilityResources,
@@ -46,10 +56,24 @@ def _work(*, capability_decision_sha256: str) -> SourceWorkItem:
         locator="https://example.com/news/announcement.pdf",
         adapter_id="direct-https",
         adapter_version="1",
+        parser_id="pdftotext",
+        parser_version="1",
+        extraction_validator_version="1",
         capability_decision_sha256=capability_decision_sha256,
         phase=SourceWorkPhase.CANDIDATE,
         predecessor_id=None,
         created_at=NOW,
+    )
+
+
+def _request(*, capabilities: tuple[Capability, ...]) -> CapabilityRequest:
+    return CapabilityRequest(
+        authority_repository=REPOSITORY,
+        target_repository=REPOSITORY,
+        capabilities=capabilities,
+        ref="refs/heads/main",
+        path="ontology/example",
+        requested_at=NOW,
     )
 
 
@@ -116,6 +140,8 @@ def test_capability_selectors_normalize_to_sorted_unique_tuples() -> None:
         ("https://user@github.com/example/ontology", "refs/heads/main", "ontology/example"),
         (REPOSITORY, "main", "ontology/example"),
         (REPOSITORY, "refs/heads/main", "../ontology/example"),
+        (REPOSITORY, "refs/heads/main/", "ontology/example"),
+        (REPOSITORY, "refs/heads/main.lock", "ontology/example"),
     ],
 )
 def test_capability_subject_rejects_unsafe_repository_selectors(
@@ -127,7 +153,7 @@ def test_capability_subject_rejects_unsafe_repository_selectors(
             repository=repository,
             refs=(ref,),
             paths=(path,),
-            bundle_sha256="a" * 64,
+            bundle_sha256=("a" * 64,),
         )
 
 
@@ -211,6 +237,29 @@ def test_source_work_identity_changes_with_authority_receipt() -> None:
     assert left.id != right.id
 
 
+def test_source_work_identity_changes_with_parser_and_validator_contracts() -> None:
+    """Omitting parser contracts would reuse derived work after incompatible changes."""
+    base = {
+        "ontology_bundle_sha256": "a" * 64,
+        "source_intent_id": "issuer-news-example",
+        "source_intent_sha256": "b" * 64,
+        "locator": "https://example.com/news/announcement.pdf",
+        "adapter_id": "direct-https",
+        "adapter_version": "1",
+        "parser_id": "pdftotext",
+        "parser_version": "1",
+        "extraction_validator_version": "1",
+        "capability_decision_sha256": "1" * 64,
+        "phase": SourceWorkPhase.CANDIDATE,
+        "predecessor_id": None,
+        "created_at": NOW,
+    }
+    parser_changed = SourceWorkItem(**{**base, "parser_version": "2"})
+    validator_changed = SourceWorkItem(**{**base, "extraction_validator_version": "2"})
+    assert SourceWorkItem(**base).id != parser_changed.id
+    assert SourceWorkItem(**base).id != validator_changed.id
+
+
 def test_source_work_rejects_phase_regression() -> None:
     """Allowing a phase regression would make immutable checkpoints inconsistent."""
     with pytest.raises(ValidationError, match="predecessor"):
@@ -221,6 +270,9 @@ def test_source_work_rejects_phase_regression() -> None:
             locator="https://example.com/news/announcement.pdf",
             adapter_id="direct-https",
             adapter_version="1",
+            parser_id="pdftotext",
+            parser_version="1",
+            extraction_validator_version="1",
             capability_decision_sha256="1" * 64,
             phase=SourceWorkPhase.AUTHORIZED,
             predecessor_phase=SourceWorkPhase.FETCHED,
@@ -243,8 +295,43 @@ def test_bootstrap_receipt_validates_phase_owned_paths_and_canonical_identity() 
         recovery_command=None,
     )
     assert receipt.id.startswith("repository-install:sha256:")
+    assert receipt.id != receipt.model_copy(update={"phase": BootstrapPhase.VERIFIED}).id
+    changed_path = receipt.model_copy(
+        update={
+            "managed_paths": (
+                ManagedPath(
+                    path=".agents/skills/geas/SKILL.md", sha256="c" * 64, role="skill"
+                ),
+            )
+        }
+    )
+    assert receipt.id != changed_path.id
     with pytest.raises(ValidationError):
         ManagedPath(path="../outside", sha256="b" * 64, role="skill")
+
+
+def test_mutation_receipt_normalizes_owned_paths_and_rejects_duplicates() -> None:
+    """Unordered or duplicate ownership entries would make recovery receipts ambiguous."""
+    first = ManagedPath(path="a/SKILL.md", sha256="a" * 64, role="skill")
+    second = ManagedPath(path="b/SKILL.md", sha256="b" * 64, role="skill")
+    left = RepositoryMutationReceipt(
+        install_receipt_id="repository-install:sha256:" + "c" * 64,
+        phase=BootstrapPhase.SKILLS_INSTALLED,
+        action="link",
+        managed_paths=(second, first),
+        recorded_at=NOW,
+    )
+    right = left.model_copy(update={"managed_paths": (first, second)})
+    assert left.managed_paths == (first, second)
+    assert left.id == right.id
+    with pytest.raises(ValidationError, match="unique"):
+        RepositoryMutationReceipt(
+            install_receipt_id="repository-install:sha256:" + "c" * 64,
+            phase=BootstrapPhase.SKILLS_INSTALLED,
+            action="link",
+            managed_paths=(first, first),
+            recorded_at=NOW,
+        )
 
 
 def test_publish_request_rejects_unclassified_paths_for_remote_modes() -> None:
@@ -263,14 +350,90 @@ def test_publish_request_rejects_unclassified_paths_for_remote_modes() -> None:
 def test_deterministic_fakes_deny_unconfigured_operations_without_wall_time() -> None:
     """Replacing the deny default or clock fixture would hide unintended effects."""
     clock = FakeClock(NOW)
-    request = CapabilityRequest(
-        authority_repository=REPOSITORY,
-        target_repository=REPOSITORY,
-        capabilities=(Capability.REPOSITORY_READ,),
-        ref="refs/heads/main",
-        path="ontology/example",
-        requested_at=clock.now(),
-    )
+    request = _request(capabilities=(Capability.REPOSITORY_READ,))
     with pytest.raises(PermissionError, match="unconfigured"):
         FakeCapabilityEvaluator().evaluate(request)
     assert clock.now() == NOW
+
+
+def test_fake_source_adapter_denies_unconfigured_discovery() -> None:
+    """A default empty discovery could hide an accidental live discovery call."""
+    intent = SourceIntent(
+        id="issuer-news-example",
+        role="issuer_news",
+        discovery=SourceDiscovery(kind=DiscoveryKind.DIRECT_URL, locator="https://example.com/news/a"),
+        allowed_hosts=("example.com",),
+        allowed_path_prefixes=("/news/",),
+        accepted_media_types=("text/html",),
+        document_patterns=(),
+        refresh=SourceRefreshPolicy(interval_seconds=900, max_items=40, max_depth=1),
+        required=True,
+        priority=10,
+        associations=SourceAssociations(),
+        temporal=SourceTemporalPolicy(field="published_at", retention="append_only"),
+        created_at=NOW,
+    )
+    with pytest.raises(PermissionError, match="unconfigured"):
+        FakeSourceAdapter().discover(intent)
+
+
+def test_capability_request_normalizes_capabilities_for_a_stable_identity() -> None:
+    """Unnormalized requested capabilities create distinct receipts for one authority request."""
+    left = _request(
+        capabilities=(
+            Capability.SOURCE_FETCH,
+            Capability.REPOSITORY_READ,
+            Capability.SOURCE_FETCH,
+        )
+    )
+    right = _request(capabilities=(Capability.REPOSITORY_READ, Capability.SOURCE_FETCH))
+    assert left.capabilities == (Capability.REPOSITORY_READ, Capability.SOURCE_FETCH)
+    assert left.id == right.id
+
+
+@pytest.mark.parametrize(
+    ("decision", "effective_capabilities"),
+    [
+        ("deny", (Capability.REPOSITORY_READ,)),
+        ("allow", (Capability.SOURCE_FETCH,)),
+    ],
+)
+def test_capability_decision_rejects_authority_inconsistent_effective_capabilities(
+    decision: str, effective_capabilities: tuple[Capability, ...]
+) -> None:
+    """Invalid receipt combinations could make an authority denial look usable."""
+    with pytest.raises(ValidationError, match="effective_capabilities"):
+        CapabilityDecision(
+            request=_request(capabilities=(Capability.REPOSITORY_READ,)),
+            decision=decision,  # type: ignore[arg-type]
+            effective_capabilities=effective_capabilities,
+            reason="fixture",
+            evaluator_version="1",
+            decided_at=NOW,
+        )
+
+
+def test_capability_decision_preserves_delegation_chain_order_and_rejects_cycles() -> None:
+    """Sorting or deduplicating delegation provenance can conceal an invalid route."""
+    first = "https://github.com/example/root"
+    second = "https://github.com/example/child"
+    decision = CapabilityDecision(
+        request=_request(capabilities=(Capability.REPOSITORY_READ,)),
+        decision="allow",
+        effective_capabilities=(Capability.REPOSITORY_READ,),
+        delegation_chain=(first, second),
+        reason="fixture",
+        evaluator_version="1",
+        decided_at=NOW,
+    )
+    assert decision.delegation_chain == (first, second)
+    with pytest.raises(ValidationError, match="delegation_chain"):
+        CapabilityDecision(
+            request=_request(capabilities=(Capability.REPOSITORY_READ,)),
+            decision="allow",
+            effective_capabilities=(Capability.REPOSITORY_READ,),
+            delegation_chain=(first, first),
+            reason="fixture",
+            evaluator_version="1",
+            decided_at=NOW,
+        )

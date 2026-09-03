@@ -83,6 +83,14 @@ class RepositoryMutationReceipt(StrictModel):
     recorded_at: datetime
     recovery_command: str | None = None
 
+    @field_validator("managed_paths")
+    @classmethod
+    def sorted_unique_paths(cls, value: tuple[ManagedPath, ...]) -> tuple[ManagedPath, ...]:
+        result = tuple(sorted(value, key=lambda item: item.path))
+        if len({item.path for item in result}) != len(result):
+            raise ValueError("managed_paths must have unique paths")
+        return result
+
     @field_validator("recorded_at")
     @classmethod
     def timezone_aware(cls, value: datetime) -> datetime:

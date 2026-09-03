@@ -51,7 +51,12 @@ class FakeSourceAdapter(SourceAdapter):
 
     def discover(self, intent: SourceIntent) -> tuple[SourceCandidate, ...]:
         self.discovery_calls.append(intent)
-        return self.discoveries.get(intent.id, ())
+        try:
+            return self.discoveries[intent.id]
+        except KeyError as error:
+            raise PermissionError(
+                "fake source adapter denies unconfigured discovery"
+            ) from error
 
     def fetch(
         self, candidate: SourceCandidate, *, prior: SourceCheckpoint | None
