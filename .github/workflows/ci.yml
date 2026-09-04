@@ -1,72 +1,115 @@
 name: CI
 
-on:
+"on":
   push:
   pull_request:
 
+# Pull-request code is always read-only. The separately protected GitHub App
+# write-back workflow verifies CI artifacts without exposing its token here.
 permissions:
   contents: read
 
 jobs:
-  windows-sqlite-boundaries:
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - uses: astral-sh/setup-uv@v5
-        with:
-          enable-cache: true
-
-      - name: Install development environment
-        run: uv sync --extra dev
-
-      # These tests fail closed if the native write-through/CAS adapter is absent;
-      # Windows must never fall back to non-atomic replacement or zero open flags.
-      - name: Windows SQLite atomicity and stable-read boundaries
-        run: >-
-          uv run pytest -q
-          tests/test_truth.py
-          tests/test_knowledge_projection.py
-          tests/test_local_connector.py
-
-  verify:
+  capability-security:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
-
       - name: Install development environment
         run: uv sync --extra dev
+      - name: Capability and security boundaries
+        run: >-
+          uv run pytest -q
+          tests/test_automatic_acquisition_contracts.py
+          tests/test_capabilities.py
+          tests/test_policy.py
+          tests/test_model_policy.py
+          tests/test_approvals.py
+          tests/test_budget.py
+          tests/test_ontology_trust.py
+          tests/test_credential_scanning.py
+          tests/test_secrets.py
 
-      - name: Lint
-        run: uv run ruff check .
+  acquisition-work:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Install development environment
+        run: uv sync --extra dev
+      - name: Acquisition and resumable work
+        run: >-
+          uv run pytest -q
+          tests/test_source_intent.py
+          tests/test_web_sources.py
+          tests/test_remote_acquisition.py
+          tests/test_discovery_acquisition.py
+          tests/test_source_work.py
+          tests/test_ontology_update.py
+          tests/test_ontology_build.py
+          tests/test_parsing.py
+          tests/test_source_library.py
 
-      - name: Skill lifecycle end to end
-        run: uv run pytest tests/test_skill_end_to_end.py -v
+  bootstrap-publishing:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Install development environment
+        run: uv sync --extra dev
+      - name: Bootstrap, publishing, and recovery
+        run: >-
+          uv run pytest -q
+          tests/test_repository_bootstrap.py
+          tests/test_bootstrap_state_adapters.py
+          tests/test_repository_publisher.py
+          tests/test_removal_recovery.py
+          tests/test_automatic_acquisition_cli.py
+          tests/test_repository_catalog_cli.py
+          tests/test_repository_subscription_end_to_end.py
+          tests/test_ontology_sync.py
+          tests/test_skill_cli.py
+          tests/test_promotion.py
+          tests/test_pr_skill_sync.py
+          tests/test_agent_skills.py
+          tests/test_skill_lifecycle.py
 
-      - name: Full test suite
-        run: uv run pytest -q
-
-      - name: Offline repository subscription integration
-        run: uv run pytest tests/test_repository_subscription_end_to_end.py -v
-
-      - name: Check formatting-only diff errors
-        run: git diff --check
-
+  maintained-demo-docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Install development environment
+        run: uv sync --extra dev
+      - name: Maintained examples and executable documentation
+        run: >-
+          uv run pytest -q
+          tests/test_repository_ontology_docs.py
+          tests/test_maintained_sample_catalog.py
+          tests/test_demo_ontology.py
+          tests/test_builtin_geas_skill.py
       - name: Build wheel
         run: uv build --wheel
-
       - name: Inspect packaged generic skill
         run: |
           uv run python - <<'PY'
@@ -86,8 +129,53 @@ jobs:
           missing = sorted(required - names)
           assert not missing, missing
           PY
-
       - name: Maintained offline demo
         run: |
           demo_root=$(mktemp -d /tmp/geas-ci-demo.XXXXXX)
           ./ontology/open-source-research-agents/demo.sh "$demo_root"
+
+  windows-sqlite-boundaries:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Install development environment
+        run: uv sync --extra dev
+      # Fail closed when the native write-through/CAS adapter is absent. Windows
+      # must not fall back to non-atomic replacement or zero open flags.
+      - name: Windows SQLite atomicity and stable-read boundaries
+        run: >-
+          uv run pytest -q
+          tests/test_truth.py
+          tests/test_knowledge_projection.py
+          tests/test_local_connector.py
+
+  full-suite:
+    needs:
+      - capability-security
+      - acquisition-work
+      - bootstrap-publishing
+      - maintained-demo-docs
+      - windows-sqlite-boundaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Install development environment
+        run: uv sync --extra dev
+      - name: Lint
+        run: uv run ruff check .
+      - name: Full test suite
+        run: uv run pytest -q
+      - name: Check formatting-only diff errors
+        run: git diff --check

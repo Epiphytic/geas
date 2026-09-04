@@ -16,20 +16,36 @@ import pytest
 import yaml
 
 import research_agent.cli as cli
-from research_agent.agent_skills import validate_snapshot
+from research_agent.agent_skills import install_builtin_geas_skill, validate_snapshot
+from research_agent.capabilities import (
+    Capability,
+    CapabilityGrant,
+    CapabilityRequest,
+    CapabilityResources,
+    CapabilitySubject,
+    DeterministicCapabilityEvaluator,
+    VerifiedDelegationManifest,
+)
 from research_agent.geas_update import GeasUpdateReceipt
 from research_agent.ontology_artifacts import (
     ArtifactRole,
     OntologyArtifact,
     OntologyArtifactManifest,
 )
+from research_agent.ontology_build import OntologyBuildConfig
 from research_agent.ontology_resolution import resolve_ontology_catalog, select_ontology
 from research_agent.ontology_subscriptions import (
     OntologyFreshnessConfig,
     OntologySubscription,
 )
 from research_agent.ontology_trust import TrustRule
-from research_agent.repository_catalog import verify_catalog
+from research_agent.repository_catalog import (
+    load_catalog,
+    load_delegation_manifest,
+    verify_catalog,
+)
+from research_agent.source_intent import DiscoveryKind
+from research_agent.truth import TruthPolicy
 from research_agent.user_config import GeasProfile, GeasUserConfig, UserConfigManager
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -66,6 +82,20 @@ REVISION_INSTANT = datetime(2026, 8, 29, 16, 30, tzinfo=UTC)
 AUDIT_INSTANT = datetime(2026, 8, 29, 17, 0, tzinfo=UTC)
 GEAS_OLD_COMMIT = "a" * 40
 GEAS_NEW_COMMIT = "b" * 40
+UPSTREAM_REPOSITORY = "https://github.com/assafelovic/gpt-researcher"
+AUTHORITY_REPOSITORY = "https://github.com/Epiphytic/geas"
+UPSTREAM_REF = "refs/heads/main"
+UPSTREAM_PATH = "README.md"
+SOURCE_INTENT_ID = "gpt-researcher-upstream"
+NEW_AUTHORITY_SCHEMAS = frozenset(
+    {
+        "src/research_agent/bootstrap_models.py",
+        "src/research_agent/capabilities.py",
+        "src/research_agent/publishing.py",
+        "src/research_agent/source_intent.py",
+        "src/research_agent/source_work.py",
+    }
+)
 
 
 def test_root_catalog_verifies_the_exact_maintained_sample_inventory() -> None:
@@ -105,40 +135,25 @@ def _git(repository: Path, *arguments: str) -> str:
 
 
 def _committed_sample_checkout(destination: Path) -> Path:
+    source_head = _git(REPOSITORY_ROOT, "rev-parse", "HEAD")
     subprocess.run(
         ("git", "clone", "--quiet", "--no-hardlinks", str(REPOSITORY_ROOT), str(destination)),
         text=True,
         capture_output=True,
         check=True,
     )
+    _git(destination, "checkout", "--detach", source_head)
     _git(destination, "checkout", "-B", "main")
     target = destination / "ontology" / ONTOLOGY_NAME
     shutil.rmtree(target)
     shutil.copytree(REPOSITORY_ROOT / "ontology" / ONTOLOGY_NAME, target)
     shutil.copyfile(CATALOG, destination / "geas.yaml")
+    delegation = REPOSITORY_ROOT / "geas-delegations.yaml"
+    if delegation.is_file():
+        shutil.copyfile(delegation, destination / delegation.name)
     shutil.copyfile(
         REPOSITORY_ROOT / "config" / "truth-policy.yaml",
         destination / "config" / "truth-policy.yaml",
-    )
-    shutil.copyfile(
-        REPOSITORY_ROOT / "src" / "research_agent" / "truth.py",
-        destination / "src" / "research_agent" / "truth.py",
-    )
-    shutil.copyfile(
-        REPOSITORY_ROOT / "src" / "research_agent" / "cli.py",
-        destination / "src" / "research_agent" / "cli.py",
-    )
-    shutil.copyfile(
-        REPOSITORY_ROOT / "src" / "research_agent" / "repository_catalog.py",
-        destination / "src" / "research_agent" / "repository_catalog.py",
-    )
-    shutil.copyfile(
-        REPOSITORY_ROOT / "src" / "research_agent" / "ontology_artifacts.py",
-        destination / "src" / "research_agent" / "ontology_artifacts.py",
-    )
-    shutil.copyfile(
-        REPOSITORY_ROOT / "src" / "research_agent" / "credential_scanning.py",
-        destination / "src" / "research_agent" / "credential_scanning.py",
     )
     shutil.copyfile(
         REPOSITORY_ROOT / "src" / "research_agent" / "default_config" / "truth-policy.yaml",
@@ -149,18 +164,260 @@ def _committed_sample_checkout(destination: Path) -> Path:
         destination,
         "add",
         "geas.yaml",
+        *(('geas-delegations.yaml',) if delegation.is_file() else ()),
         f"ontology/{ONTOLOGY_NAME}",
         "config/truth-policy.yaml",
-        "src/research_agent/truth.py",
-        "src/research_agent/cli.py",
-        "src/research_agent/repository_catalog.py",
-        "src/research_agent/ontology_artifacts.py",
-        "src/research_agent/credential_scanning.py",
         "src/research_agent/default_config/truth-policy.yaml",
     )
     if _git(destination, "status", "--porcelain"):
         _git(destination, "commit", "-m", "maintained sample fixture")
     return destination
+
+
+def _regular_tree(root: Path) -> tuple[tuple[str, bytes], ...]:
+    files: list[tuple[str, bytes]] = []
+    for candidate in sorted(root.rglob("*"), key=lambda item: item.as_posix().encode()):
+        if candidate.is_symlink():
+            raise AssertionError(f"generated skill contains a symlink: {candidate}")
+        if candidate.is_file():
+            files.append((candidate.relative_to(root).as_posix(), candidate.read_bytes()))
+    return tuple(files)
+
+
+def test_maintained_build_declares_one_optional_bounded_repository_source() -> None:
+    """The sample must exercise source intent without making network access implicit."""
+    config = OntologyBuildConfig.from_yaml(
+        REPOSITORY_ROOT / "ontology" / ONTOLOGY_NAME / "build.yaml"
+    )
+
+    assert len(config.source_intent) == 1
+    intent = config.source_intent[0]
+    assert intent.id == SOURCE_INTENT_ID
+    assert intent.role == "upstream_repository"
+    assert intent.discovery.kind is DiscoveryKind.GITHUB_REPOSITORY
+    assert intent.discovery.locator == UPSTREAM_REPOSITORY
+    assert intent.allowed_hosts == ("api.github.com", "github.com")
+    assert intent.allowed_path_prefixes == (
+        "/assafelovic/gpt-researcher",
+        "/repos/assafelovic/gpt-researcher",
+    )
+    assert intent.accepted_media_types == ("text/markdown",)
+    assert intent.document_patterns == ()
+    assert intent.refresh.interval_seconds == 604_800
+    assert intent.refresh.max_items == 1
+    assert intent.refresh.max_depth == 0
+    assert intent.required is False
+    assert intent.associations.concepts == ("concept:gpt-researcher",)
+    assert intent.associations.topics == ("open-source research agents",)
+    assert intent.temporal.field == "observed_at"
+    assert intent.temporal.retention == "append_only"
+    assert config.source_work.max_requests_per_run == 4
+    assert config.source_work.max_bytes_per_run == 1_048_576
+    assert config.source_work.max_depth == 0
+    assert config.source_work.refresh_interval_seconds == 604_800
+    assert config.source_work.max_run_seconds == 300
+    assert config.source_work.finalization_reserve_seconds == 30
+
+
+def test_root_catalog_pins_a_narrow_inert_one_hop_delegation() -> None:
+    """Catalog bytes may narrow local trust but cannot grant publication or model use."""
+    catalog = load_catalog(CATALOG)
+    assert catalog.delegations is not None
+    assert catalog.delegations.path.as_posix() == "geas-delegations.yaml"
+    manifest = load_delegation_manifest(CATALOG, catalog.delegations)
+
+    assert len(manifest.delegations) == 1
+    delegation = manifest.delegations[0]
+    assert delegation.subject.repository == UPSTREAM_REPOSITORY
+    assert delegation.subject.refs == (UPSTREAM_REF,)
+    assert delegation.subject.paths == (UPSTREAM_PATH,)
+    assert delegation.subject.bundle_sha256 == "*"
+    assert delegation.capabilities == (
+        Capability.REPOSITORY_READ,
+        Capability.SOURCE_ARCHIVE,
+        Capability.SOURCE_DISCOVER,
+        Capability.SOURCE_EXTRACT,
+        Capability.SOURCE_FETCH,
+    )
+    assert delegation.delegable_capabilities == ()
+    assert delegation.max_delegation_depth == 0
+    assert delegation.expires_at is None
+    assert delegation.resources.delegated_repositories == ()
+    assert delegation.resources.hosts == ("api.github.com", "github.com")
+    assert delegation.resources.path_prefixes == (
+        "/assafelovic/gpt-researcher",
+        "/repos/assafelovic/gpt-researcher",
+    )
+    assert delegation.resources.connectors == ("source:github-repository",)
+    assert delegation.resources.git_refs == (UPSTREAM_REF,)
+    assert delegation.resources.providers == ()
+    assert delegation.resources.models == ()
+    assert delegation.resources.data_classes == ()
+    forbidden = {
+        Capability.GIT_PULL_REQUEST,
+        Capability.GIT_AUTO_MERGE,
+        Capability.GIT_DIRECT_PUSH,
+        Capability.KNOWLEDGE_AUTO_PROMOTE,
+        Capability.MODEL_EXTERNAL,
+        Capability.TRUST_DELEGATE,
+    }
+    assert forbidden.isdisjoint(delegation.capabilities)
+
+
+def test_delegation_requires_a_local_grant_and_only_authorizes_exact_source_reads() -> None:
+    """Checked-in delegation bytes narrow authority; they never create it."""
+    catalog = load_catalog(CATALOG)
+    assert catalog.delegations is not None
+    manifest = load_delegation_manifest(CATALOG, catalog.delegations)
+    verified_manifest = VerifiedDelegationManifest(
+        repository=AUTHORITY_REPOSITORY,
+        manifest=manifest,
+        manifest_sha256=catalog.delegations.sha256,
+        catalog_commit="a" * 40,
+    )
+    request = CapabilityRequest(
+        authority_repository=AUTHORITY_REPOSITORY,
+        target_repository=UPSTREAM_REPOSITORY,
+        capabilities=(
+            Capability.REPOSITORY_READ,
+            Capability.SOURCE_ARCHIVE,
+            Capability.SOURCE_DISCOVER,
+            Capability.SOURCE_EXTRACT,
+            Capability.SOURCE_FETCH,
+        ),
+        ref=UPSTREAM_REF,
+        path=UPSTREAM_PATH,
+        connector="source:github-repository",
+        host="api.github.com",
+        target="https://api.github.com/repos/assafelovic/gpt-researcher",
+        requested_at=AUDIT_INSTANT,
+    )
+    manifests = {AUTHORITY_REPOSITORY: verified_manifest}
+
+    ungranted = DeterministicCapabilityEvaluator(
+        (), manifests, clock=lambda: AUDIT_INSTANT
+    ).evaluate(request)
+    assert ungranted.decision == "deny"
+    assert ungranted.grant_ids == ()
+
+    grant = CapabilityGrant(
+        decision="allow",
+        subject=CapabilitySubject(
+            repository=AUTHORITY_REPOSITORY,
+            refs=(UPSTREAM_REF,),
+            paths=(UPSTREAM_PATH,),
+            bundle_sha256="*",
+        ),
+        capabilities=(Capability.TRUST_DELEGATE, *request.capabilities),
+        delegable_capabilities=request.capabilities,
+        resources=CapabilityResources(
+            delegated_repositories=(UPSTREAM_REPOSITORY,),
+            hosts=("api.github.com", "github.com"),
+            path_prefixes=(
+                "/assafelovic/gpt-researcher",
+                "/repos/assafelovic/gpt-researcher",
+            ),
+            connectors=("source:github-repository",),
+            git_refs=(UPSTREAM_REF,),
+        ),
+        max_delegation_depth=1,
+        expires_at=None,
+        created_at=AUDIT_INSTANT,
+        created_via="manual",
+    )
+    evaluator = DeterministicCapabilityEvaluator(
+        (grant,), manifests, clock=lambda: AUDIT_INSTANT
+    )
+    allowed = evaluator.evaluate(request)
+    assert allowed.decision == "allow"
+    assert allowed.effective_capabilities == request.capabilities
+    assert allowed.delegation_chain == (AUTHORITY_REPOSITORY, UPSTREAM_REPOSITORY)
+    assert allowed.manifest_sha256s == (catalog.delegations.sha256,)
+
+    outside_api_path = request.model_copy(
+        update={"target": "https://api.github.com/repos/assafelovic/other"}
+    )
+    assert evaluator.evaluate(outside_api_path).decision == "deny"
+
+    forbidden_requests = (
+        CapabilityRequest(
+            authority_repository=AUTHORITY_REPOSITORY,
+            target_repository=UPSTREAM_REPOSITORY,
+            capabilities=(capability,),
+            ref=UPSTREAM_REF,
+            path=UPSTREAM_PATH,
+            provider="provider:test" if capability is Capability.MODEL_EXTERNAL else None,
+            model="model:test" if capability is Capability.MODEL_EXTERNAL else None,
+            data_class="public" if capability is Capability.MODEL_EXTERNAL else None,
+            requested_at=AUDIT_INSTANT,
+        )
+        for capability in (
+            Capability.GIT_PULL_REQUEST,
+            Capability.GIT_AUTO_MERGE,
+            Capability.GIT_DIRECT_PUSH,
+            Capability.KNOWLEDGE_AUTO_PROMOTE,
+            Capability.MODEL_EXTERNAL,
+        )
+    )
+    assert all(
+        evaluator.evaluate(forbidden).decision == "deny"
+        for forbidden in forbidden_requests
+    )
+
+
+def test_truth_policy_tracks_the_new_checked_in_authority_contracts() -> None:
+    """Source/delegation authority must participate in canonical drift detection."""
+    configured = REPOSITORY_ROOT / "config" / "truth-policy.yaml"
+    packaged = (
+        REPOSITORY_ROOT
+        / "src"
+        / "research_agent"
+        / "default_config"
+        / "truth-policy.yaml"
+    )
+    assert configured.read_bytes() == packaged.read_bytes()
+    policy = TruthPolicy.from_yaml(configured)
+    assert "geas-delegations.yaml" in policy.ontology_globs
+    assert NEW_AUTHORITY_SCHEMAS.issubset(policy.record_schema_paths)
+
+
+def test_tracked_generic_skill_is_the_packaged_generated_snapshot(tmp_path: Path) -> None:
+    """The checked-in generic skill must be regenerated, never hand-maintained."""
+    home = tmp_path / "home"
+    home.mkdir()
+    receipt = install_builtin_geas_skill(
+        config_root=tmp_path / "config",
+        home=home,
+        which=lambda _name: None,
+    )
+
+    assert receipt.conflicts == ()
+    assert len(receipt.installed) == 1
+    assert _regular_tree(receipt.installed[0]) == _regular_tree(
+        REPOSITORY_ROOT / ".agents" / "skills" / "geas"
+    )
+
+
+def test_tracked_ontology_skill_is_bound_to_the_current_catalog_and_artifact() -> None:
+    """A stale portable snapshot must not advertise superseded sample identities."""
+    snapshot = validate_snapshot(
+        REPOSITORY_ROOT / ".agents" / "skills" / ONTOLOGY_NAME
+    )
+    catalog = verify_catalog(CATALOG)[0]
+    artifact = OntologyArtifactManifest.from_yaml(
+        REPOSITORY_ROOT / "ontology" / ONTOLOGY_NAME / "artifacts.yaml"
+    ).artifacts[0]
+
+    assert snapshot.format_version == 2
+    assert snapshot.ontology.name == ONTOLOGY_NAME
+    assert snapshot.ontology.repository_url == "https://github.com/Epiphytic/geas.git"
+    assert snapshot.ontology.active_ref == "refs/heads/main"
+    assert snapshot.ontology.catalog_path == "geas.yaml"
+    assert snapshot.ontology.ontology_path == f"ontology/{ONTOLOGY_NAME}"
+    assert snapshot.ontology.bundle_sha256 == catalog.bundle_sha256
+    assert snapshot.artifact is not None
+    assert snapshot.artifact.content_sha256 == artifact.content_sha256
+    assert snapshot.artifact.input_revision == artifact.input_revision
 
 
 def test_named_subscription_selects_the_development_bundle_digest(tmp_path: Path) -> None:

@@ -37,6 +37,48 @@ repository_sync:
   check_before_use: null
   max_age_seconds: null
   hydrate_artifacts_before_use: null
+source_work:
+  max_requests_per_run: 4
+  max_bytes_per_run: 1048576
+  max_depth: 0
+  refresh_interval_seconds: 604800
+  max_run_seconds: 300
+  finalization_reserve_seconds: 30
+source_intent:
+  - version: 1
+    id: gpt-researcher-upstream
+    role: upstream_repository
+    discovery:
+      version: 1
+      kind: github_repository
+      locator: https://github.com/assafelovic/gpt-researcher
+    allowed_hosts:
+      - api.github.com
+      - github.com
+    allowed_path_prefixes:
+      - /assafelovic/gpt-researcher
+      - /repos/assafelovic/gpt-researcher
+    accepted_media_types:
+      - text/markdown
+    document_patterns: []
+    refresh:
+      version: 1
+      interval_seconds: 604800
+      max_items: 1
+      max_depth: 0
+    required: false
+    priority: 10
+    associations:
+      version: 1
+      concepts:
+        - concept:gpt-researcher
+      topics:
+        - open-source research agents
+    temporal:
+      version: 1
+      field: observed_at
+      retention: append_only
+    created_at: 2026-08-29T16:30:00Z
 discovery_enabled: true
 queries:
   - open source deep research agent GitHub

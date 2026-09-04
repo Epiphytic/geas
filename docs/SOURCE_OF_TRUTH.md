@@ -20,6 +20,20 @@ The system has one-way authority:
 Later layers cannot silently modify earlier layers. In particular, SQLite is
 never reconciled back into ontology files or immutable records.
 
+Checked-in source intent declares desired coverage, refresh cadence, and
+bounded acquisition work. It is data, not authority. Current locally trusted
+capability decisions, connector policy, storage rights, threat policy, model
+policy, and budgets must authorize each side effect. Repository content and
+retrieved sources cannot grant, widen, or replace those decisions.
+
+Discovery observations, request receipts, access constraints, source-work
+checkpoints, source versions, and parsed derivations are immutable operational
+history. A completed phase may be resumed only through its exact predecessor
+chain and source identity. Fetched bytes remain untrusted even after their hash
+and provenance are recorded. Extraction over eligible, untainted anchors is
+proposal-only; neither the source nor the model can select policy, write
+canonical knowledge, or publish a branch.
+
 An ontology Git repository may contain an `artifacts.yaml` manifest pointing
 to content-addressed private release assets. This is a distribution and cache
 mechanism only. The manifest records input revisions, hashes, sizes, and an
@@ -46,6 +60,11 @@ verification. GitHub pull requests, GitLab merge requests, Radicle patches,
 reviews, and repository automation are transport and governance layers; their
 API state is not read as ontology truth. See
 [`PROMOTIONS.md`](PROMOTIONS.md).
+
+A repository update receipt can prove which deterministic files were created,
+which capability decisions authorized publication, and how to resume or remove
+owned outputs. It cannot prove a claim true. Likewise, a successful pull
+request or GitHub App merge does not promote model proposals by itself.
 
 ### Operational ledger exception
 

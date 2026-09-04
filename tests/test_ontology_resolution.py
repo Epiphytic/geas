@@ -9,6 +9,12 @@ from pathlib import Path
 import pytest
 import yaml
 
+from research_agent.capabilities import (
+    Capability,
+    CapabilityGrant,
+    CapabilityResources,
+    CapabilitySubject,
+)
 from research_agent.ontology_resolution import (
     resolve_ontology_catalog,
     select_ontology,
@@ -146,6 +152,93 @@ def test_untrusted_repository_candidate_is_inert_until_operational_selection(
     assert catalog.candidates[0].trust_status == "untrusted"
     with pytest.raises(ValueError, match="not trusted"):
         select_ontology("untrusted", catalog=catalog)
+
+
+def test_version_two_repository_read_grant_marks_candidate_trusted(tmp_path: Path) -> None:
+    repository = _repository(tmp_path / "repository", "trusted")
+    identity = "https://github.com/example/root"
+    _git(repository, "remote", "add", "origin", identity)
+    manager = UserConfigManager(tmp_path / "config" / "config.yaml")
+    manager.root.mkdir(parents=True, exist_ok=True)
+    profile = GeasProfile(
+        ontology_git=None,
+        capability_grants=(
+            CapabilityGrant(
+                decision="allow",
+                subject=CapabilitySubject(
+                    repository=identity,
+                    refs="*",
+                    paths="*",
+                    bundle_sha256="*",
+                ),
+                capabilities=(Capability.REPOSITORY_READ,),
+                delegable_capabilities=(),
+                resources=CapabilityResources(),
+                max_delegation_depth=0,
+                expires_at=None,
+                created_at=datetime(2026, 9, 2, tzinfo=UTC),
+                created_via="manual",
+            ),
+        ),
+    )
+    manager.replace(
+        GeasUserConfig(version=2, profiles={"default": profile}),
+        upgrade_version=True,
+    )
+
+    catalog = resolve_ontology_catalog(
+        user_config=manager.load(),
+        manager=manager,
+        cwd=repository,
+        yolo=False,
+        prompt=None,
+    )
+
+    assert catalog.candidates[0].trust_status == "trusted"
+    assert catalog.candidates[0].authorization == "rule"
+
+
+@pytest.mark.parametrize("remote", (None, "git@example.invalid:Owner/Example.git"))
+def test_upgraded_v1_machine_local_and_ssh_rules_remain_usable_when_listing(
+    tmp_path: Path,
+    remote: str | None,
+) -> None:
+    repository = _repository(tmp_path / "repository", "trusted")
+    if remote is None:
+        identity = str(repository)
+    else:
+        _git(repository, "remote", "add", "origin", remote)
+        identity = "ssh://git@example.invalid/~/Owner/Example"
+    manager = _manager(
+        tmp_path,
+        GeasProfile(
+            ontology_git=None,
+            trust_rules=(
+                TrustRule(
+                    decision="allow",
+                    repository=identity,
+                    refs="*",
+                    paths="*",
+                    bundle_sha256="*",
+                    created_at=datetime(2026, 9, 2, tzinfo=UTC),
+                    created_via="manual",
+                ),
+            ),
+        ),
+    )
+    manager.replace(manager.load(), upgrade_version=True)
+
+    catalog = resolve_ontology_catalog(
+        user_config=manager.load(),
+        manager=manager,
+        cwd=repository,
+        yolo=False,
+        prompt=None,
+    )
+
+    assert catalog.candidates[0].repository_identity == identity
+    assert catalog.candidates[0].trust_status == "trusted"
+    assert catalog.candidates[0].authorization == "rule"
 
 
 def test_yolo_authorizes_repository_candidate_without_persisting_configuration(

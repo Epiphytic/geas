@@ -2,18 +2,16 @@
 # Verify hashes and embedded SQLite projection stamps before use.
 version: 1
 ontology: open-source-research-agents
-published_at: '2026-09-02T03:06:39.673057Z'
-published_by: operator:epiphytic-maintainer
+published_at: '2026-09-04T04:00:00Z'
+published_by: operator:demo
 artifacts:
 - role: knowledge-projection
   format: sqlite
-  input_revision: e40a571c8a528ab030b2f073db245c5d44faa9e558dccf99f0130a1e863ea6cc
-  content_sha256: cd4c300c0d381edf877fdc76d4ee580a22fe0cd7078dde03ef67fcf35607cfbf
+  input_revision: 2e2155b226996cdf85749e8dc9e5c57bbf32be01d868ddd89323621b39eac3ef
+  content_sha256: 1e74d446d10122ad33e9b1661c990ee3abc4c1db048e75b48902c6ef82999369
   size_bytes: 1495040
-  asset_name: geas-knowledge-projection-cd4c300c0d381edf877fdc76d4ee580a22fe0cd7078dde03ef67fcf35607cfbf.sqlite
-  release_tag: geas-artifact-cd4c300c0d381edf877fdc76d4ee580a22fe0cd7078dde03ef67fcf35607cfbf
+  asset_name: geas-knowledge-projection-1e74d446d10122ad33e9b1661c990ee3abc4c1db048e75b48902c6ef82999369.sqlite
+  release_tag: geas-artifact-1e74d446d10122ad33e9b1661c990ee3abc4c1db048e75b48902c6ef82999369
   contains_source_text: true
-  storage_rights_basis: Rebuildable accepted-knowledge projection containing attributed
-    project-authored source-card excerpts and exact license-recorded official-repository
-    extracts; documented public placeholder assignments are deterministically classified
-    as non-secret, and no private source material is included.
+  storage_rights_basis: Offline deterministic demo projection over accepted project-authored
+    source cards and accepted, license-recorded official-repository source extracts.

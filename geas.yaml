@@ -5,11 +5,11 @@ ontologies:
   path: ontology/open-source-research-agents
   files:
   - path: artifacts.yaml
-    sha256: c54d45e176d9f1584378381a91ab37784edbb8fa476fc751c3e8f637a610c2e1
-    size_bytes: 1061
+    sha256: 50c691c169260d72221c8c31d9f5bf78aca5123d236e2e4921ce6ce11364d8b4
+    size_bytes: 887
   - path: build.yaml
-    sha256: f108b4a0feba3a2bb159c4f9062b315de16f68b5085c8664daf12105da1cf975
-    size_bytes: 2214
+    sha256: 422e431d1826472e306a704cccd4968d21e26531b3eceea2fc4a0c266e4d0a45
+    size_bytes: 3239
   - path: bundle.yaml
     sha256: 991ecc2b240d5e0ac0a0d963730f3eb4c94f58967f787ec68243c14154451164
     size_bytes: 35995
@@ -64,4 +64,8 @@ ontologies:
   - path: tainted-sources.yaml
     sha256: 7d7d8323d5c44df54be7d2797ec542143989f55c40ea10aaa6dca0410349778a
     size_bytes: 1116
-  bundle_sha256: 3739d505c6abe8106d71db358c146cba81616beac4a8a5829b1849516af36eab
+  bundle_sha256: 4cbab6a3e1f4cdd8a69c2540d8e1e4cdb655708d6355f470e8295fc7a7dbecaa
+delegations:
+  path: geas-delegations.yaml
+  sha256: 0dea88b4db2737192b03b417cb1064f69caa5395b2b9c4cba4ea2fd1a940bbe1
+  size_bytes: 1027

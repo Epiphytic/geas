@@ -38,6 +38,23 @@ trust flow, synchronization, and removal lifecycle are documented in
 `--yolo` is a one-invocation override only; it never persists trust or relaxes
 catalog hashes and path confinement.
 
+For the integrated, receipt-backed lifecycle, install a verified repository as
+full source trust or read-only trust:
+
+```bash
+geas repository-install network https://github.com/example/network.git \
+  --ref refs/heads/main \
+  --trust-repository \
+  --link
+geas ontology-update network
+```
+
+`--trust-repository` records only snapshot-bounded repository read/delegation
+and declared source scopes; the default permits one delegation edge. Use
+`--read-only` for repository reads without source/delegation authority, or an
+explicit `--delegate-depth N` only when the operator approves a different
+maximum. Repository content cannot grant any of these local capabilities.
+
 Once an accepted ontology has a verified portable projection artifact, give an
 agent an optional deterministic snapshot without bundling the full acquired
 source library:
@@ -71,6 +88,51 @@ selection, output paths, and library selectors. Hand-edited build files may
 omit globally eligible fields; they then inherit `ontology_defaults` from the
 selected Geas `config.yaml`. Explicit ontology values always win. Existing
 files fail closed unless `--force` is supplied.
+
+Declare standing source work in the catalog-pinned `build.yaml`. Source intent
+is strict, sorted, and non-authoritative; trusted local grants must independently
+allow every connector, host, path, fetch, archive, and extraction effect:
+
+<!-- SOURCE_INTENT_REFERENCE_START -->
+```yaml
+source_intent:
+  - id: issuer-news
+    role: issuer_news
+    discovery:
+      kind: rss_atom
+      locator: https://issuer.example/news/feed.xml
+    allowed_hosts:
+      - issuer.example
+    allowed_path_prefixes:
+      - /news/
+    accepted_media_types:
+      - application/pdf
+      - text/html
+    document_patterns:
+      - /news/*.pdf
+    refresh:
+      interval_seconds: 900
+      max_items: 40
+      max_depth: 1
+    required: true
+    priority: 10
+    associations:
+      concepts:
+        - concept:issuer
+      topics:
+        - Issuer updates
+    temporal:
+      field: published_at
+      retention: append_only
+    created_at: 2026-09-02T00:00:00Z
+```
+<!-- SOURCE_INTENT_REFERENCE_END -->
+
+`geas ontology-update network` processes due intents in priority/UTF-8 order,
+resumes immutable checkpoints, emits progress on stderr and a canonical JSON
+receipt on stdout, and exits non-zero when required work remains incomplete.
+The receipt's `recovery_command` is the exact safe rerun; completed compatible
+phases are verified and reused rather than guessed.
 
 Validate the complete configuration without making network or model calls:
 
@@ -263,3 +325,10 @@ The provider separately declares `context_window_tokens`. For DwarfStar,
 `reasoning_effort: max` requires 384 Ki (393,216 tokens), not decimal 384,000;
 configuration validation fails rather than allowing its silent downgrade to
 high.
+
+Automatic browser acquisition and Common Crawl remain future behavior. A
+browser export can instead be deposited explicitly under the existing deposit
+policy. Publication keeps a pull request as the default; `--direct-push` is a
+separate explicit, capability-gated request. GitHub App artifact auto-merge is
+optional operator infrastructure, and automated forge approval policy is
+operator-managed rather than a Geas authorization source.

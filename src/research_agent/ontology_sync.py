@@ -5,7 +5,7 @@ import json
 import os
 import re
 import subprocess
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -14,7 +14,9 @@ from uuid import uuid4
 
 from pydantic import Field
 
+from research_agent.capabilities import Capability, CapabilityDecision
 from research_agent.credential_scanning import contains_possible_credential
+from research_agent.git_environment import confined_git_environment
 from research_agent.models import StrictModel, utc_now
 from research_agent.ontology_subscriptions import OntologySubscription
 from research_agent.user_config import OntologyGitConfig
@@ -259,7 +261,13 @@ class OntologyRepositoryManager:
         relative_paths: tuple[Path, ...] = (),
         message: str = "geas: update ontologies",
         freshness_state_path: Path | None = None,
+        capability_decisions: Sequence[CapabilityDecision] | None = None,
     ) -> dict[str, object]:
+        targets = (Path(".gitignore"), *relative_paths)
+        for target in targets:
+            if target.is_absolute() or ".." in target.parts:
+                raise OntologySyncError("ontology push path must remain checkout-relative")
+        self._authorize_legacy_push(targets, capability_decisions)
         if not self._is_branch_ref():
             raise OntologySyncError(
                 "tag and commit ontology refs are read-only; push requires a branch"
@@ -268,10 +276,6 @@ class OntologyRepositoryManager:
         self._assert_remote()
         self._set_unborn_branch()
         self.ensure_gitignore()
-        targets = (Path(".gitignore"), *relative_paths)
-        for target in targets:
-            if target.is_absolute() or ".." in target.parts:
-                raise OntologySyncError("ontology push path must remain checkout-relative")
         self._run(("git", "add", "-A", "--", *(item.as_posix() for item in targets)))
         all_staged = tuple(
             Path(line)
@@ -313,6 +317,42 @@ class OntologyRepositoryManager:
             "staged_paths": tuple(path.as_posix() for path in all_staged),
         }
 
+    def _authorize_legacy_push(
+        self,
+        targets: tuple[Path, ...],
+        decisions: Sequence[CapabilityDecision] | None,
+    ) -> None:
+        """Require an already evaluated exact local decision for each staged path."""
+        if decisions is None:
+            raise OntologySyncError(
+                "legacy ontology push requires an injected exact capability decision; "
+                "use GitRepositoryPublisher"
+            )
+        by_path = {decision.request.path: decision for decision in decisions}
+        expected = {path.as_posix() for path in targets}
+        if len(by_path) != len(tuple(decisions)) or set(by_path) != expected:
+            raise OntologySyncError(
+                "legacy ontology push capability decisions do not cover exact paths"
+            )
+        active_ref = self._active_ref()
+        for path in sorted(expected):
+            decision = by_path[path]
+            request = decision.request
+            if (
+                decision.decision != "allow"
+                or request.capabilities != (Capability.GIT_DIRECT_PUSH,)
+                or decision.effective_capabilities != (Capability.GIT_DIRECT_PUSH,)
+                or request.authority_repository != self.config.url
+                or request.target_repository != self.config.url
+                or request.ref != active_ref
+                or request.path != path
+                or not request.dirty
+                or decision.delegation_chain
+            ):
+                raise OntologySyncError(
+                    "legacy ontology push lacks exact root-local direct-push authority"
+                )
+
     def assert_removable(self) -> None:
         """Validate exact identity and clean synchronized state before removal."""
         if not (self.checkout / ".git").is_dir():
@@ -325,6 +365,75 @@ class OntologyRepositoryManager:
             raise OntologySyncError(
                 "ontology checkout has local changes; preserve it or restore them before removal"
             )
+        head = self._head()
+        synchronized = self._remote_head()
+        if head is None or synchronized is None or head != synchronized:
+            raise OntologySyncError(
+                "ontology checkout does not match its exact last synchronized commit"
+            )
+
+    def assert_replaceable(self, owned_dirty_paths: Mapping[str, str]) -> None:
+        """Allow replacement only when every local change is an exact owned leaf."""
+        if not (self.checkout / ".git").is_dir():
+            raise OntologySyncError("subscription checkout is not a Git repository")
+        self._assert_checkout_root()
+        self._assert_remote(create_missing=False)
+        self._assert_active_checkout()
+        normalized: dict[str, str] = {}
+        for raw, digest in owned_dirty_paths.items():
+            relative = Path(raw)
+            if (
+                not raw
+                or relative.is_absolute()
+                or "\\" in raw
+                or any(part in {"", ".", ".."} for part in relative.parts)
+                or relative.as_posix() != raw
+                or relative.parts[0] == ".git"
+                or not re.fullmatch(r"[0-9a-f]{64}", digest)
+            ):
+                raise OntologySyncError("owned generated path selector is invalid")
+            candidate = (self.checkout / relative).resolve(strict=False)
+            if candidate != self.checkout and self.checkout not in candidate.parents:
+                raise OntologySyncError("owned generated path escapes the checkout")
+            normalized[raw] = digest
+
+        raw_status = self._run(
+            ("git", "status", "--porcelain=v1", "-z", "--untracked-files=all")
+        ).stdout
+        changed: set[str] = set()
+        entries = iter(item for item in raw_status.split("\x00") if item)
+        for entry in entries:
+            if len(entry) < 4 or entry[2] != " ":
+                raise OntologySyncError("ontology checkout status is malformed")
+            status = entry[:2]
+            if "R" in status or "C" in status:
+                raise OntologySyncError("ontology checkout has unowned local changes")
+            path = entry[3:]
+            if path == ".gitignore":
+                ignore = self.checkout / path
+                if (
+                    status == "??"
+                    and not ignore.is_symlink()
+                    and ignore.is_file()
+                    and ignore.read_text() == DEFAULT_ONTOLOGY_GITIGNORE
+                ):
+                    continue
+            changed.add(path)
+        unexpected = changed.difference(normalized)
+        if unexpected:
+            raise OntologySyncError("ontology checkout has unowned local changes")
+
+        for relative, expected in normalized.items():
+            candidate = self.checkout / relative
+            if candidate.is_symlink():
+                actual = hashlib.sha256(os.readlink(candidate).encode()).hexdigest()
+            elif candidate.is_file():
+                actual = hashlib.sha256(candidate.read_bytes()).hexdigest()
+            else:
+                raise OntologySyncError("owned generated path is missing or unsafe")
+            if actual != expected:
+                raise OntologySyncError("owned generated path changed")
+
         head = self._head()
         synchronized = self._remote_head()
         if head is None or synchronized is None or head != synchronized:
@@ -629,14 +738,7 @@ class OntologyRepositoryManager:
 
     @staticmethod
     def _git_environment() -> dict[str, str]:
-        return {
-            **os.environ,
-            "GIT_TERMINAL_PROMPT": "0",
-            "GIT_NO_REPLACE_OBJECTS": "1",
-            "GIT_CONFIG_COUNT": "1",
-            "GIT_CONFIG_KEY_0": "core.hooksPath",
-            "GIT_CONFIG_VALUE_0": os.devnull,
-        }
+        return confined_git_environment()
 
 
 def _normalized_url(value: str) -> str:

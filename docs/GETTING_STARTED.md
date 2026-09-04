@@ -254,15 +254,18 @@ merge; models never acquire merge authority from source text or model output.
 Rerun the build after promotion to apply canonical manifests and rebuild the
 accepted SQLite and Markdown projections.
 
-Synchronize shared configuration explicitly when needed:
+Refresh shared configuration explicitly when needed:
 
 ```bash
 uv run geas ontology-sync --pull
-uv run geas ontology-sync --push --message "geas: update example ontology"
 ```
 
-Profile settings can enable pull-before-update and push-on-update for
-`ontology-init`. Generated proposals never gain automatic promotion authority.
+The legacy `--push` is ignored by this read-only synchronization command, and
+the legacy `push_on_update` is ignored by `ontology-init`; neither is
+publication authority. Use `repository-update`, whose default is a pull
+request. Direct publication additionally requires `--direct-push` and the
+matching trusted root-local capability. Generated proposals never gain
+automatic promotion authority.
 Named ontology commands perform a freshness check by default and cache a
 successful remote check for one hour. This avoids a Git fetch on every command.
 Global and per-ontology overrides, plus conditional SQLite/generated-content

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -14,6 +15,8 @@ from research_agent.library import (
 )
 from research_agent.parsing import ParsedDocumentManager
 from research_agent.store import ImmutableStore
+
+INSTANT = datetime(2026, 9, 3, 12, tzinfo=UTC)
 
 
 def _parsed_store(tmp_path: Path) -> tuple[ImmutableStore, str]:
@@ -146,3 +149,23 @@ def test_documented_source_library_cli_is_executable(tmp_path: Path) -> None:
 
     assert json.loads(build.stdout)["source_count"] == 1
     assert json.loads(query.stdout)["fragments"]
+
+
+def test_library_snapshot_identity_uses_injected_clock(tmp_path: Path) -> None:
+    store, source_id = _parsed_store(tmp_path)
+    manifest = SourceLibraryManifest(
+        version=1,
+        id="library:clocked",
+        title="Clocked library",
+        source_version_ids=(source_id,),
+    )
+
+    first = SourceLibraryBuilder(store=store, clock=lambda: INSTANT).build(
+        manifest, tmp_path / "one.sqlite"
+    )
+    second = SourceLibraryBuilder(store=store, clock=lambda: INSTANT).build(
+        manifest, tmp_path / "two.sqlite"
+    )
+
+    assert first.snapshot == second.snapshot
+    assert first.snapshot.created_at == INSTANT

@@ -3,7 +3,7 @@
 - Record ID: `concept:alibaba-nlp:deepresearch:tongyi-deepresearch`
 - Broader concepts: [concept:open-source-research-agents](open-source-research-agents--329e140278.md)
 - Narrower concepts: none
-- Synonyms: Tongyi-DeepResearch-30B-A3B
+- Synonyms: \["Tongyi-DeepResearch-30B-A3B"\]
 
 ## Untrusted concept description
 

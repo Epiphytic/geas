@@ -1,0 +1,26 @@
+version: 1
+ontologies:
+  - name: aurora-gold
+    description: Offline Canadian gold-miner automatic-acquisition acceptance fixture.
+    path: ontology
+    files:
+      - path: build.yaml
+        sha256: 23b81e179ca7903aa91cc4f0cab5d36959f13832356dd5a5cd8629fc24b4bd98
+        size_bytes: 3123
+      - path: bundle.yaml
+        sha256: d126cde9ef80180f7d5474df3d6aece8c414128fb2f4889fb3bb36d242eec156
+        size_bytes: 1007
+      - path: geas-delegations.yaml
+        sha256: 7dfc77b3ae9744cfb39fcbca33ca6ba578d02c0aa76e7663db4a29ae7bc644a5
+        size_bytes: 840
+      - path: library.yaml
+        sha256: 57faad17d30a8f7b95a816ac1e26f04e8d04e131a9c99832a0ba1dfadbc0156e
+        size_bytes: 262
+      - path: seed.md
+        sha256: 6dddecc75a338b2ad367b111f4b2a021da40f83a0314d1011463fc69d239dac5
+        size_bytes: 107
+    bundle_sha256: 7e778112e6b36b284c3de267a02e71908cc1c50fb0d2f287493cfd789f1385f7
+delegations:
+  path: geas-delegations.yaml
+  sha256: 7dfc77b3ae9744cfb39fcbca33ca6ba578d02c0aa76e7663db4a29ae7bc644a5
+  size_bytes: 840

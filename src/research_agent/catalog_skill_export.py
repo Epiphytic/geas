@@ -9,6 +9,7 @@ from pathlib import Path
 from research_agent.agent_skills import (
     OntologyIdentity,
     PortableArtifactIdentity,
+    SkillManifest,
     bind_catalog_skill_provenance,
 )
 from research_agent.ontology_artifacts import (
@@ -134,16 +135,21 @@ def export_catalog_skill(
         ontology_name=selection.name,
         repository_url=ontology.repository_url,
         branch=ontology.branch,
+        active_ref=ontology.active_ref,
         ontology_commit=ontology.commit,
         geas_version=geas_version,
         geas_commit=geas_commit,
     )
+    files = bind_catalog_skill_provenance(
+        rendered,
+        ontology=ontology,
+        artifact=identity,
+    )
+    manifest = SkillManifest.model_validate_json(files[Path("geas-skill.json")])
+    if manifest.format_version != 2:
+        raise ValueError("catalog skill export did not produce a bootstrap-aware manifest")
     return CatalogSkillExport(
-        files=bind_catalog_skill_provenance(
-            rendered,
-            ontology=ontology,
-            artifact=identity,
-        ),
+        files=files,
         artifact=hydration,
         topic_concept_id=topic_concept_id,
     )

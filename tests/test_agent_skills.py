@@ -4,6 +4,7 @@ import hashlib
 import json
 import posixpath
 import re
+import shlex
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,7 @@ from pydantic import ValidationError
 from research_agent.agent_skills import (
     GeasIdentity,
     OntologyIdentity,
+    PortableArtifactIdentity,
     ProjectionIdentity,
     SkillFile,
     SkillIdentity,
@@ -61,6 +63,38 @@ def test_manifest_round_trip_is_canonical_and_has_one_trailing_newline() -> None
     decoded = json.loads(encoded)
     assert list(decoded) == sorted(decoded)
     assert SkillManifest.model_validate(decoded) == manifest
+
+
+def test_bootstrap_aware_catalog_manifest_uses_format_two() -> None:
+    """Catches a format-two marker detached from complete catalog provenance."""
+    bare = _manifest().model_copy(update={"format_version": 2})
+    catalog = _manifest().model_copy(
+        update={
+            "format_version": 1,
+            "ontology": OntologyIdentity(
+                name="test-ontology",
+                repository_url="https://example.test/ontology.git",
+                branch="main",
+                commit=COMMIT,
+                active_ref="refs/heads/main",
+                ontology_commit=COMMIT,
+                subscription_name="example",
+                catalog_path="geas.yaml",
+                ontology_path="ontology/example",
+                bundle_sha256=SHA256,
+            ),
+            "artifact": PortableArtifactIdentity(
+                role="knowledge-projection",
+                content_sha256=SHA256,
+                input_revision=SHA256,
+            ),
+        }
+    )
+
+    with pytest.raises(ValidationError, match="format 2"):
+        SkillManifest.model_validate_json(canonical_manifest_bytes(bare))
+    with pytest.raises(ValidationError, match="format 2"):
+        SkillManifest.model_validate_json(canonical_manifest_bytes(catalog))
 
 
 def test_manifest_requires_format_version_and_safe_ontology_identity() -> None:
@@ -547,9 +581,7 @@ def test_render_ontology_skill_keeps_hostile_cross_record_link_labels_inert() ->
     )
     index = files[Path("references/index.md")].decode()
     hostile_line = next(
-        line
-        for line in index.splitlines()
-        if line.startswith("- [") and "attacker.invalid" in line
+        line for line in index.splitlines() if line.startswith("- [") and "attacker.invalid" in line
     )
 
     # An unescaped closing bracket has an even number of preceding backslashes.
@@ -631,3 +663,107 @@ def test_render_ontology_skill_uses_explicit_snapshot_path_commands() -> None:
     assert "/absolute/path/to/directory-containing-this-SKILL" in entrypoint
     for command in ("skill-update", "skill-unlink", "skill-remove"):
         assert f"geas {command} ." not in entrypoint
+
+
+def test_rendered_ontology_skill_has_exact_repository_lifecycle_and_publication_boundary() -> None:
+    """Catches a portable skill being unusable without Geas or granting itself publication."""
+    from research_agent.render import render_ontology_skill
+
+    files = render_ontology_skill(
+        _topic(),
+        skill_name="test-skill",
+        ontology_name="test-ontology",
+        repository_url="https://example.test/ontology.git",
+        branch="main",
+        ontology_commit=COMMIT,
+        geas_version="1.2.3",
+        geas_commit=None,
+    )
+    entrypoint = files[Path("SKILL.md")].decode()
+    lifecycle = files[Path("references/repository.md")].decode()
+
+    for expected in (
+        "usable as static files without Geas",
+        "https://example.test/ontology.git",
+        "test-ontology",
+        "https://github.com/Epiphytic/geas",
+        "references/repository.md",
+        "generic Geas skill's `references/cli.md`",
+    ):
+        assert expected in entrypoint
+    for expected in (
+        (
+            "`geas repository-install test-ontology https://example.test/ontology.git "
+            "--ref refs/heads/main --read-only --publish none`"
+        ),
+        "`geas repository-update test-ontology --publish none`",
+        "`geas repository-remove test-ontology`",
+        "root-local `git.pull_request`",
+        'paths: `"*"`',
+        'bundle_sha256: `"*"`',
+        "only that Git capability",
+    ):
+        assert expected in lifecycle
+
+
+@pytest.mark.parametrize(
+    "active_ref",
+    (
+        "refs/tags/v1.2.3",
+        "c" * 40,
+        "d" * 64,
+    ),
+)
+def test_rendered_repository_lifecycle_preserves_exact_nonbranch_ref(active_ref: str) -> None:
+    """Catches lifecycle guidance rewriting tags or exact commits as branch refs."""
+    from research_agent.render import render_ontology_skill
+
+    files = render_ontology_skill(
+        _topic(),
+        skill_name="test-skill",
+        ontology_name="test-ontology",
+        repository_url="https://example.test/ontology.git",
+        branch=active_ref.removeprefix("refs/heads/"),
+        active_ref=active_ref,
+        ontology_commit=COMMIT,
+        geas_version="1.2.3",
+        geas_commit=None,
+    )
+
+    lifecycle = files[Path("references/repository.md")].decode()
+    assert f"--ref {active_ref}" in lifecycle
+    assert f"refs/heads/{active_ref}" not in lifecycle
+
+
+def test_rendered_repository_lifecycle_shell_quotes_every_dynamic_argument() -> None:
+    """Catches a legal repository URL becoming shell syntax in a copyable command."""
+    from research_agent.render import render_ontology_skill
+
+    repository_url = "https://example.test/ontology.git;touch$IFS/tmp/geas-pwned"
+    files = render_ontology_skill(
+        _topic(),
+        skill_name="test-skill",
+        ontology_name="test-ontology",
+        repository_url=repository_url,
+        branch="main",
+        active_ref="refs/heads/main",
+        ontology_commit=COMMIT,
+        geas_version="1.2.3",
+        geas_commit=None,
+    )
+
+    lifecycle = files[Path("references/repository.md")].decode()
+    command = shlex.join(
+        (
+            "geas",
+            "repository-install",
+            "test-ontology",
+            repository_url,
+            "--ref",
+            "refs/heads/main",
+            "--read-only",
+            "--publish",
+            "none",
+        )
+    )
+    assert f"`{command}`" in lifecycle

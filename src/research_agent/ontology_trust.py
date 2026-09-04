@@ -15,6 +15,15 @@ from uuid import uuid4
 
 from pydantic import Field, field_validator
 
+from research_agent.capabilities import (
+    Capability,
+    CapabilityGrant,
+    CapabilityRequest,
+    CapabilityResources,
+    CapabilitySubject,
+    DeterministicCapabilityEvaluator,
+    VerifiedDelegationManifest,
+)
 from research_agent.models import StrictModel, canonical_json, utc_now
 from research_agent.removal_journal import (
     RemovalJournal,
@@ -274,7 +283,45 @@ def _matches(rule: TrustRule, context: TrustContext) -> bool:
 
 
 def evaluate_trust(context: TrustContext, rules: Sequence[TrustRule]) -> TrustDecision:
-    """Apply highest selector specificity, resolving equal scores to deny."""
+    """Compatibility wrapper over ``repository.read`` capability decisions."""
+    try:
+        grants = tuple(_capability_grant(rule) for rule in rules)
+        request = CapabilityRequest(
+            authority_repository=context.repository,
+            target_repository=context.repository,
+            capabilities=(Capability.REPOSITORY_READ,),
+            ref=context.ref,
+            path=context.path.as_posix(),
+            bundle_sha256=context.bundle_sha256,
+            dirty=context.dirty,
+            requested_at=utc_now(),
+        )
+    except ValueError:
+        # Legacy trust accepted machine-local and non-HTTPS SSH identities.
+        # Preserve that compatibility surface without broadening new grants.
+        return _evaluate_legacy_trust(context, rules)
+    decision = DeterministicCapabilityEvaluator(
+        grants,
+        {},
+        clock=utc_now,
+    ).evaluate(request)
+    if not decision.grant_ids:
+        return TrustDecision(matched=False, allowed=False)
+    by_id = {grant.id: (grant, rule) for grant, rule in zip(grants, rules, strict=True)}
+    grant, rule = by_id[decision.grant_ids[0]]
+    return TrustDecision(
+        matched=True,
+        allowed=decision.allowed,
+        specificity=_subject_specificity(grant.subject),
+        rule=rule,
+    )
+
+
+def _evaluate_legacy_trust(
+    context: TrustContext,
+    rules: Sequence[TrustRule],
+) -> TrustDecision:
+    """Apply the historical matcher only for identities v1 accepted."""
     matches = tuple(rule for rule in rules if _matches(rule, context))
     if not matches:
         return TrustDecision(matched=False, allowed=False)
@@ -291,6 +338,93 @@ def evaluate_trust(context: TrustContext, rules: Sequence[TrustRule]) -> TrustDe
         allowed=winner.decision == "allow",
         specificity=_specificity(winner),
         rule=winner,
+    )
+
+
+def _capability_grant(rule: TrustRule) -> CapabilityGrant:
+    return CapabilityGrant(
+        decision=rule.decision,
+        subject=CapabilitySubject(
+            repository=rule.repository,
+            refs=rule.refs,
+            paths=(
+                "*"
+                if rule.paths == "*"
+                else tuple(path.as_posix() for path in rule.paths)
+            ),
+            bundle_sha256=rule.bundle_sha256,
+        ),
+        capabilities=(Capability.REPOSITORY_READ,),
+        delegable_capabilities=(),
+        resources=CapabilityResources(),
+        max_delegation_depth=0,
+        expires_at=None,
+        created_at=rule.created_at,
+        created_via=rule.created_via,
+    )
+
+
+def _subject_specificity(subject: CapabilitySubject) -> int:
+    return (
+        (0 if subject.bundle_sha256 == "*" else 4)
+        + (0 if subject.paths == "*" else 2)
+        + (0 if subject.refs == "*" else 1)
+    )
+
+
+def evaluate_repository_read(
+    catalog: ResolvedRepositoryCatalog,
+    ontology: VerifiedCatalogOntology,
+    profile: GeasProfile,
+    *,
+    yolo: bool = False,
+) -> TrustDecision:
+    """Issue one normalized repository-read request against effective profile grants."""
+    context = _context(catalog, ontology)
+    if not profile.capability_grants:
+        legacy = evaluate_trust(context, profile.trust_rules)
+        if legacy.matched or not yolo:
+            return legacy
+    if catalog.repository_identity is None:
+        raise ValueError("repository catalog has no trust identity")
+    manifests = {}
+    if catalog.delegation_manifest is not None:
+        if catalog.delegation_manifest_sha256 is None or catalog.commit is None:
+            raise ValueError("verified delegation manifest lacks byte or Git commit identity")
+        manifests[catalog.repository_identity] = VerifiedDelegationManifest(
+            repository=catalog.repository_identity,
+            manifest=catalog.delegation_manifest,
+            manifest_sha256=catalog.delegation_manifest_sha256,
+            catalog_commit=catalog.commit,
+        )
+    try:
+        decision = DeterministicCapabilityEvaluator(
+            profile.effective_capability_grants(),
+            manifests,
+            clock=utc_now,
+            yolo=yolo,
+        ).evaluate(
+            CapabilityRequest(
+                authority_repository=catalog.repository_identity,
+                target_repository=catalog.repository_identity,
+                capabilities=(Capability.REPOSITORY_READ,),
+                ref=context.ref,
+                path=context.path.as_posix(),
+                bundle_sha256=context.bundle_sha256,
+                dirty=context.dirty,
+                requested_at=utc_now(),
+            )
+        )
+    except ValueError:
+        if yolo and not profile.capability_grants:
+            return TrustDecision(matched=False, allowed=True)
+        raise
+    matched = bool(decision.grant_ids)
+    return TrustDecision(
+        matched=matched,
+        allowed=decision.allowed,
+        specificity=None,
+        rule=None,
     )
 
 
@@ -332,9 +466,13 @@ def _profile_update(
     config = manager.load()
     if profile_name not in config.profiles:
         raise ValueError(f"unknown Geas profile: {profile_name}")
-    manager.replace(
-        config.model_copy(update={"profiles": {**config.profiles, profile_name: profile}})
+    updated = config.model_copy(
+        update={"profiles": {**config.profiles, profile_name: profile}}
     )
+    if config.version == 2:
+        manager.replace(updated, upgrade_version=True)
+    else:
+        manager.replace(updated)
 
 
 def _append_rules(
@@ -347,7 +485,17 @@ def _append_rules(
         profile = config.profiles[profile_name]
     except KeyError:
         raise ValueError(f"unknown Geas profile: {profile_name}") from None
-    updated = profile.model_copy(update={"trust_rules": (*profile.trust_rules, *rules)})
+    if config.version == 1:
+        updated = profile.model_copy(update={"trust_rules": (*profile.trust_rules, *rules)})
+    else:
+        updated = profile.model_copy(
+            update={
+                "capability_grants": (
+                    *profile.capability_grants,
+                    *(_capability_grant(rule) for rule in rules),
+                )
+            }
+        )
     _profile_update(manager, profile_name, updated)
 
 
@@ -375,6 +523,8 @@ def _interactive_rule(
 def _profile_with_effective_ref_denial(
     profile: GeasProfile,
     catalog: ResolvedRepositoryCatalog,
+    *,
+    capability_mode: bool = False,
 ) -> GeasProfile:
     if catalog.active_ref is None:
         raise ValueError("repository catalog has no active Git ref")
@@ -384,7 +534,16 @@ def _profile_with_effective_ref_denial(
         refs=(catalog.active_ref,),
     )
     denials = [broad_denial]
-    for rule in profile.trust_rules:
+    source_rules = (
+        tuple(
+            _trust_rule_from_capability(grant)
+            for grant in profile.capability_grants
+            if Capability.REPOSITORY_READ in grant.capabilities
+        )
+        if capability_mode
+        else profile.trust_rules
+    )
+    for rule in source_rules:
         if rule.decision != "allow" or rule.repository != broad_denial.repository:
             continue
         if rule.refs != "*" and catalog.active_ref not in rule.refs:
@@ -400,13 +559,59 @@ def _profile_with_effective_ref_denial(
                 digests=rule.bundle_sha256,
             )
         )
+    normalized = _normalized_trust_rules((*source_rules, *denials))
+    if not capability_mode:
+        return profile.model_copy(update={"trust_rules": normalized})
     return profile.model_copy(
         update={
-            "trust_rules": _normalized_trust_rules(
-                (*profile.trust_rules, *denials)
-            )
+            "trust_rules": (),
+            "capability_grants": _normalized_capability_grants(
+                (*profile.capability_grants, *(_capability_grant(rule) for rule in denials))
+            ),
         }
     )
+
+
+def _trust_rule_from_capability(grant: CapabilityGrant) -> TrustRule:
+    return TrustRule(
+        decision=grant.decision,
+        repository=grant.subject.repository,
+        refs=grant.subject.refs,
+        paths=(
+            "*"
+            if grant.subject.paths == "*"
+            else tuple(Path(path) for path in grant.subject.paths)
+        ),
+        bundle_sha256=grant.subject.bundle_sha256,
+        created_at=grant.created_at,
+        created_via=(
+            grant.created_via
+            if grant.created_via in {"interactive", "manual"}
+            else "manual"
+        ),
+    )
+
+
+def _normalized_capability_grants(
+    grants: Sequence[CapabilityGrant],
+) -> tuple[CapabilityGrant, ...]:
+    grouped: dict[tuple[object, ...], list[CapabilityGrant]] = {}
+    for grant in grants:
+        selector = (
+            grant.subject.repository,
+            grant.subject.refs,
+            grant.subject.paths,
+            grant.subject.bundle_sha256,
+            grant.capabilities,
+            grant.delegable_capabilities,
+            grant.resources.model_dump_json(),
+        )
+        grouped.setdefault(selector, []).append(grant)
+    normalized = []
+    for candidates in grouped.values():
+        denied = [grant for grant in candidates if grant.decision == "deny"]
+        normalized.append(min(denied or candidates, key=lambda grant: grant.id))
+    return tuple(sorted(normalized, key=lambda grant: grant.id))
 
 
 def _normalized_trust_rules(rules: Sequence[TrustRule]) -> tuple[TrustRule, ...]:
@@ -472,21 +677,19 @@ def authorize_repository_catalog(
     except KeyError:
         raise ValueError(f"unknown Geas profile: {profile_name}") from None
 
-    if yolo:
-        return tuple(
-            AuthorizedOntology(ontology=ontology, authorization="yolo")
-            for ontology in catalog.ontologies
-        )
-
     authorized: dict[str, AuthorizedOntology] = {}
     unresolved: list[VerifiedCatalogOntology] = []
     for ontology in catalog.ontologies:
-        decision = evaluate_trust(_context(catalog, ontology), profile.trust_rules)
+        decision = evaluate_repository_read(catalog, ontology, profile, yolo=yolo)
         if decision.matched:
             if decision.allowed:
                 authorized[ontology.name] = AuthorizedOntology(
                     ontology=ontology, authorization="rule"
                 )
+        elif decision.allowed and yolo:
+            authorized[ontology.name] = AuthorizedOntology(
+                ontology=ontology, authorization="yolo"
+            )
         else:
             unresolved.append(ontology)
     if not unresolved:
@@ -557,7 +760,11 @@ def authorize_repository_catalog(
             _profile_update(
                 manager,
                 profile_name,
-                _profile_with_effective_ref_denial(registered_profile, catalog),
+                _profile_with_effective_ref_denial(
+                    registered_profile,
+                    catalog,
+                    capability_mode=config.version == 2,
+                ),
             )
         except BaseException:
             _rollback_staged_snapshots(staged)
@@ -574,7 +781,11 @@ def authorize_repository_catalog(
         _profile_update(
             manager,
             profile_name,
-            _profile_with_effective_ref_denial(profile, catalog),
+            _profile_with_effective_ref_denial(
+                profile,
+                catalog,
+                capability_mode=config.version == 2,
+            ),
         )
         authorized.clear()
     else:  # Defensive for runtime implementations not checked by static typing.

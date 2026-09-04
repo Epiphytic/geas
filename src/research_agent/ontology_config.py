@@ -7,6 +7,7 @@ from typing import Literal
 from pydantic import Field, field_validator, model_validator
 
 from research_agent.models import ModelParameters, StrictModel
+from research_agent.source_work import SourceWorkLimits
 
 
 class OntologyAcceptanceConfig(StrictModel):
@@ -75,6 +76,7 @@ class OntologyBuildDefaults(StrictModel):
     max_batches_per_source: int | None = Field(default=None, ge=1, le=500)
     max_sources: int | None = Field(default=None, ge=1, le=10_000)
     model_parallelism: int = Field(default=1, ge=1, le=1)
+    source_work: SourceWorkLimits = Field(default_factory=SourceWorkLimits)
     acceptance: OntologyAcceptanceConfig = Field(
         default_factory=OntologyAcceptanceConfig
     )
@@ -106,10 +108,15 @@ class OntologyBuildDefaults(StrictModel):
             acceptance = self.acceptance.model_dump(mode="python", exclude_none=False)
             acceptance.update(local_acceptance)
             merged["acceptance"] = acceptance
+        local_source_work = value.get("source_work")
+        if isinstance(local_source_work, Mapping):
+            source_work = self.source_work.model_dump(mode="python", exclude_none=False)
+            source_work.update(local_source_work)
+            merged["source_work"] = source_work
         merged.update(
             (key, item)
             for key, item in value.items()
-            if key not in {"model_parameters", "acceptance"}
+            if key not in {"model_parameters", "acceptance", "source_work"}
             or not isinstance(item, Mapping)
         )
         return merged

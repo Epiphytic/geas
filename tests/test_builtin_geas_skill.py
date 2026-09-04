@@ -617,3 +617,30 @@ def test_packaged_skill_routes_retrieval_lifecycle_and_security_to_one_hop_refer
     assert "dissent" in (package / "references" / "cli.md").read_text().casefold()
     assert "source text" in (package / "references" / "security.md").read_text().casefold()
     assert "skill-remove" in (package / "references" / "skills.md").read_text()
+
+
+def test_packaged_skill_explains_exact_first_publication_authority_and_narrowing() -> None:
+    """Catches a generated skill implying that repository trust authorizes Git writes."""
+    package = Path(__file__).parents[1] / "src" / "research_agent" / "builtin_skills" / "geas"
+    entrypoint = (package / "SKILL.md").read_text()
+    cli_reference = (package / "references" / "cli.md").read_text()
+    normalized_reference = " ".join(cli_reference.split())
+
+    assert "references/cli.md" in entrypoint
+    for expected in (
+        "first remote or current-repository install",
+        "root-local `git.pull_request`",
+        "root-local `git.direct_push`",
+        'paths: `"*"`',
+        'bundle_sha256: `"*"`',
+        "only the named Git capability",
+        "`--publish none`",
+        "verified JSON receipt",
+        "complete generated skill manifests",
+        "exact local grants",
+        "`geas repository-update NAME`",
+    ):
+        assert expected in normalized_reference
+    assert "repository read, source, model, promotion, or another Git capability" in (
+        normalized_reference
+    )

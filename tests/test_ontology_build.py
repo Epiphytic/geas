@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -24,6 +25,7 @@ from research_agent.models import (
     ThreatSeverity,
     ThreatStatus,
     ThreatTarget,
+    canonical_json,
 )
 from research_agent.ontology_build import (
     BuildProgress,
@@ -109,6 +111,23 @@ def test_general_ontology_default_is_64k() -> None:
     )
     assert config.max_output_tokens == 65_536
     assert config.max_run_seconds == 1800
+    assert config.source_intent == ()
+
+
+def test_absent_source_intent_preserves_legacy_build_identity(tmp_path: Path) -> None:
+    config = OntologyBuildConfig.model_validate(
+        {
+            "version": 1,
+            "topic": "Test",
+            "topic_concept_id": "concept:test",
+            "output_directory": "ontology/test/generated",
+        }
+    )
+    legacy_fields = config.model_dump(exclude={"source_intent", "source_work"})
+
+    assert _builder(tmp_path, config).config_sha256 == hashlib.sha256(
+        canonical_json(legacy_fields)
+    ).hexdigest()
 
 
 def test_configured_topic_seed_is_materialized_without_model_authority(

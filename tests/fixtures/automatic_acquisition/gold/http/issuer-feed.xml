@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Aurora Gold news</title>
+    <link>https://aurora-gold.example.test/news/</link>
+    <item>
+      <guid>aurora-production-update-2026-08-15</guid>
+      <title>Q2 production update</title>
+      <link>https://aurora-gold.example.test/news/production-update.html</link>
+      <pubDate>Sat, 15 Aug 2026 12:00:00 GMT</pubDate>
+    </item>
+  </channel>
+</rss>

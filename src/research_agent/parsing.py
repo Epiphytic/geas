@@ -18,7 +18,13 @@ from pydantic import Field
 
 from research_agent.citations import CitationDocumentManager
 from research_agent.knowledge import DeterministicThreatScanner
-from research_agent.models import SourceVersion, StrictModel, content_id, utc_now
+from research_agent.models import (
+    SourceVersion,
+    StrictModel,
+    canonical_json,
+    content_id,
+    utc_now,
+)
 from research_agent.sandbox import BubblewrapSandbox, SandboxError
 from research_agent.store import ImmutableStore
 from research_agent.structure import StructuralDocumentManager
@@ -49,6 +55,7 @@ class TextDerivation(StrictModel):
 
 class ParsedIngestReceipt(StrictModel):
     original_source_version_id: str
+    original_source_record_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     derived_source_version_id: str
     derivation_id: str
     structural_derivation_id: str
@@ -354,6 +361,53 @@ class ParsedDocumentManager:
         if original_blob != original.content_sha256:
             raise RuntimeError("original source and blob hashes diverged")
         original_record_hash = self.store.put_record("source-version", original)
+        return self._derive(
+            original,
+            content,
+            original_record_hash,
+            persist_receipt=False,
+        )
+
+    def parse_source(
+        self,
+        source_version_id: str,
+        *,
+        source_record_sha256: str | None = None,
+    ) -> ParsedIngestReceipt:
+        """Parse one already-archived source without recreating its metadata."""
+        self.store.initialize()
+        sources = tuple(
+            (SourceVersion.model_validate(value), hashlib.sha256(canonical_json(value)).hexdigest())
+            for value in self.store.iter_records("source-version")
+            if value.get("id") == source_version_id
+        )
+        if not sources:
+            raise ValueError(f"unknown immutable source version: {source_version_id}")
+        if source_record_sha256 is not None:
+            sources = tuple(item for item in sources if item[1] == source_record_sha256)
+        if len(sources) != 1:
+            raise ValueError("ambiguous immutable source acquisition identity")
+        original, original_record_hash = sources[0]
+        content = self.store.read_blob(original.content_sha256)
+        return self._derive(
+            original,
+            content,
+            original_record_hash,
+            persist_receipt=True,
+        )
+
+    def _derive(
+        self,
+        original: SourceVersion,
+        content: bytes,
+        original_record_hash: str,
+        *,
+        persist_receipt: bool,
+    ) -> ParsedIngestReceipt:
+        acquired_at = original.acquired_at
+        media_type = original.media_type
+        connector_id = original.connector_id
+        license = original.license
         parsed = self.registry.parse(content, media_type)
         derived_content = parsed.text.encode()
         derived_digest = hashlib.sha256(derived_content).hexdigest()
@@ -435,8 +489,9 @@ class ParsedDocumentManager:
         }
         hashes.update(structure.record_hashes)
         hashes.update(citations.record_hashes)
-        return ParsedIngestReceipt(
+        receipt = ParsedIngestReceipt(
             original_source_version_id=original.id,
+            original_source_record_sha256=original_record_hash,
             derived_source_version_id=derived.id,
             derivation_id=derivation.id,
             structural_derivation_id=structure.structural_derivation_id,
@@ -448,3 +503,142 @@ class ParsedDocumentManager:
             threat_observation_ids=tuple(item.id for item in observations),
             record_hashes=hashes,
         )
+        if persist_receipt:
+            self.store.put_record("parsed-ingest-receipt", receipt)
+        return receipt
+
+
+def select_parsed_sources(
+    store: ImmutableStore,
+    source_version_ids: tuple[str, ...] = (),
+    *,
+    source_record_sha256s: tuple[str, ...] = (),
+) -> tuple[ParsedIngestReceipt, ...]:
+    """Select generic parsed receipts by original or derived immutable identity."""
+    requested = set(source_version_ids)
+    receipts = tuple(
+        ParsedIngestReceipt.model_validate(value)
+        for value in store.iter_records("parsed-ingest-receipt")
+    )
+    covered = {
+        item.derivation_id
+        for item in receipts
+    }
+    derivations = tuple(
+        TextDerivation.model_validate(value)
+        for value in store.iter_records("text-derivation")
+        if value.get("id") not in covered
+    )
+    structures = tuple(store.iter_records("structural-derivation"))
+    citations = tuple(store.iter_records("citation-derivation"))
+    evidence = tuple(store.iter_records("evidence-fragment"))
+    threats = tuple(store.iter_records("threat-observation"))
+    synthesized: list[ParsedIngestReceipt] = []
+    for derivation in derivations:
+        source_hashes = tuple(
+            hashlib.sha256(canonical_json(item)).hexdigest()
+            for item in store.iter_records("source-version")
+            if item.get("id") == derivation.original_source_version_id
+        )
+        if len(source_hashes) != 1:
+            raise ValueError("legacy parsed source has ambiguous acquisition identity")
+        matching_structures = tuple(
+            item
+            for item in structures
+            if item.get("text_derivation_id") == derivation.id
+        )
+        for structure in matching_structures:
+            matching_citations = tuple(
+                item
+                for item in citations
+                if item.get("structural_derivation_id") == structure.get("id")
+            )
+            citation = matching_citations[-1] if matching_citations else None
+            synthesized.append(
+                ParsedIngestReceipt(
+                    original_source_version_id=derivation.original_source_version_id,
+                    original_source_record_sha256=source_hashes[0],
+                    derived_source_version_id=derivation.derived_source_version_id,
+                    derivation_id=derivation.id,
+                    structural_derivation_id=str(structure["id"]),
+                    structural_anchor_ids=tuple(structure.get("anchor_ids", ())),
+                    citation_derivation_id=(
+                        str(citation["id"]) if citation is not None else "citation:none"
+                    ),
+                    research_identifier_ids=(
+                        tuple(citation.get("identifier_ids", ()))
+                        if citation is not None
+                        else ()
+                    ),
+                    bibliographic_reference_ids=(
+                        tuple(citation.get("reference_ids", ()))
+                        if citation is not None
+                        else ()
+                    ),
+                    evidence_fragment_ids=tuple(
+                        str(item["id"])
+                        for item in evidence
+                        if item.get("source_version")
+                        == derivation.derived_source_version_id
+                    ),
+                    threat_observation_ids=tuple(
+                        str(item["id"])
+                        for item in threats
+                        if item.get("target", {}).get("source_version")
+                        == derivation.derived_source_version_id
+                    ),
+                    record_hashes={},
+                )
+            )
+    receipts = (*receipts, *synthesized)
+    selected = (
+        receipts
+        if not requested
+        else tuple(
+            item
+            for item in receipts
+            if item.original_source_version_id in requested
+            or item.derived_source_version_id in requested
+        )
+    )
+    exact_records = set(source_record_sha256s)
+    if exact_records:
+        selected = tuple(
+            item
+            for item in selected
+            if item.original_source_record_sha256 in exact_records
+        )
+    elif requested:
+        for source_id in requested:
+            acquisition_ids = {
+                item.original_source_record_sha256
+                for item in selected
+                if source_id
+                in {item.original_source_version_id, item.derived_source_version_id}
+            }
+            if len(acquisition_ids) > 1:
+                raise ValueError("parsed source selection has ambiguous acquisition identity")
+    found = {
+        source_id
+        for item in selected
+        for source_id in (
+            item.original_source_version_id,
+            item.derived_source_version_id,
+        )
+    }
+    missing = sorted(requested - found)
+    if missing:
+        raise ValueError(
+            "unknown or unparsed source versions: " + ", ".join(missing)
+        )
+    distinct = {canonical_json(item): item for item in selected}
+    return tuple(
+        sorted(
+            distinct.values(),
+            key=lambda item: (
+                item.original_source_version_id,
+                item.derived_source_version_id,
+                item.derivation_id,
+            ),
+        )
+    )

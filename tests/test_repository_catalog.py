@@ -18,6 +18,7 @@ from research_agent.repository_catalog import (
     _workspace_ontology_path,
     discover_catalogs,
     load_catalog,
+    load_delegation_manifest,
     refresh_catalog,
     resolve_repository_catalog,
     verify_catalog,
@@ -137,6 +138,239 @@ def test_catalog_models_forbid_extra_fields_and_invalid_names() -> None:
                 ],
             }
         )
+
+
+def test_catalog_pins_and_resolves_delegation_manifest(git_repo: Path) -> None:
+    entry = _entry(git_repo)
+    manifest = (
+        b"version: 1\n"
+        b"delegations:\n"
+        b"  - subject:\n"
+        b"      repository: https://github.com/example/child\n"
+        b"      refs: '*'\n"
+        b"      paths: '*'\n"
+        b"      bundle_sha256: '*'\n"
+        b"    capabilities: [repository.read]\n"
+        b"    delegable_capabilities: []\n"
+        b"    resources: {}\n"
+        b"    max_delegation_depth: 0\n"
+        b"    expires_at: null\n"
+    )
+    (git_repo / "geas-delegations.yaml").write_bytes(manifest)
+    declaration = {
+        "path": "geas-delegations.yaml",
+        "sha256": _sha256(manifest),
+        "size_bytes": len(manifest),
+    }
+    (git_repo / "geas.yaml").write_text(
+        yaml.safe_dump(
+            {"version": 1, "ontologies": [entry], "delegations": declaration},
+            sort_keys=False,
+        )
+    )
+    _git(git_repo, "add", ".")
+    _git(git_repo, "commit", "-m", "catalog with delegation")
+
+    catalog = load_catalog(git_repo / "geas.yaml")
+    loaded = load_delegation_manifest(git_repo / "geas.yaml", catalog.delegations)
+    resolved = resolve_repository_catalog(git_repo)
+
+    assert loaded.delegations[0].subject.repository == (
+        "https://github.com/example/child"
+    )
+    assert resolved.delegation_manifest == loaded
+    assert resolved.delegation_manifest_sha256 == _sha256(manifest)
+    assert resolved.delegation_manifest_path == git_repo / "geas-delegations.yaml"
+
+
+def _committed_delegation_catalog(repository: Path) -> tuple[str, bytes, bytes]:
+    entry = _entry(repository)
+    manifest = b"version: 1\ndelegations: []\n"
+    (repository / "geas-delegations.yaml").write_bytes(manifest)
+    catalog = yaml.safe_dump(
+        {
+            "version": 1,
+            "ontologies": [entry],
+            "delegations": {
+                "path": "geas-delegations.yaml",
+                "sha256": _sha256(manifest),
+                "size_bytes": len(manifest),
+            },
+        },
+        sort_keys=False,
+    ).encode()
+    (repository / "geas.yaml").write_bytes(catalog)
+    _git(repository, "add", ".")
+    _git(repository, "commit", "-m", "delegation authority")
+    return _git(repository, "rev-parse", "HEAD"), catalog, manifest
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("catalog", "manifest-and-catalog", "staged", "staged-index-only"),
+)
+def test_resolved_delegation_rejects_worktree_or_index_bytes_not_in_claimed_commit(
+    git_repo: Path,
+    mutation: str,
+) -> None:
+    _, catalog, manifest = _committed_delegation_catalog(git_repo)
+    if mutation == "catalog":
+        (git_repo / "geas.yaml").write_bytes(catalog + b"# uncommitted\n")
+    else:
+        changed_manifest = manifest + b"# uncommitted\n"
+        (git_repo / "geas-delegations.yaml").write_bytes(changed_manifest)
+        parsed = yaml.safe_load(catalog)
+        parsed["delegations"]["sha256"] = _sha256(changed_manifest)
+        parsed["delegations"]["size_bytes"] = len(changed_manifest)
+        (git_repo / "geas.yaml").write_text(yaml.safe_dump(parsed, sort_keys=False))
+        if mutation in {"staged", "staged-index-only"}:
+            _git(git_repo, "add", "geas.yaml", "geas-delegations.yaml")
+        if mutation == "staged-index-only":
+            (git_repo / "geas.yaml").write_bytes(catalog)
+            (git_repo / "geas-delegations.yaml").write_bytes(manifest)
+
+    with pytest.raises(ValueError, match="commit|tracked|index"):
+        resolve_repository_catalog(git_repo)
+
+
+@pytest.mark.parametrize("name", ("geas.yaml", "geas-delegations.yaml"))
+def test_resolved_delegation_rejects_missing_tracked_authority_file(
+    git_repo: Path,
+    name: str,
+) -> None:
+    _committed_delegation_catalog(git_repo)
+    (git_repo / name).unlink()
+
+    with pytest.raises(ValueError, match="missing|commit|tracked"):
+        resolve_repository_catalog(git_repo)
+
+
+def test_resolved_catalog_rejects_untracked_authority_file(git_repo: Path) -> None:
+    entry = _entry(git_repo)
+    _write_catalog(git_repo / "geas.yaml", entry)
+    _git(git_repo, "add", "ontology")
+    _git(git_repo, "commit", "-m", "ontology without catalog")
+
+    with pytest.raises(ValueError, match="commit|tracked|untracked"):
+        resolve_repository_catalog(git_repo)
+
+
+@pytest.mark.parametrize("name", ("geas.yaml", "geas-delegations.yaml"))
+def test_resolved_delegation_rejects_symlink_edited_authority_file(
+    git_repo: Path,
+    name: str,
+) -> None:
+    _committed_delegation_catalog(git_repo)
+    authority = git_repo / name
+    replacement = git_repo / f"replacement-{name}"
+    authority.replace(replacement)
+    authority.symlink_to(replacement.name)
+
+    with pytest.raises(ValueError, match="symbolic link"):
+        resolve_repository_catalog(git_repo)
+
+
+def test_resolved_delegation_binds_exact_named_non_head_commit(git_repo: Path) -> None:
+    authority_commit, _, _ = _committed_delegation_catalog(git_repo)
+    (git_repo / "unrelated.txt").write_text("later\n")
+    _git(git_repo, "add", "unrelated.txt")
+    _git(git_repo, "commit", "-m", "unrelated later commit")
+    assert _git(git_repo, "rev-parse", "HEAD") != authority_commit
+
+    resolved = resolve_repository_catalog(git_repo, verified_commit=authority_commit)
+
+    assert resolved.commit == authority_commit
+    assert resolved.active_ref == authority_commit
+    assert resolved.delegation_manifest_sha256 == _sha256(
+        b"version: 1\ndelegations: []\n"
+    )
+
+
+def test_resolved_delegation_accepts_exact_verified_head_bytes(git_repo: Path) -> None:
+    authority_commit, _, manifest = _committed_delegation_catalog(git_repo)
+
+    resolved = resolve_repository_catalog(git_repo, verified_commit=authority_commit)
+
+    assert resolved.commit == authority_commit
+    assert resolved.delegation_manifest_sha256 == _sha256(manifest)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (lambda declaration: declaration.update({"path": "other.yaml"}), "geas-delegations"),
+        (lambda declaration: declaration.update({"sha256": "0" * 64}), "sha256"),
+        (lambda declaration: declaration.update({"size_bytes": 1}), "size"),
+    ],
+)
+def test_delegation_declaration_rejects_bad_name_hash_or_size(
+    tmp_path: Path, mutation: object, message: str
+) -> None:
+    entry = _entry(tmp_path)
+    manifest = b"version: 1\ndelegations: []\n"
+    (tmp_path / "geas-delegations.yaml").write_bytes(manifest)
+    declaration = {
+        "path": "geas-delegations.yaml",
+        "sha256": _sha256(manifest),
+        "size_bytes": len(manifest),
+    }
+    mutation(declaration)  # type: ignore[operator]
+    (tmp_path / "geas.yaml").write_text(
+        yaml.safe_dump(
+            {"version": 1, "ontologies": [entry], "delegations": declaration},
+            sort_keys=False,
+        )
+    )
+
+    with pytest.raises(ValueError, match=message):
+        catalog = load_catalog(tmp_path / "geas.yaml")
+        load_delegation_manifest(tmp_path / "geas.yaml", catalog.delegations)
+
+
+def test_delegation_manifest_rejects_symlink_and_unsorted_entries(tmp_path: Path) -> None:
+    entry = _entry(tmp_path)
+    manifest = (
+        b"version: 1\n"
+        b"delegations:\n"
+        b"  - subject: {repository: https://github.com/example/z, refs: '*', "
+        b"paths: '*', bundle_sha256: '*'}\n"
+        b"    capabilities: [repository.read]\n"
+        b"    delegable_capabilities: []\n"
+        b"    resources: {}\n"
+        b"    max_delegation_depth: 0\n"
+        b"    expires_at: null\n"
+        b"  - subject: {repository: https://github.com/example/a, refs: '*', "
+        b"paths: '*', bundle_sha256: '*'}\n"
+        b"    capabilities: [repository.read]\n"
+        b"    delegable_capabilities: []\n"
+        b"    resources: {}\n"
+        b"    max_delegation_depth: 0\n"
+        b"    expires_at: null\n"
+    )
+    real = tmp_path / "real-delegations.yaml"
+    real.write_bytes(manifest)
+    linked = tmp_path / "geas-delegations.yaml"
+    linked.symlink_to(real)
+    declaration = {
+        "path": "geas-delegations.yaml",
+        "sha256": _sha256(manifest),
+        "size_bytes": len(manifest),
+    }
+    (tmp_path / "geas.yaml").write_text(
+        yaml.safe_dump(
+            {"version": 1, "ontologies": [entry], "delegations": declaration},
+            sort_keys=False,
+        )
+    )
+    catalog = load_catalog(tmp_path / "geas.yaml")
+
+    with pytest.raises(ValueError, match="symbolic link"):
+        load_delegation_manifest(tmp_path / "geas.yaml", catalog.delegations)
+
+    linked.unlink()
+    linked.write_bytes(manifest)
+    with pytest.raises(ValueError, match="ascending|sorted"):
+        load_delegation_manifest(tmp_path / "geas.yaml", catalog.delegations)
 
 
 def test_catalog_digest_is_portable_and_metadata_sensitive(tmp_path: Path) -> None:
@@ -558,7 +792,7 @@ def test_resolved_catalog_preserves_exact_discovery_start(git_repo: Path) -> Non
 def test_resolved_catalog_includes_normalized_git_receipt_and_declared_file_dirtiness(
     git_repo: Path,
 ) -> None:
-    """A credential-bearing origin or dirty input must not be hidden from later trust checks."""
+    """A credential-bearing origin or dirty authority input must not be hidden."""
     entry = _catalog_ontology(git_repo)
     _git(git_repo, "add", ".")
     _git(git_repo, "commit", "-m", "catalog fixture")
@@ -571,7 +805,8 @@ def test_resolved_catalog_includes_normalized_git_receipt_and_declared_file_dirt
     assert result.by_name("example").dirty is False
     (git_repo / str(entry["path"]) / "build.yaml").write_text("dirty")
     refresh_catalog(git_repo / "geas.yaml")
-    assert resolve_repository_catalog(git_repo).by_name("example").dirty is True
+    with pytest.raises(ValueError, match="verified commit"):
+        resolve_repository_catalog(git_repo)
 
 
 def test_resolved_catalog_uses_machine_local_identity_without_origin(git_repo: Path) -> None:

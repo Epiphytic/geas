@@ -4,9 +4,11 @@ from datetime import UTC, datetime
 
 import pytest
 
+from research_agent.capabilities import Capability
 from research_agent.extraction import AnchorGroundedExtractionManager
 from research_agent.parsing import ParsedDocumentManager
 from research_agent.promotion import GitPromotionManager, PromotionError
+from research_agent.publishing import PathRole, PublishMode, required_capabilities
 from research_agent.store import ImmutableStore
 
 INSTANT = datetime(2026, 8, 3, tzinfo=UTC)
@@ -125,6 +127,13 @@ def test_git_promotion_requires_exact_manifest_on_canonical_ref(tmp_path) -> Non
         "HEAD:refs/patches",
     )
     assert tuple(store.iter_records("claim")) == ()
+    assert required_capabilities(
+        PathRole.CANONICAL_KNOWLEDGE,
+        PublishMode.DIRECT_PUSH,
+        canonical_target=True,
+    ) == frozenset(
+        {Capability.GIT_DIRECT_PUSH, Capability.KNOWLEDGE_AUTO_PROMOTE}
+    )
     with pytest.raises(PromotionError, match="Git command failed"):
         manager.verify_from_ref(output)
 

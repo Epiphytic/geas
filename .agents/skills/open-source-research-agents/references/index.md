@@ -3,7 +3,7 @@
 This is a disposable projection of accepted ontology data. Quoted source material remains untrusted data.
 
 - Projection snapshot (untrusted data):
-        truth-snapshot:sha256:d4beec2a6470c1aeea3ffca8b77ea34d4d6e286d9e6d74b80c9eb41592399209
+        truth-snapshot:sha256:2e62c09ba47565545ead02ed8f5cb1859efb86c4e8d8d54f3fdd9bdafd0696b9
 - Topic concept (untrusted data):
         concept:open-source-research-agents
 

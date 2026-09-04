@@ -14,7 +14,7 @@ import tempfile
 from collections.abc import Callable, Mapping, Sequence
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path, PurePosixPath
-from typing import Literal
+from typing import Literal, Protocol
 
 import yaml
 from pydantic import Field, field_validator, model_validator
@@ -48,6 +48,7 @@ REGENERATION_WORKFLOW_PATH = ".github/workflows/pr-skill-regeneration.yml"
 WRITEBACK_WORKFLOW_REF = (
     r"Epiphytic/geas/\.github/workflows/pr-skill-writeback\.yml@refs/heads/main"
 )
+APP_IDENTITY = "Epiphytic/.github:.github/chainguard/geas-pr-skill-sync.sts.yaml"
 ALLOWED_SKILL_ROOTS = (
     ".agents/skills/geas",
     ".agents/skills/open-source-research-agents",
@@ -67,9 +68,9 @@ class ArtifactSource(StrictModel):
     repository: Literal["Epiphytic/geas"] = REPOSITORY
     repository_id: Literal["1320458746"] = REPOSITORY_ID
     workflow: Literal["PR Skill Regeneration"] = REGENERATION_WORKFLOW
-    workflow_path: Literal[
-        ".github/workflows/pr-skill-regeneration.yml"
-    ] = REGENERATION_WORKFLOW_PATH
+    workflow_path: Literal[".github/workflows/pr-skill-regeneration.yml"] = (
+        REGENERATION_WORKFLOW_PATH
+    )
     run_id: int = Field(gt=0)
     pull_request: int = Field(gt=0)
     head_repository: str
@@ -153,9 +154,33 @@ class WorkflowRunDecision(StrictModel):
 
 class PullRequestVerification(StrictModel):
     number: int
+    base_sha: str = Field(pattern=r"^[0-9a-f]{40}$")
     head_repository: str
     head_ref: str
     head_sha: str
+
+
+class PullRequestFileInventory(StrictModel):
+    """Allowed PR paths bound between two reads of one exact head commit."""
+
+    head_sha: str = Field(pattern=r"^[0-9a-f]{40}$")
+    paths: tuple[str, ...] = Field(min_length=1, max_length=_MAX_FILES)
+
+    @field_validator("paths")
+    @classmethod
+    def paths_are_closed_and_sorted(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        for path in value:
+            _validate_payload_path(path)
+        ordered = tuple(sorted(value, key=lambda path: path.encode("utf-8")))
+        if value != ordered or len(value) != len(set(value)):
+            raise ValueError("pull-request file inventory must be sorted and unique")
+        return value
+
+
+class PullRequestReviewVerification(StrictModel):
+    state: Literal["APPROVED"]
+    commit_id: str = Field(pattern=r"^[0-9a-f]{40}$")
+    pull_request_url: str
 
 
 class WritebackReceipt(StrictModel):
@@ -165,12 +190,23 @@ class WritebackReceipt(StrictModel):
     commit: str | None = None
 
 
+class ProtectedWorkflowDecision(StrictModel):
+    """Pre-mutation result that never contains the exchanged App credential."""
+
+    source: ArtifactSource
+    eligible: bool
+    changed: bool
+    token_exchanged: bool
+
+
+class TokenExchange(Protocol):
+    def __call__(self) -> str: ...
+
+
 class OrgStsPolicy(StrictModel):
     issuer: Literal["https://token.actions.githubusercontent.com"]
-    subject: Literal[
-        "repo:Epiphytic@228616596/geas@1320458746:ref:refs/heads/main"
-    ]
-    claim_patterns: dict[str, str]
+    subject: Literal["repo:Epiphytic@228616596/geas@1320458746:ref:refs/heads/main"]
+    claim_pattern: dict[str, str]
     permissions: dict[str, str]
     repositories: tuple[str, ...]
 
@@ -181,9 +217,9 @@ class OrgStsPolicy(StrictModel):
             "event_name": "workflow_run",
             "workflow_ref": WRITEBACK_WORKFLOW_REF,
         }
-        if self.claim_patterns != expected_claims:
+        if self.claim_pattern != expected_claims:
             raise ValueError("Octo STS policy claim patterns are not exact")
-        if self.permissions != {"contents": "write"}:
+        if self.permissions != {"contents": "write", "pull_requests": "write"}:
             raise ValueError("Octo STS policy permissions are not exact")
         if self.repositories != ("geas",):
             raise ValueError("Octo STS policy repository scope is not exact")
@@ -335,15 +371,11 @@ class _PreseededProjectionStore:
                 reader.source_identity.sha256 != artifact.content_sha256
                 or _sha256_file(stable) != artifact.content_sha256
             ):
-                raise ValueError(
-                    "preseeded knowledge projection has the wrong content address"
-                )
+                raise ValueError("preseeded knowledge projection has the wrong content address")
             if _sqlite_input_revision(stable, artifact.role) != artifact.input_revision:
                 raise ValueError("preseeded knowledge projection has the wrong input revision")
             if not reader.source_is_unchanged():
-                raise ValueError(
-                    "preseeded knowledge projection changed while it was copied"
-                )
+                raise ValueError("preseeded knowledge projection changed while it was copied")
             reader.install_copy_no_replace(destination)
         finally:
             reader.close()
@@ -419,7 +451,9 @@ def _pull_request_catalog_selection(
     ontology_name = PurePosixPath(ALLOWED_SKILL_ROOTS[1]).name
     subscription = OntologySubscription(
         url=f"https://github.com/{source.repository}.git",
-        active_ref=f"refs/heads/{source.head_ref}",
+        # The checked-in snapshot is consumed after merge from the repository's
+        # canonical branch. Its exact PR provenance remains bound by ``commit``.
+        active_ref="refs/heads/main",
         checkout=Path("ci-pr-skill-sync"),
         catalog=Path("geas.yaml"),
         freshness=OntologyFreshnessConfig(check_before_use=False),
@@ -544,6 +578,8 @@ def verify_pull_request(
         raise ValueError("pull request number changed")
     if base_repo.get("full_name") != REPOSITORY:
         raise ValueError("pull request base repository changed")
+    if base.get("ref") != "main":
+        raise ValueError("pull request base branch changed")
     if head_repo.get("full_name") != source.head_repository:
         raise ValueError("pull request head repository changed")
     if bool(head_repo.get("fork")) or source.head_repository != REPOSITORY:
@@ -554,10 +590,137 @@ def verify_pull_request(
         raise ValueError("pull request head SHA changed")
     return PullRequestVerification(
         number=source.pull_request,
+        base_sha=str(base.get("sha")),
         head_repository=source.head_repository,
         head_ref=source.head_ref,
         head_sha=source.head_sha,
     )
+
+
+def verify_pull_request_head(
+    value: Mapping[str, object],
+    *,
+    source: ArtifactSource,
+    expected_head: str,
+) -> PullRequestVerification:
+    """Re-bind the same PR and branch to a verified post-writeback head."""
+    if not _GIT_ID.fullmatch(expected_head):
+        raise ValueError("expected pull-request head is not a full Git object ID")
+    return verify_pull_request(
+        value,
+        source=source.model_copy(update={"head_sha": expected_head}),
+    )
+
+
+def verify_pull_request_files(value: object) -> tuple[str, ...]:
+    """Accept only a bounded GitHub file inventory under the managed roots."""
+    if not isinstance(value, (list, tuple)):
+        raise ValueError("pull-request file inventory is invalid")
+    flattened: list[object] = []
+    for page in value:
+        if isinstance(page, (list, tuple)):
+            flattened.extend(page)
+        else:
+            flattened.append(page)
+    if not flattened or len(flattened) > _MAX_FILES:
+        raise ValueError("pull-request file inventory is empty or too large")
+    paths: list[str] = []
+    for raw in flattened:
+        item = _mapping(raw, "pull-request file")
+        filename = item.get("filename")
+        if not isinstance(filename, str):
+            raise ValueError("pull-request file path is invalid")
+        _validate_payload_path(filename)
+        paths.append(filename)
+        previous = item.get("previous_filename")
+        if previous is not None:
+            if not isinstance(previous, str):
+                raise ValueError("pull-request previous file path is invalid")
+            _validate_payload_path(previous)
+            paths.append(previous)
+    if len(paths) != len(set(paths)):
+        raise ValueError("pull-request file inventory contains duplicate paths")
+    return tuple(sorted(paths, key=lambda path: path.encode("utf-8")))
+
+
+def bind_pull_request_file_inventory(
+    value: object,
+    *,
+    before: Mapping[str, object],
+    after: Mapping[str, object],
+    source: ArtifactSource,
+    repository: Path | None = None,
+) -> PullRequestFileInventory:
+    """Bind a fresh complete file listing between two reads of the exact PR head."""
+    try:
+        first = verify_pull_request(before, source=source)
+        second = verify_pull_request(after, source=source)
+    except ValueError as error:
+        raise ValueError("pull request changed while file inventory was read") from error
+    if first != second:
+        raise ValueError("pull request changed while file inventory was read")
+    paths = verify_pull_request_files(value)
+    if repository is not None and paths != _exact_pull_request_paths(
+        repository,
+        base=first.base_sha,
+        head=first.head_sha,
+    ):
+        raise ValueError("pull-request file inventory does not match the exact Git commits")
+    return PullRequestFileInventory(
+        head_sha=first.head_sha,
+        paths=paths,
+    )
+
+
+def _exact_pull_request_paths(repository: Path, *, base: str, head: str) -> tuple[str, ...]:
+    root = repository.resolve()
+    for label, commit in (("base", base), ("head", head)):
+        resolved = _git(root, "rev-parse", "--verify", f"{commit}^{{commit}}").stdout.strip()
+        if resolved != commit:
+            raise ValueError(f"pull-request {label} commit did not resolve exactly")
+    merge_base = _git(root, "merge-base", base, head).stdout.strip()
+    if not _GIT_ID.fullmatch(merge_base):
+        raise ValueError("pull-request merge base is invalid")
+    raw = _git(
+        root,
+        "diff",
+        "--name-only",
+        "--no-renames",
+        "-z",
+        merge_base,
+        head,
+    ).stdout
+    paths = tuple(path for path in raw.split("\x00") if path)
+    if not paths or len(paths) > _MAX_FILES or len(paths) != len(set(paths)):
+        raise ValueError("exact pull-request file inventory is empty or too large")
+    for path in paths:
+        _validate_payload_path(path)
+    return tuple(sorted(paths, key=lambda path: path.encode("utf-8")))
+
+
+def verify_pull_request_review(
+    value: Mapping[str, object],
+    *,
+    source: ArtifactSource,
+    expected_head: str,
+) -> PullRequestReviewVerification:
+    """Require GitHub to acknowledge approval of the exact verified commit."""
+    if not _GIT_ID.fullmatch(expected_head):
+        raise ValueError("expected review head is not a full Git object ID")
+    expected_url = f"https://api.github.com/repos/{REPOSITORY}/pulls/{source.pull_request}"
+    try:
+        result = PullRequestReviewVerification(
+            state=value.get("state"),
+            commit_id=value.get("commit_id"),
+            pull_request_url=value.get("pull_request_url"),
+        )
+    except Exception:
+        raise ValueError("pull-request review response is invalid") from None
+    if result.commit_id != expected_head:
+        raise ValueError("pull-request review commit does not match the verified head")
+    if result.pull_request_url != expected_url:
+        raise ValueError("pull-request review belongs to a different pull request")
+    return result
 
 
 def effective_source_commit(repository: Path, head_sha: str) -> str:
@@ -703,6 +866,56 @@ def validate_org_sts_policy(path: Path) -> OrgStsPolicy:
         return OrgStsPolicy.model_validate(yaml.safe_load(path.read_text()))
     except Exception as error:
         raise ValueError(f"Octo STS policy is invalid: {error}") from error
+
+
+def evaluate_protected_workflow(
+    *,
+    event: Mapping[str, object],
+    pull_request: Mapping[str, object],
+    current_pull_request: Mapping[str, object],
+    pull_request_files: PullRequestFileInventory,
+    artifact: Path,
+    comparison_repository: Path,
+    sts_policy: Path,
+    app_identity: str,
+    exchange_token: TokenExchange,
+) -> ProtectedWorkflowDecision:
+    """Complete every inert read gate before exchanging an Octo STS token."""
+    workflow = evaluate_workflow_run(event)
+    if not workflow.writeback:
+        raise ValueError("workflow run is not eligible for protected write-back")
+    verify_pull_request(pull_request, source=workflow.source)
+    verify_pull_request(current_pull_request, source=workflow.source)
+    pull_request_files = PullRequestFileInventory.model_validate(
+        pull_request_files.model_dump(mode="json")
+    )
+    if pull_request_files.head_sha != workflow.source.head_sha:
+        raise ValueError("pull-request file inventory is not bound to the exact head")
+    validate_org_sts_policy(sts_policy)
+    if app_identity != APP_IDENTITY:
+        raise ValueError("protected workflow App identity is invalid")
+    changed = artifact_changed_against_commit(
+        artifact,
+        repository=comparison_repository,
+        source=workflow.source,
+    )
+    if not changed:
+        return ProtectedWorkflowDecision(
+            source=workflow.source,
+            eligible=False,
+            changed=False,
+            token_exchanged=False,
+        )
+    token = exchange_token()
+    if not isinstance(token, str) or not token:
+        raise ValueError("Octo STS returned an invalid token")
+    del token
+    return ProtectedWorkflowDecision(
+        source=workflow.source,
+        eligible=True,
+        changed=True,
+        token_exchanged=True,
+    )
 
 
 def _snapshot_identity(snapshot: Path) -> SnapshotIdentity:
@@ -1005,8 +1218,10 @@ def _assert_no_symlink_path(root: Path, relative: Path) -> None:
 
 
 def _validate_payload_path(value: str) -> None:
-    if not value or "\\" in value or any(
-        ord(character) < 32 or ord(character) == 127 for character in value
+    if (
+        not value
+        or "\\" in value
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
     ):
         raise ValueError("artifact path is not normalized")
     path = PurePosixPath(value)
@@ -1020,9 +1235,7 @@ def _validate_payload_path(value: str) -> None:
 
 
 def _root_for_path(value: str) -> str:
-    matches = tuple(
-        root for root in ALLOWED_SKILL_ROOTS if value.startswith(f"{root}/")
-    )
+    matches = tuple(root for root in ALLOWED_SKILL_ROOTS if value.startswith(f"{root}/"))
     if len(matches) != 1:
         raise ValueError("artifact path is outside the two allowed skill roots")
     return matches[0]
@@ -1081,13 +1294,16 @@ def _git(
 
 
 def _load_json(path: Path, *, label: str) -> Mapping[str, object]:
+    return _mapping(_load_json_value(path, label=label), label)
+
+
+def _load_json_value(path: Path, *, label: str) -> object:
     if path.is_symlink() or not path.is_file() or path.stat().st_size > _MAX_MANIFEST_BYTES:
         raise ValueError(f"{label} JSON is missing, unsafe, or too large")
     try:
-        value = json.loads(path.read_bytes())
+        return json.loads(path.read_bytes())
     except (json.JSONDecodeError, UnicodeDecodeError) as error:
         raise ValueError(f"{label} JSON is invalid") from error
-    return _mapping(value, label)
 
 
 def _write_outputs(path: Path, values: Mapping[str, str | int | bool]) -> None:
@@ -1115,13 +1331,31 @@ def _build_parser() -> argparse.ArgumentParser:
     verify.add_argument("--artifact", type=Path, required=True)
     verify.add_argument("--context", type=Path, required=True)
     verify.add_argument("--pull-request", type=Path, required=True)
+    verify.add_argument("--pull-request-files", type=Path, required=True)
     verify.add_argument("--github-output", type=Path, required=True)
     verify.add_argument("--repository", type=Path, required=True)
+    bind_files = subparsers.add_parser("bind-files")
+    bind_files.add_argument("--context", type=Path, required=True)
+    bind_files.add_argument("--before", type=Path, required=True)
+    bind_files.add_argument("--after", type=Path, required=True)
+    bind_files.add_argument("--files", type=Path, required=True)
+    bind_files.add_argument("--output", type=Path, required=True)
+    bind_files.add_argument("--repository", type=Path, required=True)
+    bind_files.add_argument("--expected-head")
     writeback = subparsers.add_parser("writeback")
     writeback.add_argument("--artifact", type=Path, required=True)
     writeback.add_argument("--context", type=Path, required=True)
     writeback.add_argument("--pull-request", type=Path, required=True)
     writeback.add_argument("--repository", type=Path, required=True)
+    writeback.add_argument("--github-output", type=Path)
+    verify_head = subparsers.add_parser("verify-head")
+    verify_head.add_argument("--context", type=Path, required=True)
+    verify_head.add_argument("--pull-request", type=Path, required=True)
+    verify_head.add_argument("--expected-head", required=True)
+    verify_review = subparsers.add_parser("verify-review")
+    verify_review.add_argument("--context", type=Path, required=True)
+    verify_review.add_argument("--review", type=Path, required=True)
+    verify_review.add_argument("--expected-head", required=True)
     policy = subparsers.add_parser("validate-policy")
     policy.add_argument("path", type=Path)
     return parser
@@ -1170,12 +1404,35 @@ def main() -> None:
             _load_json(args.pull_request, label="pull request"),
             source=decision.source,
         )
+        inventory = PullRequestFileInventory.model_validate_json(
+            args.pull_request_files.read_bytes()
+        )
+        if inventory.head_sha != decision.source.head_sha:
+            raise ValueError("pull-request file inventory is not bound to the exact head")
         changed = artifact_changed_against_commit(
             args.artifact,
             repository=args.repository,
             source=decision.source,
         )
         _write_outputs(args.github_output, {"changed": changed})
+        return
+    if args.command == "bind-files":
+        decision = WorkflowRunDecision.model_validate_json(args.context.read_bytes())
+        if not decision.writeback:
+            raise ValueError("workflow run is not eligible for write-back")
+        source = decision.source
+        if args.expected_head is not None:
+            if not _GIT_ID.fullmatch(args.expected_head):
+                raise ValueError("expected inventory head is not a full Git object ID")
+            source = source.model_copy(update={"head_sha": args.expected_head})
+        inventory = bind_pull_request_file_inventory(
+            _load_json_value(args.files, label="pull-request files"),
+            before=_load_json(args.before, label="pull request before files"),
+            after=_load_json(args.after, label="pull request after files"),
+            source=source,
+            repository=args.repository,
+        )
+        args.output.write_bytes(_canonical_json(inventory))
         return
     if args.command == "writeback":
         decision = WorkflowRunDecision.model_validate_json(args.context.read_bytes())
@@ -1187,7 +1444,34 @@ def main() -> None:
             source=decision.source,
             pull_request=_load_json(args.pull_request, label="pull request"),
         )
+        if args.github_output is not None:
+            outputs: dict[str, str | bool] = {"pushed": receipt.pushed}
+            if receipt.commit is not None:
+                outputs["commit"] = receipt.commit
+            _write_outputs(args.github_output, outputs)
         print(_canonical_json(receipt).decode("utf-8"), end="")
+        return
+    if args.command == "verify-head":
+        decision = WorkflowRunDecision.model_validate_json(args.context.read_bytes())
+        if not decision.writeback:
+            raise ValueError("workflow run is not eligible for write-back")
+        verification = verify_pull_request_head(
+            _load_json(args.pull_request, label="pull request"),
+            source=decision.source,
+            expected_head=args.expected_head,
+        )
+        print(_canonical_json(verification).decode("utf-8"), end="")
+        return
+    if args.command == "verify-review":
+        decision = WorkflowRunDecision.model_validate_json(args.context.read_bytes())
+        if not decision.writeback:
+            raise ValueError("workflow run is not eligible for write-back")
+        verification = verify_pull_request_review(
+            _load_json(args.review, label="pull-request review"),
+            source=decision.source,
+            expected_head=args.expected_head,
+        )
+        print(_canonical_json(verification).decode("utf-8"), end="")
         return
     if args.command == "validate-policy":
         print(_canonical_json(validate_org_sts_policy(args.path)).decode("utf-8"), end="")

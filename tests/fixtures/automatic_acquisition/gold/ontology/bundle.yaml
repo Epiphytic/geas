@@ -1,0 +1,32 @@
+version: 1
+topic: Aurora Gold
+topic_concept_id: concept:aurora-gold
+recorded_at: 2026-09-03T12:00:00Z
+sources:
+  - key: aurora-seed
+    path: seed.md
+    expected_sha256: 6dddecc75a338b2ad367b111f4b2a021da40f83a0314d1011463fc69d239dac5
+    acquired_at: 2026-09-03T12:00:00Z
+    original_locator: https://aurora-gold.example.test/about
+    title: Aurora Gold fixture seed
+    authors: []
+    publisher: Aurora Gold Fixture
+    published_at: null
+    media_type: text/markdown
+    license: CC0-1.0
+    usage_conditions: []
+    rights_basis: Offline fixture authored for the Geas test suite.
+    provenance_note: Deterministic checked-in test fixture; no network access.
+concepts:
+  - id: concept:aurora-gold
+    label: Aurora Gold
+    description: Fictional Canadian gold-mining issuer used for offline acceptance tests.
+    broader: []
+    synonyms: []
+    recorded_at: 2026-09-03T12:00:00Z
+    recorded_by: operator:gold-fixture
+    review_state: accepted
+evidence: []
+claims: []
+controversies: []
+gaps: []

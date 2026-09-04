@@ -40,6 +40,27 @@ policy bot, or other repository-authorized actor may perform the merge. The
 model still cannot accept itself: only the exact bytes reachable from the
 configured canonical branch have acceptance authority.
 
+## Repository publishing and GitHub App automation
+
+Integrated repository updates publish a pull request by default. This keeps
+the proposed branch, checks, and review decision visible. `--publish none`
+retains only receipt-owned local output. `--direct-push` is a separate,
+explicit path requiring an exact `git.direct_push` capability, a clean verified
+base and remote head, and confined force-with-lease publication.
+
+An operator may install the separately documented
+[GitHub App workflow](GITHUB_APP_AUTOMATION.md) to merge deterministic
+artifacts after protected checks. The App uses narrow repository installation
+permissions and a short-lived token; ordinary pull-request code runs with
+read-only credentials and cannot obtain that token. Enabling artifact
+automation does not imply `knowledge.auto_promote` and does not make semantic
+knowledge canonical. Semantic writes still require the exact capability,
+verified promotion manifest, canonical-branch ancestry, and local policy.
+
+Generated skills, indexes, Markdown, RDF, source libraries, and other
+deterministic artifacts remain rebuildable views. A forge label, review,
+merge, or App receipt is governance evidence; it is not an ontology fact.
+
 ## Per-ontology acceptance policy
 
 Generic defaults live under `ontology_defaults.acceptance`, and an ontology

@@ -7,6 +7,12 @@ from pathlib import Path
 import pytest
 import yaml
 
+from research_agent.capabilities import (
+    Capability,
+    CapabilityRequest,
+    DeterministicCapabilityEvaluator,
+)
+from research_agent.ontology_trust import TrustRule
 from research_agent.user_config import (
     DEFAULT_CONFIG_FILENAMES,
     DEFAULT_ONTOLOGY_REPOSITORY,
@@ -14,6 +20,212 @@ from research_agent.user_config import (
     GeasUserConfig,
     UserConfigManager,
 )
+
+
+def test_v1_trust_rule_grants_repository_read_only(tmp_path: Path) -> None:
+    manager = UserConfigManager(tmp_path / "config.yaml")
+    manager.path.write_text(
+        yaml.safe_dump(
+            {
+                "version": 1,
+                "default_profile": "default",
+                "profiles": {
+                    "default": {
+                        "trust_rules": [
+                            TrustRule(
+                                decision="allow",
+                                repository="https://github.com/example/root",
+                                refs=("refs/heads/main",),
+                                paths="*",
+                                bundle_sha256="*",
+                                created_at="2026-09-02T00:00:00Z",
+                                created_via="manual",
+                            ).model_dump(mode="json")
+                        ]
+                    }
+                },
+            },
+            sort_keys=False,
+        )
+    )
+
+    grant = manager.load().profile()[1].effective_capability_grants()[0]
+
+    assert grant.capabilities == (Capability.REPOSITORY_READ,)
+    assert grant.delegable_capabilities == ()
+
+
+def test_loading_v1_config_does_not_rewrite_its_bytes(tmp_path: Path) -> None:
+    manager = UserConfigManager(tmp_path / "config.yaml")
+    original = GeasUserConfig.default().explicit_yaml().encode()
+    manager.path.write_bytes(original)
+
+    loaded = manager.load()
+
+    assert loaded.version == 1
+    assert manager.path.read_bytes() == original
+
+
+def test_explicit_upgrade_writes_strict_v2_capability_grants(tmp_path: Path) -> None:
+    manager = UserConfigManager(tmp_path / "config.yaml")
+    manager.root.mkdir(parents=True, exist_ok=True)
+    v1 = GeasUserConfig.default()
+    profile = v1.profiles["default"].model_copy(
+        update={
+            "trust_rules": (
+                TrustRule(
+                    decision="allow",
+                    repository="https://github.com/example/root",
+                    refs=("refs/heads/main",),
+                    paths="*",
+                    bundle_sha256="*",
+                    created_at="2026-09-02T00:00:00Z",
+                    created_via="manual",
+                ),
+            )
+        }
+    )
+    v1 = v1.model_copy(update={"profiles": {"default": profile}})
+
+    manager.replace(v1, upgrade_version=True)
+    serialized = yaml.safe_load(manager.path.read_text())
+
+    assert serialized["version"] == 2
+    assert "trust_rules" not in serialized["profiles"]["default"]
+    grant = serialized["profiles"]["default"]["capability_grants"][0]
+    assert grant == {
+        "version": 1,
+        "decision": "allow",
+        "subject": {
+            "version": 1,
+            "repository": "https://github.com/example/root",
+            "refs": ["refs/heads/main"],
+            "paths": "*",
+            "bundle_sha256": "*",
+        },
+        "capabilities": ["repository.read"],
+        "delegable_capabilities": [],
+        "resources": {
+            "version": 1,
+            "delegated_repositories": [],
+            "hosts": [],
+            "path_prefixes": [],
+            "connectors": [],
+            "providers": [],
+            "models": [],
+            "data_classes": [],
+            "git_refs": [],
+        },
+        "max_delegation_depth": 0,
+        "expires_at": None,
+        "created_at": "2026-09-02T00:00:00Z",
+        "created_via": "manual",
+    }
+
+
+@pytest.mark.parametrize(
+    ("repository", "ref"),
+    (
+        ("/srv/geas/ontologies", "refs/heads/main"),
+        ("ssh://git@example.invalid/~/Owner/Example", "d" * 40),
+    ),
+    ids=("machine-local", "non-github-ssh"),
+)
+def test_v1_repository_identities_survive_v2_upgrade_load_and_evaluation(
+    tmp_path: Path,
+    repository: str,
+    ref: str,
+) -> None:
+    manager = UserConfigManager(tmp_path / "config.yaml")
+    manager.root.mkdir(parents=True, exist_ok=True)
+    rule = TrustRule(
+        decision="allow",
+        repository=repository,
+        refs=(ref,),
+        paths=(Path("ontology/a"),),
+        bundle_sha256=("a" * 64,),
+        created_at="2026-09-02T00:00:00Z",
+        created_via="manual",
+    )
+    config = GeasUserConfig(
+        profiles={"default": GeasProfile(ontology_git=None, trust_rules=(rule,))}
+    )
+
+    manager.replace(config, upgrade_version=True)
+    loaded = manager.load()
+    grant = loaded.profiles["default"].capability_grants[0]
+    decision = DeterministicCapabilityEvaluator(
+        (grant,), {}, clock=lambda: rule.created_at
+    ).evaluate(
+        CapabilityRequest(
+            authority_repository=repository,
+            target_repository=repository,
+            capabilities=(Capability.REPOSITORY_READ,),
+            ref=ref,
+            path="ontology/a",
+            bundle_sha256="a" * 64,
+            requested_at=rule.created_at,
+        )
+    )
+
+    assert loaded.version == 2
+    assert grant.subject.repository == repository
+    assert decision.allowed
+    if repository.startswith("ssh://"):
+        absolute_remote = "ssh://git@example.invalid/Owner/Example"
+        widened = DeterministicCapabilityEvaluator(
+            (grant,), {}, clock=lambda: rule.created_at
+        ).evaluate(
+            CapabilityRequest(
+                authority_repository=absolute_remote,
+                target_repository=absolute_remote,
+                capabilities=(Capability.REPOSITORY_READ,),
+                ref=ref,
+                path="ontology/a",
+                bundle_sha256="a" * 64,
+                requested_at=rule.created_at,
+            )
+        )
+        assert not widened.allowed
+
+
+def test_v2_rejects_legacy_rules_and_duplicate_normalized_grant_selectors() -> None:
+    raw = GeasUserConfig.default().model_dump(mode="json")
+    raw["version"] = 2
+    raw["profiles"]["default"]["trust_rules"] = [
+        {
+            "decision": "allow",
+            "repository": "https://github.com/example/root",
+            "refs": "*",
+            "paths": "*",
+            "bundle_sha256": "*",
+            "created_at": "2026-09-02T00:00:00Z",
+            "created_via": "manual",
+        }
+    ]
+    with pytest.raises(ValueError, match="version 2.*trust_rules"):
+        GeasUserConfig.model_validate(raw)
+
+    raw["profiles"]["default"].pop("trust_rules")
+    grant = {
+        "decision": "allow",
+        "subject": {
+            "repository": "https://github.com/example/root",
+            "refs": ["refs/heads/main"],
+            "paths": ["ontology/a"],
+            "bundle_sha256": ["a" * 64],
+        },
+        "capabilities": ["repository.read"],
+        "delegable_capabilities": [],
+        "resources": {},
+        "max_delegation_depth": 0,
+        "expires_at": None,
+        "created_at": "2026-09-02T00:00:00Z",
+        "created_via": "manual",
+    }
+    raw["profiles"]["default"]["capability_grants"] = [grant, grant]
+    with pytest.raises(ValueError, match="duplicate capability grant selectors"):
+        GeasUserConfig.model_validate(raw)
 
 
 def test_user_config_initializes_explicit_profile_and_secret_scaffold(

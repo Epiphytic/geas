@@ -1,3 +1,4 @@
+import hashlib
 import os
 import subprocess
 from datetime import UTC, datetime, timedelta
@@ -5,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from research_agent.capabilities import Capability, CapabilityDecision, CapabilityRequest
 from research_agent.ontology_subscriptions import OntologySubscription
 from research_agent.ontology_sync import (
     OntologyRepositoryManager,
@@ -68,13 +70,111 @@ def _subscription_manager(
     return OntologyRepositoryManager(checkout=checkout, config=config)
 
 
+def _push(
+    manager: OntologyRepositoryManager,
+    *,
+    relative_paths: tuple[Path, ...] = (),
+    message: str = "geas: update ontologies",
+    freshness_state_path: Path | None = None,
+) -> dict[str, object]:
+    decisions = tuple(
+        CapabilityDecision(
+            request=CapabilityRequest.model_construct(
+                authority_repository=manager.config.url,
+                target_repository=manager.config.url,
+                capabilities=(Capability.GIT_DIRECT_PUSH,),
+                ref=manager.config.active_ref,
+                path=path.as_posix(),
+                dirty=True,
+                requested_at=datetime(2026, 9, 3, tzinfo=UTC),
+            ),
+            decision="allow",
+            effective_capabilities=(Capability.GIT_DIRECT_PUSH,),
+            reason="offline exact push fixture",
+            evaluator_version="fixture/1",
+            decided_at=datetime(2026, 9, 3, tzinfo=UTC),
+        )
+        for path in (Path(".gitignore"), *relative_paths)
+    )
+    return manager.push(
+        relative_paths=relative_paths,
+        message=message,
+        freshness_state_path=freshness_state_path,
+        capability_decisions=decisions,
+    )
+
+
+def test_git_environment_disables_prompts_hooks_replacements_and_credential_helpers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    poisoned = (
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_NAMESPACE",
+        "GIT_SHALLOW_FILE",
+        "GIT_CONFIG",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_SYSTEM",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_KEY_0",
+        "GIT_CONFIG_VALUE_0",
+        "GIT_SSH_COMMAND",
+    )
+    for name in poisoned:
+        monkeypatch.setenv(name, "/tmp/attacker-controlled")
+
+    environment = OntologyRepositoryManager._git_environment()
+
+    assert all(
+        name not in environment
+        for name in (
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_COMMON_DIR",
+            "GIT_INDEX_FILE",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_NAMESPACE",
+            "GIT_SHALLOW_FILE",
+            "GIT_CONFIG",
+            "GIT_SSH_COMMAND",
+        )
+    )
+    assert environment["GIT_TERMINAL_PROMPT"] == "0"
+    assert environment["GIT_NO_REPLACE_OBJECTS"] == "1"
+    assert environment["GIT_CONFIG_NOSYSTEM"] == "1"
+    assert environment["GIT_CONFIG_GLOBAL"] == os.devnull
+    assert environment["GIT_CONFIG_SYSTEM"] == os.devnull
+    assert environment["GIT_CONFIG_COUNT"] == "2"
+    assert environment["GIT_CONFIG_KEY_0"] == "core.hooksPath"
+    assert environment["GIT_CONFIG_VALUE_0"] == os.devnull
+    assert environment["GIT_CONFIG_KEY_1"] == "credential.helper"
+    assert environment["GIT_CONFIG_VALUE_1"] == ""
+    assert environment["GIT_AUTHOR_NAME"] == "Geas Test"
+
+
+def test_legacy_push_denies_without_injected_exact_capability_before_checkout_mutation(
+    tmp_path: Path,
+) -> None:
+    manager = _manager(tmp_path / "remote.git", tmp_path / "checkout")
+
+    with pytest.raises(OntologySyncError, match="capability"):
+        manager.push(relative_paths=(Path("ontology.yaml"),), message="must fail")
+
+    assert not manager.checkout.exists()
+
+
 def _seed_remote(remote: Path, seed: Path) -> tuple[str, str]:
     remote.mkdir()
     _git("init", "--bare", "--initial-branch=main", cwd=remote)
     manager = _manager(remote, seed)
     manager.pull()
     (manager.checkout / "ontology.yaml").write_text("version: 1\n")
-    manager.push(relative_paths=(Path("ontology.yaml"),), message="seed")
+    _push(manager, relative_paths=(Path("ontology.yaml"),), message="seed")
     commit = _git("rev-parse", "HEAD", cwd=manager.checkout).stdout.strip()
     _git("tag", "-a", "release/v1", "-m", "annotated release", cwd=manager.checkout)
     _git("branch", "release/v1", cwd=manager.checkout)
@@ -86,6 +186,35 @@ def _seed_remote(remote: Path, seed: Path) -> tuple[str, str]:
         cwd=manager.checkout,
     )
     return commit, manager.checkout.as_posix()
+
+
+def test_replaceable_checkout_allows_only_exact_owned_generated_leaves(
+    tmp_path: Path,
+) -> None:
+    remote = tmp_path / "remote.git"
+    _seed_remote(remote, tmp_path / "seed")
+    local = _manager(remote, tmp_path / "local")
+    local.pull()
+    skill = local.checkout / ".agents" / "skills" / "gold" / "SKILL.md"
+    skill.parent.mkdir(parents=True)
+    skill.write_bytes(b"# Gold\n")
+    owned = {
+        skill.relative_to(local.checkout).as_posix(): hashlib.sha256(
+            skill.read_bytes()
+        ).hexdigest()
+    }
+
+    local.assert_replaceable(owned)
+
+    unrelated = local.checkout / "operator-notes.txt"
+    unrelated.write_text("preserve\n")
+    with pytest.raises(OntologySyncError, match="unowned local changes"):
+        local.assert_replaceable(owned)
+    unrelated.unlink()
+
+    skill.write_bytes(b"operator changed\n")
+    with pytest.raises(OntologySyncError, match="owned generated path changed"):
+        local.assert_replaceable(owned)
 
 
 @pytest.mark.parametrize(
@@ -128,7 +257,7 @@ def test_pull_accepts_exact_sha256_commit_id_when_git_supports_it(tmp_path: Path
     seed = _manager(remote, tmp_path / "seed")
     seed.pull()
     (seed.checkout / "ontology.yaml").write_text("version: 1\n")
-    seed.push(relative_paths=(Path("ontology.yaml"),), message="sha256 seed")
+    _push(seed, relative_paths=(Path("ontology.yaml"),), message="sha256 seed")
     commit = _git("rev-parse", "HEAD", cwd=seed.checkout).stdout.strip()
     assert len(commit) == 64
     manager = _subscription_manager(remote, tmp_path / "checkout", active_ref=commit)
@@ -159,10 +288,10 @@ def test_historical_commit_pin_remains_fetchable_after_branch_advances(
     seed = _manager(remote, tmp_path / "seed")
     seed.pull()
     (seed.checkout / "ontology.yaml").write_text("version: 1\n")
-    seed.push(relative_paths=(Path("ontology.yaml"),), message="first")
+    _push(seed, relative_paths=(Path("ontology.yaml"),), message="first")
     historical = _git("rev-parse", "HEAD", cwd=seed.checkout).stdout.strip()
     (seed.checkout / "ontology.yaml").write_text("version: 2\n")
-    seed.push(relative_paths=(Path("ontology.yaml"),), message="advance")
+    _push(seed, relative_paths=(Path("ontology.yaml"),), message="advance")
     assert _git("rev-parse", "HEAD", cwd=seed.checkout).stdout.strip() != historical
     pinned = _subscription_manager(remote, tmp_path / "pinned", active_ref=historical)
 
@@ -189,7 +318,7 @@ def test_push_rejects_read_only_tag_and_commit_refs_before_staging(
     )
 
     with pytest.raises(OntologySyncError, match="read-only|branch"):
-        manager.push(relative_paths=(Path("ontology.yaml"),), message="must fail")
+        _push(manager, relative_paths=(Path("ontology.yaml"),), message="must fail")
 
     if manager.checkout.exists():
         assert _git("status", "--porcelain", cwd=manager.checkout).stdout == before
@@ -249,7 +378,7 @@ def test_git_sync_initializes_pushes_and_fast_forward_pulls(tmp_path: Path) -> N
     ontology = first.checkout / "routing"
     ontology.mkdir()
     (ontology / "build.yaml").write_text("version: 1\n")
-    pushed = first.push(relative_paths=(Path("routing"),), message="add routing")
+    pushed = _push(first, relative_paths=(Path("routing"),), message="add routing")
     assert pushed["pushed"] is True
 
     second = _manager(remote, tmp_path / "second")
@@ -257,7 +386,7 @@ def test_git_sync_initializes_pushes_and_fast_forward_pulls(tmp_path: Path) -> N
     assert second_pull["pulled"] is True
     assert (second.checkout / "routing" / "build.yaml").is_file()
     (second.checkout / "routing" / "library.yaml").write_text("version: 1\n")
-    second.push(relative_paths=(Path("routing"),), message="add library")
+    _push(second, relative_paths=(Path("routing"),), message="add library")
 
     updated = first.pull()
     assert updated["pulled"] is True
@@ -282,14 +411,14 @@ def test_git_sync_rejects_secret_content_and_unrelated_staging(
     ontology.mkdir()
     (ontology / "public.yaml").write_text("OPENAI_API_KEY: sk-abcdefghijklmnopqrstuvwxyz\n")
     with pytest.raises(OntologySyncError, match="possible credential"):
-        manager.push(relative_paths=(Path("routing"),), message="must fail")
+        _push(manager, relative_paths=(Path("routing"),), message="must fail")
 
     _git("reset", cwd=manager.checkout)
     (ontology / "public.yaml").write_text("version: 1\n")
     (manager.checkout / "unrelated.md").write_text("not selected\n")
     _git("add", "unrelated.md", cwd=manager.checkout)
     with pytest.raises(OntologySyncError, match="previously staged"):
-        manager.push(relative_paths=(Path("routing"),), message="must fail")
+        _push(manager, relative_paths=(Path("routing"),), message="must fail")
 
 
 def test_git_sync_rejects_staged_regular_file_to_symlink_type_change(
@@ -304,7 +433,7 @@ def test_git_sync_rejects_staged_regular_file_to_symlink_type_change(
     ontology.symlink_to(".gitignore")
 
     with pytest.raises(OntologySyncError, match="symbolic link|mode"):
-        manager.push(relative_paths=(Path("ontology.yaml"),), message="must fail")
+        _push(manager, relative_paths=(Path("ontology.yaml"),), message="must fail")
 
     assert _git("rev-parse", "HEAD", cwd=manager.checkout).stdout.strip() == original
     assert _git("rev-parse", "refs/heads/main", cwd=remote).stdout.strip() == original
@@ -333,7 +462,7 @@ def test_git_sync_ignores_replacement_refs_when_inspecting_exact_index_blob(
     _git("replace", staged, safe.stdout.strip(), cwd=manager.checkout)
 
     with pytest.raises(OntologySyncError, match="possible credential"):
-        manager.push(relative_paths=(Path("ontology.yaml"),), message="must fail")
+        _push(manager, relative_paths=(Path("ontology.yaml"),), message="must fail")
 
     assert _git("rev-parse", "HEAD", cwd=manager.checkout).stdout.strip() == original
     assert _git("rev-parse", "refs/heads/main", cwd=remote).stdout.strip() == original
@@ -347,7 +476,7 @@ def test_git_sync_disables_rename_hiding_for_outside_target_deletion(
     manager = _manager(remote, tmp_path / "seed")
     outside = manager.checkout / "outside.yaml"
     outside.write_text("same ontology bytes\n")
-    manager.push(relative_paths=(Path("outside.yaml"),), message="seed outside")
+    _push(manager, relative_paths=(Path("outside.yaml"),), message="seed outside")
     baseline = _git("rev-parse", "HEAD", cwd=manager.checkout).stdout.strip()
     target = manager.checkout / "routing"
     target.mkdir()
@@ -356,7 +485,7 @@ def test_git_sync_disables_rename_hiding_for_outside_target_deletion(
     _git("add", "-A", "--", "outside.yaml", cwd=manager.checkout)
 
     with pytest.raises(OntologySyncError, match="previously staged.*outside.yaml"):
-        manager.push(relative_paths=(Path("routing"),), message="must fail")
+        _push(manager, relative_paths=(Path("routing"),), message="must fail")
 
     assert baseline != original
     assert _git("rev-parse", "HEAD", cwd=manager.checkout).stdout.strip() == baseline
@@ -382,7 +511,7 @@ def test_git_sync_rejects_oversized_index_blob_before_materializing_it(
     monkeypatch.setattr(subprocess, "run", recording_run)
 
     with pytest.raises(OntologySyncError, match="oversized ontology file"):
-        manager.push(relative_paths=(Path("ontology.yaml"),), message="must fail")
+        _push(manager, relative_paths=(Path("ontology.yaml"),), message="must fail")
 
     cat_file = [command for command in commands if command[:2] == ("git", "cat-file")]
     assert cat_file
@@ -412,7 +541,7 @@ def test_git_sync_accepts_documented_public_placeholders(
         'OPENAI_KEY="your_openai_key"\n'
     )
 
-    receipt = manager.push(relative_paths=(Path("routing"),), message="public examples")
+    receipt = _push(manager, relative_paths=(Path("routing"),), message="public examples")
 
     assert receipt["pushed"] is True
 
@@ -463,7 +592,7 @@ def test_git_sync_rejects_ambiguous_assignment_without_commit_or_remote_write(
     (ontology / "example.md").write_text(assignment)
 
     with pytest.raises(OntologySyncError, match=error_pattern):
-        manager.push(relative_paths=(Path("routing"),), message="must fail")
+        _push(manager, relative_paths=(Path("routing"),), message="must fail")
 
     remote_head = subprocess.run(
         (
@@ -505,12 +634,12 @@ def test_freshness_check_fetches_at_most_once_per_window(
     ontology = first.checkout / "routing"
     ontology.mkdir()
     (ontology / "build.yaml").write_text("version: 1\n")
-    first.push(relative_paths=(Path("routing"),), message="initial ontology")
+    _push(first, relative_paths=(Path("routing"),), message="initial ontology")
 
     second = _manager(remote, tmp_path / "second")
     second.pull()
     (second.checkout / "routing" / "library.yaml").write_text("version: 1\n")
-    second.push(relative_paths=(Path("routing"),), message="remote update")
+    _push(second, relative_paths=(Path("routing"),), message="remote update")
 
     cached = first.freshen(
         state_path=state,
@@ -534,7 +663,7 @@ def test_pull_rejects_existing_checkout_on_wrong_profile_branch(tmp_path: Path) 
     seed = _manager(remote, tmp_path / "seed")
     seed.pull()
     (seed.checkout / "ontology.yaml").write_text("version: 1\n")
-    seed.push(relative_paths=(Path("ontology.yaml"),), message="seed")
+    _push(seed, relative_paths=(Path("ontology.yaml"),), message="seed")
     checkout = _manager(remote, tmp_path / "checkout")
     checkout.pull()
     before = _git("rev-parse", "HEAD", cwd=checkout.checkout).stdout.strip()
@@ -556,7 +685,7 @@ def test_pull_binds_merge_to_exact_remote_head_despite_custom_refspec(
     seed = _manager(remote, tmp_path / "seed")
     seed.pull()
     (seed.checkout / "ontology.yaml").write_text("version: 1\n")
-    seed.push(relative_paths=(Path("ontology.yaml"),), message="seed")
+    _push(seed, relative_paths=(Path("ontology.yaml"),), message="seed")
 
     local = _manager(remote, tmp_path / "local")
     local.pull()
@@ -564,7 +693,7 @@ def test_pull_binds_merge_to_exact_remote_head_despite_custom_refspec(
     upstream = _manager(remote, tmp_path / "upstream")
     upstream.pull()
     (upstream.checkout / "legitimate.yaml").write_text("trusted: true\n")
-    upstream.push(relative_paths=(Path("legitimate.yaml"),), message="legitimate")
+    _push(upstream, relative_paths=(Path("legitimate.yaml"),), message="legitimate")
     legitimate = _git("rev-parse", "HEAD", cwd=upstream.checkout).stdout.strip()
 
     _git("switch", "-c", "forged", cwd=local.checkout)
@@ -600,7 +729,7 @@ def test_pull_rejects_ls_remote_transport_failure_before_downstream_work(
     seed = _manager(remote, tmp_path / "seed")
     seed.pull()
     (seed.checkout / "ontology.yaml").write_text("version: 1\n")
-    seed.push(relative_paths=(Path("ontology.yaml"),), message="seed")
+    _push(seed, relative_paths=(Path("ontology.yaml"),), message="seed")
     local = _manager(remote, tmp_path / "local")
     local.pull()
     remote.rename(tmp_path / "unavailable.git")
@@ -623,7 +752,7 @@ def test_pull_rejects_missing_remote_branch_when_local_head_exists(
     seed = _manager(remote, tmp_path / "seed")
     seed.pull()
     (seed.checkout / "ontology.yaml").write_text("version: 1\n")
-    seed.push(relative_paths=(Path("ontology.yaml"),), message="seed")
+    _push(seed, relative_paths=(Path("ontology.yaml"),), message="seed")
     local = _manager(remote, tmp_path / "local")
     local.pull()
     _git("update-ref", "-d", "refs/heads/main", cwd=remote)
@@ -644,13 +773,13 @@ def test_pull_disables_post_merge_hooks(tmp_path: Path) -> None:
     seed = _manager(remote, tmp_path / "seed")
     seed.pull()
     (seed.checkout / "ontology.yaml").write_text("version: 1\n")
-    seed.push(relative_paths=(Path("ontology.yaml"),), message="seed")
+    _push(seed, relative_paths=(Path("ontology.yaml"),), message="seed")
     local = _manager(remote, tmp_path / "local")
     local.pull()
     upstream = _manager(remote, tmp_path / "upstream")
     upstream.pull()
     (upstream.checkout / "ontology.yaml").write_text("version: 2\n")
-    upstream.push(relative_paths=(Path("ontology.yaml"),), message="advance")
+    _push(upstream, relative_paths=(Path("ontology.yaml"),), message="advance")
     hook = local.checkout / ".git" / "hooks" / "post-merge"
     hook.write_text("#!/bin/sh\nprintf 'hook ran\\n' > hook-ran.txt\n")
     hook.chmod(0o755)
@@ -671,13 +800,13 @@ def test_pull_rejects_post_merge_tracked_file_tampering_before_downstream_work(
     seed = _manager(remote, tmp_path / "seed")
     seed.pull()
     (seed.checkout / "ontology.yaml").write_text("version: 1\n")
-    seed.push(relative_paths=(Path("ontology.yaml"),), message="seed")
+    _push(seed, relative_paths=(Path("ontology.yaml"),), message="seed")
     local = _manager(remote, tmp_path / "local")
     local.pull()
     upstream = _manager(remote, tmp_path / "upstream")
     upstream.pull()
     (upstream.checkout / "ontology.yaml").write_text("version: 2\n")
-    upstream.push(relative_paths=(Path("ontology.yaml"),), message="advance")
+    _push(upstream, relative_paths=(Path("ontology.yaml"),), message="advance")
     original_run = local._run
 
     def tampering_run(

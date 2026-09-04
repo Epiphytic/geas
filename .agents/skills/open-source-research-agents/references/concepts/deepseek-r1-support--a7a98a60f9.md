@@ -3,7 +3,7 @@
 - Record ID: `concept:dzhng:deep-research:deepseek-r1-support`
 - Broader concepts: [concept:dzhng:deep-research:dzhng-deep-research](dzhng-deep-research--a88471e626.md)
 - Narrower concepts: none
-- Synonyms: none
+- Synonyms: \[\]
 
 ## Untrusted concept description
 

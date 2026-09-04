@@ -5,6 +5,7 @@ version: 1
 ontology_globs:
   - ontology/**/*.yaml
   - ontology/**/*.md
+  - geas-delegations.yaml
   - config/query-vocabulary.yaml
   - intelligence/sources.yaml
 ontology_exclude_globs:
@@ -25,6 +26,11 @@ operational_policy_paths:
 # Pydantic is currently authoritative for operational record envelopes.
 record_schema_paths:
   - src/research_agent/models.py
+  - src/research_agent/capabilities.py
+  - src/research_agent/bootstrap_models.py
+  - src/research_agent/publishing.py
+  - src/research_agent/source_intent.py
+  - src/research_agent/source_work.py
   - src/research_agent/discovery.py
   - src/research_agent/workflow.py
   - src/research_agent/policy.py
