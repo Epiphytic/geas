@@ -15,6 +15,11 @@ from research_agent.capabilities import (
     DeterministicCapabilityEvaluator,
 )
 from research_agent.cli import _build_parser
+from research_agent.repository_catalog import (
+    RepositoryCatalog,
+    refresh_catalog,
+    verify_catalog,
+)
 from research_agent.source_intent import DiscoveryKind, SourceIntent
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -107,6 +112,31 @@ def test_repository_ontology_command_reference_matches_the_cli() -> None:
         "skill-export",
         "topic-export",
     }
+
+
+def test_documented_catalog_scaffold_refreshes_into_a_verified_catalog(
+    tmp_path: Path,
+) -> None:
+    document = _yaml_between(
+        GUIDE.read_text(),
+        "## Author `geas.yaml`",
+        "The ontology `path` is relative",
+    )
+    scaffold = RepositoryCatalog.model_validate(document)
+    for item in scaffold.ontologies[0].files:
+        target = tmp_path / "ontology/example" / item.path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(f"fixture for {item.path.as_posix()}\n")
+    catalog_path = tmp_path / "geas.yaml"
+    catalog_path.write_text(yaml.safe_dump(document, sort_keys=False))
+
+    refreshed = refresh_catalog(catalog_path)
+
+    assert refreshed.ontologies[0].bundle_sha256 != "0" * 64
+    assert all(item.sha256 != "0" * 64 for item in refreshed.ontologies[0].files)
+    assert verify_catalog(catalog_path)[0].bundle_sha256 == (
+        refreshed.ontologies[0].bundle_sha256
+    )
 
 
 def test_task7_repository_workflow_reference_has_the_approved_exact_commands() -> None:
