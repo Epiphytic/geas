@@ -32,8 +32,8 @@ from research_agent.ontology_artifacts import (
     OntologyArtifact,
     OntologyArtifactManifest,
 )
-from research_agent.ontology_resolution import resolve_ontology_catalog, select_ontology
 from research_agent.ontology_build import OntologyBuildConfig
+from research_agent.ontology_resolution import resolve_ontology_catalog, select_ontology
 from research_agent.ontology_subscriptions import (
     OntologyFreshnessConfig,
     OntologySubscription,
