@@ -1043,6 +1043,7 @@ def test_canadian_gold_miner_automatic_acquisition_is_offline_resumable_and_owne
         source_path_prefixes=("/filings/", "/financials/", "/news/"),
         source_connectors=("source:direct-url", "source:feed"),
         delegated_repositories=(SOURCE_REPOSITORY,),
+        current_worktree=upstream.resolve(),
     )
     verified_bootstrap = VerifiedRepositoryBootstrap(
         repository=ROOT_REPOSITORY,
