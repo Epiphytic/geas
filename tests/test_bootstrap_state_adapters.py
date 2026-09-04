@@ -2361,6 +2361,20 @@ class _CopiedGitBootstrapRepository:
         if status:
             raise ValueError("checkout has local changes")
 
+    def assert_replaceable(self, owned_dirty_paths: dict[str, str]) -> None:
+        status = subprocess.run(
+            ("git", "status", "--porcelain=v1", "-z", "--untracked-files=all"),
+            cwd=self.checkout,
+            text=True,
+            capture_output=True,
+            check=True,
+        ).stdout
+        changed = {entry[3:] for entry in status.split("\0") if entry}
+        assert changed == set(owned_dirty_paths)
+        for relative, expected in owned_dirty_paths.items():
+            actual = hashlib.sha256((self.checkout / relative).read_bytes()).hexdigest()
+            assert actual == expected
+
     def assert_verified_commit(self, expected_commit: str) -> None:
         if self._head() != expected_commit:
             raise ValueError("checkout does not match the exact verified commit")
@@ -2564,6 +2578,20 @@ def test_remote_update_validates_old_then_typed_swap_then_candidate(
     events: list[str] = []
     interrupt_after_swap = True
 
+    def install_generic_skill(operation: BootstrapOperation) -> tuple[ManagedPath, ...]:
+        events.append("generic-skill")
+        skill = managed / ".agents/skills/geas/SKILL.md"
+        skill.parent.mkdir(parents=True, exist_ok=True)
+        content = f"skill at {operation.verified.commit_sha256}\n".encode()
+        skill.write_bytes(content)
+        return (
+            ManagedPath(
+                path=skill.relative_to(managed).as_posix(),
+                sha256=hashlib.sha256(content).hexdigest(),
+                role="skill",
+            ),
+        )
+
     def subscribe(operation: BootstrapOperation) -> BootstrapSubscriptionMutationReceipt:
         return service.ensure_bootstrap_subscription(
             operation.request.name,
@@ -2599,6 +2627,9 @@ def test_remote_update_validates_old_then_typed_swap_then_candidate(
             operation_key=candidate_operation.idempotency_key,
             verified_commit=candidate_operation.verified.commit_sha256,
             ownership=old_operation.subscription_ownership,
+            owned_paths=tuple(
+                item for item in old_operation.owned_paths if item.role != "receipt"
+            ),
         )
         if interrupt_after_swap:
             interrupt_after_swap = False
@@ -2616,7 +2647,7 @@ def test_remote_update_validates_old_then_typed_swap_then_candidate(
             subscribe=subscribe,
             replace_subscription=replace_subscription,
             hydrate_artifacts=lambda operation: events.append("artifacts") or (),
-            install_generic_skill=lambda operation: events.append("generic-skill") or (),
+            install_generic_skill=install_generic_skill,
             export_catalog_skills=lambda operation: events.append("catalog-skills") or (),
             link_agents=lambda operation: events.append("links") or (),
             remove_obsolete_paths=lambda operation: remove_obsolete_paths(
@@ -2663,6 +2694,9 @@ def test_remote_update_validates_old_then_typed_swap_then_candidate(
         capture_output=True,
         check=True,
     ).stdout.strip() == candidate_commit
+    assert (managed / ".agents/skills/geas/SKILL.md").read_text() == (
+        f"skill at {candidate_commit}\n"
+    )
 
 
 def _operation_subscription(operation: BootstrapOperation) -> OntologySubscription:

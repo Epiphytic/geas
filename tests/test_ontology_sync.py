@@ -1,3 +1,4 @@
+import hashlib
 import os
 import subprocess
 from datetime import UTC, datetime, timedelta
@@ -185,6 +186,35 @@ def _seed_remote(remote: Path, seed: Path) -> tuple[str, str]:
         cwd=manager.checkout,
     )
     return commit, manager.checkout.as_posix()
+
+
+def test_replaceable_checkout_allows_only_exact_owned_generated_leaves(
+    tmp_path: Path,
+) -> None:
+    remote = tmp_path / "remote.git"
+    _seed_remote(remote, tmp_path / "seed")
+    local = _manager(remote, tmp_path / "local")
+    local.pull()
+    skill = local.checkout / ".agents" / "skills" / "gold" / "SKILL.md"
+    skill.parent.mkdir(parents=True)
+    skill.write_bytes(b"# Gold\n")
+    owned = {
+        skill.relative_to(local.checkout).as_posix(): hashlib.sha256(
+            skill.read_bytes()
+        ).hexdigest()
+    }
+
+    local.assert_replaceable(owned)
+
+    unrelated = local.checkout / "operator-notes.txt"
+    unrelated.write_text("preserve\n")
+    with pytest.raises(OntologySyncError, match="unowned local changes"):
+        local.assert_replaceable(owned)
+    unrelated.unlink()
+
+    skill.write_bytes(b"operator changed\n")
+    with pytest.raises(OntologySyncError, match="owned generated path changed"):
+        local.assert_replaceable(owned)
 
 
 @pytest.mark.parametrize(

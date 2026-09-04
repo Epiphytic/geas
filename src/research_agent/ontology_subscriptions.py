@@ -597,6 +597,7 @@ class SubscriptionManager:
         operation_key: str,
         verified_commit: str,
         ownership: BootstrapSubscriptionOwnershipReceipt,
+        owned_paths: tuple[ManagedPath, ...] = (),
     ) -> BootstrapSubscriptionMutationReceipt:
         """Replace one exact owned subscription with a staged fixed-checkout clone."""
         with self.config_manager._config_lock():
@@ -607,6 +608,7 @@ class SubscriptionManager:
                 operation_key=operation_key,
                 verified_commit=verified_commit,
                 ownership=ownership,
+                owned_paths=owned_paths,
             )
 
     def _replace_bootstrap_subscription_locked(
@@ -618,6 +620,7 @@ class SubscriptionManager:
         operation_key: str,
         verified_commit: str,
         ownership: BootstrapSubscriptionOwnershipReceipt,
+        owned_paths: tuple[ManagedPath, ...],
     ) -> BootstrapSubscriptionMutationReceipt:
         self._recover_all_removals()
         validate_subscription_name(name)
@@ -663,9 +666,10 @@ class SubscriptionManager:
                 ownership,
                 old,
                 candidate,
+                owned_paths,
             )
 
-        self._assert_subscription_ownership(ownership, old)
+        self._assert_subscription_ownership(ownership, old, owned_paths=owned_paths)
         destination = self.config_manager.subscription_checkout(old)
         before, config = self.config_manager._validated_config_bytes()
 
@@ -726,6 +730,7 @@ class SubscriptionManager:
             ownership,
             old,
             candidate,
+            owned_paths,
         )
 
     def _resume_bootstrap_subscription_replace(
@@ -735,6 +740,7 @@ class SubscriptionManager:
         prior_ownership: BootstrapSubscriptionOwnershipReceipt,
         old_subscription: OntologySubscription,
         candidate: OntologySubscription,
+        owned_paths: tuple[ManagedPath, ...],
     ) -> BootstrapSubscriptionMutationReceipt:
         if journal.phase == "completed":
             assert journal.receipt is not None
@@ -765,6 +771,7 @@ class SubscriptionManager:
                 quarantine,
                 old_subscription,
                 prior_ownership.verified_commit,
+                owned_paths,
             )
             mutation = self._subscription_config_receipt(
                 journal, "subscription_replace"
@@ -777,7 +784,9 @@ class SubscriptionManager:
                 journal.bootstrap_name, journal.old_subscription_sha256
             )
         if journal.phase == "prepared":
-            self._assert_subscription_ownership(prior_ownership, old_subscription)
+            self._assert_subscription_ownership(
+                prior_ownership, old_subscription, owned_paths=owned_paths
+            )
             if (
                 staging.exists()
                 or staging.is_symlink()
@@ -818,9 +827,12 @@ class SubscriptionManager:
                     prior_ownership,
                     old_subscription,
                     checkout_override=quarantine,
+                    owned_paths=owned_paths,
                 )
             else:
-                self._assert_subscription_ownership(prior_ownership, old_subscription)
+                self._assert_subscription_ownership(
+                    prior_ownership, old_subscription, owned_paths=owned_paths
+                )
                 os.replace(destination, quarantine)
                 sync_removal_parent(self.config_manager.root, journal.quarantine)
             if destination.exists() or destination.is_symlink():
@@ -875,6 +887,7 @@ class SubscriptionManager:
                 quarantine,
                 old_subscription,
                 expected_commit=prior_ownership.verified_commit,
+                owned_paths=owned_paths,
             )
             config_bytes, config = self.config_manager._validated_config_bytes()
             current_sha256 = hashlib.sha256(config_bytes).hexdigest()
@@ -961,6 +974,7 @@ class SubscriptionManager:
                             old_subscription,
                             candidate,
                             prior_ownership.verified_commit,
+                            owned_paths,
                         )
                         journal = journal.model_copy(update={"phase": "staged"})
                         self.config_manager._write_bootstrap_state(journal_path, journal)
@@ -991,6 +1005,7 @@ class SubscriptionManager:
             quarantine,
             old_subscription,
             prior_ownership.verified_commit,
+            owned_paths,
         )
         return self._finalize_bootstrap_subscription(
             journal_path, journal, mutation, destination
@@ -1005,6 +1020,7 @@ class SubscriptionManager:
         old_subscription: OntologySubscription,
         candidate: OntologySubscription,
         old_verified_commit: str,
+        owned_paths: tuple[ManagedPath, ...],
     ) -> None:
         self._assert_checkout_identity(
             destination,
@@ -1027,6 +1043,7 @@ class SubscriptionManager:
             quarantine,
             old_subscription,
             expected_commit=old_verified_commit,
+            owned_paths=owned_paths,
         )
         os.replace(destination, staging)
         os.replace(quarantine, destination)
@@ -1038,6 +1055,7 @@ class SubscriptionManager:
         quarantine: Path,
         old_subscription: OntologySubscription,
         old_verified_commit: str,
+        owned_paths: tuple[ManagedPath, ...],
     ) -> None:
         if not (quarantine.exists() or quarantine.is_symlink()):
             return
@@ -1051,6 +1069,7 @@ class SubscriptionManager:
             quarantine,
             old_subscription,
             expected_commit=old_verified_commit,
+            owned_paths=owned_paths,
         )
         shutil.rmtree(quarantine)
         assert journal.quarantine is not None
@@ -1735,6 +1754,7 @@ class SubscriptionManager:
         expected_subscription: OntologySubscription | None = None,
         *,
         checkout_override: Path | None = None,
+        owned_paths: tuple[ManagedPath, ...] = (),
     ) -> None:
         if (
             ownership.profile_name != self.profile_name
@@ -1783,6 +1803,7 @@ class SubscriptionManager:
             checkout,
             configured_subscription,
             expected_commit=ownership.verified_commit,
+            owned_paths=owned_paths,
         )
 
     def _verify_repository_identity(
@@ -1791,6 +1812,7 @@ class SubscriptionManager:
         subscription: OntologySubscription,
         *,
         expected_commit: str,
+        owned_paths: tuple[ManagedPath, ...] = (),
     ) -> None:
         """Recheck the exact clean synchronized repository and catalog identity."""
         if checkout.is_symlink() or not checkout.is_dir():
@@ -1807,7 +1829,20 @@ class SubscriptionManager:
         if catalog.is_symlink() or not catalog.is_file():
             raise ValueError("bootstrap subscription catalog is missing or unsafe")
         repository = self._repository(checkout, subscription)
-        repository.assert_removable()
+        if owned_paths:
+            if any(item.role == "receipt" for item in owned_paths):
+                raise ValueError("repository checkout changes cannot include state receipts")
+            owned = {item.path: item.sha256 for item in owned_paths}
+            if len(owned) != len(owned_paths):
+                raise ValueError("repository checkout change ownership contains duplicates")
+            replaceable = getattr(repository, "assert_replaceable", None)
+            if not callable(replaceable):
+                raise ValueError(
+                    "repository adapter cannot verify exact owned generated changes"
+                )
+            replaceable(owned)
+        else:
+            repository.assert_removable()
         assert_verified_commit = getattr(repository, "assert_verified_commit", None)
         if callable(assert_verified_commit):
             assert_verified_commit(expected_commit)

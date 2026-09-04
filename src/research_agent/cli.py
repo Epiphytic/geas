@@ -2192,6 +2192,9 @@ def _repository_bootstrap_service(args: argparse.Namespace) -> object:
             operation_key=candidate_operation.idempotency_key,
             verified_commit=candidate_operation.verified.commit_sha256,
             ownership=old_operation.subscription_ownership,
+            owned_paths=tuple(
+                item for item in old_operation.owned_paths if item.role != "receipt"
+            ),
         )
 
     def unsubscribe(operation: BootstrapOperation):

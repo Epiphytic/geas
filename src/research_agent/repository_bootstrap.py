@@ -789,9 +789,20 @@ class RepositoryBootstrapManager:
             for item in journal.old_managed_paths
             if item.path not in {candidate.path for candidate in journal.candidate_managed_paths}
         )
-        if self._update_before(journal, RepositoryUpdatePhase.OBSOLETE_PATHS_PENDING):
+        remote_checkout_may_have_swapped = (
+            self._is_deferred_subscription(journal.candidate_request)
+            and not self._update_before(
+                journal, RepositoryUpdatePhase.SUBSCRIPTION_PENDING
+            )
+        )
+        if (
+            self._update_before(journal, RepositoryUpdatePhase.OBSOLETE_PATHS_PENDING)
+            and not remote_checkout_may_have_swapped
+        ):
             self._assert_owned_paths(obsolete)
-        elif journal.phase is RepositoryUpdatePhase.OBSOLETE_PATHS_PENDING:
+        elif self._update_before(
+            journal, RepositoryUpdatePhase.OBSOLETE_PATHS_REMOVED
+        ):
             self._assert_paths_exact_or_absent(obsolete)
         else:
             self._assert_paths_absent(obsolete)
