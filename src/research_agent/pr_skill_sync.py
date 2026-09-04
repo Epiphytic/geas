@@ -451,7 +451,9 @@ def _pull_request_catalog_selection(
     ontology_name = PurePosixPath(ALLOWED_SKILL_ROOTS[1]).name
     subscription = OntologySubscription(
         url=f"https://github.com/{source.repository}.git",
-        active_ref=f"refs/heads/{source.head_ref}",
+        # The checked-in snapshot is consumed after merge from the repository's
+        # canonical branch. Its exact PR provenance remains bound by ``commit``.
+        active_ref="refs/heads/main",
         checkout=Path("ci-pr-skill-sync"),
         catalog=Path("geas.yaml"),
         freshness=OntologyFreshnessConfig(check_before_use=False),

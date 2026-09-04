@@ -819,6 +819,13 @@ def _profile_ontology_root(
         if ontology is not None and not ontology.is_absolute() and len(ontology.parts) == 1
         else None
     )
+    resolves_through_profile = (
+        ontology is None
+        or (
+            ontology_name is not None
+            and not ontology.exists()
+        )
+    )
     freshness = user_config.ontology_freshness
     check_before_use = freshness.check_before_use
     max_age_seconds = freshness.max_age_seconds
@@ -840,7 +847,7 @@ def _profile_ontology_root(
             if override.hydrate_artifacts_before_use is not None:
                 hydrate = override.hydrate_artifacts_before_use
     repository = None
-    if pull_before_read and profile.ontology_git is not None:
+    if pull_before_read and resolves_through_profile and profile.ontology_git is not None:
         repository = OntologyRepositoryManager(
             checkout=root,
             config=profile.ontology_git,
