@@ -284,9 +284,14 @@ class RepositoryBootstrapManager:
             if self._is_deferred_subscription(request):
                 self._assert_verified_managed_root(existing.verified, require_clean=False)
             else:
-                self._assert_verified_managed_root(candidate, require_clean=True)
+                self._assert_verified_managed_root(candidate, require_clean=False)
             self._assert_complete_install(existing)
             self._assert_owned_paths(existing.managed_paths)
+            if (
+                self._requires_managed_worktree_binding
+                and not self._is_deferred_subscription(request)
+            ):
+                self._assert_only_owned_worktree_changes(existing.managed_paths)
             if existing.request == request and existing.verified == candidate:
                 return existing
             candidate_grant = repository_trust_grant(
@@ -802,6 +807,25 @@ class RepositoryBootstrapManager:
             candidate = self._owned_path(item)
             if candidate.exists() or candidate.is_symlink():
                 raise ValueError(f"managed path still exists after removal: {item.path}")
+
+    def _assert_only_owned_worktree_changes(
+        self,
+        managed: tuple[ManagedPath, ...],
+    ) -> None:
+        """Permit an owned repository snapshot while rejecting unrelated local drift."""
+        allowed = {item.path for item in managed if item.role != "receipt"}
+        status = self._managed_git(
+            ("status", "--porcelain=v1", "-z", "--untracked-files=all")
+        )
+        entries = tuple(item for item in status.split("\0") if item)
+        for entry in entries:
+            if len(entry) < 4 or entry[2] != " ":
+                raise ValueError("verified managed Git worktree status is invalid")
+            code = entry[:2]
+            if "R" in code or "C" in code:
+                raise ValueError("verified managed Git worktree contains renamed paths")
+            if entry[3:] not in allowed:
+                raise ValueError("verified managed Git worktree has unowned local changes")
 
     def _validate_loaded_update(
         self,
@@ -1723,11 +1747,19 @@ def _confined_owned_path(root: Path, relative: str) -> Path:
 
 
 def _non_skill_paths(managed: tuple[ManagedPath, ...]) -> tuple[ManagedPath, ...]:
-    return tuple(item for item in managed if item.role not in {"skill", "link"})
+    return tuple(
+        item
+        for item in managed
+        if item.role not in {"skill", "manifest", "snapshot", "link"}
+    )
 
 
 def _skill_paths(managed: tuple[ManagedPath, ...]) -> tuple[ManagedPath, ...]:
-    return tuple(item for item in managed if item.role in {"skill", "link"})
+    return tuple(
+        item
+        for item in managed
+        if item.role in {"skill", "manifest", "snapshot", "link"}
+    )
 
 
 def _fsync_directory(path: Path) -> None:

@@ -20,6 +20,7 @@ from urllib.parse import quote, urlsplit
 
 from pydantic import Field, field_validator, model_validator
 
+from research_agent.git_environment import confined_git_environment
 from research_agent.models import StrictModel
 
 _GIT_ID = re.compile(r"^[0-9a-f]{40}$")
@@ -1201,6 +1202,7 @@ def _prepare_snapshot_install(
 def _git_worktree(repository: Path) -> Path:
     completed = subprocess.run(
         ["git", "-C", os.fspath(repository), "rev-parse", "--show-toplevel"],
+        env=confined_git_environment(),
         check=False,
         capture_output=True,
         text=True,
@@ -1224,6 +1226,7 @@ def _git_ignored(worktree: Path, path: Path) -> bool:
     relative = path.relative_to(worktree).as_posix()
     completed = subprocess.run(
         ["git", "-C", os.fspath(worktree), "check-ignore", "-q", "--", relative],
+        env=confined_git_environment(),
         check=False,
         capture_output=True,
         text=True,

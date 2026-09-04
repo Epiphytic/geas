@@ -401,13 +401,15 @@ def test_subscription_selection_freshens_only_after_initial_authorization(
         url="https://example.invalid/research.git",
         checkout=Path("subscriptions/default/research"),
     )
+    current = manager.load()
     manager.replace(
-        GeasUserConfig(
-            profiles={
-                "default": GeasProfile(
-                    ontology_git=None,
-                    subscriptions={"research": subscription},
-                )
+        current.model_copy(
+            update={
+                "profiles": {
+                    "default": current.profiles["default"].model_copy(
+                        update={"subscriptions": {"research": subscription}}
+                    )
+                }
             }
         )
     )
@@ -679,7 +681,9 @@ def test_first_subscribe_failure_restores_absent_config_root(
         )
 
     assert not manager.path.exists()
-    assert not manager.root.exists()
+    assert tuple(manager.root.iterdir()) == (
+        manager.path.with_name(f".{manager.path.name}.lock"),
+    )
 
 
 def test_first_subscribe_success_completes_normal_config_scaffolding(

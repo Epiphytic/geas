@@ -528,6 +528,30 @@ def test_export_repository_requires_a_git_worktree(tmp_path: Path) -> None:
         )
 
 
+def test_export_repository_ignores_ambient_git_repository_selectors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catches ambient Git variables redirecting a repository-scoped skill write."""
+    repository = _git_repository(tmp_path / "repo")
+    sibling = _git_repository(tmp_path / "sibling")
+    monkeypatch.setenv("GIT_DIR", str(sibling / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(sibling))
+
+    receipt = export_skill(
+        _files(),
+        config_root=tmp_path / "config",
+        home=tmp_path / "home",
+        repository=repository,
+        link=False,
+        force=False,
+        which=_which(),
+    )
+
+    assert receipt.path == repository / ".agents" / "skills" / "test-skill"
+    assert not (sibling / ".agents").exists()
+
+
 def test_unlink_removes_only_managed_links_and_preserves_snapshot(tmp_path: Path) -> None:
     """Catches unlink deleting the snapshot or a link that does not target it exactly."""
     from research_agent.agent_skills import unlink_skill

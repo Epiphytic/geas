@@ -26,6 +26,7 @@ from research_agent.agent_skills import (
     SkillExportReceipt,
     SkillManifest,
     SkillRemovalReceipt,
+    _builtin_skill_snapshot_files,
     canonical_manifest_bytes,
     export_skill,
     refresh_skill,
@@ -38,6 +39,7 @@ from research_agent.audit import DeterministicKnowledgeAuditor
 from research_agent.benchmark import ProjectionBenchmark
 from research_agent.bootstrap_models import (
     BootstrapPhase,
+    ManagedPath,
     RepositoryBootstrapReceipt,
     RepositoryBootstrapRequest,
     VerifiedRepositoryBootstrap,
@@ -47,6 +49,7 @@ from research_agent.bundles import KnowledgeBundleImporter
 from research_agent.capabilities import (
     Capability,
     CapabilityDecision,
+    CapabilityGrant,
     CapabilityRequest,
     DeterministicCapabilityEvaluator,
     VerifiedDelegationManifest,
@@ -119,6 +122,7 @@ from research_agent.models import (
     PolicyStage,
     ThreatObservation,
     ThreatTarget,
+    canonical_json,
     utc_now,
 )
 from research_agent.onboarding import build_setup_guide, render_setup_guide_markdown
@@ -198,6 +202,11 @@ from research_agent.render import (
     render_topic_markdown,
     render_topic_obsidian,
     write_obsidian_vault,
+)
+from research_agent.repository_bootstrap import (
+    BootstrapOperation,
+    RepositoryBootstrapManager,
+    remove_obsolete_paths,
 )
 from research_agent.repository_catalog import (
     ResolvedRepositoryCatalog,
@@ -2036,8 +2045,356 @@ def _verified_repository_bootstrap_from_catalog(
 
 def _repository_bootstrap_service(args: argparse.Namespace) -> object:
     """Compose exact bootstrap lifecycle adapters for the selected profile."""
-    del args
-    raise ValueError("repository bootstrap composition is unavailable")
+    config_manager = _user_config_manager(args)
+    user_config, profile_name, _profile = _selected_user_config(args, config_manager)
+    previous: RepositoryBootstrapReceipt | None = None
+    if args.command in {"repository-update", "repository-remove"}:
+        previous = _load_repository_bootstrap_receipt(
+            config_manager,
+            validate_subscription_name(args.name),
+        )
+    if args.command == "repository-install" and args.current_repository:
+        root_result = subprocess.run(
+            ("git", "rev-parse", "--show-toplevel"),
+            cwd=Path.cwd(),
+            env=OntologyRepositoryManager._git_environment(),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if root_result.returncode != 0:
+            raise ValueError("current repository bootstrap requires a Git worktree")
+        managed_root = Path(root_result.stdout.strip()).resolve(strict=True)
+    elif previous is not None and previous.request.current_worktree is not None:
+        managed_root = previous.request.current_worktree
+    else:
+        name = validate_subscription_name(
+            args.name if previous is None else previous.request.name
+        )
+        managed_root = config_manager.root / "subscriptions" / profile_name / name
+    managed_root = managed_root.resolve(strict=False)
+    state_root = config_manager.root
+    subscription_manager = SubscriptionManager(
+        config_manager=config_manager,
+        profile_name=profile_name,
+        catalog_verifier=resolve_repository_catalog,
+        authorizer=lambda catalog: catalog,
+    )
+    link_requested = bool(getattr(args, "link", False)) or bool(
+        previous is not None and any(item.role == "link" for item in previous.managed_paths)
+    )
+    export_cache: dict[
+        tuple[str, str], tuple[OntologySelection, dict[Path, bytes]]
+    ] = {}
+
+    def verify(request: RepositoryBootstrapRequest) -> VerifiedRepositoryBootstrap:
+        inspected = _inspect_repository_bootstrap(
+            repository=(None if request.current_worktree is not None else request.repository),
+            active_ref=request.ref,
+            catalog=Path(request.catalog),
+            current_worktree=request.current_worktree,
+            defaults=user_config.ontology_defaults,
+        )
+        return inspected.model_copy(update={"current_worktree": managed_root})
+
+    def operation_subscription(operation: BootstrapOperation) -> OntologySubscription:
+        return OntologySubscription(
+            url=operation.request.repository,
+            active_ref=operation.request.ref,
+            checkout=Path("subscriptions") / profile_name / operation.request.name,
+            catalog=Path(operation.request.catalog),
+        )
+
+    def current_binding_path(operation: BootstrapOperation) -> Path:
+        digest = operation.idempotency_key.rsplit(":", 1)[-1]
+        return config_manager._confined_state_path(
+            Path("repository-bootstrap")
+            / "current-bindings"
+            / profile_name
+            / operation.request.name
+            / f"{digest}.json"
+        )
+
+    def bind_current(operation: BootstrapOperation) -> tuple[ManagedPath, ...]:
+        path = current_binding_path(operation)
+        expected = canonical_json(operation.verified.model_dump(mode="json")) + b"\n"
+        existing = config_manager._load_bootstrap_state(path)
+        if existing is not None and existing != expected:
+            raise ValueError("current repository bootstrap binding changed")
+        if existing is None:
+            config_manager._write_bootstrap_state(path, operation.verified)
+        relative = path.relative_to(state_root).as_posix()
+        return (
+            ManagedPath(
+                path=relative,
+                sha256=hashlib.sha256(expected).hexdigest(),
+                role="receipt",
+            ),
+        )
+
+    def record_trust(operation: BootstrapOperation, grant: CapabilityGrant):
+        return config_manager.record_bootstrap_grant(
+            operation_key=operation.idempotency_key,
+            profile_name=profile_name,
+            bootstrap_name=operation.request.name,
+            grant=grant,
+        )
+
+    def replace_trust(
+        operation: BootstrapOperation,
+        old_grant: CapabilityGrant | None,
+        new_grant: CapabilityGrant | None,
+    ):
+        if operation.grant_ownership is None:
+            raise ValueError("repository trust replacement is missing exact ownership")
+        return config_manager.replace_bootstrap_grant(
+            operation_key=operation.idempotency_key,
+            profile_name=profile_name,
+            bootstrap_name=operation.request.name,
+            ownership=operation.grant_ownership,
+            old_grant=old_grant,
+            new_grant=new_grant,
+        )
+
+    def remove_trust(operation: BootstrapOperation, grant: CapabilityGrant):
+        if operation.grant_ownership is None:
+            raise ValueError("repository trust removal is missing exact ownership")
+        return config_manager.remove_bootstrap_grant(
+            operation_key=operation.idempotency_key,
+            profile_name=profile_name,
+            bootstrap_name=operation.request.name,
+            ownership=operation.grant_ownership,
+            grant=grant,
+        )
+
+    def subscribe(operation: BootstrapOperation):
+        if operation.request.current_worktree is not None:
+            return bind_current(operation)
+        return subscription_manager.ensure_bootstrap_subscription(
+            operation.request.name,
+            operation_subscription(operation),
+            operation_key=operation.idempotency_key,
+            verified_commit=operation.verified.commit_sha256,
+        )
+
+    def replace_subscription(
+        old_operation: BootstrapOperation,
+        candidate_operation: BootstrapOperation,
+    ):
+        if candidate_operation.request.current_worktree is not None:
+            return bind_current(candidate_operation)
+        if old_operation.subscription_ownership is None:
+            raise ValueError("subscription replacement is missing exact ownership")
+        return subscription_manager.replace_bootstrap_subscription(
+            candidate_operation.request.name,
+            operation_subscription(old_operation),
+            operation_subscription(candidate_operation),
+            operation_key=candidate_operation.idempotency_key,
+            verified_commit=candidate_operation.verified.commit_sha256,
+            ownership=old_operation.subscription_ownership,
+        )
+
+    def unsubscribe(operation: BootstrapOperation):
+        if operation.request.current_worktree is not None:
+            remove_obsolete_paths(
+                managed_root,
+                operation,
+                state_root=state_root,
+            )
+            return None
+        if operation.subscription_ownership is None:
+            raise ValueError("subscription removal is missing exact ownership")
+        return subscription_manager.remove_bootstrap_subscription(
+            operation.request.name,
+            operation_subscription(operation),
+            operation_key=operation.idempotency_key,
+            ownership=operation.subscription_ownership,
+        )
+
+    def selections(operation: BootstrapOperation) -> tuple[OntologySelection, ...]:
+        resolved = resolve_repository_catalog(
+            managed_root / operation.request.catalog,
+            verified_commit=operation.verified.commit_sha256,
+        )
+        if (
+            resolved.repository_root != managed_root
+            or resolved.repository_identity != operation.verified.repository
+            or resolved.commit != operation.verified.commit_sha256
+        ):
+            raise ValueError("managed repository catalog identity changed before export")
+        paths = tuple(item.workspace_path.as_posix() for item in resolved.ontologies)
+        bundles = tuple(item.bundle_sha256 for item in resolved.ontologies)
+        if (
+            paths != operation.verified.ontology_paths
+            or bundles != operation.verified.bundle_sha256
+        ):
+            raise ValueError("managed repository ontology inventory changed before export")
+        subscription = operation_subscription(operation)
+        catalog_path = (managed_root / operation.request.catalog).resolve(strict=True)
+        return tuple(
+            OntologySelection(
+                name=ontology.name,
+                description=ontology.description,
+                source=f"subscription:{operation.request.name}",
+                source_kind="subscription",
+                ontology_directory=ontology.ontology_path,
+                verified_ontology_directory=ontology.ontology_path,
+                repository_identity=operation.verified.repository,
+                repository_root=managed_root,
+                verified_repository_root=managed_root,
+                identity_kind="remote",
+                active_ref=operation.verified.ref,
+                commit=operation.verified.commit_sha256,
+                catalog_path=catalog_path,
+                repository_path=ontology.ontology_path.relative_to(managed_root),
+                bundle_sha256=ontology.bundle_sha256,
+                files=ontology.files,
+                trust_status="trusted",
+                authorization="profile",
+                subscription_name=operation.request.name,
+                subscription=subscription,
+            )
+            for ontology in resolved.ontologies
+        )
+
+    def catalog_exports(
+        operation: BootstrapOperation,
+    ) -> tuple[tuple[OntologySelection, dict[Path, bytes]], ...]:
+        provenance = GeasUpdater().inspect()
+        if not provenance.commit:
+            raise ValueError("repository skill export requires exact Geas provenance")
+        exports: list[tuple[OntologySelection, dict[Path, bytes]]] = []
+        for selection in selections(operation):
+            key = (operation.verified.id, selection.name)
+            cached = export_cache.get(key)
+            if cached is None:
+                with tempfile.TemporaryDirectory(
+                    prefix="geas-bootstrap-artifacts-"
+                ) as temporary:
+                    exported = export_catalog_skill(
+                        selection,
+                        artifact_store=GitHubReleaseArtifactStore(
+                            operation.request.repository,
+                            branch=operation.request.ref,
+                        ),
+                        skill_name=selection.name,
+                        geas_version=provenance.version,
+                        geas_commit=provenance.commit,
+                        defaults=user_config.ontology_defaults,
+                        artifact_workspace=Path(temporary) / selection.name,
+                    )
+                cached = (selection, exported.files)
+                export_cache[key] = cached
+            exports.append(cached)
+        return tuple(exports)
+
+    def managed_snapshot_paths(receipt: SkillExportReceipt) -> tuple[ManagedPath, ...]:
+        relative_root = receipt.path.relative_to(managed_root)
+        paths = [
+            ManagedPath(
+                path=(relative_root / item.path).as_posix(),
+                sha256=item.sha256,
+                role=("manifest" if item.path == "geas-skill.json" else "skill"),
+            )
+            for item in receipt.manifest.files
+        ]
+        manifest_path = receipt.path / "geas-skill.json"
+        paths.append(
+            ManagedPath(
+                path=(relative_root / "geas-skill.json").as_posix(),
+                sha256=hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
+                role="manifest",
+            )
+        )
+        return tuple(sorted(paths, key=lambda item: item.path))
+
+    def install_files(files: Mapping[Path, bytes]) -> tuple[ManagedPath, ...]:
+        receipt = export_skill(
+            files,
+            config_root=state_root,
+            home=Path.home(),
+            repository=managed_root,
+            link=False,
+            force=False,
+            which=lambda _executable: None,
+        )
+        return managed_snapshot_paths(receipt)
+
+    def hydrate_artifacts(operation: BootstrapOperation) -> tuple[ManagedPath, ...]:
+        catalog_exports(operation)
+        return ()
+
+    def install_generic_skill(operation: BootstrapOperation) -> tuple[ManagedPath, ...]:
+        del operation
+        return install_files(_builtin_skill_snapshot_files())
+
+    def export_catalog_skills(operation: BootstrapOperation) -> tuple[ManagedPath, ...]:
+        return tuple(
+            path
+            for _selection, files in catalog_exports(operation)
+            for path in install_files(files)
+        )
+
+    def link_agents(operation: BootstrapOperation) -> tuple[ManagedPath, ...]:
+        if not link_requested:
+            return ()
+        files = (
+            _builtin_skill_snapshot_files(),
+            *(value for _selection, value in catalog_exports(operation)),
+        )
+        links = []
+        for snapshot in files:
+            receipt = export_skill(
+                snapshot,
+                config_root=state_root,
+                home=Path.home(),
+                repository=managed_root,
+                link=True,
+                force=False,
+                which=shutil.which,
+            )
+            for item in receipt.links:
+                target = os.readlink(item.path)
+                links.append(
+                    ManagedPath(
+                        path=item.path.relative_to(managed_root).as_posix(),
+                        sha256=hashlib.sha256(target.encode()).hexdigest(),
+                        role="link",
+                    )
+                )
+        return tuple(sorted(links, key=lambda item: item.path))
+
+    def remove_skills(operation: BootstrapOperation) -> None:
+        remove_obsolete_paths(managed_root, operation, state_root=state_root)
+
+    def verify_software_provenance() -> None:
+        provenance = GeasUpdater().inspect()
+        if not provenance.commit:
+            raise ValueError("repository update requires exact Geas provenance")
+
+    return RepositoryBootstrapManager(
+        managed_root=managed_root,
+        state_root=state_root,
+        announce=lambda message: print(message, file=sys.stderr),
+        verify=verify,
+        record_trust=record_trust,
+        replace_trust=replace_trust,
+        subscribe=subscribe,
+        replace_subscription=replace_subscription,
+        hydrate_artifacts=hydrate_artifacts,
+        install_generic_skill=install_generic_skill,
+        export_catalog_skills=export_catalog_skills,
+        link_agents=link_agents,
+        remove_trust=remove_trust,
+        unsubscribe=unsubscribe,
+        remove_skills=remove_skills,
+        remove_obsolete_paths=lambda operation: remove_obsolete_paths(
+            managed_root,
+            operation,
+            state_root=state_root,
+        ),
+        verify_software_provenance=verify_software_provenance,
+    )
 
 
 def _preauthorize_repository_publication(

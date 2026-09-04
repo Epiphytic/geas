@@ -378,6 +378,209 @@ def test_repository_handlers_invoke_one_domain_method_and_emit_one_receipt(
     assert "repository" in output.err.casefold()
 
 
+def test_repository_install_dispatch_composes_split_roots_and_real_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    repository = tmp_path / "repository"
+    ontology = repository / "ontology" / "gold"
+    ontology.mkdir(parents=True)
+    source = ontology / "source.txt"
+    source.write_bytes(b"verified ontology bytes\n")
+    catalog_file = CatalogFile(
+        path=Path("source.txt"),
+        sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
+        size_bytes=source.stat().st_size,
+    )
+    catalog_ontology = CatalogOntology(
+        name="gold",
+        description="Gold ontology",
+        path=Path("ontology/gold"),
+        files=(catalog_file,),
+        bundle_sha256="0" * 64,
+    )
+    catalog_ontology = catalog_ontology.model_copy(
+        update={"bundle_sha256": ontology_bundle_sha256(catalog_ontology)}
+    )
+    (repository / "geas.yaml").write_text(
+        RepositoryCatalog(ontologies=(catalog_ontology,)).model_dump_json(indent=2)
+    )
+    subprocess.run(
+        ("git", "init", "--initial-branch=main", str(repository)),
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ("git", "-C", str(repository), "config", "user.name", "Geas Test"),
+        check=True,
+    )
+    subprocess.run(
+        (
+            "git",
+            "-C",
+            str(repository),
+            "config",
+            "user.email",
+            "geas@example.invalid",
+        ),
+        check=True,
+    )
+    subprocess.run(
+        ("git", "-C", str(repository), "remote", "add", "origin", REPOSITORY),
+        check=True,
+    )
+    subprocess.run(
+        ("git", "-C", str(repository), "add", "geas.yaml", "ontology/gold/source.txt"),
+        check=True,
+    )
+    subprocess.run(
+        ("git", "-C", str(repository), "commit", "-m", "fixture catalog"),
+        check=True,
+        text=True,
+        capture_output=True,
+    )
+    commit = subprocess.run(
+        ("git", "-C", str(repository), "rev-parse", "HEAD"),
+        check=True,
+        text=True,
+        capture_output=True,
+    ).stdout.strip()
+
+    config_path = tmp_path / "config" / "config.yaml"
+    UserConfigManager(config_path).replace(
+        GeasUserConfig(profiles={"default": GeasProfile(ontology_git=None)})
+    )
+
+    def export_catalog(selection: OntologySelection, **_kwargs: object) -> object:
+        content = b"# Gold research skill\n"
+        inventory = (
+            SkillFile(path="SKILL.md", sha256=hashlib.sha256(content).hexdigest()),
+        )
+        manifest = SkillManifest(
+            format_version=2,
+            skill=SkillIdentity(name="gold"),
+            ontology=OntologyIdentity(
+                name="gold",
+                repository_url=REPOSITORY,
+                branch="main",
+                commit=commit,
+                active_ref="refs/heads/main",
+                ontology_commit=commit,
+                subscription_name="gold",
+                catalog_path="geas.yaml",
+                ontology_path="ontology/gold",
+                bundle_sha256=catalog_ontology.bundle_sha256,
+            ),
+            geas=GeasIdentity(
+                project_url="https://github.com/Epiphytic/geas",
+                version="1.0.0",
+                commit="f" * 40,
+            ),
+            projection=ProjectionIdentity(
+                snapshot_id="truth:sha256:gold",
+                topic_concept_id="concept:gold",
+            ),
+            artifact=PortableArtifactIdentity(
+                role="knowledge-projection",
+                content_sha256="c" * 64,
+                input_revision="d" * 64,
+            ),
+            files=inventory,
+            snapshot_sha256=snapshot_digest(inventory),
+        )
+        assert selection.name == "gold"
+        assert selection.repository_root == repository.resolve()
+        return SimpleNamespace(
+            files={
+                Path("SKILL.md"): content,
+                Path("geas-skill.json"): canonical_manifest_bytes(manifest),
+            }
+        )
+
+    monkeypatch.setattr(cli, "export_catalog_skill", export_catalog)
+    monkeypatch.setattr(
+        cli,
+        "GeasUpdater",
+        lambda: SimpleNamespace(
+            inspect=lambda: SimpleNamespace(version="1.0.0", commit="f" * 40)
+        ),
+    )
+    monkeypatch.chdir(repository)
+
+    _run_main(
+        monkeypatch,
+        "--geas-config",
+        str(config_path),
+        "repository-install",
+        "--current-repository",
+        "--publish",
+        "none",
+    )
+
+    output = capsys.readouterr()
+    receipt = RepositoryBootstrapReceipt.model_validate(json.loads(output.out))
+    assert receipt.completed_phases[-1] is BootstrapPhase.COMPLETED
+    assert receipt.verified is not None
+    assert receipt.verified.current_worktree == repository.resolve()
+    assert (repository / ".agents" / "skills" / "geas" / "SKILL.md").is_file()
+    assert (repository / ".agents" / "skills" / "gold" / "SKILL.md").is_file()
+    assert (config_path.parent / "repository-bootstrap" / "gold.json").is_file()
+    assert not (repository / "repository-bootstrap").exists()
+    assert output.out.count("\n{") == 0
+    assert "running repository install" in output.err.casefold()
+
+    unrelated = repository / "operator-notes.txt"
+    unrelated.write_text("preserve\n")
+    with pytest.raises(ValueError, match="unowned local changes"):
+        _run_main(
+            monkeypatch,
+            "--geas-config",
+            str(config_path),
+            "repository-update",
+            "gold",
+            "--publish",
+            "none",
+        )
+    assert unrelated.read_text() == "preserve\n"
+    assert RepositoryBootstrapReceipt.model_validate_json(
+        (config_path.parent / "repository-bootstrap" / "gold.json").read_bytes()
+    ).id == receipt.id
+    unrelated.unlink()
+    capsys.readouterr()
+
+    _run_main(
+        monkeypatch,
+        "--geas-config",
+        str(config_path),
+        "repository-update",
+        "gold",
+        "--publish",
+        "none",
+    )
+    updated_output = capsys.readouterr()
+    updated = RepositoryBootstrapReceipt.model_validate(json.loads(updated_output.out))
+    assert updated.id == receipt.id
+    assert "running repository update" in updated_output.err.casefold()
+
+    _run_main(
+        monkeypatch,
+        "--geas-config",
+        str(config_path),
+        "repository-remove",
+        "gold",
+    )
+    removed_output = capsys.readouterr()
+    removed = RepositoryBootstrapReceipt.model_validate(json.loads(removed_output.out))
+    assert removed.removed is True
+    assert not (repository / ".agents" / "skills" / "geas" / "SKILL.md").exists()
+    assert not (repository / ".agents" / "skills" / "gold" / "SKILL.md").exists()
+    assert repository.is_dir()
+    assert (repository / "geas.yaml").is_file()
+    assert "running repository remove" in removed_output.err.casefold()
+
+
 def test_repository_direct_push_denial_precedes_lifecycle_construction(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1737,15 +1940,17 @@ def test_prior_receipt_publication_scope_requires_every_complete_path(
             )
         }
     )
-    UserConfigManager(config_path).replace(
-        GeasUserConfig(
-            version=2,
-            profiles={
-                "default": GeasProfile(
-                    ontology_git=None,
-                    capability_grants=(complete,),
-                )
-            },
+    manager = UserConfigManager(config_path)
+    current = manager.load()
+    manager.replace(
+        current.model_copy(
+            update={
+                "profiles": {
+                    "default": current.profiles["default"].model_copy(
+                        update={"capability_grants": (complete,)}
+                    )
+                }
+            }
         ),
         upgrade_version=True,
     )
