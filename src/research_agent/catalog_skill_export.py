@@ -135,6 +135,7 @@ def export_catalog_skill(
         ontology_name=selection.name,
         repository_url=ontology.repository_url,
         branch=ontology.branch,
+        active_ref=ontology.active_ref,
         ontology_commit=ontology.commit,
         geas_version=geas_version,
         geas_commit=geas_commit,

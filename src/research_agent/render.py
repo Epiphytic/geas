@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import tempfile
 from collections import defaultdict
@@ -33,6 +34,7 @@ def render_ontology_skill(
     ontology_name: str,
     repository_url: str,
     branch: str,
+    active_ref: str | None = None,
     ontology_commit: str,
     geas_version: str,
     geas_commit: str | None,
@@ -54,7 +56,7 @@ def render_ontology_skill(
     reference_files[Path("references/repository.md")] = _render_repository_reference(
         ontology_name=ontology.name,
         repository_url=ontology.repository_url,
-        branch=ontology.branch,
+        active_ref=active_ref or f"refs/heads/{ontology.branch}",
     )
     files: dict[Path, bytes] = {
         Path("SKILL.md"): _render_skill_entrypoint(
@@ -179,16 +181,24 @@ def _render_repository_reference(
     *,
     ontology_name: str,
     repository_url: str,
-    branch: str,
+    active_ref: str,
 ) -> str:
     """Render optional repository lifecycle guidance outside the compact entry point."""
-    ref = f"refs/heads/{branch}"
-    install = (
-        f"geas repository-install {ontology_name} {repository_url} "
-        f"--ref {ref} --read-only --publish none"
+    install = shlex.join(
+        (
+            "geas",
+            "repository-install",
+            ontology_name,
+            repository_url,
+            "--ref",
+            active_ref,
+            "--read-only",
+            "--publish",
+            "none",
+        )
     )
-    update = f"geas repository-update {ontology_name} --publish none"
-    remove = f"geas repository-remove {ontology_name}"
+    update = shlex.join(("geas", "repository-update", ontology_name, "--publish", "none"))
+    remove = shlex.join(("geas", "repository-remove", ontology_name))
     lines = [
         "# Repository lifecycle",
         "",
@@ -208,7 +218,7 @@ def _render_repository_reference(
         (
             "Before a first remote or current-repository install may publish, configure an "
             f"exact-repository, exact-ref root-local `git.pull_request` grant for "
-            f"{_inline_code(repository_url)} and {_inline_code(ref)}, or root-local "
+            f"{_inline_code(repository_url)} and {_inline_code(active_ref)}, or root-local "
             "`git.direct_push` plus explicit `--direct-push`."
         ),
         (

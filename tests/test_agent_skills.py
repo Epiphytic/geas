@@ -4,6 +4,7 @@ import hashlib
 import json
 import posixpath
 import re
+import shlex
 from pathlib import Path
 
 import pytest
@@ -703,3 +704,66 @@ def test_rendered_ontology_skill_has_exact_repository_lifecycle_and_publication_
         "only that Git capability",
     ):
         assert expected in lifecycle
+
+
+@pytest.mark.parametrize(
+    "active_ref",
+    (
+        "refs/tags/v1.2.3",
+        "c" * 40,
+        "d" * 64,
+    ),
+)
+def test_rendered_repository_lifecycle_preserves_exact_nonbranch_ref(active_ref: str) -> None:
+    """Catches lifecycle guidance rewriting tags or exact commits as branch refs."""
+    from research_agent.render import render_ontology_skill
+
+    files = render_ontology_skill(
+        _topic(),
+        skill_name="test-skill",
+        ontology_name="test-ontology",
+        repository_url="https://example.test/ontology.git",
+        branch=active_ref.removeprefix("refs/heads/"),
+        active_ref=active_ref,
+        ontology_commit=COMMIT,
+        geas_version="1.2.3",
+        geas_commit=None,
+    )
+
+    lifecycle = files[Path("references/repository.md")].decode()
+    assert f"--ref {active_ref}" in lifecycle
+    assert f"refs/heads/{active_ref}" not in lifecycle
+
+
+def test_rendered_repository_lifecycle_shell_quotes_every_dynamic_argument() -> None:
+    """Catches a legal repository URL becoming shell syntax in a copyable command."""
+    from research_agent.render import render_ontology_skill
+
+    repository_url = "https://example.test/ontology.git;touch$IFS/tmp/geas-pwned"
+    files = render_ontology_skill(
+        _topic(),
+        skill_name="test-skill",
+        ontology_name="test-ontology",
+        repository_url=repository_url,
+        branch="main",
+        active_ref="refs/heads/main",
+        ontology_commit=COMMIT,
+        geas_version="1.2.3",
+        geas_commit=None,
+    )
+
+    lifecycle = files[Path("references/repository.md")].decode()
+    command = shlex.join(
+        (
+            "geas",
+            "repository-install",
+            "test-ontology",
+            repository_url,
+            "--ref",
+            "refs/heads/main",
+            "--read-only",
+            "--publish",
+            "none",
+        )
+    )
+    assert f"`{command}`" in lifecycle
