@@ -855,8 +855,8 @@ def test_canadian_gold_miner_automatic_acquisition_is_offline_resumable_and_owne
         financial_anchor["end"],
     )
 
-    # Task 7 is intentionally absent from this branch. This is the first
-    # cross-stream fan-in boundary after the existing services above prove green.
+    # Exercise the real CLI parser at the cross-stream fan-in boundary after the
+    # acquisition, extraction, and repository services above prove green.
     install = cli._build_parser().parse_args(
         [
             "repository-install",
@@ -871,8 +871,8 @@ def test_canadian_gold_miner_automatic_acquisition_is_offline_resumable_and_owne
     assert install.publish == "pull-request"
     assert install.direct_push is False
 
-    # These methods land with Task 7's bootstrap-state fan-in. Keeping the calls
-    # after the parser gate makes the pre-fan-in failure precise without fake state.
+    # Keep the state fan-in after the parser gate so this integration path proves
+    # both the public invocation contract and exact receipt-owned cleanup.
     from research_agent.repository_bootstrap import remove_obsolete_paths
 
     state_root = tmp_path / "geas-state"

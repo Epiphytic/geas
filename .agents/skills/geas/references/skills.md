@@ -19,6 +19,14 @@ also links to the repository and optional Geas installation, and gives exact
 `geas list`, artifact lookup, `skill-update`, `skill-unlink`, and
 `skill-remove` routes.
 
+A repository-installed snapshot also records the repository URL, active ref,
+catalog path, ontology name, and bundle digest. Inspect those values with
+`geas list`; use the bounded `topic-show`, `knowledge-query`, and
+`ontology-artifact-sync` routes rather than treating the snapshot as authority
+to fetch, install software, or widen trust. `repository-update NAME` refreshes
+the recorded lifecycle, while `repository-remove NAME` removes exact
+receipt-owned paths, links, subscriptions, and local trust only.
+
 `config-init` installs or refreshes the packaged generic `geas` skill at
 `<geas-config-root>/skills/geas`, then links it for detected agents. Codex and
 OpenCode share `~/.agents/skills/geas`; Claude uses

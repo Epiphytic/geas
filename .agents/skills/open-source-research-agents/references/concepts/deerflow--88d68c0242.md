@@ -3,7 +3,7 @@
 - Record ID: `project:deerflow`
 - Broader concepts: [concept:multi-agent-research](multi-agent-research--6500a38175.md)
 - Narrower concepts: none
-- Synonyms: none
+- Synonyms: \[\]
 
 ## Untrusted concept description
 
